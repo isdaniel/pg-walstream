@@ -9,12 +9,45 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 /// Buffer reader for parsing binary protocol messages
 ///
 /// This implementation uses the `bytes` crate for efficient, zero-copy buffer operations.
+/// It provides safe methods for reading various integer types, strings, and byte arrays
+/// from PostgreSQL's binary protocol format (network byte order / big-endian).
+///
+/// # Example
+///
+/// ```
+/// use pg_walstream::BufferReader;
+///
+/// let data = vec![0x00, 0x01, 0x02, 0x03];
+/// let mut reader = BufferReader::new(&data);
+///
+/// let byte = reader.read_u8().unwrap();
+/// assert_eq!(byte, 0x00);
+///
+/// let remaining = reader.remaining();
+/// assert_eq!(remaining, 3);
+/// ```
 pub struct BufferReader {
     data: Bytes,
 }
 
 impl BufferReader {
     /// Create a new buffer reader from a byte slice
+    ///
+    /// Copies the provided byte slice into an internal Bytes buffer.
+    /// For zero-copy operation with existing Bytes, use `from_bytes()` instead.
+    ///
+    /// # Arguments
+    ///
+    /// * `data` - Byte slice to read from
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use pg_walstream::BufferReader;
+    ///
+    /// let data = vec![0x01, 0x02, 0x03, 0x04];
+    /// let reader = BufferReader::new(&data);
+    /// ```
     #[inline]
     pub fn new(data: &[u8]) -> Self {
         Self {
@@ -69,6 +102,14 @@ impl BufferReader {
     }
 
     /// Read a single byte
+    ///
+    /// # Returns
+    ///
+    /// Returns the next byte from the buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there are insufficient bytes remaining in the buffer.
     #[inline]
     pub fn read_u8(&mut self) -> Result<u8> {
         self.ensure_bytes(1)?;
@@ -76,6 +117,16 @@ impl BufferReader {
     }
 
     /// Read a 16-bit unsigned integer in network byte order
+    ///
+    /// Reads 2 bytes and interprets them as a big-endian u16.
+    ///
+    /// # Returns
+    ///
+    /// Returns the next 16-bit unsigned integer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there are insufficient bytes remaining.
     #[inline]
     pub fn read_u16(&mut self) -> Result<u16> {
         self.ensure_bytes(2)?;
@@ -83,6 +134,16 @@ impl BufferReader {
     }
 
     /// Read a 32-bit unsigned integer in network byte order
+    ///
+    /// Reads 4 bytes and interprets them as a big-endian u32.
+    ///
+    /// # Returns
+    ///
+    /// Returns the next 32-bit unsigned integer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there are insufficient bytes remaining.
     #[inline]
     pub fn read_u32(&mut self) -> Result<u32> {
         self.ensure_bytes(4)?;
@@ -90,6 +151,17 @@ impl BufferReader {
     }
 
     /// Read a 64-bit unsigned integer in network byte order
+    ///
+    /// Reads 8 bytes and interprets them as a big-endian u64.
+    /// This is commonly used for reading LSN values.
+    ///
+    /// # Returns
+    ///
+    /// Returns the next 64-bit unsigned integer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there are insufficient bytes remaining.
     #[inline]
     pub fn read_u64(&mut self) -> Result<u64> {
         self.ensure_bytes(8)?;

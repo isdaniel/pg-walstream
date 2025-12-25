@@ -45,6 +45,35 @@ pub struct ReplicationStreamConfig {
 
 impl ReplicationStreamConfig {
     /// Create a new replication stream configuration
+    ///
+    /// # Arguments
+    ///
+    /// * `slot_name` - Name of the replication slot to use (will be created if it doesn't exist)
+    /// * `publication_name` - Name of the PostgreSQL publication to replicate from
+    /// * `protocol_version` - Protocol version (1-4). Version 2+ supports streaming transactions
+    /// * `streaming_enabled` - Enable streaming of large in-progress transactions
+    /// * `feedback_interval` - How often to send status feedback to PostgreSQL
+    /// * `connection_timeout` - Maximum time to wait for connection establishment
+    /// * `health_check_interval` - How often to check connection health
+    /// * `retry_config` - Configuration for connection retry behavior
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use pg_walstream::{ReplicationStreamConfig, RetryConfig};
+    /// use std::time::Duration;
+    ///
+    /// let config = ReplicationStreamConfig::new(
+    ///     "my_slot".to_string(),
+    ///     "my_publication".to_string(),
+    ///     2,
+    ///     true,
+    ///     Duration::from_secs(10),
+    ///     Duration::from_secs(30),
+    ///     Duration::from_secs(60),
+    ///     RetryConfig::default(),
+    /// );
+    /// ```
     pub fn new(
         slot_name: String,
         publication_name: String,
@@ -70,6 +99,53 @@ impl ReplicationStreamConfig {
 
 impl LogicalReplicationStream {
     /// Create a new logical replication stream
+    ///
+    /// This establishes a connection to PostgreSQL and prepares the stream for replication.
+    /// It does not create the replication slot or start replication - call `start()` for that.
+    ///
+    /// # Arguments
+    ///
+    /// * `connection_string` - PostgreSQL connection string. Must include `replication=database`
+    ///   parameter. Example: `"postgresql://user:pass@host:5432/dbname?replication=database"`
+    /// * `config` - Replication stream configuration
+    ///
+    /// # Returns
+    ///
+    /// A new `LogicalReplicationStream` instance ready to be started.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Connection to PostgreSQL fails
+    /// - Connection string is invalid
+    /// - PostgreSQL version is too old (< 14.0)
+    /// - Authentication fails
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig};
+    /// use std::time::Duration;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let config = ReplicationStreamConfig::new(
+    ///     "my_slot".to_string(),
+    ///     "my_publication".to_string(),
+    ///     2,
+    ///     true,
+    ///     Duration::from_secs(10),
+    ///     Duration::from_secs(30),
+    ///     Duration::from_secs(60),
+    ///     RetryConfig::default(),
+    /// );
+    ///
+    /// let stream = LogicalReplicationStream::new(
+    ///     "postgresql://postgres:password@localhost:5432/mydb?replication=database",
+    ///     config,
+    /// ).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn new(connection_string: &str, config: ReplicationStreamConfig) -> Result<Self> {
         info!("Creating logical replication stream with retry support");
 
@@ -98,7 +174,41 @@ impl LogicalReplicationStream {
     /// Set the shared LSN feedback tracker
     ///
     /// This should be called before starting replication to enable proper
-    /// LSN tracking between producer and consumer.
+    /// LSN tracking between producer (reading from PostgreSQL) and consumer
+    /// (writing to destination database).
+    ///
+    /// The feedback tracker allows the consumer to communicate back to the producer
+    /// which LSNs have been successfully committed, so the producer can send accurate
+    /// feedback to PostgreSQL. This is crucial for WAL retention management.
+    ///
+    /// # Arguments
+    ///
+    /// * `feedback` - Arc-wrapped SharedLsnFeedback instance to be shared with consumer
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use pg_walstream::{LogicalReplicationStream, SharedLsnFeedback, ReplicationStreamConfig, RetryConfig};
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let config = ReplicationStreamConfig::new(
+    ///     "my_slot".to_string(),
+    ///     "my_publication".to_string(),
+    ///     2, true,
+    ///     Duration::from_secs(10),
+    ///     Duration::from_secs(30),
+    ///     Duration::from_secs(60),
+    ///     RetryConfig::default(),
+    /// );
+    ///
+    /// let mut stream = LogicalReplicationStream::new("connection_string", config).await?;
+    /// let lsn_feedback = SharedLsnFeedback::new_shared();
+    /// stream.set_shared_lsn_feedback(lsn_feedback.clone());
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn set_shared_lsn_feedback(&mut self, feedback: Arc<SharedLsnFeedback>) {
         self.shared_lsn_feedback = Some(feedback);
     }
@@ -149,6 +259,53 @@ impl LogicalReplicationStream {
     }
 
     /// Start the replication stream
+    ///
+    /// This initializes the replication slot (creating it if necessary) and begins
+    /// streaming changes from PostgreSQL.
+    ///
+    /// # Arguments
+    ///
+    /// * `start_lsn` - Optional LSN to start replication from. If `None`, starts from
+    ///   the current WAL position. Use this to resume replication from a known position.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` if replication started successfully.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - System identification fails
+    /// - Replication slot creation fails (if it doesn't exist)
+    /// - Starting replication command fails
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig};
+    /// use std::time::Duration;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let config = ReplicationStreamConfig::new(
+    ///     "my_slot".to_string(),
+    ///     "my_publication".to_string(),
+    ///     2, true,
+    ///     Duration::from_secs(10),
+    ///     Duration::from_secs(30),
+    ///     Duration::from_secs(60),
+    ///     RetryConfig::default(),
+    /// );
+    ///
+    /// let mut stream = LogicalReplicationStream::new("connection_string", config).await?;
+    ///
+    /// // Start from the beginning
+    /// stream.start(None).await?;
+    ///
+    /// // Or resume from a specific LSN
+    /// // stream.start(Some(0x16B374D848)).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn start(&mut self, start_lsn: Option<XLogRecPtr>) -> Result<()> {
         info!("Starting logical replication stream");
 

@@ -17,7 +17,37 @@ use tracing::{debug, info, warn};
 pub use crate::types::INVALID_XLOG_REC_PTR;
 
 /// Safe wrapper around PostgreSQL connection for replication
-
+///
+/// This struct provides a safe, high-level interface to libpq for PostgreSQL
+/// logical replication. It handles connection management, replication slot
+/// creation, and COPY protocol communication.
+///
+/// # Safety
+///
+/// This struct safely wraps the unsafe libpq C API. All unsafe operations
+/// are properly encapsulated and validated.
+///
+/// # Example
+///
+/// ```no_run
+/// use pg_walstream::PgReplicationConnection;
+///
+/// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let mut conn = PgReplicationConnection::connect(
+///     "postgresql://postgres:password@localhost/mydb?replication=database"
+/// )?;
+///
+/// // Identify the system
+/// conn.identify_system()?;
+///
+/// // Create a replication slot
+/// conn.create_replication_slot("my_slot", "pgoutput")?;
+///
+/// // Start replication
+/// conn.start_replication("my_slot", 0, &[("proto_version", "2")])?
+/// # ; Ok(())
+/// # }
+/// ```
 pub struct PgReplicationConnection {
     conn: *mut PGconn,
     is_replication_conn: bool,
@@ -26,6 +56,40 @@ pub struct PgReplicationConnection {
 
 impl PgReplicationConnection {
     /// Create a new PostgreSQL connection for logical replication
+    ///
+    /// Establishes a connection to PostgreSQL using the provided connection string.
+    /// The connection string must include the `replication=database` parameter to
+    /// enable logical replication.
+    ///
+    /// # Arguments
+    ///
+    /// * `conninfo` - PostgreSQL connection string. Must include `replication=database`.
+    ///   Example: `"postgresql://user:pass@host:5432/dbname?replication=database"`
+    ///
+    /// # Returns
+    ///
+    /// Returns a new `PgReplicationConnection` if successful.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Connection string is invalid
+    /// - Cannot connect to PostgreSQL server (transient or permanent)
+    /// - Authentication fails
+    /// - PostgreSQL version is too old (< 14.0)
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use pg_walstream::PgReplicationConnection;
+    ///
+    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let conn = PgReplicationConnection::connect(
+    ///     "postgresql://postgres:password@localhost:5432/mydb?replication=database"
+    /// )?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn connect(conninfo: &str) -> Result<Self> {
         // Ensure libpq is properly initialized
         unsafe {

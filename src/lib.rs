@@ -23,17 +23,61 @@
 //!
 //! ## Quick Start
 //!
-//! ```rust,ignore
+//! ```ignore
 //! use pg_walstream::{
-//!     LogicalReplicationParser, BufferReader,
-//!     format_lsn, parse_lsn,
+//!     LogicalReplicationStream, ReplicationStreamConfig, RetryConfig,
+//!     SharedLsnFeedback, CancellationToken,
 //! };
+//! use std::sync::Arc;
+//! use std::time::Duration;
 //!
-//! // Parse WAL messages from your connection
-//! let parser = LogicalReplicationParser::with_protocol_version(2);
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     // Configure the replication stream
+//!     let config = ReplicationStreamConfig::new(
+//!         "my_slot".to_string(),           // Replication slot name
+//!         "my_publication".to_string(),     // Publication name
+//!         2,                                // Protocol version
+//!         true,                             // Enable streaming
+//!         Duration::from_secs(10),          // Feedback interval
+//!         Duration::from_secs(30),          // Connection timeout
+//!         Duration::from_secs(60),          // Health check interval
+//!         RetryConfig::default(),           // Retry configuration
+//!     );
 //!
-//! // Parse a WAL message (you provide the bytes from your connection)
-//! let message = parser.parse_wal_message(&wal_data)?;
+//!     // Create connection string
+//!     let connection_string = "postgresql://postgres:test.123@postgres:5432/postgres?replication=database";
+//!
+//!     // Create and initialize the stream
+//!     let mut stream = LogicalReplicationStream::new(connection_string, config).await?;
+//!     
+//!     // Set up LSN feedback for tracking progress
+//!     let lsn_feedback = SharedLsnFeedback::new_shared();
+//!     stream.set_shared_lsn_feedback(lsn_feedback.clone());
+//!     
+//!     // Initialize the stream (creates slot if needed) && Start replication from a specific LSN (or None for latest)
+//!     stream.start(None).await?;
+//!
+//!     // Create cancellation token for graceful shutdown
+//!     let cancel_token = CancellationToken::new();
+//!
+//!     // Process events
+//!     loop {
+//!         match stream.next_event(&cancel_token).await? {
+//!             Some(event) => {
+//!                 println!("Received event: {:?}", event);
+//!                 
+//!                 // Update LSN feedback after processing
+//!                 if let Some(lsn) = event.lsn {
+//!                     lsn_feedback.update_applied_lsn(lsn.value());
+//!                 }
+//!             }
+//!             None => {
+//!                 // No event available, continue
+//!             }
+//!         }
+//!     }
+//! }
 //! ```
 
 // Core modules

@@ -49,6 +49,19 @@ pub struct SharedLsnFeedback {
 
 impl SharedLsnFeedback {
     /// Create a new shared LSN feedback tracker
+    ///
+    /// Initializes both flushed_lsn and applied_lsn to 0.
+    /// Use `new_shared()` if you need an Arc-wrapped instance for sharing between threads.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use pg_walstream::lsn::SharedLsnFeedback;
+    ///
+    /// let feedback = SharedLsnFeedback::new();
+    /// assert_eq!(feedback.get_flushed_lsn(), 0);
+    /// assert_eq!(feedback.get_applied_lsn(), 0);
+    /// ```
     pub fn new() -> Self {
         Self {
             flushed_lsn: AtomicU64::new(0),
@@ -57,6 +70,29 @@ impl SharedLsnFeedback {
     }
 
     /// Create a new shared LSN feedback tracker wrapped in Arc for sharing
+    ///
+    /// This is the preferred way to create a feedback tracker that will be shared
+    /// between the producer (reading from PostgreSQL) and consumer (writing to destination).
+    ///
+    /// # Returns
+    ///
+    /// An `Arc<SharedLsnFeedback>` that can be cloned and shared across threads safely.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use pg_walstream::lsn::SharedLsnFeedback;
+    /// use std::sync::Arc;
+    ///
+    /// let feedback = SharedLsnFeedback::new_shared();
+    /// let consumer_feedback = Arc::clone(&feedback);
+    ///
+    /// // Consumer thread updates LSN after commit
+    /// consumer_feedback.update_applied_lsn(1000);
+    ///
+    /// // Producer thread reads LSN for PostgreSQL feedback
+    /// let (flushed, applied) = feedback.get_feedback_lsn();
+    /// ```
     pub fn new_shared() -> Arc<Self> {
         Arc::new(Self::new())
     }
@@ -131,12 +167,27 @@ impl SharedLsnFeedback {
     }
 
     /// Get the current flushed LSN
+    ///
+    /// Returns the last LSN value that was flushed to the destination database.
+    /// This represents data that has been written but may not yet be committed.
+    ///
+    /// # Returns
+    ///
+    /// The current flushed LSN as a u64 value (XLogRecPtr).
     #[inline(always)]
     pub fn get_flushed_lsn(&self) -> XLogRecPtr {
         self.flushed_lsn.load(Ordering::Acquire)
     }
 
     /// Get the current applied LSN
+    ///
+    /// Returns the last LSN value that was successfully committed to the destination database.
+    /// This is the most important LSN as PostgreSQL uses it to determine which WAL segments
+    /// can be safely recycled.
+    ///
+    /// # Returns
+    ///
+    /// The current applied LSN as a u64 value (XLogRecPtr).
     #[inline(always)]
     pub fn get_applied_lsn(&self) -> XLogRecPtr {
         self.applied_lsn.load(Ordering::Acquire)
@@ -144,7 +195,26 @@ impl SharedLsnFeedback {
 
     /// Get both LSN values atomically for feedback
     ///
-    /// Returns (flushed_lsn, applied_lsn)
+    /// Retrieves both flushed and applied LSN values. Note that these are read
+    /// sequentially but both use atomic operations, so they represent a consistent
+    /// state at the time of reading.
+    ///
+    /// # Returns
+    ///
+    /// A tuple of (flushed_lsn, applied_lsn) as u64 values.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use pg_walstream::lsn::SharedLsnFeedback;
+    ///
+    /// let feedback = SharedLsnFeedback::new();
+    /// feedback.update_applied_lsn(1000);
+    ///
+    /// let (flushed, applied) = feedback.get_feedback_lsn();
+    /// assert_eq!(flushed, 1000);
+    /// assert_eq!(applied, 1000);
+    /// ```
     #[inline(always)]
     pub fn get_feedback_lsn(&self) -> (XLogRecPtr, XLogRecPtr) {
         let flushed = self.flushed_lsn.load(Ordering::Acquire);

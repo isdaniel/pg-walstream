@@ -9,13 +9,42 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info};
 
 /// Configuration for retry logic
+///
+/// Defines the parameters for exponential backoff retry behavior when
+/// connecting to PostgreSQL or recovering from transient failures.
+///
+/// # Example
+///
+/// ```
+/// use pg_walstream::RetryConfig;
+/// use std::time::Duration;
+///
+/// // Use default configuration (5 attempts, 1s to 60s delays)
+/// let config = RetryConfig::default();
+///
+/// // Or create custom configuration
+/// let custom_config = RetryConfig {
+///     max_attempts: 10,
+///     initial_delay: Duration::from_millis(500),
+///     max_delay: Duration::from_secs(30),
+///     multiplier: 2.0,
+///     max_duration: Duration::from_secs(600),
+///     jitter: true,
+/// };
+/// ```
 #[derive(Debug, Copy, Clone)]
 pub struct RetryConfig {
+    /// Maximum number of retry attempts before giving up
     pub max_attempts: u32,
+    /// Initial delay before the first retry
     pub initial_delay: Duration,
+    /// Maximum delay between retries (caps exponential growth)
     pub max_delay: Duration,
+    /// Multiplier for exponential backoff (typically 2.0)
     pub multiplier: f64,
+    /// Maximum total duration for all retry attempts
     pub max_duration: Duration,
+    /// Whether to add random jitter to delays (reduces thundering herd)
     pub jitter: bool,
 }
 
@@ -45,6 +74,27 @@ pub struct ExponentialBackoff {
 
 impl ExponentialBackoff {
     /// Create a new exponential backoff instance
+    ///
+    /// Initializes the backoff state machine with parameters from the provided
+    /// RetryConfig. The backoff starts at `initial_delay` and grows by `multiplier`
+    /// on each call to `next_delay()`, up to `max_delay`.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Retry configuration specifying backoff parameters
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use pg_walstream::{ExponentialBackoff, RetryConfig};
+    ///
+    /// let config = RetryConfig::default();
+    /// let mut backoff = ExponentialBackoff::new(&config);
+    ///
+    /// let delay1 = backoff.next_delay();
+    /// let delay2 = backoff.next_delay();
+    /// assert!(delay2 > delay1); // Delay increases exponentially
+    /// ```
     pub fn new(config: &RetryConfig) -> Self {
         Self {
             initial_delay: config.initial_delay,
@@ -57,6 +107,35 @@ impl ExponentialBackoff {
     }
 
     /// Get the next delay duration
+    ///
+    /// Returns the current delay and advances the internal state for the next call.
+    /// Each call increases the delay by the configured multiplier until it reaches
+    /// the maximum delay. Optional jitter is applied to prevent thundering herd problems.
+    ///
+    /// # Returns
+    ///
+    /// Duration to wait before the next retry attempt.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use pg_walstream::{ExponentialBackoff, RetryConfig};
+    /// use std::time::Duration;
+    ///
+    /// let config = RetryConfig {
+    ///     max_attempts: 5,
+    ///     initial_delay: Duration::from_millis(100),
+    ///     max_delay: Duration::from_secs(10),
+    ///     multiplier: 2.0,
+    ///     max_duration: Duration::from_secs(60),
+    ///     jitter: false,
+    /// };
+    ///
+    /// let mut backoff = ExponentialBackoff::new(&config);
+    /// let d1 = backoff.next_delay(); // ~100ms
+    /// let d2 = backoff.next_delay(); // ~200ms
+    /// let d3 = backoff.next_delay(); // ~400ms
+    /// ```
     pub fn next_delay(&mut self) -> Duration {
         let delay = self.current_delay;
 
@@ -126,6 +205,37 @@ impl ReplicationConnectionRetry {
     }
 
     /// Retry connection establishment with exponential backoff
+    ///
+    /// Attempts to establish a PostgreSQL replication connection with automatic
+    /// retry logic. Uses exponential backoff with optional jitter to handle
+    /// transient connection failures gracefully.
+    ///
+    /// # Returns
+    ///
+    /// Returns a connected `PgReplicationConnection` on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - All retry attempts are exhausted
+    /// - Maximum duration is exceeded
+    /// - A permanent error occurs (authentication, unsupported version, etc.)
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use pg_walstream::{ReplicationConnectionRetry, RetryConfig};
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let retry_handler = ReplicationConnectionRetry::new(
+    ///     RetryConfig::default(),
+    ///     "postgresql://postgres:password@localhost/mydb?replication=database".to_string(),
+    /// );
+    ///
+    /// let connection = retry_handler.connect_with_retry().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn connect_with_retry(&self) -> Result<PgReplicationConnection> {
         let start_time = Instant::now();
         let mut backoff = self.config.to_backoff();

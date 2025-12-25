@@ -24,6 +24,31 @@ pub type Oid = u32;
 pub type TimestampTz = i64;
 
 /// Convert SystemTime to PostgreSQL timestamp format (microseconds since 2000-01-01)
+///
+/// PostgreSQL uses a different epoch than Unix (2000-01-01 vs 1970-01-01).
+/// This function converts from Rust's SystemTime to PostgreSQL's timestamp format.
+///
+/// # Arguments
+///
+/// * `time` - SystemTime to convert
+///
+/// # Returns
+///
+/// Microseconds since PostgreSQL epoch (2000-01-01 00:00:00 UTC)
+///
+/// # Panics
+///
+/// Panics if the SystemTime is before Unix epoch (1970-01-01).
+///
+/// # Example
+///
+/// ```
+/// use pg_walstream::system_time_to_postgres_timestamp;
+/// use std::time::SystemTime;
+///
+/// let now = SystemTime::now();
+/// let pg_timestamp = system_time_to_postgres_timestamp(now);
+/// ```
 pub fn system_time_to_postgres_timestamp(time: SystemTime) -> TimestampTz {
     let duration_since_unix = time
         .duration_since(UNIX_EPOCH)
@@ -64,6 +89,35 @@ pub fn postgres_timestamp_to_chrono(ts: i64) -> chrono::DateTime<chrono::Utc> {
 }
 
 /// Parse LSN from string format (e.g., "0/12345678")
+///
+/// PostgreSQL represents LSN (Log Sequence Number) as two 32-bit hexadecimal numbers
+/// separated by a slash. This function parses that string format into a 64-bit integer.
+///
+/// # Arguments
+///
+/// * `lsn_str` - LSN string in PostgreSQL format (e.g., "0/12345678" or "16/B374D848")
+///
+/// # Returns
+///
+/// Returns the parsed LSN as a 64-bit unsigned integer (XLogRecPtr).
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The string format is invalid (doesn't contain exactly one '/')
+/// - Either part cannot be parsed as hexadecimal
+///
+/// # Example
+///
+/// ```
+/// use pg_walstream::parse_lsn;
+///
+/// let lsn = parse_lsn("16/B374D848").unwrap();
+/// assert_eq!(lsn, 0x16B374D848);
+///
+/// let lsn = parse_lsn("0/0").unwrap();
+/// assert_eq!(lsn, 0);
+/// ```
 pub fn parse_lsn(lsn_str: &str) -> Result<XLogRecPtr> {
     let parts: Vec<&str> = lsn_str.split('/').collect();
     if parts.len() != 2 {
@@ -82,6 +136,29 @@ pub fn parse_lsn(lsn_str: &str) -> Result<XLogRecPtr> {
 }
 
 /// Format LSN as string (e.g., "0/12345678")
+///
+/// Converts a 64-bit LSN value into PostgreSQL's string representation format.
+/// The format is two 32-bit hexadecimal numbers separated by a slash.
+///
+/// # Arguments
+///
+/// * `lsn` - 64-bit LSN value (XLogRecPtr)
+///
+/// # Returns
+///
+/// String representation in PostgreSQL format (e.g., "16/B374D848")
+///
+/// # Example
+///
+/// ```
+/// use pg_walstream::format_lsn;
+///
+/// let lsn_str = format_lsn(0x16B374D848);
+/// assert_eq!(lsn_str, "16/B374D848");
+///
+/// let lsn_str = format_lsn(0);
+/// assert_eq!(lsn_str, "0/0");
+/// ```
 pub fn format_lsn(lsn: XLogRecPtr) -> String {
     format!("{:X}/{:X}", lsn >> 32, lsn & 0xFFFFFFFF)
 }
@@ -104,6 +181,27 @@ pub enum ReplicaIdentity {
 
 impl ReplicaIdentity {
     /// Create replica identity from byte
+    ///
+    /// Converts a PostgreSQL replica identity byte code to the enum variant.
+    ///
+    /// # Arguments
+    ///
+    /// * `byte` - Single byte representing replica identity ('d', 'n', 'f', or 'i')
+    ///
+    /// # Returns
+    ///
+    /// * `Some(ReplicaIdentity)` if the byte is valid
+    /// * `None` if the byte is unrecognized
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use pg_walstream::ReplicaIdentity;
+    ///
+    /// assert_eq!(ReplicaIdentity::from_byte(b'd'), Some(ReplicaIdentity::Default));
+    /// assert_eq!(ReplicaIdentity::from_byte(b'f'), Some(ReplicaIdentity::Full));
+    /// assert_eq!(ReplicaIdentity::from_byte(b'x'), None);
+    /// ```
     pub fn from_byte(byte: u8) -> Option<Self> {
         match byte {
             b'd' => Some(ReplicaIdentity::Default),
@@ -115,6 +213,25 @@ impl ReplicaIdentity {
     }
 
     /// Convert to byte representation
+    ///
+    /// Converts the replica identity enum to PostgreSQL's single-byte format.
+    ///
+    /// # Returns
+    ///
+    /// Single byte representing the replica identity:
+    /// * `b'd'` - Default (primary key)
+    /// * `b'n'` - Nothing (no replica identity)
+    /// * `b'f'` - Full (all columns)
+    /// * `b'i'` - Index (specific index)
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use pg_walstream::ReplicaIdentity;
+    ///
+    /// assert_eq!(ReplicaIdentity::Default.to_byte(), b'd');
+    /// assert_eq!(ReplicaIdentity::Full.to_byte(), b'f');
+    /// ```
     pub fn to_byte(&self) -> u8 {
         match self {
             ReplicaIdentity::Default => b'd',
@@ -160,11 +277,35 @@ pub struct Lsn(pub u64);
 
 impl Lsn {
     /// Create a new LSN from a u64 value
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - 64-bit LSN value (XLogRecPtr)
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use pg_walstream::Lsn;
+    ///
+    /// let lsn = Lsn::new(0x16B374D848);
+    /// assert_eq!(lsn.value(), 0x16B374D848);
+    /// ```
     pub fn new(value: u64) -> Self {
         Self(value)
     }
 
     /// Get the raw u64 value
+    ///
+    /// Returns the underlying 64-bit LSN value.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use pg_walstream::Lsn;
+    ///
+    /// let lsn = Lsn::new(12345);
+    /// assert_eq!(lsn.value(), 12345);
+    /// ```
     pub fn value(&self) -> u64 {
         self.0
     }
@@ -278,6 +419,31 @@ pub struct ChangeEvent {
 
 impl ChangeEvent {
     /// Create a new INSERT event
+    ///
+    /// # Arguments
+    ///
+    /// * `schema_name` - Database schema name
+    /// * `table_name` - Table name
+    /// * `relation_oid` - PostgreSQL relation OID
+    /// * `data` - Inserted row data as column_name -> value map
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use pg_walstream::ChangeEvent;
+    /// use std::collections::HashMap;
+    ///
+    /// let mut data = HashMap::new();
+    /// data.insert("id".to_string(), serde_json::json!(1));
+    /// data.insert("name".to_string(), serde_json::json!("Alice"));
+    ///
+    /// let event = ChangeEvent::insert(
+    ///     "public".to_string(),
+    ///     "users".to_string(),
+    ///     12345,
+    ///     data,
+    /// );
+    /// ```
     pub fn insert(
         schema_name: String,
         table_name: String,
@@ -297,6 +463,41 @@ impl ChangeEvent {
     }
 
     /// Create a new UPDATE event
+    ///
+    /// # Arguments
+    ///
+    /// * `schema_name` - Database schema name
+    /// * `table_name` - Table name
+    /// * `relation_oid` - PostgreSQL relation OID
+    /// * `old_data` - Previous row data (may be None depending on replica identity)
+    /// * `new_data` - New row data after update
+    /// * `replica_identity` - Table's replica identity setting (affects old_data availability)
+    /// * `key_columns` - Names of columns that form the replica identity key
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use pg_walstream::{ChangeEvent, ReplicaIdentity};
+    /// use std::collections::HashMap;
+    ///
+    /// let mut old_data = HashMap::new();
+    /// old_data.insert("id".to_string(), serde_json::json!(1));
+    /// old_data.insert("name".to_string(), serde_json::json!("Alice"));
+    ///
+    /// let mut new_data = HashMap::new();
+    /// new_data.insert("id".to_string(), serde_json::json!(1));
+    /// new_data.insert("name".to_string(), serde_json::json!("Bob"));
+    ///
+    /// let event = ChangeEvent::update(
+    ///     "public".to_string(),
+    ///     "users".to_string(),
+    ///     12345,
+    ///     Some(old_data),
+    ///     new_data,
+    ///     ReplicaIdentity::Default,
+    ///     vec!["id".to_string()],
+    /// );
+    /// ```
     pub fn update(
         schema_name: String,
         table_name: String,
@@ -322,6 +523,35 @@ impl ChangeEvent {
     }
 
     /// Create a new DELETE event
+    ///
+    /// # Arguments
+    ///
+    /// * `schema_name` - Database schema name
+    /// * `table_name` - Table name
+    /// * `relation_oid` - PostgreSQL relation OID
+    /// * `old_data` - Deleted row data (columns available depend on replica identity)
+    /// * `replica_identity` - Table's replica identity setting
+    /// * `key_columns` - Names of columns that form the replica identity key
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use pg_walstream::{ChangeEvent, ReplicaIdentity};
+    /// use std::collections::HashMap;
+    ///
+    /// let mut old_data = HashMap::new();
+    /// old_data.insert("id".to_string(), serde_json::json!(1));
+    /// old_data.insert("name".to_string(), serde_json::json!("Alice"));
+    ///
+    /// let event = ChangeEvent::delete(
+    ///     "public".to_string(),
+    ///     "users".to_string(),
+    ///     12345,
+    ///     old_data,
+    ///     ReplicaIdentity::Full,
+    ///     vec!["id".to_string()],
+    /// );
+    /// ```
     pub fn delete(
         schema_name: String,
         table_name: String,
@@ -345,6 +575,13 @@ impl ChangeEvent {
     }
 
     /// Create a BEGIN transaction event
+    ///
+    /// Marks the beginning of a transaction in the replication stream.
+    ///
+    /// # Arguments
+    ///
+    /// * `transaction_id` - PostgreSQL transaction ID (XID)
+    /// * `commit_timestamp` - Transaction start timestamp
     pub fn begin(transaction_id: u32, commit_timestamp: chrono::DateTime<chrono::Utc>) -> Self {
         Self {
             event_type: EventType::Begin {
@@ -357,6 +594,13 @@ impl ChangeEvent {
     }
 
     /// Create a COMMIT transaction event
+    ///
+    /// Marks the successful commit of a transaction in the replication stream.
+    ///
+    /// # Arguments
+    ///
+    /// * `_transaction_id` - PostgreSQL transaction ID (unused but kept for API compatibility)
+    /// * `commit_timestamp` - Transaction commit timestamp
     pub fn commit(_transaction_id: u32, commit_timestamp: chrono::DateTime<chrono::Utc>) -> Self {
         Self {
             event_type: EventType::Commit { commit_timestamp },
