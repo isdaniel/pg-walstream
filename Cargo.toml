@@ -1,0 +1,27 @@
+[package]
+name = "pg_walstream"
+version = "0.0.1"
+edition = "2021"
+authors = ["danielshih <dog830228@gmail.com>"]
+license = "BSD-3-Clause"
+repository = "https://github.com/isdaniel/pg-walstream"
+homepage = "https://github.com/isdaniel/pg-walstream"
+documentation = "https://docs.rs/pg_walstream"
+readme = "../README.md"
+description = "PostgreSQL logical replication protocol library - parse and handle PostgreSQL WAL streaming messages"
+keywords = ["postgresql", "replication", "wal", "logical-decoding", "streaming"]
+categories = ["database", "parsing", "network-programming"]
+
+[dependencies]
+tokio = { version = "1.47.1", features = ["io-util", "net", "time", "macros"] }
+tokio-util = { version = "0.7.16", features = ["compat"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.142"
+chrono = { version = "0.4.41", features = ["serde"] }
+bytes = "1.10.1"
+tracing = "0.1.41"
+libpq-sys = "0.8"
+thiserror = "2.0.12"
+
+[features]
+default = []

@@ -1,0 +1,73 @@
+name: Code Quality
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ "*" ] 
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  formatting:
+    name: Check Formatting
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt
+    - name: Check formatting
+      run: cargo fmt --all -- --check
+
+  # clippy:
+  #   name: Clippy
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #   - uses: actions/checkout@v4
+    
+  #   - uses: dtolnay/rust-toolchain@stable
+  #     with:
+  #       components: clippy
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libpq-dev pkg-config libssl-dev
+
+    - name: Cache dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+    # - name: Run clippy
+    #   run: cargo clippy --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious -D clippy::complexity -D clippy::perf
+
+  unused-dependencies:
+    name: Check Unused Dependencies
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@nightly
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libpq-dev pkg-config libssl-dev
+
+    - name: Install cargo-udeps
+      run: cargo install cargo-udeps --locked
+
+    - name: Check for unused dependencies
+      run: cargo +nightly udeps --all-targets
+
+  typos:
+    name: Check for Typos
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: crate-ci/typos@master
