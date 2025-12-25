@@ -2,8 +2,9 @@ name: Publish pg-walstream to crates.io
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches: [ main ]
+  pull_request:
+    branches: [ "*" ] 
 
 env:
   CARGO_TERM_COLOR: always
