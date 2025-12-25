@@ -22,6 +22,24 @@ Add this to your `Cargo.toml`:
 pg_walstream = "0.1.0"
 ```
 
+## System Dependencies
+
+Make sure you have libpq development libraries installed:
+
+**Ubuntu/Debian:**
+```bash
+sudo apt-get install libpq-dev \
+    clang \
+    libclang-dev 
+```
+
+**CentOS/RHEL/Fedora:**
+```bash
+sudo yum install postgresql-devel
+# or
+sudo dnf install postgresql-devel
+```
+
 ## Quick Start
 
 ### Complete Replication Stream

@@ -92,7 +92,6 @@ jobs:
       run: cargo build --verbose
 
     - name: Run unit tests
-      working-directory: pg-walstream
       run: cargo test --lib --verbose
 
   security:
@@ -125,18 +124,3 @@ jobs:
       run: cargo doc --no-deps --all-features
       env:
         RUSTDOCFLAGS: "-D warnings"
-
-  # minimum-supported-rust-version:
-  #   name: Minimum Supported Rust Version
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #   - uses: actions/checkout@v4
-  #   - name: Install dependencies
-  #     run: |
-  #       sudo apt-get update
-  #       sudo apt-get install -y libpq-dev pkg-config libssl-dev
-
-  #   # We test with Rust 1.70.0 as it's the edition 2021 minimum
-  #   - uses: dtolnay/rust-toolchain@1.70.0
-  #   - name: Check MSRV
-  #     run: cargo check --all-targets --all-features
