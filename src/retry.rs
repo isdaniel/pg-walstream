@@ -309,7 +309,7 @@ mod tests {
         assert_eq!(backoff.attempt(), 2);
         backoff.next_delay();
         assert_eq!(backoff.attempt(), 3);
-        
+
         // After 3 attempts, we've reached max_attempts
         assert_eq!(backoff.attempt(), config.max_attempts);
     }
@@ -353,7 +353,7 @@ mod tests {
         };
 
         let mut backoff = ExponentialBackoff::new(&config);
-        
+
         assert_eq!(backoff.current_delay, Duration::from_millis(100));
         backoff.next_delay();
         assert_eq!(backoff.current_delay, Duration::from_millis(200));
@@ -376,7 +376,7 @@ mod tests {
         backoff.next_delay();
 
         backoff.reset();
-        
+
         assert_eq!(backoff.attempt(), 0);
         assert_eq!(backoff.current_delay, Duration::from_millis(100));
     }

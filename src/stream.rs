@@ -103,13 +103,8 @@ impl LogicalReplicationStream {
         self.shared_lsn_feedback = Some(feedback);
     }
 
-    /// Get the shared LSN feedback tracker
-    pub fn get_shared_lsn_feedback(&self) -> Option<Arc<SharedLsnFeedback>> {
-        self.shared_lsn_feedback.clone()
-    }
-
     /// Initialize the replication stream
-    pub async fn initialize(&mut self) -> Result<()> {
+    async fn initialize(&mut self) -> Result<()> {
         info!("Initializing replication stream");
 
         // Identify the system
@@ -157,6 +152,7 @@ impl LogicalReplicationStream {
     pub async fn start(&mut self, start_lsn: Option<XLogRecPtr>) -> Result<()> {
         info!("Starting logical replication stream");
 
+        self.initialize().await?;
         let start_lsn = start_lsn.unwrap_or(INVALID_XLOG_REC_PTR);
 
         // Build replication options
