@@ -23,11 +23,14 @@
 //!
 //! ## Quick Start
 //!
+//! ### Using the Stream API
+//!
 //! ```ignore
 //! use pg_walstream::{
 //!     LogicalReplicationStream, ReplicationStreamConfig, RetryConfig,
 //!     SharedLsnFeedback, CancellationToken,
 //! };
+//! use futures::StreamExt;
 //! use std::sync::Arc;
 //! use std::time::Duration;
 //!
@@ -49,11 +52,10 @@
 //!     let connection_string = "postgresql://postgres:test.123@postgres:5432/postgres?replication=database";
 //!
 //!     // Create and initialize the stream
-//!     let mut stream = LogicalReplicationStream::new(connection_string, config).await?;
-//!     
-//!     // Set up LSN feedback for tracking progress
-//!     let lsn_feedback = SharedLsnFeedback::new_shared();
-//!     stream.set_shared_lsn_feedback(lsn_feedback.clone());
+//!     let mut stream = LogicalReplicationStream::new(
+//!         connection_string,
+//!         config,
+//!     ).await?;
 //!     
 //!     // Initialize the stream (creates slot if needed) && Start replication from a specific LSN (or None for latest)
 //!     stream.start(None).await?;
@@ -61,22 +63,78 @@
 //!     // Create cancellation token for graceful shutdown
 //!     let cancel_token = CancellationToken::new();
 //!
-//!     // Process events
-//!     loop {
-//!         match stream.next_event(&cancel_token).await? {
-//!             Some(event) => {
+//!     // Convert to async Stream (recommended - more ergonomic)
+//!     let mut event_stream = stream.into_stream(cancel_token);
+//!
+//!     // Process events using Stream API
+//!     while let Some(result) = event_stream.next().await {
+//!         match result {
+//!             Ok(event) => {
 //!                 println!("Received event: {:?}", event);
 //!                 
 //!                 // Update LSN feedback after processing
-//!                 if let Some(lsn) = event.lsn {
-//!                     lsn_feedback.update_applied_lsn(lsn.value());
-//!                 }
+//!                 stream.shared_lsn_feedback.update_applied_lsn(event.lsn.value());
 //!             }
-//!             None => {
-//!                 // No event available, continue
+//!             Err(e) => {
+//!                 eprintln!("Error: {}", e);
+//!                 break;
 //!             }
 //!         }
 //!     }
+//!     
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ### Using the Polling API
+//!
+//! ```ignore
+//! use pg_walstream::{
+//!     LogicalReplicationStream, ReplicationStreamConfig, RetryConfig,
+//!     SharedLsnFeedback, CancellationToken,
+//! };
+//! use std::sync::Arc;
+//! use std::time::Duration;
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let config = ReplicationStreamConfig::new(
+//!         "my_slot".to_string(),
+//!         "my_publication".to_string(),
+//!         2, true,
+//!         Duration::from_secs(10),
+//!         Duration::from_secs(30),
+//!         Duration::from_secs(60),
+//!         RetryConfig::default(),
+//!     );
+//!
+//!     let mut stream = LogicalReplicationStream::new(
+//!         "postgresql://postgres:password@localhost:5432/mydb?replication=database",
+//!         config,
+//!     ).await?;
+//!     
+//!     stream.start(None).await?;
+//!
+//!     let cancel_token = CancellationToken::new();
+//!
+//!     // Traditional polling loop with automatic retry
+//!     loop {
+//!         match stream.next_event_with_retry(&cancel_token).await {
+//!             Ok(Some(event)) => {
+//!                 println!("Received event: {:?}", event);
+//!                 stream.shared_lsn_feedback.update_applied_lsn(event.lsn.value());
+//!             }
+//!             Ok(None) => {
+//!                 // No event available, continue
+//!             }
+//!             Err(e) => {
+//!                 eprintln!("Error: {}", e);
+//!                 break;
+//!             }
+//!         }
+//!     }
+//!     
+//!     Ok(())
 //! }
 //! ```
 
@@ -132,7 +190,7 @@ pub use protocol::{
 };
 
 // Re-export stream types
-pub use stream::{LogicalReplicationStream, ReplicationStreamConfig};
+pub use stream::{EventStream, EventStreamRef, LogicalReplicationStream, ReplicationStreamConfig};
 
 // Re-export tokio_util for CancellationToken
 pub use tokio_util::sync::CancellationToken;

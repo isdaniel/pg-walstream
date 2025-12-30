@@ -97,9 +97,8 @@ impl PgReplicationConnection {
             debug!("Using libpq version: {}", library_version);
         }
 
-        let c_conninfo = CString::new(conninfo).map_err(|e| {
-            ReplicationError::connection(format!("Invalid connection string: {}", e))
-        })?;
+        let c_conninfo = CString::new(conninfo)
+            .map_err(|e| ReplicationError::connection(format!("Invalid connection string: {e}")))?;
 
         let conn = unsafe { PQconnectdb(c_conninfo.as_ptr()) };
 
@@ -128,21 +127,18 @@ impl PgReplicationConnection {
                 || error_msg_lower.contains("role does not exist")
             {
                 return Err(ReplicationError::authentication(format!(
-                    "PostgreSQL authentication failed: {}",
-                    error_msg
+                    "PostgreSQL authentication failed: {error_msg}"
                 )));
             } else if error_msg_lower.contains("database does not exist")
                 || error_msg_lower.contains("invalid connection string")
                 || error_msg_lower.contains("unsupported")
             {
                 return Err(ReplicationError::permanent_connection(format!(
-                    "PostgreSQL connection failed (permanent): {}",
-                    error_msg
+                    "PostgreSQL connection failed (permanent): {error_msg}"
                 )));
             } else {
                 return Err(ReplicationError::transient_connection(format!(
-                    "PostgreSQL connection failed (transient): {}",
-                    error_msg
+                    "PostgreSQL connection failed (transient): {error_msg}"
                 )));
             }
         }
@@ -152,8 +148,7 @@ impl PgReplicationConnection {
         if server_version < 140000 {
             unsafe { PQfinish(conn) };
             return Err(ReplicationError::permanent_connection(format!(
-                "PostgreSQL version {} is not supported. Logical replication requires PostgreSQL 14+",
-                server_version
+                "PostgreSQL version {server_version} is not supported. Logical replication requires PostgreSQL 14+"
             )));
         }
 
@@ -169,7 +164,7 @@ impl PgReplicationConnection {
     /// Execute a replication command (like IDENTIFY_SYSTEM)
     pub fn exec(&self, query: &str) -> Result<PgResult> {
         let c_query = CString::new(query)
-            .map_err(|e| ReplicationError::protocol(format!("Invalid query string: {}", e)))?;
+            .map_err(|e| ReplicationError::protocol(format!("Invalid query string: {e}")))?;
 
         let result = unsafe { PQexec(self.conn, c_query.as_ptr()) };
 
@@ -197,8 +192,7 @@ impl PgReplicationConnection {
                 .error_message()
                 .unwrap_or_else(|| "Unknown error".to_string());
             return Err(ReplicationError::protocol(format!(
-                "Query execution failed: {}",
-                error_msg
+                "Query execution failed: {error_msg}"
             )));
         }
 
@@ -233,8 +227,7 @@ impl PgReplicationConnection {
         output_plugin: &str,
     ) -> Result<PgResult> {
         let create_slot_sql = format!(
-            "CREATE_REPLICATION_SLOT \"{}\" LOGICAL {} NOEXPORT_SNAPSHOT;",
-            slot_name, output_plugin
+            "CREATE_REPLICATION_SLOT \"{slot_name}\" LOGICAL {output_plugin} NOEXPORT_SNAPSHOT;"
         );
 
         let result = self.exec(&create_slot_sql)?;
@@ -260,14 +253,11 @@ impl PgReplicationConnection {
             if i > 0 {
                 options_str.push_str(", ");
             }
-            options_str.push_str(&format!("\"{}\" '{}'", key, value));
+            options_str.push_str(&format!("\"{key}\" '{value}'"));
         }
 
         let start_replication_sql = if start_lsn == INVALID_XLOG_REC_PTR {
-            format!(
-                "START_REPLICATION SLOT \"{}\" LOGICAL 0/0 ({})",
-                slot_name, options_str
-            )
+            format!("START_REPLICATION SLOT \"{slot_name}\" LOGICAL 0/0 ({options_str})")
         } else {
             format!(
                 "START_REPLICATION SLOT \"{}\" LOGICAL {} ({})",
@@ -328,8 +318,7 @@ impl PgReplicationConnection {
         if result != 1 {
             let error_msg = self.last_error_message();
             return Err(ReplicationError::protocol(format!(
-                "Failed to send standby status update: {}",
-                error_msg
+                "Failed to send standby status update: {error_msg}"
             )));
         }
 
@@ -338,8 +327,7 @@ impl PgReplicationConnection {
         if flush_result != 0 {
             let error_msg = self.last_error_message();
             return Err(ReplicationError::protocol(format!(
-                "Failed to flush connection: {}",
-                error_msg
+                "Failed to flush connection: {error_msg}"
             )));
         }
 
@@ -364,7 +352,7 @@ impl PgReplicationConnection {
         }
 
         let async_fd = AsyncFd::new(sock)
-            .map_err(|e| ReplicationError::protocol(format!("Failed to create AsyncFd: {}", e)))?;
+            .map_err(|e| ReplicationError::protocol(format!("Failed to create AsyncFd: {e}")))?;
 
         self.async_fd = Some(async_fd);
         Ok(())
@@ -410,13 +398,13 @@ impl PgReplicationConnection {
                     info!("Found buffered data after cancellation, returning it");
                     return Ok(Some(data));
                 }
-                return Ok(None);
+                Ok(None)
             }
 
             // Wait for socket to become readable
             guard_result = async_fd.readable() => {
                 let mut guard = guard_result.map_err(|e| {
-                    ReplicationError::protocol(format!("Failed to wait for socket readability: {}", e))
+                    ReplicationError::protocol(format!("Failed to wait for socket readability: {e}"))
                 })?;
 
                 // Socket is readable - consume input from the OS socket. This is the ONLY place we call PQconsumeInput, avoiding busy-loops
@@ -469,8 +457,7 @@ impl PgReplicationConnection {
                 Ok(None)
             }
             _ => Err(ReplicationError::protocol(format!(
-                "Unexpected PQgetCopyData result: {}",
-                result
+                "Unexpected PQgetCopyData result: {result}"
             ))),
         }
     }

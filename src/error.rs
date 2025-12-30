@@ -266,19 +266,19 @@ mod tests {
     #[test]
     fn test_error_display() {
         let err = ReplicationError::Protocol("test".to_string());
-        assert!(format!("{}", err).contains("Protocol parsing error"));
+        assert!(format!("{err}").contains("Protocol parsing error"));
 
         let err = ReplicationError::Buffer("test".to_string());
-        assert!(format!("{}", err).contains("Buffer error"));
+        assert!(format!("{err}").contains("Buffer error"));
 
         let err = ReplicationError::Timeout("test".to_string());
-        assert!(format!("{}", err).contains("Operation timed out"));
+        assert!(format!("{err}").contains("Operation timed out"));
     }
 
     #[test]
     fn test_result_type() {
         let ok_result: Result<i32> = Ok(42);
-        assert_eq!(ok_result.unwrap(), 42);
+        assert_eq!(ok_result.expect("should be ok"), 42);
 
         let err_result: Result<i32> = Err(ReplicationError::protocol("test"));
         assert!(err_result.is_err());

@@ -12,7 +12,11 @@ use crate::{
     ReplicationConnectionRetry, ReplicationState, RetryConfig, StreamingReplicationMessage,
     TupleData, XLogRecPtr, INVALID_XLOG_REC_PTR,
 };
+use futures::stream::Stream;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -27,7 +31,7 @@ pub struct LogicalReplicationStream {
     retry_handler: ReplicationConnectionRetry,
     last_health_check: Instant,
     /// Shared LSN feedback for communication with consumer. This allows the consumer to update flushed/applied LSN after commits
-    shared_lsn_feedback: Option<Arc<SharedLsnFeedback>>,
+    pub shared_lsn_feedback: Arc<SharedLsnFeedback>,
 }
 
 /// Configuration for the replication stream
@@ -103,6 +107,11 @@ impl LogicalReplicationStream {
     /// This establishes a connection to PostgreSQL and prepares the stream for replication.
     /// It does not create the replication slot or start replication - call `start()` for that.
     ///
+    /// The stream automatically creates a shared LSN feedback tracker accessible via the
+    /// `shared_lsn_feedback` field. The consumer should use this to update flushed/applied
+    /// LSN values after committing data to the destination. This allows the stream to send
+    /// accurate feedback to PostgreSQL, which is crucial for WAL retention management.
+    ///
     /// # Arguments
     ///
     /// * `connection_string` - PostgreSQL connection string. Must include `replication=database`
@@ -111,7 +120,7 @@ impl LogicalReplicationStream {
     ///
     /// # Returns
     ///
-    /// A new `LogicalReplicationStream` instance ready to be started.
+    /// A new `LogicalReplicationStream` instance with an initialized LSN feedback tracker.
     ///
     /// # Errors
     ///
@@ -139,10 +148,13 @@ impl LogicalReplicationStream {
     ///     RetryConfig::default(),
     /// );
     ///
-    /// let stream = LogicalReplicationStream::new(
+    /// let mut stream = LogicalReplicationStream::new(
     ///     "postgresql://postgres:password@localhost:5432/mydb?replication=database",
     ///     config,
     /// ).await?;
+    ///
+    /// // Access LSN feedback directly
+    /// stream.shared_lsn_feedback.update_applied_lsn(12345);
     /// # Ok(())
     /// # }
     /// ```
@@ -159,6 +171,9 @@ impl LogicalReplicationStream {
         let state = ReplicationState::new();
         let last_health_check = Instant::now();
 
+        // Create shared LSN feedback for consumer
+        let shared_lsn_feedback = SharedLsnFeedback::new_shared();
+
         Ok(Self {
             connection,
             parser,
@@ -167,50 +182,8 @@ impl LogicalReplicationStream {
             slot_created: false,
             retry_handler,
             last_health_check,
-            shared_lsn_feedback: None,
+            shared_lsn_feedback,
         })
-    }
-
-    /// Set the shared LSN feedback tracker
-    ///
-    /// This should be called before starting replication to enable proper
-    /// LSN tracking between producer (reading from PostgreSQL) and consumer
-    /// (writing to destination database).
-    ///
-    /// The feedback tracker allows the consumer to communicate back to the producer
-    /// which LSNs have been successfully committed, so the producer can send accurate
-    /// feedback to PostgreSQL. This is crucial for WAL retention management.
-    ///
-    /// # Arguments
-    ///
-    /// * `feedback` - Arc-wrapped SharedLsnFeedback instance to be shared with consumer
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use pg_walstream::{LogicalReplicationStream, SharedLsnFeedback, ReplicationStreamConfig, RetryConfig};
-    /// use std::sync::Arc;
-    /// use std::time::Duration;
-    ///
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let config = ReplicationStreamConfig::new(
-    ///     "my_slot".to_string(),
-    ///     "my_publication".to_string(),
-    ///     2, true,
-    ///     Duration::from_secs(10),
-    ///     Duration::from_secs(30),
-    ///     Duration::from_secs(60),
-    ///     RetryConfig::default(),
-    /// );
-    ///
-    /// let mut stream = LogicalReplicationStream::new("connection_string", config).await?;
-    /// let lsn_feedback = SharedLsnFeedback::new_shared();
-    /// stream.set_shared_lsn_feedback(lsn_feedback.clone());
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn set_shared_lsn_feedback(&mut self, feedback: Arc<SharedLsnFeedback>) {
-        self.shared_lsn_feedback = Some(feedback);
     }
 
     /// Initialize the replication stream
@@ -337,14 +310,58 @@ impl LogicalReplicationStream {
 
     /// Process the next single replication event with cancellation support
     ///
+    /// This is the core method for retrieving individual change events from PostgreSQL.
+    /// It handles WAL messages, keepalive messages, and automatically sends feedback
+    /// to PostgreSQL when appropriate.
+    ///
+    /// For production use, consider using `next_event_with_retry()` which adds automatic
+    /// retry and recovery logic, or use `into_stream()` for an iterator-like interface.
+    ///
     /// # Arguments
     /// * `cancellation_token` - Optional cancellation token to abort the operation
     ///
     /// # Returns
     /// * `Ok(Some(event))` - Successfully received a change event
-    /// * `Ok(None)` - No event available currently
+    /// * `Ok(None)` - No event available currently (will retry on next call)
     /// * `Err(ReplicationError::Cancelled(_))` - Operation was cancelled
-    /// * `Err(_)` - Other errors occurred
+    /// * `Err(_)` - Connection or protocol errors occurred
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig};
+    /// use tokio_util::sync::CancellationToken;
+    /// use std::time::Duration;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let config = ReplicationStreamConfig::new(
+    ///     "my_slot".to_string(),
+    ///     "my_publication".to_string(),
+    ///     2, true,
+    ///     Duration::from_secs(10),
+    ///     Duration::from_secs(30),
+    ///     Duration::from_secs(60),
+    ///     RetryConfig::default(),
+    /// );
+    ///
+    /// let mut stream = LogicalReplicationStream::new("connection_string", config).await?;
+    /// stream.start(None).await?;
+    ///
+    /// let cancel_token = CancellationToken::new();
+    ///
+    /// // Simple polling loop
+    /// loop {
+    ///     match stream.next_event(&cancel_token).await? {
+    ///         Some(event) => {
+    ///             println!("Event: {:?}", event);
+    ///         }
+    ///         None => {
+    ///             // No event available, continue
+    ///         }
+    ///     }
+    /// }
+    /// # }
+    /// ```
     pub async fn next_event(
         &mut self,
         cancellation_token: &CancellationToken,
@@ -386,7 +403,7 @@ impl LogicalReplicationStream {
             }
         }
 
-        // No event received
+        // No event received (keepalive or unknown message processed)
         Ok(None)
     }
 
@@ -451,14 +468,65 @@ impl LogicalReplicationStream {
 
     /// Enhanced next_event with automatic retry, recovery and cancellation support
     ///
+    /// This is the recommended method for production use. It wraps `next_event()` with:
+    /// - Automatic retry logic for transient errors (up to 3 attempts)
+    /// - Connection health checks and automatic recovery
+    /// - Exponential backoff between retries
+    /// - Proper cancellation handling
+    ///
+    /// For an even more ergonomic API, consider using `into_stream()` which provides
+    /// an async iterator interface that automatically calls this method.
+    ///
     /// # Arguments
-    /// * `cancellation_token` - Optional cancellation token to abort the operation
+    /// * `cancellation_token` - Token to signal cancellation/shutdown
     ///
     /// # Returns
     /// * `Ok(Some(event))` - Successfully received a change event
-    /// * `Ok(None)` - No event available currently
+    /// * `Ok(None)` - No event available currently (caller should retry)
     /// * `Err(ReplicationError::Cancelled(_))` - Operation was cancelled
-    /// * `Err(_)` - Other errors occurred
+    /// * `Err(_)` - Permanent error after exhausting retries
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig};
+    /// use tokio_util::sync::CancellationToken;
+    /// use std::time::Duration;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let config = ReplicationStreamConfig::new(
+    ///     "my_slot".to_string(),
+    ///     "my_publication".to_string(),
+    ///     2, true,
+    ///     Duration::from_secs(10),
+    ///     Duration::from_secs(30),
+    ///     Duration::from_secs(60),
+    ///     RetryConfig::default(),
+    /// );
+    ///
+    /// let mut stream = LogicalReplicationStream::new("connection_string", config).await?;
+    /// stream.start(None).await?;
+    ///
+    /// let cancel_token = CancellationToken::new();
+    ///
+    /// // Robust polling loop with automatic retry
+    /// loop {
+    ///     match stream.next_event_with_retry(&cancel_token).await {
+    ///         Ok(Some(event)) => {
+    ///             println!("Event: {:?}", event);
+    ///         }
+    ///         Ok(None) => {
+    ///             // No event, continue
+    ///         }
+    ///         Err(e) => {
+    ///             eprintln!("Fatal error: {}", e);
+    ///             break;
+    ///         }
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn next_event_with_retry(
         &mut self,
         cancellation_token: &CancellationToken,
@@ -469,50 +537,62 @@ impl LogicalReplicationStream {
             // Don't fail immediately, try to continue
         }
 
-        // Try to get the next event, with manual retry logic for connection issues
-        let max_attempts = 3;
+        // Try to get the next event with retry logic for transient connection errors
+        const MAX_ATTEMPTS: u32 = 3;
         let mut attempt = 0;
 
-        while attempt < max_attempts {
+        loop {
             attempt += 1;
 
             match self.next_event(cancellation_token).await {
-                Ok(event) => {
-                    return Ok(event);
-                }
+                Ok(event) => return Ok(event),
                 Err(e) => {
-                    // Check if it's a cancellation error
+                    // Check if it's a cancellation error - these should not be retried
                     if matches!(e, ReplicationError::Cancelled(_)) {
                         error!("Operation cancelled: {}", e);
                         return Err(e);
                     }
 
-                    if attempt >= max_attempts {
-                        error!("Exhausted retry attempts for event processing: {}", e);
+                    // Check if we've exhausted retry attempts
+                    if attempt >= MAX_ATTEMPTS {
+                        error!(
+                            "Exhausted retry attempts ({}) for event processing: {}",
+                            MAX_ATTEMPTS, e
+                        );
                         return Err(e);
                     }
 
                     warn!(
-                        "Transient error in event processing (attempt {}): {}",
-                        attempt, e
+                        "Transient error in event processing (attempt {}/{}): {}",
+                        attempt, MAX_ATTEMPTS, e
                     );
 
-                    // Try to recover the connection if it's a connection issue
+                    // Attempt connection recovery if connection is dead
                     if !self.connection.is_alive() {
                         if let Err(recovery_err) = self.recover_connection().await {
                             error!("Failed to recover connection: {}", recovery_err);
                             return Err(recovery_err);
                         }
+                        info!("Connection recovered successfully");
                     }
 
-                    // Wait before retrying with cancellation support
+                    // Exponential backoff before retry
                     let delay = Duration::from_millis(1000 * (1 << (attempt - 1)));
-                    tokio::time::sleep(delay).await;
+                    debug!("Waiting {:?} before retry attempt {}", delay, attempt + 1);
+
+                    // Use tokio::select! to allow cancellation during backoff
+                    tokio::select! {
+                        biased;
+                        _ = tokio::time::sleep(delay) => {},
+                        _ = cancellation_token.cancelled() => {
+                            return Err(ReplicationError::cancelled(
+                                "Operation cancelled during retry backoff"
+                            ));
+                        }
+                    }
                 }
             }
         }
-
-        Err(ReplicationError::generic("Exhausted all retry attempts"))
     }
 
     /// Process a WAL data message
@@ -617,7 +697,7 @@ impl LogicalReplicationStream {
                             relation_oid: relation_id,
                             data,
                         },
-                        lsn: Some(Lsn::new(lsn)),
+                        lsn: Lsn::new(lsn),
                         metadata: None,
                     }
                 } else {
@@ -652,7 +732,7 @@ impl LogicalReplicationStream {
                             replica_identity,
                             key_columns,
                         },
-                        lsn: Some(Lsn::new(lsn)),
+                        lsn: Lsn::new(lsn),
                         metadata: None,
                     }
                 } else {
@@ -680,7 +760,7 @@ impl LogicalReplicationStream {
                             replica_identity,
                             key_columns,
                         },
-                        lsn: Some(Lsn::new(lsn)),
+                        lsn: Lsn::new(lsn),
                         metadata: None,
                     }
                 } else {
@@ -696,7 +776,7 @@ impl LogicalReplicationStream {
                         transaction_id: xid,
                         commit_timestamp: postgres_timestamp_to_chrono(timestamp),
                     },
-                    lsn: Some(Lsn::new(lsn)),
+                    lsn: Lsn::new(lsn),
                     metadata: None,
                 }
             }
@@ -716,7 +796,7 @@ impl LogicalReplicationStream {
                     event_type: EventType::Commit {
                         commit_timestamp: postgres_timestamp_to_chrono(timestamp),
                     },
-                    lsn: Some(Lsn::new(lsn)),
+                    lsn: Lsn::new(lsn),
                     metadata: None,
                 }
             }
@@ -735,7 +815,7 @@ impl LogicalReplicationStream {
 
                 ChangeEvent {
                     event_type: EventType::Truncate(truncate_tables),
-                    lsn: Some(Lsn::new(lsn)),
+                    lsn: Lsn::new(lsn),
                     metadata: None,
                 }
             }
@@ -748,7 +828,7 @@ impl LogicalReplicationStream {
                         transaction_id: xid,
                         first_segment,
                     },
-                    lsn: Some(Lsn::new(lsn)),
+                    lsn: Lsn::new(lsn),
                     metadata: None,
                 }
             }
@@ -757,7 +837,7 @@ impl LogicalReplicationStream {
                 debug!("Stream stop");
                 ChangeEvent {
                     event_type: EventType::StreamStop,
-                    lsn: Some(Lsn::new(lsn)),
+                    lsn: Lsn::new(lsn),
                     metadata: None,
                 }
             }
@@ -780,7 +860,7 @@ impl LogicalReplicationStream {
                         transaction_id: xid,
                         commit_timestamp: postgres_timestamp_to_chrono(timestamp),
                     },
-                    lsn: Some(Lsn::new(lsn)),
+                    lsn: Lsn::new(lsn),
                     metadata: None,
                 }
             }
@@ -791,7 +871,7 @@ impl LogicalReplicationStream {
                     event_type: EventType::StreamAbort {
                         transaction_id: xid,
                     },
-                    lsn: Some(Lsn::new(lsn)),
+                    lsn: Lsn::new(lsn),
                     metadata: None,
                 }
             }
@@ -823,7 +903,7 @@ impl LogicalReplicationStream {
                 } else {
                     // For binary data, convert to hex string
                     let hex_string = hex::encode(column_data.as_bytes());
-                    serde_json::Value::String(format!("\\x{}", hex_string))
+                    serde_json::Value::String(format!("\\x{hex_string}"))
                 };
 
                 data.insert(column_info.name.clone(), value);
@@ -862,31 +942,24 @@ impl LogicalReplicationStream {
             return Ok(());
         }
 
-        // Get flushed and applied LSN from shared feedback if available
         // This allows the consumer to update these values after committing to destination
-        let (flushed_lsn, applied_lsn) = if let Some(ref feedback) = self.shared_lsn_feedback {
-            let (f, a) = feedback.get_feedback_lsn();
-            // If shared feedback has values, use them; otherwise fall back to received LSN
-            let flushed = if f > 0 && f <= self.state.last_received_lsn {
-                f
-            } else if f > self.state.last_received_lsn {
-                // Consumer is ahead - this shouldn't happen but handle gracefully
-                self.state.last_received_lsn
-            } else {
-                // No consumer updates yet, use 0 to indicate nothing flushed/applied
-                0
-            };
-            let applied = if a > 0 && a <= self.state.last_received_lsn {
-                a
-            } else if a > self.state.last_received_lsn {
-                self.state.last_received_lsn
-            } else {
-                0
-            };
-            (flushed, applied)
+        let (f, a) = self.shared_lsn_feedback.get_feedback_lsn();
+        // If shared feedback has values, use them; otherwise fall back to received LSN
+        let flushed_lsn = if f > 0 && f <= self.state.last_received_lsn {
+            f
+        } else if f > self.state.last_received_lsn {
+            // Consumer is ahead - this shouldn't happen but handle gracefully
+            self.state.last_received_lsn
         } else {
-            // No shared feedback - fall back to local state (legacy behavior)
-            (self.state.last_flushed_lsn, self.state.last_applied_lsn)
+            // No consumer updates yet, use 0 to indicate nothing flushed/applied
+            0
+        };
+        let applied_lsn = if a > 0 && a <= self.state.last_received_lsn {
+            a
+        } else if a > self.state.last_received_lsn {
+            self.state.last_received_lsn
+        } else {
+            0
         };
 
         // Update local state from shared feedback for consistency
@@ -1008,11 +1081,766 @@ impl LogicalReplicationStream {
     pub fn current_lsn(&self) -> XLogRecPtr {
         self.state.last_received_lsn
     }
+
+    /// Convert into an async stream of change events
+    ///
+    /// This method provides an iterator-like interface for consuming replication events.
+    /// It returns an `EventStream` that implements `futures::Stream`, allowing you to
+    /// use async stream combinators like `filter`, `map`, `take`, etc.
+    ///
+    /// The stream automatically handles retries, reconnections, and cancellation.
+    /// When cancelled, the stream will cleanly terminate.
+    ///
+    /// # Arguments
+    ///
+    /// * `cancellation_token` - Token to signal cancellation/shutdown
+    ///
+    /// # Returns
+    ///
+    /// An `EventStream` that yields `Result<ChangeEvent>` items.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig};
+    /// use tokio_util::sync::CancellationToken;
+    /// use futures::StreamExt;
+    /// use std::time::Duration;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let config = ReplicationStreamConfig::new(
+    ///     "my_slot".to_string(),
+    ///     "my_publication".to_string(),
+    ///     2, true,
+    ///     Duration::from_secs(10),
+    ///     Duration::from_secs(30),
+    ///     Duration::from_secs(60),
+    ///     RetryConfig::default(),
+    /// );
+    ///
+    /// let mut stream = LogicalReplicationStream::new("connection_string", config).await?;
+    /// stream.start(None).await?;
+    ///
+    /// let cancel_token = CancellationToken::new();
+    /// let mut event_stream = stream.into_stream(cancel_token);
+    ///
+    /// // Use stream combinators
+    /// while let Some(result) = event_stream.next().await {
+    ///     match result {
+    ///         Ok(event) => println!("Event: {:?}", event),
+    ///         Err(e) => eprintln!("Error: {}", e),
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn into_stream(self, cancellation_token: CancellationToken) -> EventStream {
+        EventStream {
+            inner: self,
+            cancellation_token,
+        }
+    }
+
+    /// Create an async stream of change events (borrows self)
+    ///
+    /// Similar to `into_stream` but borrows the stream instead of consuming it.
+    /// This is useful when you want to maintain ownership of the LogicalReplicationStream
+    /// while still using the Stream interface.
+    ///
+    /// # Arguments
+    ///
+    /// * `cancellation_token` - Token to signal cancellation/shutdown
+    ///
+    /// # Returns
+    ///
+    /// An `EventStreamRef` that yields `Result<ChangeEvent>` items.
+    pub fn stream(&mut self, cancellation_token: CancellationToken) -> EventStreamRef<'_> {
+        EventStreamRef {
+            inner: self,
+            cancellation_token,
+        }
+    }
+}
+
+/// Async stream of PostgreSQL replication events (owned version)
+///
+/// This struct implements `futures::Stream` to provide an iterator-like interface
+/// for consuming replication events. It automatically handles retries, reconnections,
+/// and cancellation.
+///
+/// Create an `EventStream` by calling `into_stream()` on `LogicalReplicationStream`.
+///
+/// # Example
+///
+/// ```no_run
+/// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig};
+/// use tokio_util::sync::CancellationToken;
+/// use futures::StreamExt;
+/// use std::time::Duration;
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let config = ReplicationStreamConfig::new(
+///     "my_slot".to_string(),
+///     "my_publication".to_string(),
+///     2, true,
+///     Duration::from_secs(10),
+///     Duration::from_secs(30),
+///     Duration::from_secs(60),
+///     RetryConfig::default(),
+/// );
+///
+/// let mut stream = LogicalReplicationStream::new("connection_string", config).await?;
+/// stream.start(None).await?;
+///
+/// let cancel_token = CancellationToken::new();
+/// let mut event_stream = stream.into_stream(cancel_token);
+///
+/// while let Some(result) = event_stream.next().await {
+///     match result {
+///         Ok(event) => {
+///             // Process event
+///             println!("Received: {:?}", event);
+///         }
+///         Err(e) => {
+///             // Handle error
+///             eprintln!("Error: {}", e);
+///             break;
+///         }
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// ```
+pub struct EventStream {
+    inner: LogicalReplicationStream,
+    cancellation_token: CancellationToken,
+}
+
+impl EventStream {
+    /// Get a reference to the underlying LogicalReplicationStream
+    pub fn inner(&self) -> &LogicalReplicationStream {
+        &self.inner
+    }
+
+    /// Get a mutable reference to the underlying LogicalReplicationStream
+    pub fn inner_mut(&mut self) -> &mut LogicalReplicationStream {
+        &mut self.inner
+    }
+
+    /// Get the current LSN position
+    pub fn current_lsn(&self) -> XLogRecPtr {
+        self.inner.current_lsn()
+    }
+}
+
+impl Stream for EventStream {
+    type Item = Result<ChangeEvent>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // Check if cancelled - return None for graceful stream termination
+        if self.cancellation_token.is_cancelled() {
+            return Poll::Ready(None);
+        }
+
+        // Clone the cancellation token to avoid borrow issues
+        let cancel_token = self.cancellation_token.clone();
+
+        // Create a future for the next event
+        let future = self.inner.next_event_with_retry(&cancel_token);
+        tokio::pin!(future);
+
+        match future.poll(cx) {
+            Poll::Ready(Ok(Some(event))) => Poll::Ready(Some(Ok(event))),
+            Poll::Ready(Ok(None)) => {
+                // No event available, schedule wakeup
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Poll::Ready(Err(e)) => {
+                // Error occurred, yield it
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// Async stream of PostgreSQL replication events (borrowed version)
+///
+/// This struct implements `futures::Stream` similar to `EventStream` but borrows
+/// the underlying `LogicalReplicationStream` instead of owning it.
+///
+/// Create an `EventStreamRef` by calling `stream()` on `LogicalReplicationStream`.
+pub struct EventStreamRef<'a> {
+    inner: &'a mut LogicalReplicationStream,
+    cancellation_token: CancellationToken,
+}
+
+impl<'a> EventStreamRef<'a> {
+    /// Get a reference to the underlying LogicalReplicationStream
+    pub fn inner(&self) -> &LogicalReplicationStream {
+        self.inner
+    }
+
+    /// Get a mutable reference to the underlying LogicalReplicationStream
+    pub fn inner_mut(&mut self) -> &mut LogicalReplicationStream {
+        self.inner
+    }
+
+    /// Get the current LSN position
+    pub fn current_lsn(&self) -> XLogRecPtr {
+        self.inner.current_lsn()
+    }
+}
+
+impl<'a> Stream for EventStreamRef<'a> {
+    type Item = Result<ChangeEvent>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // Check if cancelled - return None for graceful stream termination
+        if self.cancellation_token.is_cancelled() {
+            return Poll::Ready(None);
+        }
+
+        // Clone the cancellation token to avoid borrow issues
+        let cancel_token = self.cancellation_token.clone();
+
+        // Create a future for the next event
+        let future = self.inner.next_event_with_retry(&cancel_token);
+        tokio::pin!(future);
+
+        match future.poll(cx) {
+            Poll::Ready(Ok(Some(event))) => Poll::Ready(Some(Ok(event))),
+            Poll::Ready(Ok(None)) => {
+                // No event available, schedule wakeup
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Poll::Ready(Err(e)) => {
+                // Error occurred, yield it
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 // Simple hex encoding implementation to avoid adding another dependency
 mod hex {
     pub fn encode(data: &[u8]) -> String {
-        data.iter().map(|b| format!("{:02x}", b)).collect()
+        data.iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{parse_lsn, ReplicaIdentity};
+    use std::collections::HashMap;
+
+    /// Helper function to create a test configuration
+    fn create_test_config() -> ReplicationStreamConfig {
+        ReplicationStreamConfig::new(
+            "test_slot".to_string(),
+            "test_publication".to_string(),
+            2,
+            true,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        )
+    }
+
+    #[test]
+    fn test_replication_stream_config_creation() {
+        let config = create_test_config();
+
+        assert_eq!(config.slot_name, "test_slot");
+        assert_eq!(config.publication_name, "test_publication");
+        assert_eq!(config.protocol_version, 2);
+        assert!(config.streaming_enabled);
+        assert_eq!(config.feedback_interval, Duration::from_secs(10));
+        assert_eq!(config.connection_timeout, Duration::from_secs(30));
+        assert_eq!(config.health_check_interval, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_replication_stream_config_clone() {
+        let config1 = create_test_config();
+        let config2 = config1.clone();
+
+        assert_eq!(config1.slot_name, config2.slot_name);
+        assert_eq!(config1.publication_name, config2.publication_name);
+        assert_eq!(config1.protocol_version, config2.protocol_version);
+    }
+
+    #[test]
+    fn test_replication_state_new() {
+        let state = ReplicationState::new();
+
+        assert_eq!(state.last_received_lsn, 0);
+        assert_eq!(state.last_flushed_lsn, 0);
+        assert_eq!(state.last_applied_lsn, 0);
+    }
+
+    #[test]
+    fn test_replication_state_update_lsn() {
+        let mut state = ReplicationState::new();
+
+        // Update to a higher LSN
+        state.update_lsn(1000);
+        assert_eq!(state.last_received_lsn, 1000);
+
+        // Update to an even higher LSN
+        state.update_lsn(2000);
+        assert_eq!(state.last_received_lsn, 2000);
+
+        // Trying to update to a lower LSN should not change it
+        state.update_lsn(500);
+        assert_eq!(state.last_received_lsn, 2000);
+    }
+
+    #[test]
+    fn test_replication_state_should_send_feedback() {
+        let mut state = ReplicationState::new();
+        let feedback_interval = Duration::from_millis(50);
+
+        // Update LSN so there's something to send feedback about
+        state.update_lsn(1000);
+
+        // Should send feedback after receiving data (interval has elapsed since creation)
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(state.should_send_feedback(feedback_interval));
+
+        // Mark as sent
+        state.mark_feedback_sent();
+
+        // Immediately after, should not send
+        assert!(!state.should_send_feedback(feedback_interval));
+
+        // After waiting long enough, should send again
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(state.should_send_feedback(feedback_interval));
+    }
+
+    #[test]
+    fn test_relation_info_creation() {
+        let columns = vec![
+            crate::protocol::ColumnInfo {
+                flags: 1,
+                name: "id".to_string(),
+                type_id: 23,
+                type_modifier: -1,
+            },
+            crate::protocol::ColumnInfo {
+                flags: 0,
+                name: "name".to_string(),
+                type_id: 25,
+                type_modifier: -1,
+            },
+        ];
+
+        let relation = RelationInfo::new(
+            16384,
+            "public".to_string(),
+            "users".to_string(),
+            b'd',
+            columns,
+        );
+
+        assert_eq!(relation.relation_id, 16384);
+        assert_eq!(relation.namespace, "public");
+        assert_eq!(relation.relation_name, "users");
+        assert_eq!(relation.columns.len(), 2);
+    }
+
+    #[test]
+    fn test_relation_info_full_name() {
+        let relation = RelationInfo::new(
+            16384,
+            "public".to_string(),
+            "users".to_string(),
+            b'd',
+            vec![],
+        );
+
+        assert_eq!(relation.full_name(), "public.users");
+    }
+
+    #[test]
+    fn test_relation_info_get_column_by_index() {
+        let columns = vec![
+            crate::protocol::ColumnInfo {
+                flags: 1,
+                name: "id".to_string(),
+                type_id: 23,
+                type_modifier: -1,
+            },
+            crate::protocol::ColumnInfo {
+                flags: 0,
+                name: "name".to_string(),
+                type_id: 25,
+                type_modifier: -1,
+            },
+        ];
+
+        let relation = RelationInfo::new(
+            16384,
+            "public".to_string(),
+            "users".to_string(),
+            b'd',
+            columns,
+        );
+
+        // Valid index
+        assert!(relation.get_column_by_index(0).is_some());
+        assert_eq!(relation.get_column_by_index(0).unwrap().name, "id");
+
+        // Invalid index
+        assert!(relation.get_column_by_index(10).is_none());
+    }
+
+    #[test]
+    fn test_relation_info_get_key_columns() {
+        let columns = vec![
+            crate::protocol::ColumnInfo {
+                flags: 1, // Key column
+                name: "id".to_string(),
+                type_id: 23,
+                type_modifier: -1,
+            },
+            crate::protocol::ColumnInfo {
+                flags: 0, // Non-key column
+                name: "name".to_string(),
+                type_id: 25,
+                type_modifier: -1,
+            },
+        ];
+
+        let relation = RelationInfo::new(
+            16384,
+            "public".to_string(),
+            "users".to_string(),
+            b'd',
+            columns,
+        );
+
+        let key_columns = relation.get_key_columns();
+        assert_eq!(key_columns.len(), 1);
+        assert_eq!(key_columns[0].name, "id");
+    }
+
+    #[test]
+    fn test_change_event_insert_creation() {
+        let mut data = HashMap::new();
+        data.insert("id".to_string(), serde_json::json!(1));
+        data.insert("name".to_string(), serde_json::json!("Alice"));
+
+        let event = ChangeEvent::insert(
+            "public".to_string(),
+            "users".to_string(),
+            16384,
+            data.clone(),
+            Lsn::new(1000),
+        );
+
+        match event.event_type {
+            EventType::Insert {
+                schema,
+                table,
+                relation_oid,
+                data: event_data,
+            } => {
+                assert_eq!(schema, "public");
+                assert_eq!(table, "users");
+                assert_eq!(relation_oid, 16384);
+                assert_eq!(event_data.len(), 2);
+            }
+            _ => panic!("Expected Insert event"),
+        }
+
+        assert_eq!(event.lsn.value(), 1000);
+    }
+
+    #[test]
+    fn test_change_event_update_creation() {
+        let mut old_data = HashMap::new();
+        old_data.insert("id".to_string(), serde_json::json!(1));
+        old_data.insert("name".to_string(), serde_json::json!("Alice"));
+
+        let mut new_data = HashMap::new();
+        new_data.insert("id".to_string(), serde_json::json!(1));
+        new_data.insert("name".to_string(), serde_json::json!("Bob"));
+
+        let event = ChangeEvent::update(
+            "public".to_string(),
+            "users".to_string(),
+            16384,
+            Some(old_data),
+            new_data,
+            ReplicaIdentity::Default,
+            vec!["id".to_string()],
+            Lsn::new(2000),
+        );
+
+        match event.event_type {
+            EventType::Update {
+                schema,
+                table,
+                relation_oid,
+                old_data,
+                new_data,
+                replica_identity,
+                key_columns,
+            } => {
+                assert_eq!(schema, "public");
+                assert_eq!(table, "users");
+                assert_eq!(relation_oid, 16384);
+                assert!(old_data.is_some());
+                assert_eq!(new_data.len(), 2);
+                assert_eq!(replica_identity, ReplicaIdentity::Default);
+                assert_eq!(key_columns.len(), 1);
+            }
+            _ => panic!("Expected Update event"),
+        }
+    }
+
+    #[test]
+    fn test_change_event_delete_creation() {
+        let mut old_data = HashMap::new();
+        old_data.insert("id".to_string(), serde_json::json!(1));
+
+        let event = ChangeEvent::delete(
+            "public".to_string(),
+            "users".to_string(),
+            16384,
+            old_data,
+            ReplicaIdentity::Default,
+            vec!["id".to_string()],
+            Lsn::new(3000),
+        );
+
+        match event.event_type {
+            EventType::Delete {
+                schema,
+                table,
+                relation_oid,
+                old_data,
+                replica_identity,
+                key_columns,
+            } => {
+                assert_eq!(schema, "public");
+                assert_eq!(table, "users");
+                assert_eq!(relation_oid, 16384);
+                assert_eq!(old_data.len(), 1);
+                assert_eq!(replica_identity, ReplicaIdentity::Default);
+                assert_eq!(key_columns.len(), 1);
+            }
+            _ => panic!("Expected Delete event"),
+        }
+    }
+
+    #[test]
+    fn test_hex_encoding() {
+        assert_eq!(hex::encode(&[0x00, 0x01, 0x02]), "000102");
+        assert_eq!(hex::encode(&[0xff, 0xfe, 0xfd]), "fffefd");
+        assert_eq!(hex::encode(&[]), "");
+        assert_eq!(hex::encode(&[0x12, 0x34, 0x56, 0x78]), "12345678");
+    }
+
+    #[test]
+    fn test_cancellation_token_basic() {
+        use tokio_util::sync::CancellationToken;
+
+        let cancel_token = CancellationToken::new();
+
+        // Initially not cancelled
+        assert!(!cancel_token.is_cancelled());
+
+        // Cancel it
+        cancel_token.cancel();
+
+        // Should be cancelled now
+        assert!(cancel_token.is_cancelled());
+    }
+
+    #[test]
+    fn test_cancellation_token_clone() {
+        use tokio_util::sync::CancellationToken;
+
+        let cancel_token = CancellationToken::new();
+        let clone = cancel_token.clone();
+
+        // Neither should be cancelled initially
+        assert!(!cancel_token.is_cancelled());
+        assert!(!clone.is_cancelled());
+
+        // Cancel the original
+        cancel_token.cancel();
+
+        // Both should be cancelled
+        assert!(cancel_token.is_cancelled());
+        assert!(clone.is_cancelled());
+    }
+
+    #[test]
+    fn test_shared_lsn_feedback_integration() {
+        let feedback = SharedLsnFeedback::new_shared();
+
+        // Initial values should be 0
+        assert_eq!(feedback.get_flushed_lsn(), 0);
+        assert_eq!(feedback.get_applied_lsn(), 0);
+
+        // Update flushed LSN
+        feedback.update_flushed_lsn(1000);
+        assert_eq!(feedback.get_flushed_lsn(), 1000);
+        assert_eq!(feedback.get_applied_lsn(), 0);
+
+        // Update applied LSN (should also update flushed)
+        feedback.update_applied_lsn(2000);
+        assert_eq!(feedback.get_flushed_lsn(), 2000);
+        assert_eq!(feedback.get_applied_lsn(), 2000);
+
+        // Get both values at once
+        let (flushed, applied) = feedback.get_feedback_lsn();
+        assert_eq!(flushed, 2000);
+        assert_eq!(applied, 2000);
+    }
+
+    #[test]
+    fn test_lsn_value_operations() {
+        let lsn1 = Lsn::new(1000);
+        let lsn2 = Lsn::new(2000);
+        let lsn3 = Lsn::new(1000);
+
+        // Test value retrieval
+        assert_eq!(lsn1.value(), 1000);
+        assert_eq!(lsn2.value(), 2000);
+
+        // Test equality
+        assert_eq!(lsn1, lsn3);
+        assert_ne!(lsn1, lsn2);
+
+        // Test ordering
+        assert!(lsn1 < lsn2);
+        assert!(lsn2 > lsn1);
+    }
+
+    #[test]
+    fn test_replica_identity_conversions() {
+        // Test Default
+        assert_eq!(
+            ReplicaIdentity::from_byte(b'd'),
+            Some(ReplicaIdentity::Default)
+        );
+        assert_eq!(ReplicaIdentity::Default.to_byte(), b'd');
+
+        // Test Nothing
+        assert_eq!(
+            ReplicaIdentity::from_byte(b'n'),
+            Some(ReplicaIdentity::Nothing)
+        );
+        assert_eq!(ReplicaIdentity::Nothing.to_byte(), b'n');
+
+        // Test Full
+        assert_eq!(
+            ReplicaIdentity::from_byte(b'f'),
+            Some(ReplicaIdentity::Full)
+        );
+        assert_eq!(ReplicaIdentity::Full.to_byte(), b'f');
+
+        // Test Index
+        assert_eq!(
+            ReplicaIdentity::from_byte(b'i'),
+            Some(ReplicaIdentity::Index)
+        );
+        assert_eq!(ReplicaIdentity::Index.to_byte(), b'i');
+
+        // Test invalid byte
+        assert_eq!(ReplicaIdentity::from_byte(b'x'), None);
+    }
+
+    #[test]
+    fn test_retry_config_default() {
+        let config = RetryConfig::default();
+
+        assert_eq!(config.max_attempts, 5);
+        assert_eq!(config.initial_delay, Duration::from_secs(1));
+        assert_eq!(config.max_delay, Duration::from_secs(60));
+        assert_eq!(config.multiplier, 2.0);
+        assert_eq!(config.max_duration, Duration::from_secs(300));
+        assert!(config.jitter);
+    }
+
+    #[test]
+    fn test_retry_config_custom() {
+        let config = RetryConfig {
+            max_attempts: 10,
+            initial_delay: Duration::from_millis(500),
+            max_delay: Duration::from_secs(30),
+            multiplier: 3.0,
+            max_duration: Duration::from_secs(600),
+            jitter: false,
+        };
+
+        assert_eq!(config.max_attempts, 10);
+        assert_eq!(config.initial_delay, Duration::from_millis(500));
+        assert!(!config.jitter);
+    }
+
+    #[test]
+    fn test_exponential_backoff_progression() {
+        let config = RetryConfig {
+            max_attempts: 5,
+            initial_delay: Duration::from_millis(100),
+            max_delay: Duration::from_secs(10),
+            multiplier: 2.0,
+            max_duration: Duration::from_secs(60),
+            jitter: false,
+        };
+
+        let mut backoff = crate::retry::ExponentialBackoff::new(&config);
+
+        // First delay should be initial_delay
+        let delay1 = backoff.next_delay();
+        assert!(delay1 >= Duration::from_millis(100));
+        assert!(delay1 <= Duration::from_millis(100));
+
+        // Second delay should be doubled
+        let delay2 = backoff.next_delay();
+        assert!(delay2 >= Duration::from_millis(200));
+
+        // Third delay should be doubled again
+        let delay3 = backoff.next_delay();
+        assert!(delay3 >= Duration::from_millis(400));
+    }
+
+    #[test]
+    fn test_format_lsn() {
+        assert_eq!(format_lsn(0), "0/0");
+        assert_eq!(format_lsn(0x16B374D848), "16/B374D848");
+        assert_eq!(format_lsn(0x100000000), "1/0");
+        assert_eq!(format_lsn(0xFFFFFFFFFFFFFFFF), "FFFFFFFF/FFFFFFFF");
+    }
+
+    #[test]
+    fn test_parse_lsn() {
+        assert_eq!(parse_lsn("0/0").unwrap(), 0);
+        assert_eq!(parse_lsn("16/B374D848").unwrap(), 0x16B374D848);
+        assert_eq!(parse_lsn("1/0").unwrap(), 0x100000000);
+
+        // Test invalid formats
+        assert!(parse_lsn("invalid").is_err());
+        assert!(parse_lsn("1/2/3").is_err());
+        assert!(parse_lsn("xyz/abc").is_err());
+    }
+
+    #[test]
+    fn test_lsn_roundtrip() {
+        let original_lsn = 0x16B374D848u64;
+        let formatted = format_lsn(original_lsn);
+        let parsed = parse_lsn(&formatted).unwrap();
+        assert_eq!(original_lsn, parsed);
     }
 }
