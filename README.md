@@ -77,12 +77,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create and initialize the stream
     let mut stream = LogicalReplicationStream::new(
         "postgresql://postgres:password@localhost:5432/mydb?replication=database",
-        config
+        config,
     ).await?;
     
-    // Set up LSN feedback for tracking progress
-    let lsn_feedback = SharedLsnFeedback::new_shared();
-    stream.set_shared_lsn_feedback(lsn_feedback.clone());
     stream.start(None).await?;
 
     // Create cancellation token for graceful shutdown
@@ -96,7 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match result {
             Ok(event) => {
                 println!("Received event: {:?}", event);
-                lsn_feedback.update_applied_lsn(event.lsn.value());
+                stream.shared_lsn_feedback.update_applied_lsn(event.lsn.value());
             }
             Err(e) => {
                 eprintln!("Error: {}", e);
@@ -135,11 +132,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut stream = LogicalReplicationStream::new(
         "postgresql://postgres:password@localhost:5432/mydb?replication=database",
-        config
+        config,
     ).await?;
     
-    let lsn_feedback = SharedLsnFeedback::new_shared();
-    stream.set_shared_lsn_feedback(lsn_feedback.clone());
     stream.start(None).await?;
 
     let cancel_token = CancellationToken::new();
@@ -149,7 +144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match stream.next_event_with_retry(&cancel_token).await {
             Ok(Some(event)) => {
                 println!("Received event: {:?}", event);
-                lsn_feedback.update_applied_lsn(event.lsn.value());
+                stream.shared_lsn_feedback.update_applied_lsn(event.lsn.value());
             }
             Ok(None) => {
                 // No event available, continue

@@ -52,11 +52,10 @@
 //!     let connection_string = "postgresql://postgres:test.123@postgres:5432/postgres?replication=database";
 //!
 //!     // Create and initialize the stream
-//!     let mut stream = LogicalReplicationStream::new(connection_string, config).await?;
-//!     
-//!     // Set up LSN feedback for tracking progress
-//!     let lsn_feedback = SharedLsnFeedback::new_shared();
-//!     stream.set_shared_lsn_feedback(lsn_feedback.clone());
+//!     let mut stream = LogicalReplicationStream::new(
+//!         connection_string,
+//!         config,
+//!     ).await?;
 //!     
 //!     // Initialize the stream (creates slot if needed) && Start replication from a specific LSN (or None for latest)
 //!     stream.start(None).await?;
@@ -74,7 +73,7 @@
 //!                 println!("Received event: {:?}", event);
 //!                 
 //!                 // Update LSN feedback after processing
-//!                 lsn_feedback.update_applied_lsn(event.lsn.value());
+//!                 stream.shared_lsn_feedback.update_applied_lsn(event.lsn.value());
 //!             }
 //!             Err(e) => {
 //!                 eprintln!("Error: {}", e);
@@ -111,11 +110,9 @@
 //!
 //!     let mut stream = LogicalReplicationStream::new(
 //!         "postgresql://postgres:password@localhost:5432/mydb?replication=database",
-//!         config
+//!         config,
 //!     ).await?;
 //!     
-//!     let lsn_feedback = SharedLsnFeedback::new_shared();
-//!     stream.set_shared_lsn_feedback(lsn_feedback.clone());
 //!     stream.start(None).await?;
 //!
 //!     let cancel_token = CancellationToken::new();
@@ -125,7 +122,7 @@
 //!         match stream.next_event_with_retry(&cancel_token).await {
 //!             Ok(Some(event)) => {
 //!                 println!("Received event: {:?}", event);
-//!                 lsn_feedback.update_applied_lsn(event.lsn.value());
+//!                 stream.shared_lsn_feedback.update_applied_lsn(event.lsn.value());
 //!             }
 //!             Ok(None) => {
 //!                 // No event available, continue

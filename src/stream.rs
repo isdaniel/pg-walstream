@@ -31,7 +31,7 @@ pub struct LogicalReplicationStream {
     retry_handler: ReplicationConnectionRetry,
     last_health_check: Instant,
     /// Shared LSN feedback for communication with consumer. This allows the consumer to update flushed/applied LSN after commits
-    shared_lsn_feedback: Option<Arc<SharedLsnFeedback>>,
+    pub shared_lsn_feedback: Arc<SharedLsnFeedback>,
 }
 
 /// Configuration for the replication stream
@@ -107,6 +107,11 @@ impl LogicalReplicationStream {
     /// This establishes a connection to PostgreSQL and prepares the stream for replication.
     /// It does not create the replication slot or start replication - call `start()` for that.
     ///
+    /// The stream automatically creates a shared LSN feedback tracker accessible via the
+    /// `shared_lsn_feedback` field. The consumer should use this to update flushed/applied
+    /// LSN values after committing data to the destination. This allows the stream to send
+    /// accurate feedback to PostgreSQL, which is crucial for WAL retention management.
+    ///
     /// # Arguments
     ///
     /// * `connection_string` - PostgreSQL connection string. Must include `replication=database`
@@ -115,7 +120,7 @@ impl LogicalReplicationStream {
     ///
     /// # Returns
     ///
-    /// A new `LogicalReplicationStream` instance ready to be started.
+    /// A new `LogicalReplicationStream` instance with an initialized LSN feedback tracker.
     ///
     /// # Errors
     ///
@@ -143,10 +148,13 @@ impl LogicalReplicationStream {
     ///     RetryConfig::default(),
     /// );
     ///
-    /// let stream = LogicalReplicationStream::new(
+    /// let mut stream = LogicalReplicationStream::new(
     ///     "postgresql://postgres:password@localhost:5432/mydb?replication=database",
     ///     config,
     /// ).await?;
+    ///
+    /// // Access LSN feedback directly
+    /// stream.shared_lsn_feedback.update_applied_lsn(12345);
     /// # Ok(())
     /// # }
     /// ```
@@ -163,6 +171,9 @@ impl LogicalReplicationStream {
         let state = ReplicationState::new();
         let last_health_check = Instant::now();
 
+        // Create shared LSN feedback for consumer
+        let shared_lsn_feedback = SharedLsnFeedback::new_shared();
+
         Ok(Self {
             connection,
             parser,
@@ -171,50 +182,8 @@ impl LogicalReplicationStream {
             slot_created: false,
             retry_handler,
             last_health_check,
-            shared_lsn_feedback: None,
+            shared_lsn_feedback,
         })
-    }
-
-    /// Set the shared LSN feedback tracker
-    ///
-    /// This should be called before starting replication to enable proper
-    /// LSN tracking between producer (reading from PostgreSQL) and consumer
-    /// (writing to destination database).
-    ///
-    /// The feedback tracker allows the consumer to communicate back to the producer
-    /// which LSNs have been successfully committed, so the producer can send accurate
-    /// feedback to PostgreSQL. This is crucial for WAL retention management.
-    ///
-    /// # Arguments
-    ///
-    /// * `feedback` - Arc-wrapped SharedLsnFeedback instance to be shared with consumer
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use pg_walstream::{LogicalReplicationStream, SharedLsnFeedback, ReplicationStreamConfig, RetryConfig};
-    /// use std::sync::Arc;
-    /// use std::time::Duration;
-    ///
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let config = ReplicationStreamConfig::new(
-    ///     "my_slot".to_string(),
-    ///     "my_publication".to_string(),
-    ///     2, true,
-    ///     Duration::from_secs(10),
-    ///     Duration::from_secs(30),
-    ///     Duration::from_secs(60),
-    ///     RetryConfig::default(),
-    /// );
-    ///
-    /// let mut stream = LogicalReplicationStream::new("connection_string", config).await?;
-    /// let lsn_feedback = SharedLsnFeedback::new_shared();
-    /// stream.set_shared_lsn_feedback(lsn_feedback.clone());
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn set_shared_lsn_feedback(&mut self, feedback: Arc<SharedLsnFeedback>) {
-        self.shared_lsn_feedback = Some(feedback);
     }
 
     /// Initialize the replication stream
@@ -610,7 +579,17 @@ impl LogicalReplicationStream {
                     // Exponential backoff before retry
                     let delay = Duration::from_millis(1000 * (1 << (attempt - 1)));
                     debug!("Waiting {:?} before retry attempt {}", delay, attempt + 1);
-                    tokio::time::sleep(delay).await;
+
+                    // Use tokio::select! to allow cancellation during backoff
+                    tokio::select! {
+                        biased;
+                        _ = tokio::time::sleep(delay) => {},
+                        _ = cancellation_token.cancelled() => {
+                            return Err(ReplicationError::cancelled(
+                                "Operation cancelled during retry backoff"
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -963,31 +942,24 @@ impl LogicalReplicationStream {
             return Ok(());
         }
 
-        // Get flushed and applied LSN from shared feedback if available
         // This allows the consumer to update these values after committing to destination
-        let (flushed_lsn, applied_lsn) = if let Some(ref feedback) = self.shared_lsn_feedback {
-            let (f, a) = feedback.get_feedback_lsn();
-            // If shared feedback has values, use them; otherwise fall back to received LSN
-            let flushed = if f > 0 && f <= self.state.last_received_lsn {
-                f
-            } else if f > self.state.last_received_lsn {
-                // Consumer is ahead - this shouldn't happen but handle gracefully
-                self.state.last_received_lsn
-            } else {
-                // No consumer updates yet, use 0 to indicate nothing flushed/applied
-                0
-            };
-            let applied = if a > 0 && a <= self.state.last_received_lsn {
-                a
-            } else if a > self.state.last_received_lsn {
-                self.state.last_received_lsn
-            } else {
-                0
-            };
-            (flushed, applied)
+        let (f, a) = self.shared_lsn_feedback.get_feedback_lsn();
+        // If shared feedback has values, use them; otherwise fall back to received LSN
+        let flushed_lsn = if f > 0 && f <= self.state.last_received_lsn {
+            f
+        } else if f > self.state.last_received_lsn {
+            // Consumer is ahead - this shouldn't happen but handle gracefully
+            self.state.last_received_lsn
         } else {
-            // No shared feedback - fall back to local state (legacy behavior)
-            (self.state.last_flushed_lsn, self.state.last_applied_lsn)
+            // No consumer updates yet, use 0 to indicate nothing flushed/applied
+            0
+        };
+        let applied_lsn = if a > 0 && a <= self.state.last_received_lsn {
+            a
+        } else if a > self.state.last_received_lsn {
+            self.state.last_received_lsn
+        } else {
+            0
         };
 
         // Update local state from shared feedback for consistency
@@ -1265,11 +1237,9 @@ impl Stream for EventStream {
     type Item = Result<ChangeEvent>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // Check if cancelled
+        // Check if cancelled - return None for graceful stream termination
         if self.cancellation_token.is_cancelled() {
-            return Poll::Ready(Some(Err(ReplicationError::Cancelled(
-                "Stream cancelled".to_string(),
-            ))));
+            return Poll::Ready(None);
         }
 
         // Clone the cancellation token to avoid borrow issues
@@ -1327,11 +1297,9 @@ impl<'a> Stream for EventStreamRef<'a> {
     type Item = Result<ChangeEvent>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // Check if cancelled
+        // Check if cancelled - return None for graceful stream termination
         if self.cancellation_token.is_cancelled() {
-            return Poll::Ready(Some(Err(ReplicationError::Cancelled(
-                "Stream cancelled".to_string(),
-            ))));
+            return Poll::Ready(None);
         }
 
         // Clone the cancellation token to avoid borrow issues
