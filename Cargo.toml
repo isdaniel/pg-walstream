@@ -15,6 +15,7 @@ categories = ["database", "parsing", "network-programming"]
 [dependencies]
 tokio = { version = "1.47.1", features = ["io-util", "net", "time", "macros"] }
 tokio-util = { version = "0.7.16", features = ["compat"] }
+futures = "0.3.31"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.142"
 chrono = { version = "0.4.41", features = ["serde"] }

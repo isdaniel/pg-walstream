@@ -1233,8 +1233,7 @@ impl LogicalReplicationParser {
                 }
                 _ => {
                     return Err(ReplicationError::protocol(format!(
-                        "Unknown column data type: '{}'",
-                        column_type
+                        "Unknown column data type: '{column_type}'"
                     )));
                 }
             };
@@ -1481,13 +1480,13 @@ mod tests {
         data.push(0x01); // flags (key column)
         data.extend_from_slice(&write_cstring("id"));
         data.extend_from_slice(&write_u32_be(23)); // type_id (int4)
-        data.extend_from_slice(&write_u32_be(0xFFFFFFFF).as_slice()); // type_modifier
+        data.extend_from_slice(write_u32_be(0xFFFFFFFF).as_slice()); // type_modifier
 
         // Column 2: name
         data.push(0x00); // flags (not a key)
         data.extend_from_slice(&write_cstring("name"));
         data.extend_from_slice(&write_u32_be(25)); // type_id (text)
-        data.extend_from_slice(&write_u32_be(0xFFFFFFFF).as_slice()); // type_modifier
+        data.extend_from_slice(write_u32_be(0xFFFFFFFF).as_slice()); // type_modifier
 
         let result = parser.parse_wal_message(&data).unwrap();
         match result.message {

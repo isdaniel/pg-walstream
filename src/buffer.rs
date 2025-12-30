@@ -202,7 +202,7 @@ impl BufferReader {
         // Read the string bytes
         let string_bytes = self.data.copy_to_bytes(bytes_to_read);
         let result = String::from_utf8(string_bytes.to_vec())
-            .map_err(|e| ReplicationError::protocol(format!("Invalid UTF-8 in string: {}", e)))?;
+            .map_err(|e| ReplicationError::protocol(format!("Invalid UTF-8 in string: {e}")))?;
 
         // Skip null terminator
         self.data.advance(1);
@@ -216,7 +216,7 @@ impl BufferReader {
         self.ensure_bytes(length)?;
         let string_bytes = self.data.copy_to_bytes(length);
         let result = String::from_utf8(string_bytes.to_vec())
-            .map_err(|e| ReplicationError::protocol(format!("Invalid UTF-8 in string: {}", e)))?;
+            .map_err(|e| ReplicationError::protocol(format!("Invalid UTF-8 in string: {e}")))?;
         Ok(result)
     }
 
@@ -369,8 +369,14 @@ impl BufferWriter {
         self.data.capacity()
     }
 
-    /// Get a reference to the internal data
-    pub fn as_ref(&self) -> &[u8] {
+    /// Get a reference to the internal data  
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+impl AsRef<[u8]> for BufferWriter {
+    fn as_ref(&self) -> &[u8] {
         &self.data
     }
 }

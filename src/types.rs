@@ -67,7 +67,7 @@ pub fn format_postgres_timestamp(timestamp: TimestampTz) -> String {
     let unix_secs = unix_micros / 1_000_000;
 
     match SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(unix_secs as u64)) {
-        Some(_) => format!("timestamp={}", unix_secs),
+        Some(_) => format!("timestamp={unix_secs}"),
         None => "invalid timestamp".to_string(),
     }
 }
@@ -122,15 +122,14 @@ pub fn parse_lsn(lsn_str: &str) -> Result<XLogRecPtr> {
     let parts: Vec<&str> = lsn_str.split('/').collect();
     if parts.len() != 2 {
         return Err(ReplicationError::protocol(format!(
-            "Invalid LSN format: {}. Expected format: high/low",
-            lsn_str
+            "Invalid LSN format: {lsn_str}. Expected format: high/low"
         )));
     }
 
     let high = u64::from_str_radix(parts[0], 16)
-        .map_err(|e| ReplicationError::protocol(format!("Invalid LSN high part: {}", e)))?;
+        .map_err(|e| ReplicationError::protocol(format!("Invalid LSN high part: {e}")))?;
     let low = u64::from_str_radix(parts[1], 16)
-        .map_err(|e| ReplicationError::protocol(format!("Invalid LSN low part: {}", e)))?;
+        .map_err(|e| ReplicationError::protocol(format!("Invalid LSN low part: {e}")))?;
 
     Ok((high << 32) | low)
 }
@@ -411,7 +410,7 @@ pub struct ChangeEvent {
     pub event_type: EventType,
 
     /// LSN (Log Sequence Number) position
-    pub lsn: Option<Lsn>,
+    pub lsn: Lsn,
 
     /// Additional metadata
     pub metadata: Option<std::collections::HashMap<String, serde_json::Value>>,
@@ -426,11 +425,12 @@ impl ChangeEvent {
     /// * `table_name` - Table name
     /// * `relation_oid` - PostgreSQL relation OID
     /// * `data` - Inserted row data as column_name -> value map
+    /// * `lsn` - Log Sequence Number for this event
     ///
     /// # Example
     ///
     /// ```
-    /// use pg_walstream::ChangeEvent;
+    /// use pg_walstream::{ChangeEvent, Lsn};
     /// use std::collections::HashMap;
     ///
     /// let mut data = HashMap::new();
@@ -442,6 +442,7 @@ impl ChangeEvent {
     ///     "users".to_string(),
     ///     12345,
     ///     data,
+    ///     Lsn::new(0x16B374D848),
     /// );
     /// ```
     pub fn insert(
@@ -449,6 +450,7 @@ impl ChangeEvent {
         table_name: String,
         relation_oid: u32,
         data: std::collections::HashMap<String, serde_json::Value>,
+        lsn: Lsn,
     ) -> Self {
         Self {
             event_type: EventType::Insert {
@@ -457,7 +459,7 @@ impl ChangeEvent {
                 relation_oid,
                 data,
             },
-            lsn: None,
+            lsn,
             metadata: None,
         }
     }
@@ -473,11 +475,12 @@ impl ChangeEvent {
     /// * `new_data` - New row data after update
     /// * `replica_identity` - Table's replica identity setting (affects old_data availability)
     /// * `key_columns` - Names of columns that form the replica identity key
+    /// * `lsn` - Log Sequence Number for this event
     ///
     /// # Example
     ///
     /// ```
-    /// use pg_walstream::{ChangeEvent, ReplicaIdentity};
+    /// use pg_walstream::{ChangeEvent, ReplicaIdentity, Lsn};
     /// use std::collections::HashMap;
     ///
     /// let mut old_data = HashMap::new();
@@ -496,8 +499,10 @@ impl ChangeEvent {
     ///     new_data,
     ///     ReplicaIdentity::Default,
     ///     vec!["id".to_string()],
+    ///     Lsn::new(0x16B374D848),
     /// );
     /// ```
+    #[allow(clippy::too_many_arguments)] // Configuration constructor - parameters are all necessary
     pub fn update(
         schema_name: String,
         table_name: String,
@@ -506,6 +511,7 @@ impl ChangeEvent {
         new_data: std::collections::HashMap<String, serde_json::Value>,
         replica_identity: ReplicaIdentity,
         key_columns: Vec<String>,
+        lsn: Lsn,
     ) -> Self {
         Self {
             event_type: EventType::Update {
@@ -517,7 +523,7 @@ impl ChangeEvent {
                 replica_identity,
                 key_columns,
             },
-            lsn: None,
+            lsn,
             metadata: None,
         }
     }
@@ -532,11 +538,12 @@ impl ChangeEvent {
     /// * `old_data` - Deleted row data (columns available depend on replica identity)
     /// * `replica_identity` - Table's replica identity setting
     /// * `key_columns` - Names of columns that form the replica identity key
+    /// * `lsn` - Log Sequence Number for this event
     ///
     /// # Example
     ///
     /// ```
-    /// use pg_walstream::{ChangeEvent, ReplicaIdentity};
+    /// use pg_walstream::{ChangeEvent, ReplicaIdentity, Lsn};
     /// use std::collections::HashMap;
     ///
     /// let mut old_data = HashMap::new();
@@ -550,6 +557,7 @@ impl ChangeEvent {
     ///     old_data,
     ///     ReplicaIdentity::Full,
     ///     vec!["id".to_string()],
+    ///     Lsn::new(0x16B374D848),
     /// );
     /// ```
     pub fn delete(
@@ -559,6 +567,7 @@ impl ChangeEvent {
         old_data: std::collections::HashMap<String, serde_json::Value>,
         replica_identity: ReplicaIdentity,
         key_columns: Vec<String>,
+        lsn: Lsn,
     ) -> Self {
         Self {
             event_type: EventType::Delete {
@@ -569,7 +578,7 @@ impl ChangeEvent {
                 replica_identity,
                 key_columns,
             },
-            lsn: None,
+            lsn,
             metadata: None,
         }
     }
@@ -582,13 +591,18 @@ impl ChangeEvent {
     ///
     /// * `transaction_id` - PostgreSQL transaction ID (XID)
     /// * `commit_timestamp` - Transaction start timestamp
-    pub fn begin(transaction_id: u32, commit_timestamp: chrono::DateTime<chrono::Utc>) -> Self {
+    /// * `lsn` - Log Sequence Number for this event
+    pub fn begin(
+        transaction_id: u32,
+        commit_timestamp: chrono::DateTime<chrono::Utc>,
+        lsn: Lsn,
+    ) -> Self {
         Self {
             event_type: EventType::Begin {
                 transaction_id,
                 commit_timestamp,
             },
-            lsn: None,
+            lsn,
             metadata: None,
         }
     }
@@ -601,55 +615,81 @@ impl ChangeEvent {
     ///
     /// * `_transaction_id` - PostgreSQL transaction ID (unused but kept for API compatibility)
     /// * `commit_timestamp` - Transaction commit timestamp
-    pub fn commit(_transaction_id: u32, commit_timestamp: chrono::DateTime<chrono::Utc>) -> Self {
+    /// * `lsn` - Log Sequence Number for this event
+    pub fn commit(
+        _transaction_id: u32,
+        commit_timestamp: chrono::DateTime<chrono::Utc>,
+        lsn: Lsn,
+    ) -> Self {
         Self {
             event_type: EventType::Commit { commit_timestamp },
-            lsn: None,
+            lsn,
             metadata: None,
         }
     }
 
     /// Create a TRUNCATE event
-    pub fn truncate(tables: Vec<String>) -> Self {
+    ///
+    /// # Arguments
+    ///
+    /// * `tables` - List of table names that were truncated
+    /// * `lsn` - Log Sequence Number for this event
+    pub fn truncate(tables: Vec<String>, lsn: Lsn) -> Self {
         Self {
             event_type: EventType::Truncate(tables),
-            lsn: None,
+            lsn,
             metadata: None,
         }
     }
 
     /// Create a RELATION event
-    pub fn relation() -> Self {
+    ///
+    /// # Arguments
+    ///
+    /// * `lsn` - Log Sequence Number for this event
+    pub fn relation(lsn: Lsn) -> Self {
         Self {
             event_type: EventType::Relation,
-            lsn: None,
+            lsn,
             metadata: None,
         }
     }
 
     /// Create a TYPE event
-    pub fn type_event() -> Self {
+    ///
+    /// # Arguments
+    ///
+    /// * `lsn` - Log Sequence Number for this event
+    pub fn type_event(lsn: Lsn) -> Self {
         Self {
             event_type: EventType::Type,
-            lsn: None,
+            lsn,
             metadata: None,
         }
     }
 
     /// Create an ORIGIN event
-    pub fn origin() -> Self {
+    ///
+    /// # Arguments
+    ///
+    /// * `lsn` - Log Sequence Number for this event
+    pub fn origin(lsn: Lsn) -> Self {
         Self {
             event_type: EventType::Origin,
-            lsn: None,
+            lsn,
             metadata: None,
         }
     }
 
     /// Create a MESSAGE event
-    pub fn message() -> Self {
+    ///
+    /// # Arguments
+    ///
+    /// * `lsn` - Log Sequence Number for this event
+    pub fn message(lsn: Lsn) -> Self {
         Self {
             event_type: EventType::Message,
-            lsn: None,
+            lsn,
             metadata: None,
         }
     }
@@ -746,7 +786,7 @@ mod tests {
 
         // Allow slight difference due to truncation to microseconds
         let diff = (dt.timestamp_micros() - chrono_now.timestamp_micros()).abs();
-        assert!(diff < 2, "Round trip difference too large: {}", diff);
+        assert!(diff < 2, "Round trip difference too large: {diff}");
     }
 
     #[test]
@@ -808,10 +848,10 @@ mod tests {
     #[test]
     fn test_lsn_display() {
         let lsn = Lsn::new(0x12345678);
-        assert_eq!(format!("{}", lsn), "0/12345678");
+        assert_eq!(format!("{lsn}"), "0/12345678");
 
         let lsn = Lsn::new(0x100000000 + 0x12345678);
-        assert_eq!(format!("{}", lsn), "1/12345678");
+        assert_eq!(format!("{lsn}"), "1/12345678");
     }
 
     #[test]
@@ -842,7 +882,13 @@ mod tests {
         data.insert("id".to_string(), serde_json::json!(1));
         data.insert("name".to_string(), serde_json::json!("test"));
 
-        let event = ChangeEvent::insert("public".to_string(), "users".to_string(), 12345, data);
+        let event = ChangeEvent::insert(
+            "public".to_string(),
+            "users".to_string(),
+            12345,
+            data,
+            Lsn::new(0x16B374D848),
+        );
 
         if let EventType::Insert {
             schema,
@@ -858,6 +904,9 @@ mod tests {
         } else {
             panic!("Expected Insert event");
         }
+
+        // Verify LSN is present
+        assert_eq!(event.lsn.value(), 0x16B374D848);
     }
 
     #[test]
