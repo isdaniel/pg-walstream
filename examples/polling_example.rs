@@ -31,7 +31,7 @@
 //! ```
 
 use pg_walstream::{
-    CancellationToken, EventType, LogicalReplicationStream, ReplicationStreamConfig, RetryConfig,
+    CancellationToken, LogicalReplicationStream, ReplicationStreamConfig, RetryConfig,
 };
 use std::env;
 use std::time::Duration;
@@ -93,8 +93,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cancel_token_clone.cancel();
     });
 
-    let mut event_count = 0;
-
     // Manual polling loop
     loop {
         // Check if we should stop
@@ -105,99 +103,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Poll for the next event
         match stream.next_event(&cancel_token).await {
-            Ok(Some(event)) => {
-                event_count += 1;
-
-                // Display event information based on type
-                match &event.event_type {
-                    EventType::Insert {
-                        schema,
-                        table,
-                        relation_oid,
-                        data,
-                    } => {
-                        info!(
-                            "INSERT on {}.{} (OID: {}, LSN: {})",
-                            schema, table, relation_oid, event.lsn
-                        );
-                        info!("   Data: {} columns", data.len());
-                    }
-                    EventType::Update {
-                        schema,
-                        table,
-                        relation_oid,
-                        old_data,
-                        new_data,
-                        ..
-                    } => {
-                        info!(
-                            "UPDATE on {}.{} (OID: {}, LSN: {})",
-                            schema, table, relation_oid, event.lsn
-                        );
-                        if old_data.is_some() {
-                            info!("   Has old data");
-                        }
-                        info!("   New data: {} columns", new_data.len());
-                    }
-                    EventType::Delete {
-                        schema,
-                        table,
-                        relation_oid,
-                        old_data,
-                        ..
-                    } => {
-                        info!(
-                            "DELETE on {}.{} (OID: {}, LSN: {})",
-                            schema, table, relation_oid, event.lsn
-                        );
-                        info!("   Deleted data: {} columns", old_data.len());
-                    }
-                    EventType::Begin {
-                        transaction_id,
-                        commit_timestamp,
-                    } => {
-                        info!(
-                            "BEGIN TRANSACTION (XID: {}, Time: {})",
-                            transaction_id, commit_timestamp
-                        );
-                    }
-                    EventType::Commit { commit_timestamp } => {
-                        info!(
-                            "COMMIT TRANSACTION (LSN: {}, Time: {})",
-                            event.lsn, commit_timestamp
-                        );
-                    }
-                    EventType::Relation => {
-                        info!("RELATION (LSN: {})", event.lsn);
-                    }
-                    _ => {
-                        info!("Event: {:?} (LSN: {})", event.event_type, event.lsn);
-                    }
-                }
-
-                // Update LSN feedback after processing
+            Ok(event) => {
+                info!("Received event: {:?}", event);
                 stream
                     .shared_lsn_feedback
                     .update_applied_lsn(event.lsn.value());
-
-                if event_count % 10 == 0 {
-                    info!("Processed {} events so far", event_count);
-                }
             }
-            Ok(None) => {
-                // No event available within timeout, continue polling
+            Err(e) if matches!(e, pg_walstream::ReplicationError::Cancelled(_)) => {
+                info!("Operation cancelled, shutting down gracefully");
+                break;
             }
             Err(e) => {
                 error!("Error polling for event: {}", e);
                 break;
             }
         }
-
-        // Optional: Add a small delay to prevent tight polling
-        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    info!("Polling stopped. Total events processed: {}", event_count);
     info!("Example completed successfully");
     Ok(())
 }

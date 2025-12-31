@@ -301,7 +301,7 @@ impl TupleData {
 #[derive(Debug, Clone)]
 pub struct ColumnData {
     pub data_type: char, // 'n' = null, 't' = text, 'b' = binary, 'u' = unchanged toast
-    pub data: Vec<u8>,
+    data: bytes::Bytes,
 }
 
 impl ColumnData {
@@ -309,7 +309,15 @@ impl ColumnData {
     pub const fn null() -> Self {
         Self {
             data_type: 'n',
-            data: Vec::new(),
+            data: bytes::Bytes::from_static(b""),
+        }
+    }
+
+    #[inline(always)]
+    pub fn text_bytes(data: bytes::Bytes) -> Self {
+        Self {
+            data_type: 't',
+            data,
         }
     }
 
@@ -317,6 +325,14 @@ impl ColumnData {
     pub fn text(data: Vec<u8>) -> Self {
         Self {
             data_type: 't',
+            data: bytes::Bytes::from(data),
+        }
+    }
+
+    #[inline(always)]
+    pub fn binary_bytes(data: bytes::Bytes) -> Self {
+        Self {
+            data_type: 'b',
             data,
         }
     }
@@ -325,7 +341,7 @@ impl ColumnData {
     pub fn binary(data: Vec<u8>) -> Self {
         Self {
             data_type: 'b',
-            data,
+            data: bytes::Bytes::from(data),
         }
     }
 
@@ -333,7 +349,7 @@ impl ColumnData {
     pub const fn unchanged() -> Self {
         Self {
             data_type: 'u',
-            data: Vec::new(),
+            data: bytes::Bytes::from_static(b""),
         }
     }
 
@@ -386,6 +402,11 @@ impl ColumnData {
     #[inline(always)]
     pub fn as_bytes(&self) -> &[u8] {
         &self.data
+    }
+
+    #[inline(always)]
+    pub fn into_bytes(self) -> bytes::Bytes {
+        self.data
     }
 }
 
@@ -1223,13 +1244,13 @@ impl LogicalReplicationParser {
                 'u' => ColumnData::unchanged(),
                 't' => {
                     let length = reader.read_u32()?;
-                    let data = reader.read_bytes(length as usize)?;
-                    ColumnData::text(data)
+                    let data = reader.read_bytes_buf(length as usize)?;
+                    ColumnData::text_bytes(data)
                 }
                 'b' => {
                     let length = reader.read_u32()?;
-                    let data = reader.read_bytes(length as usize)?;
-                    ColumnData::binary(data)
+                    let data = reader.read_bytes_buf(length as usize)?;
+                    ColumnData::binary_bytes(data)
                 }
                 _ => {
                     return Err(ReplicationError::protocol(format!(

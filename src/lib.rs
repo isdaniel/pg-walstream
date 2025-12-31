@@ -12,7 +12,20 @@
 //! - Parallel streaming support (protocol v4+)
 //! - Zero-copy buffer operations using `bytes` crate
 //! - Thread-safe LSN tracking
+//! - **Truly async, non-blocking I/O** - Tasks properly yield to the executor
+//! - **Graceful cancellation** - All operations support cancellation tokens
 //! - No platform-specific dependencies (no libpq required)
+//!
+//! ## Async I/O Performance
+//!
+//! The library implements proper async I/O patterns that allow tokio to efficiently
+//! schedule tasks without blocking threads:
+//!
+//! - When waiting for data from PostgreSQL, the task is suspended and the thread
+//!   is released back to the executor to run other tasks
+//! - Uses `AsyncFd` with proper edge-triggered readiness handling
+//! - Supports concurrent processing of multiple replication streams on a single thread
+//! - Enables efficient resource utilization in high-concurrency scenarios
 //!
 //! ## Protocol Support
 //!
@@ -55,12 +68,13 @@
 //!     // Traditional polling loop with automatic retry
 //!     loop {
 //!         match stream.next_event_with_retry(&cancel_token).await {
-//!             Ok(Some(event)) => {
+//!             Ok(event) => {
 //!                 println!("Received event: {:?}", event);
 //!                 stream.shared_lsn_feedback.update_applied_lsn(event.lsn.value());
 //!             }
-//!             Ok(None) => {
-//!                 // No event available, continue
+//!             Err(e) if matches!(e, pg_walstream::ReplicationError::Cancelled(_)) => {
+//!                 println!("Cancelled, shutting down gracefully");
+//!                 break;
 //!             }
 //!             Err(e) => {
 //!                 eprintln!("Error: {}", e);
