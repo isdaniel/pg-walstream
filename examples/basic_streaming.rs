@@ -102,11 +102,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut event_stream = stream.into_stream(cancel_token);
 
     // Process events as they arrive
-    while let Some(result) = event_stream.next().await {
-        match result {
+    loop {
+        match event_stream.next().await {
             Ok(event) => {
                 println!("Received event: {:?}", event);
                 event_stream.update_applied_lsn(event.lsn.value());
+            }
+            Err(e) if matches!(e, pg_walstream::ReplicationError::Cancelled(_)) => {
+                info!("Stream cancelled, shutting down gracefully");
+                break;
             }
             Err(e) => {
                 eprintln!("Error: {}", e);

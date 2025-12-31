@@ -306,10 +306,10 @@ pub struct ColumnData {
 
 impl ColumnData {
     #[inline(always)]
-    pub fn null() -> Self {
+    pub const fn null() -> Self {
         Self {
             data_type: 'n',
-            data: bytes::Bytes::new(),
+            data: bytes::Bytes::from_static(b""),
         }
     }
 
@@ -346,10 +346,10 @@ impl ColumnData {
     }
 
     #[inline(always)]
-    pub fn unchanged() -> Self {
+    pub const fn unchanged() -> Self {
         Self {
             data_type: 'u',
-            data: bytes::Bytes::new(),
+            data: bytes::Bytes::from_static(b""),
         }
     }
 

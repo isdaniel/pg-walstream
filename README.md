@@ -88,12 +88,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut event_stream = stream.into_stream(cancel_token);
 
     // Process events using Stream combinators
-    while let Some(result) = event_stream.next().await {
-        match result {
+    loop {
+        match event_stream.next().await {
             Ok(event) => {
                 println!("Received event: {:?}", event);
                 // Update LSN feedback using the convenient method
                 event_stream.update_applied_lsn(event.lsn.value());
+            }
+            Err(e) if matches!(e, pg_walstream::ReplicationError::Cancelled(_)) => {
+                println!("Stream cancelled, shutting down gracefully");
+                break;
             }
             Err(e) => {
                 eprintln!("Error: {}", e);
@@ -142,12 +146,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Traditional polling loop with automatic retry
     loop {
         match stream.next_event_with_retry(&cancel_token).await {
-            Ok(Some(event)) => {
+            Ok(event) => {
                 println!("Received event: {:?}", event);
                 stream.shared_lsn_feedback.update_applied_lsn(event.lsn.value());
             }
-            Ok(None) => {
-                // No event available, continue
+            Err(e) if matches!(e, pg_walstream::ReplicationError::Cancelled(_)) => {
+                println!("Cancelled, shutting down gracefully");
+                break;
             }
             Err(e) => {
                 eprintln!("Error: {}", e);
@@ -288,6 +293,7 @@ The project includes 95 comprehensive unit tests covering:
 - **Atomic Operations**: Thread-safe LSN tracking with minimal overhead
 - **Connection Pooling**: Reusable connection with automatic retry
 - **Streaming Support**: Handle large transactions without memory issues
+- **Efficient Blocking**: Async I/O with tokio::select eliminates busy-waiting
 
 ## Limitations
 

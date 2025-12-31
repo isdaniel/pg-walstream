@@ -105,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Poll for the next event
         match stream.next_event(&cancel_token).await {
-            Ok(Some(event)) => {
+            Ok(event) => {
                 event_count += 1;
 
                 // Display event information based on type
@@ -184,17 +184,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     info!("Processed {} events so far", event_count);
                 }
             }
-            Ok(None) => {
-                // No event available within timeout, continue polling
+            Err(e) if matches!(e, pg_walstream::ReplicationError::Cancelled(_)) => {
+                info!("Operation cancelled, shutting down gracefully");
+                break;
             }
             Err(e) => {
                 error!("Error polling for event: {}", e);
                 break;
             }
         }
-
-        // Optional: Add a small delay to prevent tight polling
-        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
     info!("Polling stopped. Total events processed: {}", event_count);

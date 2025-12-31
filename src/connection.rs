@@ -358,20 +358,19 @@ impl PgReplicationConnection {
         Ok(())
     }
 
-    /// Get copy data from replication stream (async non-blocking version)
+    /// Get copy data from replication stream (async blocking version)
     ///
     /// # Arguments
-    /// * `cancellation_token` - Optional cancellation token to abort the operation
+    /// * `cancellation_token` - Cancellation token to abort the operation
     ///
     /// # Returns
-    /// * `Ok(Some(data))` - Successfully received data
-    /// * `Ok(None)` - No data available currently
+    /// * `Ok(data)` - Successfully received data
     /// * `Err(ReplicationError::Cancelled(_))` - Operation was cancelled
-    /// * `Err(_)` - Other errors occurred
+    /// * `Err(_)` - Other errors occurred (connection issues, protocol errors)
     pub async fn get_copy_data_async(
         &mut self,
         cancellation_token: &CancellationToken,
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<Vec<u8>> {
         if !self.is_replication_conn {
             return Err(ReplicationError::protocol(
                 "Connection is not in replication mode".to_string(),
@@ -383,43 +382,47 @@ impl PgReplicationConnection {
             .as_ref()
             .ok_or_else(|| ReplicationError::protocol("AsyncFd not initialized".to_string()))?;
 
-        // First, try to read any buffered data without blocking
-        if let Some(data) = self.try_read_buffered_data()? {
-            return Ok(Some(data));
-        }
-
-        // If no buffered data, wait for either socket readability or cancellation
-        tokio::select! {
-            biased;
-
-            _ = cancellation_token.cancelled() => {
-                info!("Cancellation detected in get_copy_data_async");
-                if let Some(data) = self.try_read_buffered_data()? {
-                    info!("Found buffered data after cancellation, returning it");
-                    return Ok(Some(data));
-                }
-                Ok(None)
+        // Loop until we get data or cancellation
+        loop {
+            // First, try to read any buffered data without blocking
+            if let Some(data) = self.try_read_buffered_data()? {
+                return Ok(data);
             }
 
-            // Wait for socket to become readable
-            guard_result = async_fd.readable() => {
-                let mut guard = guard_result.map_err(|e| {
-                    ReplicationError::protocol(format!("Failed to wait for socket readability: {e}"))
-                })?;
+            // If no buffered data, wait for either socket readability or cancellation
+            tokio::select! {
+                biased;
 
-                // Socket is readable - consume input from the OS socket. This is the ONLY place we call PQconsumeInput, avoiding busy-loops
-                let consumed = unsafe { PQconsumeInput(self.conn) };
-                if consumed == 0 {
-                    return Err(ReplicationError::protocol(self.last_error_message()));
+                _ = cancellation_token.cancelled() => {
+                    info!("Cancellation detected in get_copy_data_async");
+                    // Check one more time for buffered data before returning error
+                    if let Some(data) = self.try_read_buffered_data()? {
+                        info!("Found buffered data after cancellation, returning it");
+                        return Ok(data);
+                    }
+                    return Err(ReplicationError::Cancelled("Operation cancelled".to_string()));
                 }
 
-                // Check if we have complete data now
-                if let Some(data) = self.try_read_buffered_data()? {
-                    return Ok(Some(data));
-                }
+                // Wait for socket to become readable
+                guard_result = async_fd.readable() => {
+                    let mut guard = guard_result.map_err(|e| {
+                        ReplicationError::protocol(format!("Failed to wait for socket readability: {e}"))
+                    })?;
 
-                guard.clear_ready();
-                Ok(None)
+                    // Socket is readable - consume input from the OS socket
+                    let consumed = unsafe { PQconsumeInput(self.conn) };
+                    if consumed == 0 {
+                        return Err(ReplicationError::protocol(self.last_error_message()));
+                    }
+
+                    // Check if we have complete data now
+                    if let Some(data) = self.try_read_buffered_data()? {
+                        return Ok(data);
+                    }
+
+                    // No complete message yet, clear ready and continue loop
+                    guard.clear_ready();
+                }
             }
         }
     }

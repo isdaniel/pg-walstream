@@ -318,8 +318,7 @@ impl LogicalReplicationStream {
     /// * `cancellation_token` - Optional cancellation token to abort the operation
     ///
     /// # Returns
-    /// * `Ok(Some(event))` - Successfully received a change event
-    /// * `Ok(None)` - No event available currently (will retry on next call)
+    /// * `Ok(event)` - Successfully received a change event
     /// * `Err(ReplicationError::Cancelled(_))` - Operation was cancelled
     /// * `Err(_)` - Connection or protocol errors occurred
     ///
@@ -348,60 +347,60 @@ impl LogicalReplicationStream {
     ///
     /// // Simple polling loop
     /// loop {
-    ///     match stream.next_event(&cancel_token).await? {
-    ///         Some(event) => {
+    ///     match stream.next_event(&cancel_token).await {
+    ///         Ok(event) => {
     ///             println!("Event: {:?}", event);
     ///         }
-    ///         None => {
-    ///             // No event available, continue
-    ///         }
+    ///         Err(_) => break,
     ///     }
     /// }
+    /// # Ok(())
     /// # }
     /// ```
     pub async fn next_event(
         &mut self,
         cancellation_token: &CancellationToken,
-    ) -> Result<Option<ChangeEvent>> {
-        // Send proactive feedback if enough time has passed
-        self.maybe_send_feedback();
-
-        match self
-            .connection
-            .get_copy_data_async(cancellation_token)
-            .await?
-        {
-            Some(data) => {
-                if data.is_empty() {
-                    return Ok(None);
-                }
-                match data[0] as char {
-                    'w' => {
-                        // WAL data message
-                        if let Some(event) = self.process_wal_message(&data)? {
-                            // Send feedback after processing WAL data
-                            self.maybe_send_feedback();
-                            return Ok(Some(event));
-                        }
-                    }
-                    'k' => {
-                        // Keepalive message
-                        self.process_keepalive_message(&data)?;
-                    }
-                    _ => {
-                        debug!("Received unknown message type: {}", data[0] as char);
-                    }
-                }
+    ) -> Result<ChangeEvent> {
+        // Loop until we get a valid event or encounter an error/cancellation
+        loop {
+            // Check cancellation before processing
+            if cancellation_token.is_cancelled() {
+                return Err(ReplicationError::Cancelled(
+                    "Operation cancelled".to_string(),
+                ));
             }
-            None => {
-                // No data available or cancelled - still send feedback
-                self.maybe_send_feedback();
-                return Ok(None);
+
+            // Send proactive feedback if enough time has passed
+            self.maybe_send_feedback();
+
+            // Get data from replication stream (now blocks until data arrives)
+            let data = self
+                .connection
+                .get_copy_data_async(cancellation_token)
+                .await?;
+
+            if data.is_empty() {
+                continue;
+            }
+
+            match data[0] as char {
+                'w' => {
+                    // WAL data message
+                    if let Some(event) = self.process_wal_message(&data)? {
+                        // Send feedback after processing WAL data
+                        self.maybe_send_feedback();
+                        return Ok(event);
+                    }
+                }
+                'k' => {
+                    // Keepalive message
+                    self.process_keepalive_message(&data)?;
+                }
+                _ => {
+                    warn!("Received unknown message type: {}", data[0] as char);
+                }
             }
         }
-
-        // No event received (keepalive or unknown message processed)
-        Ok(None)
     }
 
     /// Check connection health and attempt recovery if needed
@@ -478,8 +477,7 @@ impl LogicalReplicationStream {
     /// * `cancellation_token` - Token to signal cancellation/shutdown
     ///
     /// # Returns
-    /// * `Ok(Some(event))` - Successfully received a change event
-    /// * `Ok(None)` - No event available currently (caller should retry)
+    /// * `Ok(event)` - Successfully received a change event
     /// * `Err(ReplicationError::Cancelled(_))` - Operation was cancelled
     /// * `Err(_)` - Permanent error after exhausting retries
     ///
@@ -509,11 +507,8 @@ impl LogicalReplicationStream {
     /// // Robust polling loop with automatic retry
     /// loop {
     ///     match stream.next_event_with_retry(&cancel_token).await {
-    ///         Ok(Some(event)) => {
+    ///         Ok(event) => {
     ///             println!("Event: {:?}", event);
-    ///         }
-    ///         Ok(None) => {
-    ///             // No event, continue
     ///         }
     ///         Err(e) => {
     ///             eprintln!("Fatal error: {}", e);
@@ -527,7 +522,7 @@ impl LogicalReplicationStream {
     pub async fn next_event_with_retry(
         &mut self,
         cancellation_token: &CancellationToken,
-    ) -> Result<Option<ChangeEvent>> {
+    ) -> Result<ChangeEvent> {
         // Perform periodic health check
         if let Err(e) = self.check_connection_health().await {
             warn!("Health check failed: {}", e);
@@ -1128,10 +1123,10 @@ impl LogicalReplicationStream {
     /// let cancel_token = CancellationToken::new();
     /// let mut event_stream = stream.into_stream(cancel_token);
     ///
-    /// while let Some(result) = event_stream.next().await {
-    ///     match result {
+    /// loop {
+    ///     match event_stream.next().await {
     ///         Ok(event) => println!("Event: {:?}", event),
-    ///         Err(e) => eprintln!("Error: {}", e),
+    ///         Err(_) => break,
     ///     }
     /// }
     /// # Ok(())
@@ -1168,7 +1163,7 @@ impl LogicalReplicationStream {
 /// Async stream of PostgreSQL replication events (owned version)
 ///
 /// This struct provides an iterator-like interface for consuming replication events.
-/// It has a built-in `next()` method that returns `Future<Option<Result<ChangeEvent>>>`,
+/// It has a built-in `next()` method that returns `Future<Result<ChangeEvent>>`,
 /// allowing you to call `.next().await` without importing any traits.
 ///
 /// Create an `EventStream` by calling `into_stream()` on `LogicalReplicationStream`.
@@ -1198,11 +1193,16 @@ impl LogicalReplicationStream {
 /// let mut event_stream = stream.into_stream(cancel_token);
 ///
 /// // No need to import futures::StreamExt!
-/// while let Some(result) = event_stream.next().await {
-///     match result {
+/// loop {
+///     match event_stream.next().await {
 ///         Ok(event) => {
 ///             // Process event
 ///             println!("Received: {:?}", event);
+///         }
+///         Err(e) if matches!(e, pg_walstream::ReplicationError::Cancelled(_)) => {
+///             // Graceful shutdown
+///             println!("Stream cancelled");
+///             break;
 ///         }
 ///         Err(e) => {
 ///             // Handle error
@@ -1261,14 +1261,14 @@ impl EventStream {
     /// # let cancel_token = CancellationToken::new();
     /// let mut event_stream = stream.into_stream(cancel_token);
     ///
-    /// while let Some(result) = event_stream.next().await {
-    ///     match result {
+    /// loop {
+    ///     match event_stream.next().await {
     ///         Ok(event) => {
     ///             // Process the event...
     ///             // Update flushed LSN after writing to destination
     ///             event_stream.update_flushed_lsn(event.lsn.value());
     ///         }
-    ///         Err(e) => break,
+    ///         Err(_) => break,
     ///     }
     /// }
     /// # Ok(())
@@ -1305,14 +1305,14 @@ impl EventStream {
     /// # let cancel_token = CancellationToken::new();
     /// let mut event_stream = stream.into_stream(cancel_token);
     ///
-    /// while let Some(result) = event_stream.next().await {
-    ///     match result {
+    /// loop {
+    ///     match event_stream.next().await {
     ///         Ok(event) => {
     ///             // Process and commit the event...
     ///             // Update applied LSN after successful commit
     ///             event_stream.update_applied_lsn(event.lsn.value());
     ///         }
-    ///         Err(e) => break,
+    ///         Err(_) => break,
     ///     }
     /// }
     /// # Ok(())
@@ -1363,8 +1363,8 @@ impl EventStream {
     /// Get the next event from the stream
     ///
     /// This method provides a native async API without requiring any trait imports.
-    /// It returns `None` when the stream is cancelled or finished, `Some(Ok(event))`
-    /// when an event is available, and `Some(Err(e))` when an error occurs.
+    /// It returns `Ok(event)` when an event is available, and `Err(e)` when an error occurs
+    /// (including cancellation via `Err(ReplicationError::Cancelled(_))`).
     ///
     /// # Example
     ///
@@ -1391,33 +1391,26 @@ impl EventStream {
     /// let mut event_stream = stream.into_stream(cancel_token);
     ///
     /// // No need to import futures::StreamExt!
-    /// while let Some(result) = event_stream.next().await {
-    ///     match result {
+    /// loop {
+    ///     match event_stream.next().await {
     ///         Ok(event) => println!("Event: {:?}", event),
-    ///         Err(e) => eprintln!("Error: {}", e),
+    ///         Err(e) if matches!(e, pg_walstream::ReplicationError::Cancelled(_)) => {
+    ///             println!("Stream cancelled, shutting down gracefully");
+    ///             break;
+    ///         }
+    ///         Err(e) => {
+    ///             eprintln!("Error: {}", e);
+    ///             break;
+    ///         }
     ///     }
     /// }
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn next(&mut self) -> Option<Result<ChangeEvent>> {
-        // Check if cancelled - return None for graceful stream termination
-        if self.cancellation_token.is_cancelled() {
-            return None;
-        }
-
-        match self
-            .inner
+    pub async fn next(&mut self) -> Result<ChangeEvent> {
+        self.inner
             .next_event_with_retry(&self.cancellation_token)
             .await
-        {
-            Ok(Some(event)) => Some(Ok(event)),
-            Ok(None) => {
-                // Try again
-                Box::pin(self.next()).await
-            }
-            Err(e) => Some(Err(e)),
-        }
     }
 }
 
@@ -1427,7 +1420,7 @@ impl EventStream {
 /// similar to `EventStream` but borrows the underlying `LogicalReplicationStream`
 /// instead of owning it.
 ///
-/// It has a built-in `next()` method that returns `Future<Option<Result<ChangeEvent>>>`,
+/// It has a built-in `next()` method that returns `Future<Result<ChangeEvent>>`,
 /// allowing you to call `.next().await` without importing any traits.
 ///
 /// Create an `EventStreamRef` by calling `stream()` on `LogicalReplicationStream`.
@@ -1455,8 +1448,8 @@ impl<'a> EventStreamRef<'a> {
     /// Get the next event from the stream
     ///
     /// This method provides a native async API without requiring any trait imports.
-    /// It returns `None` when the stream is cancelled or finished, `Some(Ok(event))`
-    /// when an event is available, and `Some(Err(e))` when an error occurs.
+    /// It returns `Ok(event)` when an event is available, and `Err(e)` when an error occurs
+    /// (including cancellation via `Err(ReplicationError::Cancelled(_))`).
     ///
     /// # Example
     ///
@@ -1483,33 +1476,26 @@ impl<'a> EventStreamRef<'a> {
     /// let mut event_stream = stream.stream(cancel_token);
     ///
     /// // No need to import futures::StreamExt!
-    /// while let Some(result) = event_stream.next().await {
-    ///     match result {
+    /// loop {
+    ///     match event_stream.next().await {
     ///         Ok(event) => println!("Event: {:?}", event),
-    ///         Err(e) => eprintln!("Error: {}", e),
+    ///         Err(e) if matches!(e, pg_walstream::ReplicationError::Cancelled(_)) => {
+    ///             println!("Stream cancelled, shutting down gracefully");
+    ///             break;
+    ///         }
+    ///         Err(e) => {
+    ///             eprintln!("Error: {}", e);
+    ///             break;
+    ///         }
     ///     }
     /// }
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn next(&mut self) -> Option<Result<ChangeEvent>> {
-        // Check if cancelled - return None for graceful stream termination
-        if self.cancellation_token.is_cancelled() {
-            return None;
-        }
-
-        match self
-            .inner
+    pub async fn next(&mut self) -> Result<ChangeEvent> {
+        self.inner
             .next_event_with_retry(&self.cancellation_token)
             .await
-        {
-            Ok(Some(event)) => Some(Ok(event)),
-            Ok(None) => {
-                // Try again
-                Box::pin(self.next()).await
-            }
-            Err(e) => Some(Err(e)),
-        }
     }
 }
 

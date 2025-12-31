@@ -55,12 +55,13 @@
 //!     // Traditional polling loop with automatic retry
 //!     loop {
 //!         match stream.next_event_with_retry(&cancel_token).await {
-//!             Ok(Some(event)) => {
+//!             Ok(event) => {
 //!                 println!("Received event: {:?}", event);
 //!                 stream.shared_lsn_feedback.update_applied_lsn(event.lsn.value());
 //!             }
-//!             Ok(None) => {
-//!                 // No event available, continue
+//!             Err(e) if matches!(e, pg_walstream::ReplicationError::Cancelled(_)) => {
+//!                 println!("Cancelled, shutting down gracefully");
+//!                 break;
 //!             }
 //!             Err(e) => {
 //!                 eprintln!("Error: {}", e);
