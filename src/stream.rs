@@ -1505,8 +1505,6 @@ impl<'a> EventStreamRef<'a> {
         {
             Ok(Some(event)) => Some(Ok(event)),
             Ok(None) => {
-                // No event available yet, keep trying
-                tokio::task::yield_now().await;
                 // Try again
                 Box::pin(self.next()).await
             }
@@ -2554,8 +2552,11 @@ mod tests {
 
         // Final LSN should be consistent
         let (flushed, applied) = feedback.get_feedback_lsn();
-        assert!(flushed >= 0);
-        assert!(applied >= 0);
+        // Verify both are non-zero after concurrent updates
+        assert!(
+            flushed > 0 || applied > 0,
+            "At least one LSN should be updated"
+        );
     }
 
     #[test]
