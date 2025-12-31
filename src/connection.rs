@@ -2,14 +2,40 @@
 //!
 //! This module provides safe wrappers around libpq functions for logical replication.
 //! It's an optional feature that requires the `libpq` feature flag.
+//!
+//! # Async I/O Architecture
+//!
+//! This module implements truly async, non-blocking I/O using tokio's `AsyncFd` wrapper
+//! around libpq's file descriptor. The key design principles are:
+//!
+//! - **Non-blocking socket operations**: Uses `AsyncFd::readable()` with `try_io()` pattern
+//!   to properly yield tasks to the tokio executor when data is not immediately available
+//! - **Thread release**: When waiting for data, the task is suspended and the thread is
+//!   released back to the executor to run other tasks, preventing thread pool starvation
+//! - **Cancellation-aware**: All async operations support cancellation tokens for graceful
+//!   shutdown without resource leaks
+//! - **Edge-triggered readiness**: Properly handles edge-triggered epoll notifications by
+//!   only clearing the ready flag when actual I/O would block
+//!
+//! ## How it works
+//!
+//! 1. `get_copy_data_async()` first checks libpq's internal buffer (non-blocking)
+//! 2. If no data available, it awaits `AsyncFd::readable()` which yields the task
+//! 3. When the socket becomes readable, tokio wakes the task
+//! 4. The task uses `guard.try_io()` to safely consume data from the OS socket
+//! 5. If data is still not complete, the loop repeats, properly yielding again
+//!
+//! This ensures that no thread is blocked waiting for network I/O, maximizing
+//! throughput and enabling efficient concurrent processing of multiple replication streams.
 use crate::buffer::BufferWriter;
 use crate::error::{ReplicationError, Result};
 use crate::types::{format_lsn, system_time_to_postgres_timestamp, XLogRecPtr};
 use libpq_sys::*;
 use std::ffi::{CStr, CString};
+use std::os::raw::c_void;
 use std::os::unix::io::RawFd;
-use std::ptr;
 use std::time::SystemTime;
+use std::{ptr, slice};
 use tokio::io::unix::AsyncFd;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -358,7 +384,11 @@ impl PgReplicationConnection {
         Ok(())
     }
 
-    /// Get copy data from replication stream (async blocking version)
+    /// Get copy data from replication stream (truly async, non-blocking)
+    ///
+    /// This method uses proper async I/O patterns with AsyncFd to enable the tokio
+    /// scheduler to yield the task when no data is available, allowing other tasks
+    /// to run without blocking threads.
     ///
     /// # Arguments
     /// * `cancellation_token` - Cancellation token to abort the operation
@@ -381,12 +411,31 @@ impl PgReplicationConnection {
             .async_fd
             .as_ref()
             .ok_or_else(|| ReplicationError::protocol("AsyncFd not initialized".to_string()))?;
-
-        // Loop until we get data or cancellation
+        /*
+        OUTER LOOP
+        ├─ buffered data? → return
+        ├─ cancelled? → return
+        ├─ await readable()
+        │    INNER LOOP
+        │     ├─ try_io → success
+        │     ├─ try_io → success
+        │     ├─ try_io → WouldBlock → break
+        └─ repeat
+        */
         loop {
             // First, try to read any buffered data without blocking
-            if let Some(data) = self.try_read_buffered_data()? {
-                return Ok(data);
+            match self.try_read_buffered_data() {
+                Ok(data) => return Ok(data),
+                Err(e) if e.is_would_block() => {
+                    // No data ready, continue to wait for socket readability
+                }
+                Err(e) if e.is_copy_finished() => {
+                    // COPY stream finished - return as connection closed
+                    return Err(ReplicationError::ReplicationConnection(
+                        "COPY stream finished by server".to_string(),
+                    ));
+                }
+                Err(e) => return Err(e),
             }
 
             // If no buffered data, wait for either socket readability or cancellation
@@ -396,11 +445,18 @@ impl PgReplicationConnection {
                 _ = cancellation_token.cancelled() => {
                     info!("Cancellation detected in get_copy_data_async");
                     // Check one more time for buffered data before returning error
-                    if let Some(data) = self.try_read_buffered_data()? {
-                        info!("Found buffered data after cancellation, returning it");
-                        return Ok(data);
+                    match self.try_read_buffered_data() {
+                        Ok(data) => {
+                            info!("Found buffered data after cancellation, returning it");
+                            return Ok(data);
+                        }
+                        Err(e) if e.is_copy_finished() => {
+                            return Err(ReplicationError::ReplicationConnection(
+                                "COPY stream finished by server".to_string()
+                            ));
+                        }
+                        Err(_) => return Err(ReplicationError::Cancelled("Operation cancelled".to_string())),
                     }
-                    return Err(ReplicationError::Cancelled("Operation cancelled".to_string()));
                 }
 
                 // Wait for socket to become readable
@@ -409,30 +465,94 @@ impl PgReplicationConnection {
                         ReplicationError::protocol(format!("Failed to wait for socket readability: {e}"))
                     })?;
 
-                    // Socket is readable - consume input from the OS socket
-                    let consumed = unsafe { PQconsumeInput(self.conn) };
-                    if consumed == 0 {
-                        return Err(ReplicationError::protocol(self.last_error_message()));
-                    }
+                    // IMPORTANT: retry try_io until it would block
+                    loop {
+                        match guard.try_io(|_| self.consume_input_once()) {
+                            Ok(Ok(())) => {
+                                // Successfully consumed input
+                                match self.try_read_buffered_data() {
+                                    Ok(data) => return Ok(data),
+                                    Err(e) if e.is_would_block() => {
+                                        // There may be more data available in the same readiness window
+                                        continue;
+                                    }
+                                    Err(e) if e.is_copy_finished() => {
+                                        return Err(ReplicationError::ReplicationConnection(
+                                            "COPY stream finished by server".to_string()
+                                        ));
+                                    }
+                                    Err(e) => return Err(e),
+                                }
+                            }
 
-                    // Check if we have complete data now
-                    if let Some(data) = self.try_read_buffered_data()? {
-                        return Ok(data);
-                    }
+                            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                                return Err(ReplicationError::ReplicationConnection(
+                                    "Replication connection closed by server".to_string()
+                                ));
+                            }
 
-                    // No complete message yet, clear ready and continue loop
-                    guard.clear_ready();
+                            Ok(Err(e)) => {
+                                return Err(ReplicationError::protocol(format!(
+                                    "Failed to consume input: {e}"
+                                )));
+                            }
+
+                            Err(_) => {
+                                // Would block / false readiness
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 
+    fn consume_input_once(&self) -> std::io::Result<()> {
+        let consumed = unsafe { PQconsumeInput(self.conn) };
+        if consumed != 0 {
+            return Ok(());
+        }
+
+        // consumed == 0 → error or EOF
+        let status = unsafe { PQstatus(self.conn) };
+        let err = self.last_error_message();
+
+        if status == ConnStatusType::CONNECTION_BAD {
+            if err.is_empty() {
+                // Clean EOF: server closed replication connection
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "replication connection closed by server",
+                ));
+            }
+
+            return Err(std::io::Error::other(err));
+        }
+
+        Err(std::io::Error::other(if err.is_empty() {
+            "PQconsumeInput failed with unknown error"
+        } else {
+            err.as_str()
+        }))
+    }
+
     /// Try to read copy data from libpq's internal buffer without consuming OS socket
-    /// This should only be called after PQconsumeInput has been called
-    fn try_read_buffered_data(&self) -> Result<Option<Vec<u8>>> {
+    /// This is a non-blocking operation that only checks libpq's internal buffer.
+    /// It should only be called after PQconsumeInput has been called to transfer
+    /// data from the OS socket to libpq's buffer.
+    ///
+    /// # Returns
+    /// * `Ok(data)` - Complete message available in buffer
+    /// * `Err(ReplicationError::WouldBlock)` - No complete message yet, need to wait for more data
+    /// * `Err(ReplicationError::CopyFinished)` - COPY stream finished or closed by server
+    /// * `Err(_)` - Protocol or buffer error
+    #[inline]
+    fn try_read_buffered_data(&self) -> Result<Vec<u8>> {
         // Check if data is ready without blocking. PQisBusy returns 0 if a complete message is available
-        if unsafe { PQisBusy(self.conn) } != 0 {
-            return Ok(None); // Buffer not complete, wait for next socket readable event
+        let is_busy = unsafe { PQisBusy(self.conn) };
+        if is_busy != 0 {
+            return Err(ReplicationError::would_block()); // Buffer not complete, wait for next socket readable event
         }
 
         let mut buffer: *mut std::os::raw::c_char = ptr::null_mut();
@@ -446,21 +566,24 @@ impl PgReplicationConnection {
                     ));
                 }
 
-                let data = unsafe {
-                    std::slice::from_raw_parts(buffer as *const u8, len as usize).to_vec()
-                };
+                let data =
+                    unsafe { slice::from_raw_parts(buffer as *const u8, len as usize).to_vec() };
 
-                unsafe { PQfreemem(buffer as *mut std::os::raw::c_void) };
-                Ok(Some(data))
+                // Free the buffer allocated by PostgreSQL
+                unsafe { PQfreemem(buffer as *mut c_void) };
+                Ok(data)
             }
-            0 | -2 => Ok(None), // No complete data available, continue waiting
+            0 | -2 => {
+                // No complete data available, continue waiting
+                Err(ReplicationError::would_block())
+            }
             -1 => {
                 // COPY finished or channel closed
                 debug!("COPY finished or channel closed");
-                Ok(None)
+                Err(ReplicationError::copy_finished())
             }
-            _ => Err(ReplicationError::protocol(format!(
-                "Unexpected PQgetCopyData result: {result}"
+            other => Err(ReplicationError::protocol(format!(
+                "Unexpected PQgetCopyData result: {other}"
             ))),
         }
     }

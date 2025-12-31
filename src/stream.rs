@@ -2868,7 +2868,7 @@ mod tests {
         for i in 0..100 {
             columns.push(crate::protocol::ColumnInfo {
                 flags: if i < 5 { 1 } else { 0 }, // First 5 are keys
-                name: format!("col_{}", i),
+                name: format!("col_{i}"),
                 type_id: 23,
                 type_modifier: -1,
             });

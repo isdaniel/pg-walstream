@@ -44,6 +44,14 @@ pub enum ReplicationError {
     #[error("Operation was cancelled: {0}")]
     Cancelled(String),
 
+    /// Would block - no data available yet (not an error, used for async flow control)
+    #[error("Operation would block")]
+    WouldBlock,
+
+    /// COPY stream finished or closed by server
+    #[error("COPY stream finished")]
+    CopyFinished,
+
     /// Configuration errors
     #[error("Configuration error: {0}")]
     Config(String),
@@ -117,6 +125,16 @@ impl ReplicationError {
         ReplicationError::Config(msg.into())
     }
 
+    /// Create a new would block error
+    pub fn would_block() -> Self {
+        ReplicationError::WouldBlock
+    }
+
+    /// Create a new copy finished error
+    pub fn copy_finished() -> Self {
+        ReplicationError::CopyFinished
+    }
+
     /// Create a new generic error
     pub fn generic<S: Into<String>>(msg: S) -> Self {
         ReplicationError::Generic(msg.into())
@@ -146,6 +164,16 @@ impl ReplicationError {
     /// Check if the error is due to cancellation
     pub fn is_cancelled(&self) -> bool {
         matches!(self, ReplicationError::Cancelled(_))
+    }
+
+    /// Check if the error is a would-block condition (not a real error)
+    pub fn is_would_block(&self) -> bool {
+        matches!(self, ReplicationError::WouldBlock)
+    }
+
+    /// Check if the error indicates COPY stream finished
+    pub fn is_copy_finished(&self) -> bool {
+        matches!(self, ReplicationError::CopyFinished)
     }
 }
 
@@ -276,11 +304,13 @@ mod tests {
     }
 
     #[test]
-    fn test_result_type() {
+    fn test_result_type_alias() {
         let ok_result: Result<i32> = Ok(42);
-        assert_eq!(ok_result.expect("should be ok"), 42);
+        if let Ok(val) = ok_result {
+            assert_eq!(val, 42);
+        }
 
-        let err_result: Result<i32> = Err(ReplicationError::protocol("test"));
+        let err_result: Result<i32> = Err(ReplicationError::protocol("test error"));
         assert!(err_result.is_err());
     }
 }

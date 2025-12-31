@@ -39,7 +39,7 @@ use pg_walstream::{
 };
 use std::env;
 use std::time::Duration;
-use tracing::{info, Level};
+use tracing::{error, info, Level};
 use tracing_subscriber;
 
 #[tokio::main]
@@ -105,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         match event_stream.next().await {
             Ok(event) => {
-                println!("Received event: {:?}", event);
+                info!("Received event: {:?}", event);
                 event_stream.update_applied_lsn(event.lsn.value());
             }
             Err(e) if matches!(e, pg_walstream::ReplicationError::Cancelled(_)) => {
@@ -113,7 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
             Err(e) => {
-                eprintln!("Error: {}", e);
+                error!("Error: {}", e);
                 break;
             }
         }
