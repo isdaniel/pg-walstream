@@ -49,14 +49,13 @@ sudo dnf install postgresql-devel
 
 ### Using the Stream API
 
-The Stream API provides an ergonomic, iterator-like interface using Rust's `futures::Stream` trait:
+The Stream API provides an ergonomic, iterator-like interface:
 
 ```rust
 use pg_walstream::{
     LogicalReplicationStream, ReplicationStreamConfig, RetryConfig,
     SharedLsnFeedback, CancellationToken,
 };
-use futures::StreamExt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -93,7 +92,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match result {
             Ok(event) => {
                 println!("Received event: {:?}", event);
-                stream.shared_lsn_feedback.update_applied_lsn(event.lsn.value());
+                // Update LSN feedback using the convenient method
+                event_stream.update_applied_lsn(event.lsn.value());
             }
             Err(e) => {
                 eprintln!("Error: {}", e);

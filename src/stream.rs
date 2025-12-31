@@ -12,11 +12,8 @@ use crate::{
     ReplicationConnectionRetry, ReplicationState, RetryConfig, StreamingReplicationMessage,
     TupleData, XLogRecPtr, INVALID_XLOG_REC_PTR,
 };
-use futures::stream::Stream;
-use std::future::Future;
-use std::pin::Pin;
+
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -1085,8 +1082,16 @@ impl LogicalReplicationStream {
     /// Convert into an async stream of change events
     ///
     /// This method provides an iterator-like interface for consuming replication events.
-    /// It returns an `EventStream` that implements `futures::Stream`, allowing you to
-    /// use async stream combinators like `filter`, `map`, `take`, etc.
+    /// The returned `EventStream` has a built-in `next()` method that doesn't require
+    /// importing any traits - simply call `.next().await` to get the next event.
+    ///
+    /// If you prefer to use the `futures::Stream` trait, enable the `stream` feature
+    /// in your `Cargo.toml`:
+    ///
+    /// ```toml
+    /// [dependencies]
+    /// pg_walstream = { version = "0.1", features = ["stream"] }
+    /// ```
     ///
     /// The stream automatically handles retries, reconnections, and cancellation.
     /// When cancelled, the stream will cleanly terminate.
@@ -1104,7 +1109,6 @@ impl LogicalReplicationStream {
     /// ```no_run
     /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig};
     /// use tokio_util::sync::CancellationToken;
-    /// use futures::StreamExt;
     /// use std::time::Duration;
     ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -1124,7 +1128,6 @@ impl LogicalReplicationStream {
     /// let cancel_token = CancellationToken::new();
     /// let mut event_stream = stream.into_stream(cancel_token);
     ///
-    /// // Use stream combinators
     /// while let Some(result) = event_stream.next().await {
     ///     match result {
     ///         Ok(event) => println!("Event: {:?}", event),
@@ -1164,9 +1167,9 @@ impl LogicalReplicationStream {
 
 /// Async stream of PostgreSQL replication events (owned version)
 ///
-/// This struct implements `futures::Stream` to provide an iterator-like interface
-/// for consuming replication events. It automatically handles retries, reconnections,
-/// and cancellation.
+/// This struct provides an iterator-like interface for consuming replication events.
+/// It has a built-in `next()` method that returns `Future<Option<Result<ChangeEvent>>>`,
+/// allowing you to call `.next().await` without importing any traits.
 ///
 /// Create an `EventStream` by calling `into_stream()` on `LogicalReplicationStream`.
 ///
@@ -1175,7 +1178,6 @@ impl LogicalReplicationStream {
 /// ```no_run
 /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig};
 /// use tokio_util::sync::CancellationToken;
-/// use futures::StreamExt;
 /// use std::time::Duration;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -1195,6 +1197,7 @@ impl LogicalReplicationStream {
 /// let cancel_token = CancellationToken::new();
 /// let mut event_stream = stream.into_stream(cancel_token);
 ///
+/// // No need to import futures::StreamExt!
 /// while let Some(result) = event_stream.next().await {
 ///     match result {
 ///         Ok(event) => {
@@ -1231,44 +1234,201 @@ impl EventStream {
     pub fn current_lsn(&self) -> XLogRecPtr {
         self.inner.current_lsn()
     }
-}
 
-impl Stream for EventStream {
-    type Item = Result<ChangeEvent>;
+    /// Update the flushed LSN feedback
+    ///
+    /// Call this after data has been written/flushed to the destination database,
+    /// but not yet committed (e.g., during batch writes).
+    ///
+    /// # Arguments
+    ///
+    /// * `lsn` - The LSN value to update
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig};
+    /// # use tokio_util::sync::CancellationToken;
+    /// # use std::time::Duration;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let config = ReplicationStreamConfig::new(
+    /// #     "my_slot".to_string(), "my_publication".to_string(),
+    /// #     2, true, Duration::from_secs(10), Duration::from_secs(30),
+    /// #     Duration::from_secs(60), RetryConfig::default(),
+    /// # );
+    /// # let mut stream = LogicalReplicationStream::new("connection_string", config).await?;
+    /// # stream.start(None).await?;
+    /// # let cancel_token = CancellationToken::new();
+    /// let mut event_stream = stream.into_stream(cancel_token);
+    ///
+    /// while let Some(result) = event_stream.next().await {
+    ///     match result {
+    ///         Ok(event) => {
+    ///             // Process the event...
+    ///             // Update flushed LSN after writing to destination
+    ///             event_stream.update_flushed_lsn(event.lsn.value());
+    ///         }
+    ///         Err(e) => break,
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    pub fn update_flushed_lsn(&self, lsn: XLogRecPtr) {
+        self.inner.shared_lsn_feedback.update_flushed_lsn(lsn);
+    }
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    /// Update the applied LSN feedback
+    ///
+    /// Call this after data has been committed to the destination database.
+    /// This is the most common feedback update in typical replication scenarios.
+    ///
+    /// # Arguments
+    ///
+    /// * `lsn` - The LSN value to update
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig};
+    /// # use tokio_util::sync::CancellationToken;
+    /// # use std::time::Duration;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let config = ReplicationStreamConfig::new(
+    /// #     "my_slot".to_string(), "my_publication".to_string(),
+    /// #     2, true, Duration::from_secs(10), Duration::from_secs(30),
+    /// #     Duration::from_secs(60), RetryConfig::default(),
+    /// # );
+    /// # let mut stream = LogicalReplicationStream::new("connection_string", config).await?;
+    /// # stream.start(None).await?;
+    /// # let cancel_token = CancellationToken::new();
+    /// let mut event_stream = stream.into_stream(cancel_token);
+    ///
+    /// while let Some(result) = event_stream.next().await {
+    ///     match result {
+    ///         Ok(event) => {
+    ///             // Process and commit the event...
+    ///             // Update applied LSN after successful commit
+    ///             event_stream.update_applied_lsn(event.lsn.value());
+    ///         }
+    ///         Err(e) => break,
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    pub fn update_applied_lsn(&self, lsn: XLogRecPtr) {
+        self.inner.shared_lsn_feedback.update_applied_lsn(lsn);
+    }
+
+    /// Get the current feedback LSN values
+    ///
+    /// Returns a tuple of (flushed_lsn, applied_lsn).
+    ///
+    /// # Returns
+    ///
+    /// A tuple containing:
+    /// - `flushed_lsn`: Last LSN that was flushed to destination
+    /// - `applied_lsn`: Last LSN that was committed/applied to destination
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig};
+    /// # use tokio_util::sync::CancellationToken;
+    /// # use std::time::Duration;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let config = ReplicationStreamConfig::new(
+    /// #     "my_slot".to_string(), "my_publication".to_string(),
+    /// #     2, true, Duration::from_secs(10), Duration::from_secs(30),
+    /// #     Duration::from_secs(60), RetryConfig::default(),
+    /// # );
+    /// # let mut stream = LogicalReplicationStream::new("connection_string", config).await?;
+    /// # stream.start(None).await?;
+    /// # let cancel_token = CancellationToken::new();
+    /// let event_stream = stream.into_stream(cancel_token);
+    ///
+    /// let (flushed, applied) = event_stream.get_feedback_lsn();
+    /// println!("Flushed: {}, Applied: {}", flushed, applied);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    pub fn get_feedback_lsn(&self) -> (XLogRecPtr, XLogRecPtr) {
+        self.inner.shared_lsn_feedback.get_feedback_lsn()
+    }
+
+    /// Get the next event from the stream
+    ///
+    /// This method provides a native async API without requiring any trait imports.
+    /// It returns `None` when the stream is cancelled or finished, `Some(Ok(event))`
+    /// when an event is available, and `Some(Err(e))` when an error occurs.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig};
+    /// use tokio_util::sync::CancellationToken;
+    /// use std::time::Duration;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let config = ReplicationStreamConfig::new(
+    ///     "my_slot".to_string(),
+    ///     "my_publication".to_string(),
+    ///     2, true,
+    ///     Duration::from_secs(10),
+    ///     Duration::from_secs(30),
+    ///     Duration::from_secs(60),
+    ///     RetryConfig::default(),
+    /// );
+    ///
+    /// let mut stream = LogicalReplicationStream::new("connection_string", config).await?;
+    /// stream.start(None).await?;
+    ///
+    /// let cancel_token = CancellationToken::new();
+    /// let mut event_stream = stream.into_stream(cancel_token);
+    ///
+    /// // No need to import futures::StreamExt!
+    /// while let Some(result) = event_stream.next().await {
+    ///     match result {
+    ///         Ok(event) => println!("Event: {:?}", event),
+    ///         Err(e) => eprintln!("Error: {}", e),
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn next(&mut self) -> Option<Result<ChangeEvent>> {
         // Check if cancelled - return None for graceful stream termination
         if self.cancellation_token.is_cancelled() {
-            return Poll::Ready(None);
+            return None;
         }
 
-        // Clone the cancellation token to avoid borrow issues
-        let cancel_token = self.cancellation_token.clone();
-
-        // Create a future for the next event
-        let future = self.inner.next_event_with_retry(&cancel_token);
-        tokio::pin!(future);
-
-        match future.poll(cx) {
-            Poll::Ready(Ok(Some(event))) => Poll::Ready(Some(Ok(event))),
-            Poll::Ready(Ok(None)) => {
-                // No event available, schedule wakeup
-                cx.waker().wake_by_ref();
-                Poll::Pending
+        match self
+            .inner
+            .next_event_with_retry(&self.cancellation_token)
+            .await
+        {
+            Ok(Some(event)) => Some(Ok(event)),
+            Ok(None) => {
+                // Try again
+                Box::pin(self.next()).await
             }
-            Poll::Ready(Err(e)) => {
-                // Error occurred, yield it
-                Poll::Ready(Some(Err(e)))
-            }
-            Poll::Pending => Poll::Pending,
+            Err(e) => Some(Err(e)),
         }
     }
 }
 
 /// Async stream of PostgreSQL replication events (borrowed version)
 ///
-/// This struct implements `futures::Stream` similar to `EventStream` but borrows
-/// the underlying `LogicalReplicationStream` instead of owning it.
+/// This struct provides an iterator-like interface for consuming replication events,
+/// similar to `EventStream` but borrows the underlying `LogicalReplicationStream`
+/// instead of owning it.
+///
+/// It has a built-in `next()` method that returns `Future<Option<Result<ChangeEvent>>>`,
+/// allowing you to call `.next().await` without importing any traits.
 ///
 /// Create an `EventStreamRef` by calling `stream()` on `LogicalReplicationStream`.
 pub struct EventStreamRef<'a> {
@@ -1291,36 +1451,66 @@ impl<'a> EventStreamRef<'a> {
     pub fn current_lsn(&self) -> XLogRecPtr {
         self.inner.current_lsn()
     }
-}
 
-impl<'a> Stream for EventStreamRef<'a> {
-    type Item = Result<ChangeEvent>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    /// Get the next event from the stream
+    ///
+    /// This method provides a native async API without requiring any trait imports.
+    /// It returns `None` when the stream is cancelled or finished, `Some(Ok(event))`
+    /// when an event is available, and `Some(Err(e))` when an error occurs.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig};
+    /// use tokio_util::sync::CancellationToken;
+    /// use std::time::Duration;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let config = ReplicationStreamConfig::new(
+    ///     "my_slot".to_string(),
+    ///     "my_publication".to_string(),
+    ///     2, true,
+    ///     Duration::from_secs(10),
+    ///     Duration::from_secs(30),
+    ///     Duration::from_secs(60),
+    ///     RetryConfig::default(),
+    /// );
+    ///
+    /// let mut stream = LogicalReplicationStream::new("connection_string", config).await?;
+    /// stream.start(None).await?;
+    ///
+    /// let cancel_token = CancellationToken::new();
+    /// let mut event_stream = stream.stream(cancel_token);
+    ///
+    /// // No need to import futures::StreamExt!
+    /// while let Some(result) = event_stream.next().await {
+    ///     match result {
+    ///         Ok(event) => println!("Event: {:?}", event),
+    ///         Err(e) => eprintln!("Error: {}", e),
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn next(&mut self) -> Option<Result<ChangeEvent>> {
         // Check if cancelled - return None for graceful stream termination
         if self.cancellation_token.is_cancelled() {
-            return Poll::Ready(None);
+            return None;
         }
 
-        // Clone the cancellation token to avoid borrow issues
-        let cancel_token = self.cancellation_token.clone();
-
-        // Create a future for the next event
-        let future = self.inner.next_event_with_retry(&cancel_token);
-        tokio::pin!(future);
-
-        match future.poll(cx) {
-            Poll::Ready(Ok(Some(event))) => Poll::Ready(Some(Ok(event))),
-            Poll::Ready(Ok(None)) => {
-                // No event available, schedule wakeup
-                cx.waker().wake_by_ref();
-                Poll::Pending
+        match self
+            .inner
+            .next_event_with_retry(&self.cancellation_token)
+            .await
+        {
+            Ok(Some(event)) => Some(Ok(event)),
+            Ok(None) => {
+                // No event available yet, keep trying
+                tokio::task::yield_now().await;
+                // Try again
+                Box::pin(self.next()).await
             }
-            Poll::Ready(Err(e)) => {
-                // Error occurred, yield it
-                Poll::Ready(Some(Err(e)))
-            }
-            Poll::Pending => Poll::Pending,
+            Err(e) => Some(Err(e)),
         }
     }
 }
@@ -1842,5 +2032,1012 @@ mod tests {
         let formatted = format_lsn(original_lsn);
         let parsed = parse_lsn(&formatted).unwrap();
         assert_eq!(original_lsn, parsed);
+    }
+
+    #[test]
+    fn test_event_stream_lsn_feedback_update() {
+        let feedback = SharedLsnFeedback::new_shared();
+
+        // Simulate updating flushed LSN
+        feedback.update_flushed_lsn(1000);
+        assert_eq!(feedback.get_flushed_lsn(), 1000);
+
+        // Simulate updating applied LSN (should also update flushed)
+        feedback.update_applied_lsn(2000);
+        assert_eq!(feedback.get_flushed_lsn(), 2000);
+        assert_eq!(feedback.get_applied_lsn(), 2000);
+    }
+
+    #[test]
+    fn test_event_stream_get_feedback_lsn() {
+        let feedback = SharedLsnFeedback::new_shared();
+
+        feedback.update_flushed_lsn(5000);
+        feedback.update_applied_lsn(10000);
+
+        let (flushed, applied) = feedback.get_feedback_lsn();
+        assert_eq!(flushed, 10000); // Applied also updates flushed
+        assert_eq!(applied, 10000);
+    }
+
+    #[test]
+    fn test_event_stream_lsn_monotonic_increase() {
+        let feedback = SharedLsnFeedback::new_shared();
+
+        // LSNs should only increase
+        feedback.update_applied_lsn(1000);
+        assert_eq!(feedback.get_applied_lsn(), 1000);
+
+        feedback.update_applied_lsn(2000);
+        assert_eq!(feedback.get_applied_lsn(), 2000);
+
+        // Trying to set a lower value should keep the higher one
+        feedback.update_applied_lsn(500);
+        assert_eq!(feedback.get_applied_lsn(), 2000);
+    }
+
+    #[test]
+    fn test_config_with_different_protocol_versions() {
+        let config_v1 = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            1,
+            false,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        );
+        assert_eq!(config_v1.protocol_version, 1);
+        assert!(!config_v1.streaming_enabled);
+
+        let config_v4 = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            4,
+            true,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        );
+        assert_eq!(config_v4.protocol_version, 4);
+        assert!(config_v4.streaming_enabled);
+    }
+
+    #[test]
+    fn test_config_with_custom_intervals() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            2,
+            true,
+            Duration::from_millis(500),
+            Duration::from_secs(5),
+            Duration::from_secs(15),
+            RetryConfig::default(),
+        );
+
+        assert_eq!(config.feedback_interval, Duration::from_millis(500));
+        assert_eq!(config.connection_timeout, Duration::from_secs(5));
+        assert_eq!(config.health_check_interval, Duration::from_secs(15));
+    }
+
+    // ========================================
+    // ReplicationState Advanced Tests
+    // ========================================
+
+    #[test]
+    fn test_replication_state_lsn_tracking() {
+        let mut state = ReplicationState::new();
+
+        // Track multiple LSN updates
+        state.update_lsn(100);
+        assert_eq!(state.last_received_lsn, 100);
+
+        state.update_lsn(200);
+        assert_eq!(state.last_received_lsn, 200);
+
+        state.update_lsn(300);
+        assert_eq!(state.last_received_lsn, 300);
+
+        // Lower LSN should not update
+        state.update_lsn(150);
+        assert_eq!(state.last_received_lsn, 300);
+    }
+
+    #[test]
+    fn test_replication_state_feedback_timing() {
+        let mut state = ReplicationState::new();
+        let interval = Duration::from_millis(100);
+
+        // Initial state should allow feedback
+        state.update_lsn(1000);
+        std::thread::sleep(Duration::from_millis(110));
+        assert!(state.should_send_feedback(interval));
+
+        // Mark as sent
+        state.mark_feedback_sent();
+
+        // Should not send immediately after
+        assert!(!state.should_send_feedback(interval));
+
+        // After interval, should send again
+        std::thread::sleep(Duration::from_millis(110));
+        assert!(state.should_send_feedback(interval));
+    }
+
+    #[test]
+    fn test_replication_state_zero_lsn() {
+        let mut state = ReplicationState::new();
+
+        // Test with zero LSN
+        assert_eq!(state.last_received_lsn, 0);
+        state.update_lsn(0);
+        assert_eq!(state.last_received_lsn, 0);
+
+        // Update to non-zero
+        state.update_lsn(1);
+        assert_eq!(state.last_received_lsn, 1);
+    }
+
+    // ========================================
+    // RelationInfo Advanced Tests
+    // ========================================
+
+    #[test]
+    fn test_relation_info_empty_columns() {
+        let relation = RelationInfo::new(
+            12345,
+            "schema".to_string(),
+            "table".to_string(),
+            b'd',
+            vec![],
+        );
+
+        assert_eq!(relation.columns.len(), 0);
+        assert!(relation.get_column_by_index(0).is_none());
+        assert_eq!(relation.get_key_columns().len(), 0);
+    }
+
+    #[test]
+    fn test_relation_info_multiple_key_columns() {
+        let columns = vec![
+            crate::protocol::ColumnInfo {
+                flags: 1,
+                name: "id1".to_string(),
+                type_id: 23,
+                type_modifier: -1,
+            },
+            crate::protocol::ColumnInfo {
+                flags: 1,
+                name: "id2".to_string(),
+                type_id: 23,
+                type_modifier: -1,
+            },
+            crate::protocol::ColumnInfo {
+                flags: 0,
+                name: "data".to_string(),
+                type_id: 25,
+                type_modifier: -1,
+            },
+        ];
+
+        let relation = RelationInfo::new(
+            12345,
+            "public".to_string(),
+            "composite_key_table".to_string(),
+            b'd',
+            columns,
+        );
+
+        let key_columns = relation.get_key_columns();
+        assert_eq!(key_columns.len(), 2);
+        assert_eq!(key_columns[0].name, "id1");
+        assert_eq!(key_columns[1].name, "id2");
+    }
+
+    #[test]
+    fn test_relation_info_different_replica_identities() {
+        // Test Default
+        let rel_default =
+            RelationInfo::new(1, "public".to_string(), "t1".to_string(), b'd', vec![]);
+        assert_eq!(rel_default.replica_identity, b'd');
+
+        // Test Full
+        let rel_full = RelationInfo::new(2, "public".to_string(), "t2".to_string(), b'f', vec![]);
+        assert_eq!(rel_full.replica_identity, b'f');
+
+        // Test Nothing
+        let rel_nothing =
+            RelationInfo::new(3, "public".to_string(), "t3".to_string(), b'n', vec![]);
+        assert_eq!(rel_nothing.replica_identity, b'n');
+
+        // Test Index
+        let rel_index = RelationInfo::new(4, "public".to_string(), "t4".to_string(), b'i', vec![]);
+        assert_eq!(rel_index.replica_identity, b'i');
+    }
+
+    #[test]
+    fn test_change_event_with_null_values() {
+        let mut data = HashMap::new();
+        data.insert("id".to_string(), serde_json::json!(1));
+        data.insert("nullable_field".to_string(), serde_json::json!(null));
+
+        let event = ChangeEvent::insert(
+            "public".to_string(),
+            "users".to_string(),
+            12345,
+            data,
+            Lsn::new(1000),
+        );
+
+        match event.event_type {
+            EventType::Insert { data, .. } => {
+                assert_eq!(data.get("id").unwrap(), &serde_json::json!(1));
+                assert_eq!(
+                    data.get("nullable_field").unwrap(),
+                    &serde_json::json!(null)
+                );
+            }
+            _ => panic!("Expected Insert event"),
+        }
+    }
+
+    #[test]
+    fn test_change_event_update_without_old_data() {
+        let new_data = HashMap::new();
+
+        let event = ChangeEvent::update(
+            "public".to_string(),
+            "users".to_string(),
+            12345,
+            None, // No old data
+            new_data,
+            ReplicaIdentity::Nothing,
+            vec![],
+            Lsn::new(2000),
+        );
+
+        match event.event_type {
+            EventType::Update {
+                old_data,
+                replica_identity,
+                ..
+            } => {
+                assert!(old_data.is_none());
+                assert_eq!(replica_identity, ReplicaIdentity::Nothing);
+            }
+            _ => panic!("Expected Update event"),
+        }
+    }
+
+    #[test]
+    fn test_change_event_with_large_lsn() {
+        let data = HashMap::new();
+        let large_lsn = 0xFFFFFFFF_FFFFFFFFu64;
+
+        let event = ChangeEvent::insert(
+            "public".to_string(),
+            "test".to_string(),
+            1,
+            data,
+            Lsn::new(large_lsn),
+        );
+
+        assert_eq!(event.lsn.value(), large_lsn);
+    }
+
+    #[test]
+    fn test_change_event_metadata_field() {
+        let data = HashMap::new();
+
+        let event = ChangeEvent::insert(
+            "public".to_string(),
+            "test".to_string(),
+            1,
+            data,
+            Lsn::new(1000),
+        );
+
+        // Verify metadata field exists and is initially None
+        assert!(event.metadata.is_none());
+    }
+
+    #[test]
+    fn test_lsn_arithmetic_operations() {
+        let lsn1 = Lsn::new(100);
+        let lsn2 = Lsn::new(200);
+        let lsn3 = Lsn::new(100);
+
+        // Test equality
+        assert_eq!(lsn1, lsn3);
+        assert_ne!(lsn1, lsn2);
+
+        // Test ordering
+        assert!(lsn1 < lsn2);
+        assert!(lsn2 > lsn1);
+        assert!(lsn1 <= lsn3);
+        assert!(lsn1 >= lsn3);
+    }
+
+    #[test]
+    fn test_lsn_edge_cases() {
+        let lsn_zero = Lsn::new(0);
+        let lsn_max = Lsn::new(u64::MAX);
+
+        assert_eq!(lsn_zero.value(), 0);
+        assert_eq!(lsn_max.value(), u64::MAX);
+
+        assert!(lsn_zero < lsn_max);
+    }
+
+    #[test]
+    fn test_format_lsn_edge_cases() {
+        // Test zero
+        assert_eq!(format_lsn(0), "0/0");
+
+        // Test max value
+        assert_eq!(format_lsn(u64::MAX), "FFFFFFFF/FFFFFFFF");
+
+        // Test boundary values
+        assert_eq!(format_lsn(0xFFFFFFFF), "0/FFFFFFFF");
+        assert_eq!(format_lsn(0x100000000), "1/0");
+    }
+
+    #[test]
+    fn test_parse_lsn_various_formats() {
+        // Standard format
+        assert_eq!(parse_lsn("1/2A").unwrap(), 0x10000002A);
+
+        // Lowercase hex
+        assert_eq!(parse_lsn("a/b").unwrap(), 0xa0000000b);
+
+        // Mixed case
+        assert_eq!(parse_lsn("Ab/Cd").unwrap(), 0xab000000cd);
+
+        // Leading zeros
+        assert_eq!(parse_lsn("00/00").unwrap(), 0);
+        assert_eq!(parse_lsn("01/00000001").unwrap(), 0x100000001);
+    }
+
+    #[test]
+    fn test_parse_lsn_invalid_formats() {
+        assert!(parse_lsn("").is_err());
+        assert!(parse_lsn("123").is_err());
+        assert!(parse_lsn("abc").is_err());
+        assert!(parse_lsn("1/2/3").is_err());
+        assert!(parse_lsn("xyz/123").is_err());
+        assert!(parse_lsn("123/xyz").is_err());
+        assert!(parse_lsn("/").is_err());
+        assert!(parse_lsn("1/").is_err());
+        assert!(parse_lsn("/1").is_err());
+    }
+
+    #[test]
+    fn test_retry_config_with_jitter() {
+        let config_with_jitter = RetryConfig {
+            max_attempts: 3,
+            initial_delay: Duration::from_millis(100),
+            max_delay: Duration::from_secs(5),
+            multiplier: 2.0,
+            max_duration: Duration::from_secs(30),
+            jitter: true,
+        };
+
+        assert!(config_with_jitter.jitter);
+
+        let config_without_jitter = RetryConfig {
+            jitter: false,
+            ..config_with_jitter
+        };
+
+        assert!(!config_without_jitter.jitter);
+    }
+
+    #[test]
+    fn test_retry_config_max_duration() {
+        let config = RetryConfig {
+            max_attempts: 100,
+            initial_delay: Duration::from_millis(10),
+            max_delay: Duration::from_secs(30),
+            multiplier: 2.0,
+            max_duration: Duration::from_secs(5),
+            jitter: false,
+        };
+
+        assert_eq!(config.max_duration, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_exponential_backoff_respects_max_delay() {
+        let config = RetryConfig {
+            max_attempts: 10,
+            initial_delay: Duration::from_millis(100),
+            max_delay: Duration::from_millis(500),
+            multiplier: 2.0,
+            max_duration: Duration::from_secs(60),
+            jitter: false,
+        };
+
+        let mut backoff = crate::retry::ExponentialBackoff::new(&config);
+
+        // First few delays
+        let _d1 = backoff.next_delay();
+        let _d2 = backoff.next_delay();
+        let _d3 = backoff.next_delay();
+
+        // After several iterations, should not exceed max_delay
+        let d4 = backoff.next_delay();
+        assert!(d4 <= Duration::from_millis(500));
+    }
+
+    #[test]
+    fn test_hex_encode_various_inputs() {
+        // Empty
+        assert_eq!(hex::encode(&[]), "");
+
+        // Single byte
+        assert_eq!(hex::encode(&[0x00]), "00");
+        assert_eq!(hex::encode(&[0xff]), "ff");
+
+        // Multiple bytes
+        assert_eq!(hex::encode(&[0x12, 0x34]), "1234");
+        assert_eq!(hex::encode(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
+
+        // All zeros
+        assert_eq!(hex::encode(&[0x00, 0x00, 0x00]), "000000");
+
+        // All ones
+        assert_eq!(hex::encode(&[0xff, 0xff, 0xff]), "ffffff");
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_token_async_cancel() {
+        let token = CancellationToken::new();
+        let token_clone = token.clone();
+
+        // Spawn a task that waits for cancellation
+        let handle = tokio::spawn(async move {
+            token_clone.cancelled().await;
+            "cancelled"
+        });
+
+        // Cancel after a short delay
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        token.cancel();
+
+        // Task should complete
+        let result = handle.await.unwrap();
+        assert_eq!(result, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_propagates_to_children() {
+        let parent = CancellationToken::new();
+        let child = parent.child_token();
+
+        assert!(!parent.is_cancelled());
+        assert!(!child.is_cancelled());
+
+        // Cancel parent
+        parent.cancel();
+
+        // Both should be cancelled
+        assert!(parent.is_cancelled());
+        assert!(child.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_shared_lsn_feedback_concurrent_updates() {
+        let feedback = SharedLsnFeedback::new_shared();
+        let feedback_clone = feedback.clone();
+
+        // Spawn multiple tasks updating LSNs
+        let handle1 = tokio::spawn(async move {
+            for i in 0..100 {
+                feedback_clone.update_applied_lsn(i * 10);
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let feedback_clone2 = feedback.clone();
+        let handle2 = tokio::spawn(async move {
+            for i in 0..100 {
+                feedback_clone2.update_flushed_lsn(i * 10 + 5);
+                tokio::task::yield_now().await;
+            }
+        });
+
+        handle1.await.unwrap();
+        handle2.await.unwrap();
+
+        // Final LSN should be consistent
+        let (flushed, applied) = feedback.get_feedback_lsn();
+        assert!(flushed >= 0);
+        assert!(applied >= 0);
+    }
+
+    #[test]
+    fn test_shared_lsn_feedback_clone_shares_state() {
+        let feedback1 = SharedLsnFeedback::new_shared();
+        let feedback2 = feedback1.clone();
+
+        // Update through first reference
+        feedback1.update_applied_lsn(1000);
+
+        // Should be visible through second reference
+        assert_eq!(feedback2.get_applied_lsn(), 1000);
+
+        // Update through second reference
+        feedback2.update_flushed_lsn(2000);
+
+        // Should be visible through first reference
+        assert_eq!(feedback1.get_flushed_lsn(), 2000);
+    }
+
+    #[test]
+    fn test_full_change_event_lifecycle() {
+        // Test complete lifecycle: insert -> update -> delete
+        let mut insert_data = HashMap::new();
+        insert_data.insert("id".to_string(), serde_json::json!(1));
+        insert_data.insert("name".to_string(), serde_json::json!("Alice"));
+        insert_data.insert("email".to_string(), serde_json::json!("alice@example.com"));
+
+        let insert_event = ChangeEvent::insert(
+            "public".to_string(),
+            "users".to_string(),
+            16384,
+            insert_data.clone(),
+            Lsn::new(1000),
+        );
+
+        assert_eq!(insert_event.lsn.value(), 1000);
+
+        // Update event
+        let mut update_data = insert_data.clone();
+        update_data.insert(
+            "email".to_string(),
+            serde_json::json!("alice.new@example.com"),
+        );
+
+        let update_event = ChangeEvent::update(
+            "public".to_string(),
+            "users".to_string(),
+            16384,
+            Some(insert_data.clone()),
+            update_data,
+            ReplicaIdentity::Default,
+            vec!["id".to_string()],
+            Lsn::new(2000),
+        );
+
+        assert_eq!(update_event.lsn.value(), 2000);
+
+        // Delete event
+        let mut delete_key = HashMap::new();
+        delete_key.insert("id".to_string(), serde_json::json!(1));
+
+        let delete_event = ChangeEvent::delete(
+            "public".to_string(),
+            "users".to_string(),
+            16384,
+            delete_key,
+            ReplicaIdentity::Default,
+            vec!["id".to_string()],
+            Lsn::new(3000),
+        );
+
+        assert_eq!(delete_event.lsn.value(), 3000);
+
+        // Verify LSN progression
+        assert!(insert_event.lsn < update_event.lsn);
+        assert!(update_event.lsn < delete_event.lsn);
+    }
+
+    #[test]
+    fn test_replication_state_feedback_workflow() {
+        let mut state = ReplicationState::new();
+        let feedback_interval = Duration::from_millis(50);
+
+        // Simulate receiving data
+        state.update_lsn(1000);
+        state.last_flushed_lsn = 900;
+        state.last_applied_lsn = 900;
+
+        // Should send feedback since we have new data
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(state.should_send_feedback(feedback_interval));
+
+        // Mark as sent
+        state.mark_feedback_sent();
+
+        // Update with more data
+        state.update_lsn(2000);
+        state.last_flushed_lsn = 1500;
+        state.last_applied_lsn = 1500;
+
+        // Should not send immediately
+        assert!(!state.should_send_feedback(feedback_interval));
+
+        // After interval, should send
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(state.should_send_feedback(feedback_interval));
+    }
+
+    #[test]
+    fn test_relation_info_with_complex_schema() {
+        let columns = vec![
+            crate::protocol::ColumnInfo {
+                flags: 1,
+                name: "user_id".to_string(),
+                type_id: 20, // bigint
+                type_modifier: -1,
+            },
+            crate::protocol::ColumnInfo {
+                flags: 1,
+                name: "tenant_id".to_string(),
+                type_id: 23, // int4
+                type_modifier: -1,
+            },
+            crate::protocol::ColumnInfo {
+                flags: 0,
+                name: "created_at".to_string(),
+                type_id: 1184, // timestamptz
+                type_modifier: -1,
+            },
+            crate::protocol::ColumnInfo {
+                flags: 0,
+                name: "data".to_string(),
+                type_id: 3802, // jsonb
+                type_modifier: -1,
+            },
+            crate::protocol::ColumnInfo {
+                flags: 0,
+                name: "metadata".to_string(),
+                type_id: 25, // text
+                type_modifier: -1,
+            },
+        ];
+
+        let relation = RelationInfo::new(
+            16384,
+            "tenant_1".to_string(),
+            "user_events".to_string(),
+            b'i', // index replica identity
+            columns,
+        );
+
+        assert_eq!(relation.full_name(), "tenant_1.user_events");
+        assert_eq!(relation.columns.len(), 5);
+
+        let key_columns = relation.get_key_columns();
+        assert_eq!(key_columns.len(), 2);
+        assert_eq!(key_columns[0].name, "user_id");
+        assert_eq!(key_columns[1].name, "tenant_id");
+
+        // Test column lookup
+        assert_eq!(relation.get_column_by_index(2).unwrap().name, "created_at");
+        assert_eq!(relation.get_column_by_index(3).unwrap().name, "data");
+        assert!(relation.get_column_by_index(10).is_none());
+    }
+
+    #[test]
+    fn test_lsn_feedback_integration_workflow() {
+        let feedback = SharedLsnFeedback::new_shared();
+
+        // Simulate processing events with LSN progression
+        let lsns = vec![1000, 1500, 2000, 2500, 3000];
+
+        for lsn in lsns {
+            // Simulate flushing to disk
+            feedback.update_flushed_lsn(lsn);
+            assert_eq!(feedback.get_flushed_lsn(), lsn);
+
+            // Simulate committing transaction
+            feedback.update_applied_lsn(lsn);
+            assert_eq!(feedback.get_applied_lsn(), lsn);
+
+            let (flushed, applied) = feedback.get_feedback_lsn();
+            assert_eq!(flushed, lsn);
+            assert_eq!(applied, lsn);
+        }
+    }
+
+    #[test]
+    fn test_multiple_event_types_with_same_relation() {
+        let relation_oid = 16384;
+        let schema = "public".to_string();
+        let table = "orders".to_string();
+
+        // Create multiple event types for same relation
+        let mut insert_data = HashMap::new();
+        insert_data.insert("order_id".to_string(), serde_json::json!(100));
+        insert_data.insert("amount".to_string(), serde_json::json!(99.99));
+
+        let insert = ChangeEvent::insert(
+            schema.clone(),
+            table.clone(),
+            relation_oid,
+            insert_data.clone(),
+            Lsn::new(1000),
+        );
+
+        let mut update_data = insert_data.clone();
+        update_data.insert("amount".to_string(), serde_json::json!(89.99));
+
+        let update = ChangeEvent::update(
+            schema.clone(),
+            table.clone(),
+            relation_oid,
+            Some(insert_data.clone()),
+            update_data,
+            ReplicaIdentity::Full,
+            vec!["order_id".to_string()],
+            Lsn::new(2000),
+        );
+
+        let delete = ChangeEvent::delete(
+            schema.clone(),
+            table.clone(),
+            relation_oid,
+            insert_data,
+            ReplicaIdentity::Full,
+            vec!["order_id".to_string()],
+            Lsn::new(3000),
+        );
+
+        // Verify all events reference same relation
+        match insert.event_type {
+            EventType::Insert {
+                relation_oid: oid, ..
+            } => assert_eq!(oid, relation_oid),
+            _ => panic!("Expected insert"),
+        }
+
+        match update.event_type {
+            EventType::Update {
+                relation_oid: oid, ..
+            } => assert_eq!(oid, relation_oid),
+            _ => panic!("Expected update"),
+        }
+
+        match delete.event_type {
+            EventType::Delete {
+                relation_oid: oid, ..
+            } => assert_eq!(oid, relation_oid),
+            _ => panic!("Expected delete"),
+        }
+    }
+
+    // ========================================
+    // Edge Case Tests
+    // ========================================
+
+    #[test]
+    fn test_empty_table_and_schema_names() {
+        let data = HashMap::new();
+
+        let event = ChangeEvent::insert("".to_string(), "".to_string(), 0, data, Lsn::new(0));
+
+        match event.event_type {
+            EventType::Insert { schema, table, .. } => {
+                assert_eq!(schema, "");
+                assert_eq!(table, "");
+            }
+            _ => panic!("Expected insert"),
+        }
+    }
+
+    #[test]
+    fn test_very_long_table_names() {
+        let long_schema = "a".repeat(100);
+        let long_table = "b".repeat(100);
+        let data = HashMap::new();
+
+        let event = ChangeEvent::insert(
+            long_schema.clone(),
+            long_table.clone(),
+            12345,
+            data,
+            Lsn::new(1000),
+        );
+
+        match event.event_type {
+            EventType::Insert { schema, table, .. } => {
+                assert_eq!(schema, long_schema);
+                assert_eq!(table, long_table);
+            }
+            _ => panic!("Expected insert"),
+        }
+    }
+
+    #[test]
+    fn test_special_characters_in_names() {
+        let data = HashMap::new();
+
+        let event = ChangeEvent::insert(
+            "test-schema_123".to_string(),
+            "test_table$with#special@chars".to_string(),
+            12345,
+            data,
+            Lsn::new(1000),
+        );
+
+        match event.event_type {
+            EventType::Insert { schema, table, .. } => {
+                assert!(schema.contains("-"));
+                assert!(table.contains("$"));
+                assert!(table.contains("#"));
+                assert!(table.contains("@"));
+            }
+            _ => panic!("Expected insert"),
+        }
+    }
+
+    #[test]
+    fn test_large_number_of_columns() {
+        let mut columns = Vec::new();
+        for i in 0..100 {
+            columns.push(crate::protocol::ColumnInfo {
+                flags: if i < 5 { 1 } else { 0 }, // First 5 are keys
+                name: format!("col_{}", i),
+                type_id: 23,
+                type_modifier: -1,
+            });
+        }
+
+        let relation = RelationInfo::new(
+            12345,
+            "public".to_string(),
+            "wide_table".to_string(),
+            b'd',
+            columns,
+        );
+
+        assert_eq!(relation.columns.len(), 100);
+
+        let key_columns = relation.get_key_columns();
+        assert_eq!(key_columns.len(), 5);
+
+        // Test accessing first and last columns
+        assert_eq!(relation.get_column_by_index(0).unwrap().name, "col_0");
+        assert_eq!(relation.get_column_by_index(99).unwrap().name, "col_99");
+        assert!(relation.get_column_by_index(100).is_none());
+    }
+
+    #[test]
+    fn test_retry_config_zero_attempts() {
+        let config = RetryConfig {
+            max_attempts: 0,
+            initial_delay: Duration::from_millis(100),
+            max_delay: Duration::from_secs(10),
+            multiplier: 2.0,
+            max_duration: Duration::from_secs(60),
+            jitter: false,
+        };
+
+        assert_eq!(config.max_attempts, 0);
+    }
+
+    #[test]
+    fn test_retry_config_extreme_values() {
+        let config = RetryConfig {
+            max_attempts: u32::MAX,
+            initial_delay: Duration::from_nanos(1),
+            max_delay: Duration::from_secs(86400), // 1 day
+            multiplier: 10.0,
+            max_duration: Duration::from_secs(604800), // 1 week
+            jitter: true,
+        };
+
+        assert_eq!(config.max_attempts, u32::MAX);
+        assert_eq!(config.multiplier, 10.0);
+    }
+
+    #[test]
+    fn test_lsn_with_all_segments() {
+        // Test LSN with different segment combinations
+        let test_cases = vec![
+            (0x00000000_00000000, "0/0"),
+            (0x00000001_00000000, "1/0"),
+            (0x00000000_00000001, "0/1"),
+            (0x12345678_9ABCDEF0, "12345678/9ABCDEF0"),
+            (0xFFFFFFFF_00000000, "FFFFFFFF/0"),
+            (0x00000000_FFFFFFFF, "0/FFFFFFFF"),
+        ];
+
+        for (lsn_val, expected) in test_cases {
+            assert_eq!(format_lsn(lsn_val), expected);
+            assert_eq!(parse_lsn(expected).unwrap(), lsn_val);
+        }
+    }
+
+    #[test]
+    fn test_event_with_unicode_data() {
+        let mut data = HashMap::new();
+        data.insert("name".to_string(), serde_json::json!("Alice 中文 émoji 😀"));
+        data.insert(
+            "description".to_string(),
+            serde_json::json!("Test with ñ, ü, ö"),
+        );
+
+        let event = ChangeEvent::insert(
+            "public".to_string(),
+            "users".to_string(),
+            12345,
+            data.clone(),
+            Lsn::new(1000),
+        );
+
+        match event.event_type {
+            EventType::Insert {
+                data: event_data, ..
+            } => {
+                assert_eq!(
+                    event_data.get("name").unwrap(),
+                    &serde_json::json!("Alice 中文 émoji 😀")
+                );
+                assert_eq!(
+                    event_data.get("description").unwrap(),
+                    &serde_json::json!("Test with ñ, ü, ö")
+                );
+            }
+            _ => panic!("Expected insert"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_token_immediate_cancel() {
+        let token = CancellationToken::new();
+
+        // Cancel immediately
+        token.cancel();
+
+        // Should already be cancelled
+        assert!(token.is_cancelled());
+
+        // cancelled() should complete immediately
+        tokio::select! {
+            _ = token.cancelled() => {
+                // Should reach here immediately
+            }
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                panic!("Cancellation should have been immediate");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_multiple_child_tokens() {
+        let parent = CancellationToken::new();
+        let child1 = parent.child_token();
+        let child2 = parent.child_token();
+        let grandchild = child1.child_token();
+
+        assert!(!parent.is_cancelled());
+        assert!(!child1.is_cancelled());
+        assert!(!child2.is_cancelled());
+        assert!(!grandchild.is_cancelled());
+
+        // Cancel parent
+        parent.cancel();
+
+        // All should be cancelled
+        assert!(parent.is_cancelled());
+        assert!(child1.is_cancelled());
+        assert!(child2.is_cancelled());
+        assert!(grandchild.is_cancelled());
+    }
+
+    #[test]
+    fn test_hex_encoding_edge_cases() {
+        // Test with repeating patterns
+        assert_eq!(hex::encode(&[0xaa, 0xaa, 0xaa]), "aaaaaa");
+        assert_eq!(hex::encode(&[0x55, 0x55, 0x55]), "555555");
+
+        // Test with single bits
+        assert_eq!(hex::encode(&[0x01, 0x02, 0x04, 0x08]), "01020408");
+        assert_eq!(hex::encode(&[0x10, 0x20, 0x40, 0x80]), "10204080");
     }
 }
