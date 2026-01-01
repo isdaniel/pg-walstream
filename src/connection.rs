@@ -8,22 +8,24 @@
 //! This module implements truly async, non-blocking I/O using tokio's `AsyncFd` wrapper
 //! around libpq's file descriptor. The key design principles are:
 //!
-//! - **Non-blocking socket operations**: Uses `AsyncFd::readable()` with `try_io()` pattern
-//!   to properly yield tasks to the tokio executor when data is not immediately available
+//! - **Non-blocking socket operations**: Uses `AsyncFd::readable()` with proper drain pattern
+//!   to handle edge-triggered epoll notifications correctly
+//! - **Edge-triggered drain**: When the socket becomes readable, ALL available messages are
+//!   drained from libpq's buffer before clearing the ready flag, preventing message loss
 //! - **Thread release**: When waiting for data, the task is suspended and the thread is
 //!   released back to the executor to run other tasks, preventing thread pool starvation
 //! - **Cancellation-aware**: All async operations support cancellation tokens for graceful
 //!   shutdown without resource leaks
-//! - **Edge-triggered readiness**: Properly handles edge-triggered epoll notifications by
-//!   only clearing the ready flag when actual I/O would block
+//! - **Graceful COPY termination**: Properly detects and handles COPY stream end
 //!
 //! ## How it works
 //!
 //! 1. `get_copy_data_async()` first checks libpq's internal buffer (non-blocking)
 //! 2. If no data available, it awaits `AsyncFd::readable()` which yields the task
 //! 3. When the socket becomes readable, tokio wakes the task
-//! 4. The task uses `guard.try_io()` to safely consume data from the OS socket
-//! 5. If data is still not complete, the loop repeats, properly yielding again
+//! 4. The task calls `PQconsumeInput()` to transfer data from OS socket to libpq's buffer
+//! 5. **Critical**: It then drains ALL available messages in a loop before clearing ready flag
+//! 6. If no complete message yet, `clear_ready()` is called and the loop repeats
 //!
 //! This ensures that no thread is blocked waiting for network I/O, maximizing
 //! throughput and enabling efficient concurrent processing of multiple replication streams.
@@ -41,6 +43,17 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 pub use crate::types::INVALID_XLOG_REC_PTR;
+
+/// Result of attempting to read from libpq's internal buffer
+#[derive(Debug)]
+enum ReadResult {
+    /// Successfully read complete data
+    Data(Vec<u8>),
+    /// No complete message available (would block)
+    WouldBlock,
+    /// COPY stream has ended gracefully
+    CopyDone,
+}
 
 /// Safe wrapper around PostgreSQL connection for replication
 ///
@@ -395,7 +408,7 @@ impl PgReplicationConnection {
     ///
     /// # Returns
     /// * `Ok(data)` - Successfully received data
-    /// * `Err(ReplicationError::Cancelled(_))` - Operation was cancelled
+    /// * `Err(ReplicationError::Cancelled(_))` - Operation was cancelled or COPY stream ended
     /// * `Err(_)` - Other errors occurred (connection issues, protocol errors)
     pub async fn get_copy_data_async(
         &mut self,
@@ -412,11 +425,15 @@ impl PgReplicationConnection {
             .as_ref()
             .ok_or_else(|| ReplicationError::protocol("AsyncFd not initialized".to_string()))?;
 
-
         loop {
             // First, try to read any buffered data without blocking
-            if let Some(data) = self.try_read_buffered_data()? {
-                return Ok(data);
+            match self.try_read_buffered_data()? {
+                ReadResult::Data(data) => return Ok(data),
+                ReadResult::CopyDone => {
+                    debug!("COPY stream ended gracefully");
+                    return Err(ReplicationError::Cancelled("COPY stream ended".to_string()));
+                }
+                ReadResult::WouldBlock => {}
             }
 
             // If no buffered data, wait for either socket readability or cancellation
@@ -424,11 +441,22 @@ impl PgReplicationConnection {
                 biased;
 
                 _ = cancellation_token.cancelled() => {
-                    info!("Cancellation detected in get_copy_data_async");
+                    debug!("Cancellation detected in get_copy_data_async");
                     // Check one more time for buffered data before returning
-                    if let Some(data) = self.try_read_buffered_data()? {
-                        info!("Found buffered data after cancellation, returning it");
-                        return Ok(data);
+                    match self.try_read_buffered_data()? {
+                        ReadResult::Data(data) => {
+                            info!("Found buffered data after cancellation, returning it");
+                            return Ok(data);
+                        }
+                        ReadResult::CopyDone => {
+                            info!("Cancellation token triggered COPY stream ended during cancellation check");
+                            return Err(ReplicationError::Cancelled(
+                                "COPY stream ended".to_string(),
+                            ));
+                        }
+                        ReadResult::WouldBlock => {
+                            info!("Cancellation token triggered with no buffered data");
+                        }
                     }
                     return Err(ReplicationError::Cancelled("Operation cancelled".to_string()));
                 }
@@ -443,17 +471,31 @@ impl PgReplicationConnection {
                     // This is the ONLY place we call PQconsumeInput, avoiding busy-loops
                     let consumed = unsafe { PQconsumeInput(self.conn) };
                     if consumed == 0 {
-                        return Err(ReplicationError::protocol(self.last_error_message()));
+                        let error_msg = self.last_error_message();
+                        return Err(ReplicationError::protocol(format!(
+                            "PQconsumeInput failed: {error_msg}"
+                        )));
                     }
 
-                    // Check if we have complete data now
-                    if let Some(data) = self.try_read_buffered_data()? {
-                        return Ok(data);
+                    // Check if we got a complete message after consuming input.
+                    // If we got data, return it immediately (the guard drop will clear ready flag).
+                    // If no complete message yet, explicitly clear the ready flag to re-arm epoll.
+                    match self.try_read_buffered_data()? {
+                        ReadResult::Data(data) => {
+                            return Ok(data);
+                        }
+                        ReadResult::CopyDone => {
+                            debug!("COPY stream ended after consuming input");
+                            return Err(ReplicationError::Cancelled(
+                                "COPY stream ended".to_string(),
+                            ));
+                        }
+                        ReadResult::WouldBlock => {
+                            // No complete message available yet.
+                            // Clear the ready flag to re-arm epoll and continue waiting.
+                            guard.clear_ready();
+                        }
                     }
-
-                    // No complete message yet - clear ready flag and continue loop
-                    // This properly yields back to tokio and awaits again
-                    guard.clear_ready();
                 }
             }
         }
@@ -465,17 +507,13 @@ impl PgReplicationConnection {
     /// data from the OS socket to libpq's buffer.
     ///
     /// # Returns
-    /// * `Ok(Some(data))` - Complete message available in buffer
-    /// * `Ok(None)` - No complete message yet, need to wait for more data
+    /// * `Ok(ReadResult::Data(data))` - Complete message available in buffer
+    /// * `Ok(ReadResult::WouldBlock)` - No complete message yet, need to wait for more data
+    /// * `Ok(ReadResult::CopyDone)` - COPY stream has ended gracefully
     /// * `Err(_)` - Protocol or buffer error
     #[inline]
-    fn try_read_buffered_data(&self) -> Result<Option<Vec<u8>>> {
-        // Check if data is ready without blocking. PQisBusy returns 0 if a complete message is available
-        let is_busy = unsafe { PQisBusy(self.conn) };
-        if is_busy != 0 {
-            return Ok(None); // Buffer not complete, wait for next socket readable event
-        }
-
+    fn try_read_buffered_data(&self) -> Result<ReadResult> {
+        // PQgetCopyData with async=1 is already non-blocking, so we don't need PQisBusy check.
         let mut buffer: *mut std::os::raw::c_char = ptr::null_mut();
         let result = unsafe { PQgetCopyData(self.conn, &mut buffer, 1) };
 
@@ -492,16 +530,17 @@ impl PgReplicationConnection {
 
                 // Free the buffer allocated by PostgreSQL
                 unsafe { PQfreemem(buffer as *mut c_void) };
-                Ok(Some(data))
+                Ok(ReadResult::Data(data))
             }
             0 | -2 => {
-                // No complete data available, continue waiting
-                Ok(None)
+                // 0 : According to libpq docs, 0 means async mode and no data ready
+                // 2 : No complete data available yet, would block
+                Ok(ReadResult::WouldBlock)
             }
             -1 => {
-                // COPY finished or channel closed
-                debug!("COPY finished or channel closed");
-                Ok(None)
+                // COPY finished - this is a graceful shutdown signal
+                debug!("COPY stream finished (PQgetCopyData returned -1)");
+                Ok(ReadResult::CopyDone)
             }
             other => Err(ReplicationError::protocol(format!(
                 "Unexpected PQgetCopyData result: {other}"
