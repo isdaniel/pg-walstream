@@ -373,7 +373,7 @@ impl LogicalReplicationStream {
             // Send proactive feedback if enough time has passed
             self.maybe_send_feedback();
 
-            // Get data from replication stream (now blocks until data arrives)
+            // Get data from replication stream
             let data = self
                 .connection
                 .get_copy_data_async(cancellation_token)
@@ -628,7 +628,7 @@ impl LogicalReplicationStream {
     fn process_keepalive_message(&mut self, data: &[u8]) -> Result<()> {
         let keepalive = parse_keepalive_message(data)?;
 
-        info!(
+        debug!(
             "Received keepalive: wal_end={}, reply_requested={}",
             format_lsn(keepalive.wal_end),
             keepalive.reply_requested

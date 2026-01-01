@@ -44,14 +44,6 @@ pub enum ReplicationError {
     #[error("Operation was cancelled: {0}")]
     Cancelled(String),
 
-    /// Would block - no data available yet (not an error, used for async flow control)
-    #[error("Operation would block")]
-    WouldBlock,
-
-    /// COPY stream finished or closed by server
-    #[error("COPY stream finished")]
-    CopyFinished,
-
     /// Configuration errors
     #[error("Configuration error: {0}")]
     Config(String),
@@ -125,16 +117,6 @@ impl ReplicationError {
         ReplicationError::Config(msg.into())
     }
 
-    /// Create a new would block error
-    pub fn would_block() -> Self {
-        ReplicationError::WouldBlock
-    }
-
-    /// Create a new copy finished error
-    pub fn copy_finished() -> Self {
-        ReplicationError::CopyFinished
-    }
-
     /// Create a new generic error
     pub fn generic<S: Into<String>>(msg: S) -> Self {
         ReplicationError::Generic(msg.into())
@@ -164,16 +146,6 @@ impl ReplicationError {
     /// Check if the error is due to cancellation
     pub fn is_cancelled(&self) -> bool {
         matches!(self, ReplicationError::Cancelled(_))
-    }
-
-    /// Check if the error is a would-block condition (not a real error)
-    pub fn is_would_block(&self) -> bool {
-        matches!(self, ReplicationError::WouldBlock)
-    }
-
-    /// Check if the error indicates COPY stream finished
-    pub fn is_copy_finished(&self) -> bool {
-        matches!(self, ReplicationError::CopyFinished)
     }
 }
 
