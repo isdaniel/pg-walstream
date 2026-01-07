@@ -254,6 +254,111 @@ pub struct TypeInfo {
     pub namespace: String,
 }
 
+/// Replication slot type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotType {
+    /// Logical replication slot (requires output plugin)
+    Logical,
+    /// Physical replication slot (for streaming replication)
+    Physical,
+}
+
+impl SlotType {
+    /// Convert to PostgreSQL string representation
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SlotType::Logical => "LOGICAL",
+            SlotType::Physical => "PHYSICAL",
+        }
+    }
+}
+
+impl std::fmt::Display for SlotType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Options for creating a replication slot
+#[derive(Debug, Clone)]
+pub struct ReplicationSlotOptions {
+    /// Create a temporary slot (not saved to disk, dropped on error or session end)
+    pub temporary: bool,
+
+    /// Enable two-phase commit support (logical slots only)
+    pub two_phase: bool,
+
+    /// Reserve WAL immediately (physical slots only)
+    pub reserve_wal: bool,
+
+    /// Snapshot behavior: 'export', 'use', or 'nothing' (logical slots only)
+    pub snapshot: Option<String>,
+
+    /// Enable slot for failover synchronization (logical slots only)
+    pub failover: bool,
+}
+
+impl Default for ReplicationSlotOptions {
+    fn default() -> Self {
+        Self {
+            temporary: false,
+            two_phase: false,
+            reserve_wal: false,
+            snapshot: None,
+            failover: false,
+        }
+    }
+}
+
+/// Options for BASE_BACKUP command
+#[derive(Debug, Clone, Default)]
+pub struct BaseBackupOptions {
+    /// Backup label (default: \"base backup\")
+    pub label: Option<String>,
+
+    /// Target: 'client' (default), 'server', or 'blackhole'
+    pub target: Option<String>,
+
+    /// Target detail (e.g., server directory path when target is 'server')
+    pub target_detail: Option<String>,
+
+    /// Include progress information
+    pub progress: bool,
+
+    /// Checkpoint type: 'fast' or 'spread' (default: 'spread')
+    pub checkpoint: Option<String>,
+
+    /// Include WAL files in the backup
+    pub wal: bool,
+
+    /// Wait for WAL archiving (default: true)
+    pub wait: bool,
+
+    /// Compression method: 'gzip', 'lz4', or 'zstd'
+    pub compression: Option<String>,
+
+    /// Compression details (level, workers, etc.)
+    pub compression_detail: Option<String>,
+
+    /// Maximum transfer rate in KB/s (0 = unlimited)
+    pub max_rate: Option<u64>,
+
+    /// Include tablespace map
+    pub tablespace_map: bool,
+
+    /// Verify checksums during backup
+    pub verify_checksums: bool,
+
+    /// Manifest option: 'yes', 'no', or 'force-encode'
+    pub manifest: Option<String>,
+
+    /// Manifest checksum algorithm: 'NONE', 'CRC32C', 'SHA224', 'SHA256', 'SHA384', 'SHA512'
+    pub manifest_checksums: Option<String>,
+
+    /// Request an incremental backup
+    pub incremental: bool,
+}
+
 /// Transaction information
 #[derive(Debug, Clone)]
 pub struct TransactionInfo {
@@ -376,10 +481,13 @@ pub enum EventType {
     Truncate(Vec<String>),
     Begin {
         transaction_id: u32,
+        final_lsn: Lsn,
         commit_timestamp: chrono::DateTime<chrono::Utc>,
     },
     Commit {
         commit_timestamp: chrono::DateTime<chrono::Utc>,
+        commit_lsn: Lsn,
+        end_lsn: Lsn,
     },
     /// Streaming transaction start (protocol v2+)
     StreamStart {
@@ -391,11 +499,16 @@ pub enum EventType {
     /// Streaming transaction commit (final commit of streamed transaction)
     StreamCommit {
         transaction_id: u32,
+        commit_lsn: Lsn,
+        end_lsn: Lsn,
         commit_timestamp: chrono::DateTime<chrono::Utc>,
     },
     /// Streaming transaction abort
     StreamAbort {
         transaction_id: u32,
+        subtransaction_xid: u32,
+        abort_lsn: Option<Lsn>,
+        abort_timestamp: Option<chrono::DateTime<chrono::Utc>>,
     },
     Relation,
     Type,
@@ -590,16 +703,19 @@ impl ChangeEvent {
     /// # Arguments
     ///
     /// * `transaction_id` - PostgreSQL transaction ID (XID)
+    /// * `final_lsn` - The final LSN of the transaction
     /// * `commit_timestamp` - Transaction start timestamp
     /// * `lsn` - Log Sequence Number for this event
     pub fn begin(
         transaction_id: u32,
+        final_lsn: Lsn,
         commit_timestamp: chrono::DateTime<chrono::Utc>,
         lsn: Lsn,
     ) -> Self {
         Self {
             event_type: EventType::Begin {
                 transaction_id,
+                final_lsn,
                 commit_timestamp,
             },
             lsn,
@@ -613,16 +729,20 @@ impl ChangeEvent {
     ///
     /// # Arguments
     ///
-    /// * `_transaction_id` - PostgreSQL transaction ID (unused but kept for API compatibility)
     /// * `commit_timestamp` - Transaction commit timestamp
     /// * `lsn` - Log Sequence Number for this event
     pub fn commit(
-        _transaction_id: u32,
         commit_timestamp: chrono::DateTime<chrono::Utc>,
         lsn: Lsn,
+        commit_lsn: Lsn,
+        end_lsn: Lsn,
     ) -> Self {
         Self {
-            event_type: EventType::Commit { commit_timestamp },
+            event_type: EventType::Commit {
+                commit_timestamp,
+                commit_lsn,
+                end_lsn,
+            },
             lsn,
             metadata: None,
         }

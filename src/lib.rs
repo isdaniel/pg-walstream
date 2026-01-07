@@ -117,11 +117,14 @@ pub use types::{
     postgres_timestamp_to_chrono,
     system_time_to_postgres_timestamp,
     // High-level CDC types
+    BaseBackupOptions,
     ChangeEvent,
     EventType,
     Lsn,
     Oid,
     ReplicaIdentity,
+    ReplicationSlotOptions,
+    SlotType,
     TimestampTz,
     // Type aliases matching PostgreSQL types
     XLogRecPtr,

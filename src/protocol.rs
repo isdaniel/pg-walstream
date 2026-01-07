@@ -5,12 +5,16 @@
 //! - <https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html>
 //! - <https://www.postgresql.org/docs/current/protocol-logical-replication.html>
 
-use crate::buffer::BufferReader;
+use crate::buffer::{BufferReader, BufferWriter};
 use crate::error::{ReplicationError, Result};
-use crate::types::{format_lsn, Oid, TimestampTz, XLogRecPtr, Xid};
+use crate::types::{
+    format_lsn, system_time_to_postgres_timestamp, Oid, TimestampTz, XLogRecPtr, Xid,
+};
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::time::SystemTime;
 use tracing::debug;
 
 /// Message type constants for logical replication protocol
@@ -39,6 +43,8 @@ pub mod message_types {
     pub const COMMIT_PREPARED: u8 = b'K';
     pub const ROLLBACK_PREPARED: u8 = b'r';
     pub const STREAM_PREPARE: u8 = b'p';
+
+    pub const HOT_STANDBY_FEEDBACK: u8 = b'h';
 }
 
 /// PostgreSQL logical replication message types enum
@@ -1293,6 +1299,50 @@ pub struct KeepaliveMessage {
     pub wal_end: XLogRecPtr,
     pub timestamp: TimestampTz,
     pub reply_requested: bool,
+}
+
+/// Build a hot standby feedback message for physical replication
+///
+/// This function creates a properly formatted hot standby feedback message
+/// according to the PostgreSQL streaming replication protocol.
+///
+/// # Arguments
+///
+/// * `xmin` - Oldest transaction ID still considered active
+/// * `xmin_epoch` - Epoch for xmin
+/// * `catalog_xmin` - Oldest transaction ID affecting catalog still considered active  
+/// * `catalog_xmin_epoch` - Epoch for catalog_xmin
+///
+/// # Returns
+///
+/// Returns a Bytes buffer containing the properly formatted hot standby feedback message.
+///
+/// # Protocol Format
+///
+/// The message format is:
+/// - Byte1('h'): Message type identifier
+/// - Int64: Current timestamp
+/// - Int32: xmin
+/// - Int32: xmin epoch
+/// - Int32: catalog_xmin
+/// - Int32: catalog_xmin epoch
+pub fn build_hot_standby_feedback_message(
+    xmin: u32,
+    xmin_epoch: u32,
+    catalog_xmin: u32,
+    catalog_xmin_epoch: u32,
+) -> Result<Bytes> {
+    let timestamp = system_time_to_postgres_timestamp(SystemTime::now());
+    let mut buffer = BufferWriter::with_capacity(25);
+
+    buffer.write_u8(message_types::HOT_STANDBY_FEEDBACK)?;
+    buffer.write_i64(timestamp)?;
+    buffer.write_u32(xmin)?;
+    buffer.write_u32(xmin_epoch)?;
+    buffer.write_u32(catalog_xmin)?;
+    buffer.write_u32(catalog_xmin_epoch)?;
+
+    Ok(buffer.freeze())
 }
 
 #[cfg(test)]
