@@ -5,11 +5,12 @@
 
 # pg-walstream
 
-A high-performance Rust library for PostgreSQL logical replication protocol parsing and streaming. This library provides a robust, type-safe interface for consuming PostgreSQL Write-Ahead Log (WAL) streams.
+A high-performance Rust library for PostgreSQL logical and physical replication protocol parsing and streaming. This library provides a robust, type-safe interface for consuming PostgreSQL Write-Ahead Log (WAL) streams.
 
 ## Features
 
-- **Full Protocol Support**: Implements PostgreSQL logical replication protocol versions 1-4
+- **Full Logical Replication Support**: Implements PostgreSQL logical replication protocol versions 1-4
+- **Physical Replication Support**: Stream raw WAL data for standby servers and PITR
 - **Streaming Transactions**: Support for streaming large transactions (protocol v2+)
 - **Two-Phase Commit**: Prepared transaction support (protocol v3+)
 - **Parallel Streaming**: Multi-stream parallel replication (protocol v4+)
@@ -47,7 +48,7 @@ sudo dnf install postgresql-devel
 
 ## Quick Start
 
-### Using the Stream API
+### Logical Replication - Stream API
 
 The Stream API provides an ergonomic, iterator-like interface:
 
@@ -184,7 +185,7 @@ feedback.update_applied_lsn(commit_lsn);
 
 ## PostgreSQL Setup
 
-Before using this library, you need to configure PostgreSQL for logical replication:
+Before using this library, you need to configure PostgreSQL for replication:
 
 ### 1. Configure PostgreSQL
 
@@ -218,6 +219,22 @@ CREATE USER replication_user WITH REPLICATION PASSWORD 'secure_password';
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO replication_user;
 GRANT USAGE ON SCHEMA public TO replication_user;
 ```
+
+### 4. Create Replication Slot with Advanced Options
+
+The library provides two methods for creating replication slots:
+
+#### Replication Slot Options
+
+- **`temporary`** (`bool`): Create a temporary slot that is not saved to disk and is dropped on error or session end. Default: `false`
+- **`two_phase`** (`Option<bool>`): Enable two-phase commit support for logical slots. This allows the slot to receive prepared transaction events. Requires PostgreSQL 15+. Default: `None`
+- **`reserve_wal`** (`Option<bool>`): Reserve WAL immediately for physical slots. Prevents WAL files from being removed before the slot is active. Default: `None`
+- **`snapshot`** (`Option<String>`): Control snapshot behavior for logical slots:
+  - `"export"` - Export the snapshot for use by other sessions
+  - `"use"` - Use an existing snapshot
+  - `"nothing"` - Don't export or use a snapshot
+  - Default: `None`
+- **`failover`** (`Option<bool>`): Enable the slot for failover synchronization. When enabled, the slot will be synchronized to standby servers for high availability. Requires PostgreSQL 16+. Default: `None`
 
 ## Message Types
 
