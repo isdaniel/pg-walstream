@@ -761,11 +761,20 @@ impl LogicalReplicationStream {
                 }
             }
 
-            LogicalReplicationMessage::Begin { xid, timestamp, .. } => {
-                debug!("Transaction begin: xid={}", xid);
+            LogicalReplicationMessage::Begin {
+                final_lsn,
+                xid,
+                timestamp,
+            } => {
+                debug!(
+                    "Transaction begin: xid={}, final_lsn={}",
+                    xid,
+                    format_lsn(final_lsn)
+                );
                 ChangeEvent {
                     event_type: EventType::Begin {
                         transaction_id: xid,
+                        final_lsn: Lsn::new(final_lsn),
                         commit_timestamp: postgres_timestamp_to_chrono(timestamp),
                     },
                     lsn: Lsn::new(lsn),
@@ -774,19 +783,22 @@ impl LogicalReplicationStream {
             }
 
             LogicalReplicationMessage::Commit {
+                flags,
                 timestamp,
                 commit_lsn,
                 end_lsn,
-                ..
             } => {
                 debug!(
-                    "Transaction commit, commit_lsn:{}, end_lsn:{}",
+                    "Transaction commit, flags={}, commit_lsn:{}, end_lsn:{}",
+                    flags,
                     format_lsn(commit_lsn),
                     format_lsn(end_lsn)
                 );
                 ChangeEvent {
                     event_type: EventType::Commit {
                         commit_timestamp: postgres_timestamp_to_chrono(timestamp),
+                        commit_lsn: Lsn::new(commit_lsn),
+                        end_lsn: Lsn::new(end_lsn),
                     },
                     lsn: Lsn::new(lsn),
                     metadata: None,
@@ -795,12 +807,16 @@ impl LogicalReplicationStream {
 
             LogicalReplicationMessage::Truncate {
                 relation_ids,
-                flags: _,
+                flags,
             } => {
                 let mut truncate_tables = Vec::with_capacity(relation_ids.len());
                 for relation_id in relation_ids {
                     if let Some(relation) = self.state.get_relation(relation_id) {
-                        info!("Table truncated: {}", relation.full_name());
+                        info!(
+                            "Table truncated: {} (flags={})",
+                            relation.full_name(),
+                            flags
+                        );
                         truncate_tables.push(relation.full_name());
                     }
                 }
@@ -836,20 +852,23 @@ impl LogicalReplicationStream {
 
             LogicalReplicationMessage::StreamCommit {
                 xid,
+                flags,
                 timestamp,
                 commit_lsn,
                 end_lsn,
-                ..
             } => {
                 debug!(
-                    "Stream commit: xid={}, commit_lsn={}, end_lsn={}",
+                    "Stream commit: xid={}, flags={}, commit_lsn={}, end_lsn={}",
                     xid,
+                    flags,
                     format_lsn(commit_lsn),
                     format_lsn(end_lsn)
                 );
                 ChangeEvent {
                     event_type: EventType::StreamCommit {
                         transaction_id: xid,
+                        commit_lsn: Lsn::new(commit_lsn),
+                        end_lsn: Lsn::new(end_lsn),
                         commit_timestamp: postgres_timestamp_to_chrono(timestamp),
                     },
                     lsn: Lsn::new(lsn),
@@ -857,11 +876,25 @@ impl LogicalReplicationStream {
                 }
             }
 
-            LogicalReplicationMessage::StreamAbort { xid, .. } => {
-                debug!("Stream abort: xid={}", xid);
+            LogicalReplicationMessage::StreamAbort {
+                xid,
+                subtransaction_xid,
+                abort_lsn,
+                abort_timestamp,
+            } => {
+                debug!(
+                    "Stream abort: xid={}, subtransaction_xid={}, abort_lsn={:?}, abort_timestamp={:?}",
+                    xid,
+                    subtransaction_xid,
+                    abort_lsn.map(format_lsn),
+                    abort_timestamp
+                );
                 ChangeEvent {
                     event_type: EventType::StreamAbort {
                         transaction_id: xid,
+                        subtransaction_xid,
+                        abort_lsn: abort_lsn.map(Lsn::new),
+                        abort_timestamp: abort_timestamp.map(postgres_timestamp_to_chrono),
                     },
                     lsn: Lsn::new(lsn),
                     metadata: None,

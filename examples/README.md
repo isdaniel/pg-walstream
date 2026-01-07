@@ -33,6 +33,30 @@ Shows the lower-level polling API for manual event retrieval.
 cargo run --example polling_example
 ```
 
+### 3. safe_transaction_consumer.rs
+
+**NEW**: Advanced example demonstrating safe transaction processing with ordered commits.
+
+**Features:**
+- Transaction buffering until commit
+- Ordered transaction application
+- LSN feedback only after successful application
+- Backpressure handling when too many transactions are buffered
+- Graceful shutdown with proper cleanup
+- Real-time statistics reporting
+- Transaction boundary enforcement
+
+**Run:**
+```bash
+cargo run --example safe_transaction_consumer
+```
+
+**Use Cases:**
+- Building production-ready replication consumers
+- Ensuring data consistency across systems
+- Implementing exactly-once processing semantics
+- Safe CDC (Change Data Capture) pipelines
+
 ## Prerequisites
 
 ### 1. PostgreSQL Configuration

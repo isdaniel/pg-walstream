@@ -31,7 +31,11 @@
 //! throughput and enabling efficient concurrent processing of multiple replication streams.
 use crate::buffer::BufferWriter;
 use crate::error::{ReplicationError, Result};
-use crate::types::{format_lsn, system_time_to_postgres_timestamp, XLogRecPtr};
+use crate::protocol::build_hot_standby_feedback_message;
+use crate::types::{
+    format_lsn, system_time_to_postgres_timestamp, BaseBackupOptions, ReplicationSlotOptions,
+    XLogRecPtr,
+};
 use libpq_sys::*;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
@@ -572,6 +576,259 @@ impl PgReplicationConnection {
     /// Get the server version
     pub fn server_version(&self) -> i32 {
         unsafe { PQserverVersion(self.conn) }
+    }
+
+    /// Create a replication slot with advanced options
+    pub fn create_replication_slot_with_options(
+        &self,
+        slot_name: &str,
+        slot_type: &str,
+        output_plugin: Option<&str>,
+        options: &ReplicationSlotOptions,
+    ) -> Result<PgResult> {
+        let mut sql = format!("CREATE_REPLICATION_SLOT \"{}\" ", slot_name);
+
+        if options.temporary {
+            sql.push_str("TEMPORARY ");
+        }
+
+        sql.push_str(slot_type);
+        sql.push(' ');
+
+        if slot_type.eq_ignore_ascii_case("LOGICAL") {
+            let plugin = output_plugin.ok_or_else(|| {
+                ReplicationError::protocol("Output plugin required for LOGICAL slots".to_string())
+            })?;
+            sql.push_str(plugin);
+            sql.push(' ');
+        }
+
+        let mut opts = Vec::new();
+
+        if let Some(two_phase) = options.two_phase {
+            opts.push(format!("TWO_PHASE {}", two_phase));
+        }
+
+        if let Some(reserve_wal) = options.reserve_wal {
+            opts.push(format!("RESERVE_WAL {}", reserve_wal));
+        }
+
+        if let Some(ref snapshot) = options.snapshot {
+            opts.push(format!("SNAPSHOT '{}'", snapshot));
+        }
+
+        if let Some(failover) = options.failover {
+            opts.push(format!("FAILOVER {}", failover));
+        }
+
+        if !opts.is_empty() {
+            sql.push('(');
+            sql.push_str(&opts.join(", "));
+            sql.push(')');
+        }
+
+        sql.push(';');
+
+        debug!("Creating replication slot with options: {}", sql);
+        self.exec(&sql)
+    }
+
+    /// Alter a replication slot (logical slots only)
+    pub fn alter_replication_slot(
+        &self,
+        slot_name: &str,
+        two_phase: Option<bool>,
+        failover: Option<bool>,
+    ) -> Result<PgResult> {
+        let mut opts = Vec::new();
+
+        if let Some(tp) = two_phase {
+            opts.push(format!("TWO_PHASE {}", tp));
+        }
+
+        if let Some(fo) = failover {
+            opts.push(format!("FAILOVER {}", fo));
+        }
+
+        if opts.is_empty() {
+            return Err(ReplicationError::protocol(
+                "At least one option must be specified for ALTER_REPLICATION_SLOT".to_string(),
+            ));
+        }
+
+        let alter_slot_sql = format!(
+            "ALTER_REPLICATION_SLOT \"{}\" ({});",
+            slot_name,
+            opts.join(", ")
+        );
+
+        debug!("Altering replication slot: {}", alter_slot_sql);
+        let result = self.exec(&alter_slot_sql)?;
+        debug!("Replication slot {} altered", slot_name);
+        Ok(result)
+    }
+
+    /// Start physical replication
+    pub fn start_physical_replication(
+        &mut self,
+        slot_name: Option<&str>,
+        start_lsn: XLogRecPtr,
+        timeline_id: Option<u32>,
+    ) -> Result<()> {
+        let mut sql = String::from("START_REPLICATION ");
+
+        if let Some(slot) = slot_name {
+            sql.push_str(&format!("SLOT \"{}\" ", slot));
+        }
+
+        sql.push_str("PHYSICAL ");
+
+        let lsn_str = if start_lsn == INVALID_XLOG_REC_PTR {
+            "0/0".to_string()
+        } else {
+            format_lsn(start_lsn)
+        };
+        sql.push_str(&lsn_str);
+
+        if let Some(tli) = timeline_id {
+            sql.push_str(&format!(" TIMELINE {}", tli));
+        }
+
+        debug!("Starting physical replication: {}", sql);
+        let _result = self.exec(&sql)?;
+
+        self.is_replication_conn = true;
+        self.initialize_async_socket()?;
+
+        debug!("Physical replication started successfully");
+        Ok(())
+    }
+
+    /// Send hot standby feedback message to the server
+    pub fn send_hot_standby_feedback(
+        &self,
+        xmin: u32,
+        xmin_epoch: u32,
+        catalog_xmin: u32,
+        catalog_xmin_epoch: u32,
+    ) -> Result<()> {
+        if !self.is_replication_conn {
+            return Err(ReplicationError::protocol(
+                "Connection is not in replication mode".to_string(),
+            ));
+        }
+
+        let feedback_data =
+            build_hot_standby_feedback_message(xmin, xmin_epoch, catalog_xmin, catalog_xmin_epoch)?;
+
+        let result = unsafe {
+            PQputCopyData(
+                self.conn,
+                feedback_data.as_ptr() as *const std::os::raw::c_char,
+                feedback_data.len() as i32,
+            )
+        };
+
+        if result != 1 {
+            let error_msg = self.last_error_message();
+            return Err(ReplicationError::protocol(format!(
+                "Failed to send hot standby feedback: {error_msg}"
+            )));
+        }
+
+        let flush_result = unsafe { PQflush(self.conn) };
+        if flush_result != 0 {
+            let error_msg = self.last_error_message();
+            return Err(ReplicationError::protocol(format!(
+                "Failed to flush connection: {error_msg}"
+            )));
+        }
+
+        debug!(
+            "Sent hot standby feedback: xmin={}, catalog_xmin={}",
+            xmin, catalog_xmin
+        );
+        Ok(())
+    }
+
+    /// Start a base backup with options
+    pub fn base_backup(&mut self, options: &BaseBackupOptions) -> Result<PgResult> {
+        let mut opts = Vec::new();
+
+        if let Some(ref label) = options.label {
+            opts.push(format!("LABEL '{}'", label.replace('\'', "''")));
+        }
+
+        if let Some(ref target) = options.target {
+            opts.push(format!("TARGET '{}'", target));
+        }
+
+        if let Some(ref target_detail) = options.target_detail {
+            opts.push(format!("TARGET_DETAIL '{}'", target_detail));
+        }
+
+        if options.progress {
+            opts.push("PROGRESS true".to_string());
+        }
+
+        if let Some(ref checkpoint) = options.checkpoint {
+            opts.push(format!("CHECKPOINT '{}'", checkpoint));
+        }
+
+        if options.wal {
+            opts.push("WAL true".to_string());
+        }
+
+        if options.wait {
+            opts.push("WAIT true".to_string());
+        }
+
+        if let Some(ref compression) = options.compression {
+            opts.push(format!("COMPRESSION '{}'", compression));
+        }
+
+        if let Some(ref compression_detail) = options.compression_detail {
+            opts.push(format!("COMPRESSION_DETAIL {}", compression_detail));
+        }
+
+        if let Some(max_rate) = options.max_rate {
+            opts.push(format!("MAX_RATE {}", max_rate));
+        }
+
+        if options.tablespace_map {
+            opts.push("TABLESPACE_MAP true".to_string());
+        }
+
+        if options.verify_checksums {
+            opts.push("VERIFY_CHECKSUMS true".to_string());
+        }
+
+        if let Some(ref manifest) = options.manifest {
+            opts.push(format!("MANIFEST '{}'", manifest));
+        }
+
+        if let Some(ref manifest_checksums) = options.manifest_checksums {
+            opts.push(format!("MANIFEST_CHECKSUMS '{}'", manifest_checksums));
+        }
+
+        if options.incremental {
+            opts.push("INCREMENTAL".to_string());
+        }
+
+        let base_backup_sql = if opts.is_empty() {
+            "BASE_BACKUP".to_string()
+        } else {
+            format!("BASE_BACKUP ({})", opts.join(", "))
+        };
+
+        debug!("Starting base backup: {}", base_backup_sql);
+        let result = self.exec(&base_backup_sql)?;
+
+        self.is_replication_conn = true;
+        self.initialize_async_socket()?;
+
+        debug!("Base backup started successfully");
+        Ok(result)
     }
 
     fn close_replication_connection(&mut self) {
