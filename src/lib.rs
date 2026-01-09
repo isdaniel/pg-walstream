@@ -124,6 +124,7 @@ pub use types::{
     Oid,
     ReplicaIdentity,
     ReplicationSlotOptions,
+    SlotType,
     TimestampTz,
     // Type aliases matching PostgreSQL types
     XLogRecPtr,
