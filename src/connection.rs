@@ -34,7 +34,7 @@ use crate::error::{ReplicationError, Result};
 use crate::protocol::build_hot_standby_feedback_message;
 use crate::types::{
     format_lsn, system_time_to_postgres_timestamp, BaseBackupOptions, ReplicationSlotOptions,
-    XLogRecPtr,
+    SlotType, XLogRecPtr,
 };
 use libpq_sys::*;
 use std::ffi::{CStr, CString};
@@ -45,6 +45,27 @@ use std::{ptr, slice};
 use tokio::io::unix::AsyncFd;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+
+/// Sanitize a string value for use in PostgreSQL replication protocol commands
+/// by escaping single quotes (replacing ' with '')
+///
+/// This prevents SQL injection when values are used in replication commands.
+///
+/// # Arguments
+/// * `value` - The string value to sanitize
+///
+/// # Returns
+/// A sanitized string safe for use in SQL string literals
+#[inline]
+fn sanitize_sql_string_value(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+/// Sanitize a string value and wrap it in single quotes for SQL
+#[inline]
+fn quote_sql_string_value(value: &str) -> String {
+    format!("'{}'", sanitize_sql_string_value(value))
+}
 
 pub use crate::types::INVALID_XLOG_REC_PTR;
 
@@ -230,6 +251,7 @@ impl PgReplicationConnection {
             ExecStatusType::PGRES_TUPLES_OK
                 | ExecStatusType::PGRES_COMMAND_OK
                 | ExecStatusType::PGRES_COPY_BOTH
+                | ExecStatusType::PGRES_COPY_OUT
         ) {
             let error_msg = pg_result
                 .error_message()
@@ -269,19 +291,17 @@ impl PgReplicationConnection {
         slot_name: &str,
         output_plugin: &str,
     ) -> Result<PgResult> {
-        let create_slot_sql = format!(
-            "CREATE_REPLICATION_SLOT \"{slot_name}\" LOGICAL {output_plugin} NOEXPORT_SNAPSHOT;"
-        );
+        let options = ReplicationSlotOptions {
+            snapshot: Some("nothing".to_string()), // NOEXPORT_SNAPSHOT behavior
+            ..Default::default()
+        };
 
-        let result = self.exec(&create_slot_sql)?;
-
-        if result.ntuples() > 0 {
-            if let Some(slot_name_result) = result.get_value(0, 0) {
-                debug!("Replication slot created: {}", slot_name_result);
-            }
-        }
-
-        Ok(result)
+        self.create_replication_slot_with_options(
+            slot_name,
+            SlotType::Logical,
+            Some(output_plugin),
+            &options,
+        )
     }
 
     /// Start logical replication
@@ -296,7 +316,8 @@ impl PgReplicationConnection {
             if i > 0 {
                 options_str.push_str(", ");
             }
-            options_str.push_str(&format!("\"{key}\" '{value}'"));
+            let sanitized_value = sanitize_sql_string_value(value);
+            options_str.push_str(&format!("\"{key}\" '{sanitized_value}'"));
         }
 
         let start_replication_sql = if start_lsn == INVALID_XLOG_REC_PTR {
@@ -330,11 +351,7 @@ impl PgReplicationConnection {
         applied_lsn: XLogRecPtr,
         reply_requested: bool,
     ) -> Result<()> {
-        if !self.is_replication_conn {
-            return Err(ReplicationError::protocol(
-                "Connection is not in replication mode".to_string(),
-            ));
-        }
+        self.ensure_replication_mode()?;
 
         let timestamp = system_time_to_postgres_timestamp(SystemTime::now());
 
@@ -349,30 +366,7 @@ impl PgReplicationConnection {
         buffer.write_u8(if reply_requested { 1 } else { 0 })?;
 
         let reply_data = buffer.freeze();
-
-        let result = unsafe {
-            PQputCopyData(
-                self.conn,
-                reply_data.as_ptr() as *const std::os::raw::c_char,
-                reply_data.len() as i32,
-            )
-        };
-
-        if result != 1 {
-            let error_msg = self.last_error_message();
-            return Err(ReplicationError::protocol(format!(
-                "Failed to send standby status update: {error_msg}"
-            )));
-        }
-
-        // Flush the connection
-        let flush_result = unsafe { PQflush(self.conn) };
-        if flush_result != 0 {
-            let error_msg = self.last_error_message();
-            return Err(ReplicationError::protocol(format!(
-                "Failed to flush connection: {error_msg}"
-            )));
-        }
+        self.put_copy_data_and_flush(&reply_data)?;
 
         info!(
             "Sent standby status update: received={}, flushed={}, applied={}, reply_requested={}",
@@ -418,11 +412,7 @@ impl PgReplicationConnection {
         &mut self,
         cancellation_token: &CancellationToken,
     ) -> Result<Vec<u8>> {
-        if !self.is_replication_conn {
-            return Err(ReplicationError::protocol(
-                "Connection is not in replication mode".to_string(),
-            ));
-        }
+        self.ensure_replication_mode()?;
 
         let async_fd = self
             .async_fd
@@ -564,6 +554,54 @@ impl PgReplicationConnection {
         }
     }
 
+    /// Helper: Check if connection is in replication mode
+    #[inline]
+    fn ensure_replication_mode(&self) -> Result<()> {
+        if !self.is_replication_conn {
+            return Err(ReplicationError::protocol(
+                "Connection is not in replication mode".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Helper: Send data via COPY protocol and flush
+    fn put_copy_data_and_flush(&self, data: &[u8]) -> Result<()> {
+        let result = unsafe {
+            PQputCopyData(
+                self.conn,
+                data.as_ptr() as *const std::os::raw::c_char,
+                data.len() as i32,
+            )
+        };
+
+        if result != 1 {
+            let error_msg = self.last_error_message();
+            return Err(ReplicationError::protocol(format!(
+                "Failed to send data via COPY protocol: {error_msg}"
+            )));
+        }
+
+        let flush_result = unsafe { PQflush(self.conn) };
+        if flush_result != 0 {
+            let error_msg = self.last_error_message();
+            return Err(ReplicationError::protocol(format!(
+                "Failed to flush connection: {error_msg}"
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Helper: Build SQL options string from key-value pairs
+    fn build_sql_options(options: &[String]) -> String {
+        if options.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", options.join(", "))
+        }
+    }
+
     /// Check if the connection is still alive
     pub fn is_alive(&self) -> bool {
         if self.conn.is_null() {
@@ -582,7 +620,7 @@ impl PgReplicationConnection {
     pub fn create_replication_slot_with_options(
         &self,
         slot_name: &str,
-        slot_type: &str,
+        slot_type: SlotType,
         output_plugin: Option<&str>,
         options: &ReplicationSlotOptions,
     ) -> Result<PgResult> {
@@ -592,10 +630,10 @@ impl PgReplicationConnection {
             sql.push_str("TEMPORARY ");
         }
 
-        sql.push_str(slot_type);
+        sql.push_str(slot_type.as_str());
         sql.push(' ');
 
-        if slot_type.eq_ignore_ascii_case("LOGICAL") {
+        if slot_type == SlotType::Logical {
             let plugin = output_plugin.ok_or_else(|| {
                 ReplicationError::protocol("Output plugin required for LOGICAL slots".to_string())
             })?;
@@ -605,28 +643,23 @@ impl PgReplicationConnection {
 
         let mut opts = Vec::new();
 
-        if let Some(two_phase) = options.two_phase {
-            opts.push(format!("TWO_PHASE {}", two_phase));
+        if options.two_phase {
+            opts.push("TWO_PHASE true".to_string());
         }
 
-        if let Some(reserve_wal) = options.reserve_wal {
-            opts.push(format!("RESERVE_WAL {}", reserve_wal));
+        if options.reserve_wal {
+            opts.push("RESERVE_WAL true".to_string());
         }
 
         if let Some(ref snapshot) = options.snapshot {
-            opts.push(format!("SNAPSHOT '{}'", snapshot));
+            opts.push(format!("SNAPSHOT {}", quote_sql_string_value(snapshot)));
         }
 
-        if let Some(failover) = options.failover {
-            opts.push(format!("FAILOVER {}", failover));
+        if options.failover {
+            opts.push("FAILOVER true".to_string());
         }
 
-        if !opts.is_empty() {
-            sql.push('(');
-            sql.push_str(&opts.join(", "));
-            sql.push(')');
-        }
-
+        sql.push_str(&Self::build_sql_options(&opts));
         sql.push(';');
 
         debug!("Creating replication slot with options: {}", sql);
@@ -646,8 +679,8 @@ impl PgReplicationConnection {
             opts.push(format!("TWO_PHASE {}", tp));
         }
 
-        if let Some(fo) = failover {
-            opts.push(format!("FAILOVER {}", fo));
+        if let Some(failover_value) = failover {
+            opts.push(format!("FAILOVER {}", failover_value));
         }
 
         if opts.is_empty() {
@@ -656,11 +689,8 @@ impl PgReplicationConnection {
             ));
         }
 
-        let alter_slot_sql = format!(
-            "ALTER_REPLICATION_SLOT \"{}\" ({});",
-            slot_name,
-            opts.join(", ")
-        );
+        let options_str = Self::build_sql_options(&opts);
+        let alter_slot_sql = format!("ALTER_REPLICATION_SLOT \"{}\"{};", slot_name, options_str);
 
         debug!("Altering replication slot: {}", alter_slot_sql);
         let result = self.exec(&alter_slot_sql)?;
@@ -712,37 +742,12 @@ impl PgReplicationConnection {
         catalog_xmin: u32,
         catalog_xmin_epoch: u32,
     ) -> Result<()> {
-        if !self.is_replication_conn {
-            return Err(ReplicationError::protocol(
-                "Connection is not in replication mode".to_string(),
-            ));
-        }
+        self.ensure_replication_mode()?;
 
         let feedback_data =
             build_hot_standby_feedback_message(xmin, xmin_epoch, catalog_xmin, catalog_xmin_epoch)?;
 
-        let result = unsafe {
-            PQputCopyData(
-                self.conn,
-                feedback_data.as_ptr() as *const std::os::raw::c_char,
-                feedback_data.len() as i32,
-            )
-        };
-
-        if result != 1 {
-            let error_msg = self.last_error_message();
-            return Err(ReplicationError::protocol(format!(
-                "Failed to send hot standby feedback: {error_msg}"
-            )));
-        }
-
-        let flush_result = unsafe { PQflush(self.conn) };
-        if flush_result != 0 {
-            let error_msg = self.last_error_message();
-            return Err(ReplicationError::protocol(format!(
-                "Failed to flush connection: {error_msg}"
-            )));
-        }
+        self.put_copy_data_and_flush(&feedback_data)?;
 
         debug!(
             "Sent hot standby feedback: xmin={}, catalog_xmin={}",
@@ -756,15 +761,18 @@ impl PgReplicationConnection {
         let mut opts = Vec::new();
 
         if let Some(ref label) = options.label {
-            opts.push(format!("LABEL '{}'", label.replace('\'', "''")));
+            opts.push(format!("LABEL {}", quote_sql_string_value(label)));
         }
 
         if let Some(ref target) = options.target {
-            opts.push(format!("TARGET '{}'", target));
+            opts.push(format!("TARGET {}", quote_sql_string_value(target)));
         }
 
         if let Some(ref target_detail) = options.target_detail {
-            opts.push(format!("TARGET_DETAIL '{}'", target_detail));
+            opts.push(format!(
+                "TARGET_DETAIL {}",
+                quote_sql_string_value(target_detail)
+            ));
         }
 
         if options.progress {
@@ -772,7 +780,7 @@ impl PgReplicationConnection {
         }
 
         if let Some(ref checkpoint) = options.checkpoint {
-            opts.push(format!("CHECKPOINT '{}'", checkpoint));
+            opts.push(format!("CHECKPOINT {}", quote_sql_string_value(checkpoint)));
         }
 
         if options.wal {
@@ -784,11 +792,17 @@ impl PgReplicationConnection {
         }
 
         if let Some(ref compression) = options.compression {
-            opts.push(format!("COMPRESSION '{}'", compression));
+            opts.push(format!(
+                "COMPRESSION {}",
+                quote_sql_string_value(compression)
+            ));
         }
 
         if let Some(ref compression_detail) = options.compression_detail {
-            opts.push(format!("COMPRESSION_DETAIL {}", compression_detail));
+            opts.push(format!(
+                "COMPRESSION_DETAIL {}",
+                quote_sql_string_value(compression_detail)
+            ));
         }
 
         if let Some(max_rate) = options.max_rate {
@@ -804,11 +818,14 @@ impl PgReplicationConnection {
         }
 
         if let Some(ref manifest) = options.manifest {
-            opts.push(format!("MANIFEST '{}'", manifest));
+            opts.push(format!("MANIFEST {}", quote_sql_string_value(manifest)));
         }
 
         if let Some(ref manifest_checksums) = options.manifest_checksums {
-            opts.push(format!("MANIFEST_CHECKSUMS '{}'", manifest_checksums));
+            opts.push(format!(
+                "MANIFEST_CHECKSUMS {}",
+                quote_sql_string_value(manifest_checksums)
+            ));
         }
 
         if options.incremental {
@@ -943,5 +960,129 @@ impl Drop for PgResult {
                 PQclear(self.result);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitize_sql_string_value_no_quotes() {
+        let input = "test_value";
+        let sanitized = sanitize_sql_string_value(input);
+        assert_eq!(sanitized, "test_value");
+    }
+
+    #[test]
+    fn test_sanitize_sql_string_value_single_quote() {
+        let input = "test'value";
+        let sanitized = sanitize_sql_string_value(input);
+        assert_eq!(sanitized, "test''value");
+    }
+
+    #[test]
+    fn test_sanitize_sql_string_value_multiple_quotes() {
+        let input = "test'value'with'quotes";
+        let sanitized = sanitize_sql_string_value(input);
+        assert_eq!(sanitized, "test''value''with''quotes");
+    }
+
+    #[test]
+    fn test_sanitize_sql_string_value_sql_injection_attempt() {
+        let input = "'; DROP TABLE users; --";
+        let sanitized = sanitize_sql_string_value(input);
+        assert_eq!(sanitized, "''; DROP TABLE users; --");
+    }
+
+    #[test]
+    fn test_sanitize_sql_string_value_empty() {
+        let input = "";
+        let sanitized = sanitize_sql_string_value(input);
+        assert_eq!(sanitized, "");
+    }
+
+    #[test]
+    fn test_sanitize_sql_string_value_only_quote() {
+        let input = "'";
+        let sanitized = sanitize_sql_string_value(input);
+        assert_eq!(sanitized, "''");
+    }
+
+    #[test]
+    fn test_sanitize_sql_string_value_consecutive_quotes() {
+        let input = "''";
+        let sanitized = sanitize_sql_string_value(input);
+        assert_eq!(sanitized, "''''");
+    }
+
+    #[test]
+    fn test_quote_sql_string_value_basic() {
+        let input = "test_value";
+        let quoted = quote_sql_string_value(input);
+        assert_eq!(quoted, "'test_value'");
+    }
+
+    #[test]
+    fn test_quote_sql_string_value_with_quotes() {
+        let input = "test'value";
+        let quoted = quote_sql_string_value(input);
+        assert_eq!(quoted, "'test''value'");
+    }
+
+    #[test]
+    fn test_quote_sql_string_value_sql_injection() {
+        let input = "'; DROP TABLE users; --";
+        let quoted = quote_sql_string_value(input);
+        assert_eq!(quoted, "'''; DROP TABLE users; --'");
+        // After sanitization, the single quote is escaped, making the SQL injection ineffective
+    }
+
+    #[test]
+    fn test_quote_sql_string_value_empty() {
+        let input = "";
+        let quoted = quote_sql_string_value(input);
+        assert_eq!(quoted, "''");
+    }
+
+    #[test]
+    fn test_sanitize_complex_injection_attempt() {
+        // Test a more complex SQL injection attempt
+        let input = "value' OR '1'='1";
+        let sanitized = sanitize_sql_string_value(input);
+        assert_eq!(sanitized, "value'' OR ''1''=''1");
+
+        let quoted = quote_sql_string_value(input);
+        assert_eq!(quoted, "'value'' OR ''1''=''1'");
+    }
+
+    #[test]
+    fn test_sanitize_unicode_with_quotes() {
+        let input = "test'值'测试";
+        let sanitized = sanitize_sql_string_value(input);
+        assert_eq!(sanitized, "test''值''测试");
+    }
+
+    #[test]
+    fn test_sanitize_special_chars_without_quotes() {
+        // These should not be affected by our sanitization
+        let input = "test;value--comment/**/";
+        let sanitized = sanitize_sql_string_value(input);
+        assert_eq!(sanitized, "test;value--comment/**/");
+    }
+
+    #[test]
+    fn test_sanitize_backslash_and_quote() {
+        // Backslashes should not be specially treated, only single quotes
+        let input = "test\\'value";
+        let sanitized = sanitize_sql_string_value(input);
+        assert_eq!(sanitized, "test\\''value");
+    }
+
+    #[test]
+    fn test_sanitize_newlines_and_quotes() {
+        let input = "line1'quote\nline2'quote";
+        let sanitized = sanitize_sql_string_value(input);
+        assert_eq!(sanitized, "line1''quote\nline2''quote");
     }
 }

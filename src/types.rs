@@ -254,23 +254,60 @@ pub struct TypeInfo {
     pub namespace: String,
 }
 
+/// Replication slot type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotType {
+    /// Logical replication slot (requires output plugin)
+    Logical,
+    /// Physical replication slot (for streaming replication)
+    Physical,
+}
+
+impl SlotType {
+    /// Convert to PostgreSQL string representation
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SlotType::Logical => "LOGICAL",
+            SlotType::Physical => "PHYSICAL",
+        }
+    }
+}
+
+impl std::fmt::Display for SlotType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 /// Options for creating a replication slot
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ReplicationSlotOptions {
     /// Create a temporary slot (not saved to disk, dropped on error or session end)
     pub temporary: bool,
 
     /// Enable two-phase commit support (logical slots only)
-    pub two_phase: Option<bool>,
+    pub two_phase: bool,
 
     /// Reserve WAL immediately (physical slots only)
-    pub reserve_wal: Option<bool>,
+    pub reserve_wal: bool,
 
     /// Snapshot behavior: 'export', 'use', or 'nothing' (logical slots only)
     pub snapshot: Option<String>,
 
     /// Enable slot for failover synchronization (logical slots only)
-    pub failover: Option<bool>,
+    pub failover: bool,
+}
+
+impl Default for ReplicationSlotOptions {
+    fn default() -> Self {
+        Self {
+            temporary: false,
+            two_phase: false,
+            reserve_wal: false,
+            snapshot: None,
+            failover: false,
+        }
+    }
 }
 
 /// Options for BASE_BACKUP command

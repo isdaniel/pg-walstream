@@ -75,6 +75,7 @@ impl ReplicationStreamConfig {
     ///     RetryConfig::default(),
     /// );
     /// ```
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         slot_name: String,
         publication_name: String,
