@@ -679,8 +679,8 @@ impl PgReplicationConnection {
             opts.push(format!("TWO_PHASE {}", tp));
         }
 
-        if let Some(fo) = failover {
-            opts.push(format!("FAILOVER {}", fo));
+        if let Some(failover_value) = failover {
+            opts.push(format!("FAILOVER {}", failover_value));
         }
 
         if opts.is_empty() {
