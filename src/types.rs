@@ -280,7 +280,7 @@ impl std::fmt::Display for SlotType {
 }
 
 /// Options for creating a replication slot
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ReplicationSlotOptions {
     /// Create a temporary slot (not saved to disk, dropped on error or session end)
     pub temporary: bool,
@@ -296,18 +296,6 @@ pub struct ReplicationSlotOptions {
 
     /// Enable slot for failover synchronization (logical slots only)
     pub failover: bool,
-}
-
-impl Default for ReplicationSlotOptions {
-    fn default() -> Self {
-        Self {
-            temporary: false,
-            two_phase: false,
-            reserve_wal: false,
-            snapshot: None,
-            failover: false,
-        }
-    }
 }
 
 /// Options for BASE_BACKUP command

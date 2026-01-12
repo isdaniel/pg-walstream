@@ -30,7 +30,7 @@
 //! cargo run --example pg_basebackup
 //!
 //! # Or with custom connection string:
-//! PGCONNSTRING="postgresql://postgres:password@localhost:5432/postgres?replication=database" \
+//! DATABASE_URL="postgresql://postgres:password@localhost:5432/postgres?replication=database" \
 //!   cargo run --example pg_basebackup
 //! ```
 //!

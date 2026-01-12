@@ -526,6 +526,9 @@ pub struct ReplicationState {
     pub last_applied_lsn: XLogRecPtr,
     /// Last feedback time
     pub last_feedback_time: std::time::Instant,
+    /// Last LSN values sent in feedback (for throttling)
+    last_sent_flush_lsn: XLogRecPtr,
+    last_sent_applied_lsn: XLogRecPtr,
 }
 
 impl ReplicationState {
@@ -537,6 +540,8 @@ impl ReplicationState {
             last_flushed_lsn: 0,
             last_applied_lsn: 0,
             last_feedback_time: std::time::Instant::now(),
+            last_sent_flush_lsn: 0,
+            last_sent_applied_lsn: 0,
         }
     }
 
@@ -585,13 +590,26 @@ impl ReplicationState {
         self.update_received_lsn(lsn);
     }
 
-    /// Check if feedback should be sent
+    /// Check if the configured feedback interval has elapsed since the last feedback was sent.
     #[inline]
     pub fn should_send_feedback(&self, interval: std::time::Duration) -> bool {
         self.last_feedback_time.elapsed() >= interval
     }
 
-    /// Mark feedback as sent
+    /// Check if LSN values have changed since last feedback, this helps avoid sending redundant status updates
+    #[inline]
+    pub fn lsn_has_changed(&self, flush_lsn: XLogRecPtr, applied_lsn: XLogRecPtr) -> bool {
+        flush_lsn != self.last_sent_flush_lsn || applied_lsn != self.last_sent_applied_lsn
+    }
+
+    /// Mark feedback as sent and record the LSN values sent
+    pub fn mark_feedback_sent_with_lsn(&mut self, flush_lsn: XLogRecPtr, applied_lsn: XLogRecPtr) {
+        self.last_feedback_time = std::time::Instant::now();
+        self.last_sent_flush_lsn = flush_lsn;
+        self.last_sent_applied_lsn = applied_lsn;
+    }
+
+    /// Mark feedback as sent (backward compatibility)
     pub fn mark_feedback_sent(&mut self) {
         self.last_feedback_time = std::time::Instant::now();
     }

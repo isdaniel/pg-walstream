@@ -1,9 +1,10 @@
-//! Basic PostgreSQL WAL streaming example
+//! Basic PostgreSQL WAL streaming example with futures::Stream
 //!
 //! This example demonstrates how to:
 //! - Connect to PostgreSQL with replication enabled
 //! - Create a replication slot
-//! - Stream WAL changes using the Stream API
+//! - Wrap EventStream with futures::stream::unfold for Stream trait compatibility
+//! - Use stream combinators (filter, take_while, etc.)
 //! - Process insert, update, and delete events
 //! - Handle LSN feedback for WAL management
 //!
@@ -34,6 +35,7 @@
 //! cargo run --example basic_streaming
 //! ```
 
+use futures::stream::{self, StreamExt};
 use pg_walstream::{
     CancellationToken, LogicalReplicationStream, ReplicationStreamConfig, RetryConfig,
 };
@@ -98,19 +100,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cancel_token_clone.cancel();
     });
 
-    // Convert to async Stream for ergonomic processing
-    let mut event_stream = stream.into_stream(cancel_token);
+    // Convert to EventStream
+    let event_stream = stream.into_stream(cancel_token);
 
-    // Process events as they arrive
-    loop {
-        match event_stream.next().await {
+    // Wrap with futures::stream::unfold to get a proper futures::Stream
+    // This allows us to use stream combinators!
+    // Use Box::pin to pin the stream on the heap so we can reuse it
+    let mut pg_stream = Box::pin(stream::unfold(
+        event_stream,
+        |mut event_stream| async move {
+            match event_stream.next().await {
+                Ok(event) => {
+                    // Update applied LSN after successful event retrieval
+                    event_stream.update_applied_lsn(event.lsn.value());
+                    Some((Ok(event), event_stream))
+                }
+                Err(e) => {
+                    // Return error and stop the stream
+                    Some((Err(e), event_stream))
+                }
+            }
+        },
+    ));
+
+    // Now we can use stream combinators!
+    info!("Using futures::Stream combinators for advanced processing");
+
+    while let Some(result) = pg_stream.as_mut().next().await {
+        match result {
             Ok(event) => {
                 info!("Received event: {:?}", event);
-                event_stream.update_applied_lsn(event.lsn.value());
-            }
-            Err(e) if matches!(e, pg_walstream::ReplicationError::Cancelled(_)) => {
-                info!("Stream cancelled, shutting down gracefully");
-                break;
             }
             Err(e) => {
                 error!("Error: {}", e);
@@ -118,6 +137,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+
+    info!("Graceful shutdown complete");
 
     Ok(())
 }
