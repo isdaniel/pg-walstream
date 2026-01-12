@@ -590,14 +590,7 @@ impl ReplicationState {
         self.update_received_lsn(lsn);
     }
 
-    /// Check if feedback should be sent
-    ///
-    /// Feedback should be sent if:
-    /// 1. The configured interval has elapsed, AND
-    /// 2. Either flushed or applied LSN has changed since last feedback
-    ///
-    /// This implements intelligent throttling similar to Supabase's approach,
-    /// avoiding unnecessary status updates when LSN values haven't changed.
+    /// Check if the configured feedback interval has elapsed since the last feedback was sent.
     #[inline]
     pub fn should_send_feedback(&self, interval: std::time::Duration) -> bool {
         self.last_feedback_time.elapsed() >= interval
