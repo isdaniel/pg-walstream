@@ -2,6 +2,16 @@
 //!
 //! This module provides high-level management of logical replication streams,
 //! including connection management, slot creation, and message processing.
+//!
+//! ## Async Stream API
+//!
+//! The `EventStream` and `EventStreamRef` types provide a native `.next().await` API
+//! for simple usage without requiring trait imports. This design prioritizes ergonomics
+//! and ease of use.
+//!
+//! If you need to use this with the `futures::Stream` trait for stream combinators,
+//! you can easily wrap it using `futures::stream::unfold`. See the EventStream
+//! documentation for an example.
 
 use crate::error::{ReplicationError, Result};
 use crate::lsn::SharedLsnFeedback;
@@ -940,16 +950,42 @@ impl LogicalReplicationStream {
     }
 
     /// Check if feedback should be sent and send it
+    ///
+    /// Implements intelligent throttling: only sends feedback if the configured
+    /// interval has elapsed AND the LSN values have actually changed. This avoids
+    /// unnecessary status updates and reduces network overhead.
     #[inline]
     pub fn maybe_send_feedback(&mut self) {
-        if self
+        // Check if enough time has elapsed
+        if !self
             .state
             .should_send_feedback(self.config.feedback_interval)
         {
-            self.send_feedback().unwrap_or_else(|e| {
+            return;
+        }
+
+        // Get current LSN values that would be sent
+        let (f, a) = self.shared_lsn_feedback.get_feedback_lsn();
+        let flushed_lsn = if f > 0 && f <= self.state.last_received_lsn {
+            f
+        } else if f > self.state.last_received_lsn {
+            self.state.last_received_lsn
+        } else {
+            0
+        };
+        let applied_lsn = if a > 0 && a <= self.state.last_received_lsn {
+            a
+        } else if a > self.state.last_received_lsn {
+            self.state.last_received_lsn
+        } else {
+            0
+        };
+
+        // Only send feedback if LSN values have changed
+        if self.state.lsn_has_changed(flushed_lsn, applied_lsn) {
+            if let Err(e) = self.send_feedback() {
                 warn!("Failed to send feedback: {}", e);
-            });
-            self.state.mark_feedback_sent();
+            }
         }
     }
 
@@ -963,6 +999,9 @@ impl LogicalReplicationStream {
     /// If a shared LSN feedback tracker is configured, it will use the flushed/applied
     /// values from there (updated by the consumer). Otherwise, it falls back to the
     /// local state values.
+    ///
+    /// The method tracks the last sent LSN values to enable intelligent throttling
+    /// and avoid sending redundant status updates.
     pub fn send_feedback(&mut self) -> Result<()> {
         if self.state.last_received_lsn == 0 {
             return Ok(());
@@ -1002,6 +1041,10 @@ impl LogicalReplicationStream {
             applied_lsn,
             false, // Don't request reply
         )?;
+
+        // Record the LSN values we sent for intelligent throttling
+        self.state
+            .mark_feedback_sent_with_lsn(flushed_lsn, applied_lsn);
 
         debug!(
             "Sent feedback: received={}, flushed={}, applied={}",
@@ -1203,6 +1246,105 @@ impl LogicalReplicationStream {
 /// Create an `EventStream` by calling `into_stream()` on `LogicalReplicationStream`.
 ///
 /// # Example
+///
+/// ```no_run
+/// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig};
+/// use tokio_util::sync::CancellationToken;
+/// use std::time::Duration;
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let config = ReplicationStreamConfig::new(
+///     "my_slot".to_string(),
+///     "my_publication".to_string(),
+///     2, true,
+///     Duration::from_secs(10),
+///     Duration::from_secs(30),
+///     Duration::from_secs(60),
+///     RetryConfig::default(),
+/// );
+///
+/// let mut stream = LogicalReplicationStream::new("connection_string", config).await?;
+/// stream.start(None).await?;
+///
+/// let cancel_token = CancellationToken::new();
+/// let mut event_stream = stream.into_stream(cancel_token);
+///
+/// // No need to import futures::StreamExt!
+/// loop {
+///     match event_stream.next().await {
+///         Ok(event) => {
+///             // Process event
+///             println!("Received: {:?}", event);
+///         }
+///         Err(e) if matches!(e, pg_walstream::ReplicationError::Cancelled(_)) => {
+///             // Graceful shutdown
+///             println!("Stream cancelled");
+///             break;
+///         }
+///         Err(e) => {
+///             // Handle error
+///             eprintln!("Error: {}", e);
+///             break;
+///         }
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// ```
+/// Async stream of PostgreSQL replication events (owned version)
+///
+/// This struct provides an iterator-like interface for consuming replication events.
+/// It has a built-in `next()` method that returns `Future<Result<ChangeEvent>>`,
+/// allowing you to call `.next().await` without importing any traits.
+///
+/// Create an `EventStream` by calling `into_stream()` on `LogicalReplicationStream`.
+///
+/// # Using with `futures::Stream`
+///
+/// If you need to use stream combinators from the `futures` crate, you can easily
+/// wrap this with `futures::stream::unfold`:
+///
+/// ```no_run
+/// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig};
+/// use tokio_util::sync::CancellationToken;
+/// use futures::stream::{self, StreamExt};
+/// use std::time::Duration;
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let config = ReplicationStreamConfig::new(
+///     "my_slot".to_string(),
+///     "my_publication".to_string(),
+///     2, true,
+///     Duration::from_secs(10),
+///     Duration::from_secs(30),
+///     Duration::from_secs(60),
+///     RetryConfig::default(),
+/// );
+///
+/// let stream = LogicalReplicationStream::new("connection_string", config).await?;
+/// let cancel_token = CancellationToken::new();
+/// let event_stream = stream.into_stream(cancel_token);
+///
+/// // Wrap with unfold to get a futures::Stream
+/// let pg_stream = stream::unfold(event_stream, |mut event_stream| async move {
+///     match event_stream.next().await {
+///         Ok(event) => Some((event, event_stream)),
+///         Err(_) => None,
+///     }
+/// });
+///
+/// // Pin the stream so we can poll it
+/// let mut stream = Box::pin(pg_stream);
+///
+/// // Now you can use stream combinators!
+/// while let Some(event) = stream.next().await {
+///     println!("Event: {:?}", event);
+/// }
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Basic Example
 ///
 /// ```no_run
 /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig};

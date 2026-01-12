@@ -6,12 +6,13 @@ This directory contains examples demonstrating how to use the `pg_walstream` lib
 
 ### 1. basic_streaming.rs
 
-Demonstrates the high-level Stream API for consuming WAL changes.
+Demonstrates the high-level Stream API wrapped with `futures::stream::unfold` for Stream trait compatibility.
 
 **Features:**
-- Async iterator-like interface
+- Async iterator-like interface with futures::Stream compatibility
 - Automatic event processing with retry logic
 - Comprehensive event type handling (Insert, Update, Delete, etc.)
+- Stream combinators support (filter, take_while, etc.)
 - Graceful shutdown with Ctrl+C
 
 **Run:**
@@ -19,7 +20,35 @@ Demonstrates the high-level Stream API for consuming WAL changes.
 cargo run --example basic_streaming
 ```
 
-### 2. polling_example.rs
+### 2. rate_limited_streaming.rs
+
+**NEW**: Demonstrates rate limiting and flow control using futures::Stream combinators.
+
+**Features:**
+- Rate limiting to prevent overwhelming downstream systems
+- Configurable events per second limit
+- Real-time rate statistics and monitoring
+- Backpressure handling with automatic throttling
+- Practical example of Stream trait usage
+- Protection for downstream APIs with rate limits
+
+**Run:**
+```bash
+# Default: 10 events per second
+cargo run --example rate_limited_streaming
+
+# Custom rate limit
+MAX_EVENTS_PER_SECOND=50 cargo run --example rate_limited_streaming
+```
+
+**Use Cases:**
+- Protecting downstream APIs from being overwhelmed
+- Complying with third-party service rate limits
+- Spreading load over time for cost optimization
+- Controlled batch processing
+- Testing with realistic production loads
+
+### 3. polling_example.rs
 
 Shows the lower-level polling API for manual event retrieval.
 
@@ -33,7 +62,7 @@ Shows the lower-level polling API for manual event retrieval.
 cargo run --example polling_example
 ```
 
-### 3. safe_transaction_consumer.rs
+### 4. safe_transaction_consumer.rs
 
 **NEW**: Advanced example demonstrating safe transaction processing with ordered commits.
 
@@ -57,7 +86,7 @@ cargo run --example safe_transaction_consumer
 - Implementing exactly-once processing semantics
 - Safe CDC (Change Data Capture) pipelines
 
-### 4. pg_basebackup.rs
+### 5. pg_basebackup.rs
 
 **NEW**: Complete implementation of pg_basebackup functionality for creating physical database backups.
 
@@ -154,7 +183,7 @@ host    replication     postgres        127.0.0.1/32            md5
 #### 3. Connection String
 
 ```bash
-export PGCONNSTRING="postgresql://postgres:password@localhost:5432/postgres?replication=database"
+export DATABASE_URL="postgresql://postgres:password@localhost:5432/postgres?replication=database"
 ```
 
 **Note:** Physical replication requires the `replication=database` parameter and appropriate permissions.

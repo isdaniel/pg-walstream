@@ -29,3 +29,5 @@ default = []
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1.47.2", features = ["full"] }
+futures = "0.3.31"
+tokio-stream = { version = "0.1.18", features = ["time"] }
