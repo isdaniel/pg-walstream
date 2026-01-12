@@ -966,17 +966,13 @@ impl LogicalReplicationStream {
 
         // Get current LSN values that would be sent
         let (f, a) = self.shared_lsn_feedback.get_feedback_lsn();
-        let flushed_lsn = if f > 0 && f <= self.state.last_received_lsn {
-            f
-        } else if f > self.state.last_received_lsn {
-            self.state.last_received_lsn
+        let flushed_lsn = if f > 0 {
+            f.min(self.state.last_received_lsn)
         } else {
             0
         };
-        let applied_lsn = if a > 0 && a <= self.state.last_received_lsn {
-            a
-        } else if a > self.state.last_received_lsn {
-            self.state.last_received_lsn
+        let applied_lsn = if a > 0 {
+            a.min(self.state.last_received_lsn)
         } else {
             0
         };
@@ -1009,20 +1005,14 @@ impl LogicalReplicationStream {
 
         // This allows the consumer to update these values after committing to destination
         let (f, a) = self.shared_lsn_feedback.get_feedback_lsn();
-        // If shared feedback has values, use them; otherwise fall back to received LSN
-        let flushed_lsn = if f > 0 && f <= self.state.last_received_lsn {
-            f
-        } else if f > self.state.last_received_lsn {
-            // Consumer is ahead - this shouldn't happen but handle gracefully
-            self.state.last_received_lsn
+        // Cap LSN values to last_received_lsn (consumer shouldn't be ahead, but handle gracefully)
+        let flushed_lsn = if f > 0 {
+            f.min(self.state.last_received_lsn)
         } else {
-            // No consumer updates yet, use 0 to indicate nothing flushed/applied
             0
         };
-        let applied_lsn = if a > 0 && a <= self.state.last_received_lsn {
-            a
-        } else if a > self.state.last_received_lsn {
-            self.state.last_received_lsn
+        let applied_lsn = if a > 0 {
+            a.min(self.state.last_received_lsn)
         } else {
             0
         };
