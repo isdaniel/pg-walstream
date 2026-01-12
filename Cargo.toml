@@ -1,6 +1,6 @@
 [package]
 name = "pg_walstream"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 authors = ["danielshih <dog830228@gmail.com>"]
 license = "BSD-3-Clause"
@@ -13,15 +13,15 @@ keywords = ["postgresql", "replication", "wal", "logical-decoding", "streaming"]
 categories = ["database", "parsing", "network-programming"]
 
 [dependencies]
-tokio = { version = "1.47.2", features = ["io-util", "net", "time", "macros"] }
-tokio-util = { version = "0.7.16", features = ["compat"] }
-serde = { version = "1.0.219", features = ["derive"] }
-serde_json = "1.0.142"
-chrono = { version = "0.4.41", features = ["serde"] }
-bytes = "1.10.1"
-tracing = "0.1.41"
+tokio = { version = "1.49.0", features = ["io-util", "net", "time", "macros"] }
+tokio-util = { version = "0.7.18", features = ["compat"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+chrono = { version = "0.4.42", features = ["serde"] }
+bytes = "1.11.0"
+tracing = "0.1.44"
 libpq-sys = "0.8"
-thiserror = "2.0.12"
+thiserror = "2.0.17"
 
 [features]
 default = []
