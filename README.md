@@ -227,14 +227,14 @@ The library provides two methods for creating replication slots:
 #### Replication Slot Options
 
 - **`temporary`** (`bool`): Create a temporary slot that is not saved to disk and is dropped on error or session end. Default: `false`
-- **`two_phase`** (`Option<bool>`): Enable two-phase commit support for logical slots. This allows the slot to receive prepared transaction events. Requires PostgreSQL 15+. Default: `None`
-- **`reserve_wal`** (`Option<bool>`): Reserve WAL immediately for physical slots. Prevents WAL files from being removed before the slot is active. Default: `None`
+- **`two_phase`** (`bool`): Enable two-phase commit support for logical slots. This allows the slot to receive prepared transaction events. Requires PostgreSQL 15+. Default: `None`
+- **`reserve_wal`** (`bool`): Reserve WAL immediately for physical slots. Prevents WAL files from being removed before the slot is active. Default: `None`
 - **`snapshot`** (`Option<String>`): Control snapshot behavior for logical slots:
   - `"export"` - Export the snapshot for use by other sessions
   - `"use"` - Use an existing snapshot
   - `"nothing"` - Don't export or use a snapshot
   - Default: `None`
-- **`failover`** (`Option<bool>`): Enable the slot for failover synchronization. When enabled, the slot will be synchronized to standby servers for high availability. Requires PostgreSQL 16+. Default: `None`
+- **`failover`** (`bool`): Enable the slot for failover synchronization. When enabled, the slot will be synchronized to standby servers for high availability. Requires PostgreSQL 16+. Default: `None`
 
 ## Message Types
 
