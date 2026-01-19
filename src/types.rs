@@ -241,19 +241,6 @@ impl ReplicaIdentity {
     }
 }
 
-/// PostgreSQL type information
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TypeInfo {
-    /// Type OID
-    pub type_oid: u32,
-
-    /// Type name
-    pub type_name: String,
-
-    /// Namespace name
-    pub namespace: String,
-}
-
 /// Replication slot type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotType {
@@ -345,22 +332,6 @@ pub struct BaseBackupOptions {
 
     /// Request an incremental backup
     pub incremental: bool,
-}
-
-/// Transaction information
-#[derive(Debug, Clone)]
-pub struct TransactionInfo {
-    /// Transaction ID
-    pub xid: u32,
-
-    /// Commit timestamp
-    pub commit_timestamp: chrono::DateTime<chrono::Utc>,
-
-    /// Transaction start LSN
-    pub start_lsn: u64,
-
-    /// Transaction commit LSN
-    pub commit_lsn: u64,
 }
 
 /// LSN (Log Sequence Number) representation
