@@ -23,6 +23,7 @@ use crate::{
     TupleData, XLogRecPtr, INVALID_XLOG_REC_PTR,
 };
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -172,8 +173,12 @@ impl LogicalReplicationStream {
         let retry_handler =
             ReplicationConnectionRetry::new(config.retry_config, connection_string.to_string());
 
-        // Establish initial connection with retry
-        let connection = retry_handler.connect_with_retry().await?;
+        // Establish initial connection with retry and enforce timeout
+        let connection = timeout_or_error(
+            config.connection_timeout,
+            retry_handler.connect_with_retry(),
+        )
+        .await?;
 
         let parser = LogicalReplicationParser::with_protocol_version(config.protocol_version);
         let state = ReplicationState::new();
@@ -447,8 +452,12 @@ impl LogicalReplicationStream {
     async fn recover_connection(&mut self) -> Result<()> {
         info!("Attempting to recover replication connection");
 
-        // Attempt reconnection with retry logic
-        self.connection = self.retry_handler.connect_with_retry().await?;
+        // Attempt reconnection with retry logic and enforce timeout
+        self.connection = timeout_or_error(
+            self.config.connection_timeout,
+            self.retry_handler.connect_with_retry(),
+        )
+        .await?;
 
         // Re-initialize the connection
         self.connection.identify_system()?;
@@ -461,10 +470,14 @@ impl LogicalReplicationStream {
 
         let proto_version = self.config.protocol_version.to_string();
         let publication_names = format!("\"{}\"", self.config.publication_name);
-        let options = vec![
+        let mut options = vec![
             ("proto_version", proto_version.as_str()),
             ("publication_names", publication_names.as_str()),
         ];
+
+        if self.config.streaming_enabled {
+            options.push(("streaming", "on"));
+        }
 
         self.connection
             .start_replication(&self.config.slot_name, last_lsn, &options)?;
@@ -616,12 +629,12 @@ impl LogicalReplicationStream {
         // Parse WAL message header
         // Format: 'w' + start_lsn (8) + end_lsn (8) + send_time (8) + message_data
         let start_lsn = reader.read_u64()?;
-        let _end_lsn = reader.read_u64()?;
+        let end_lsn = reader.read_u64()?;
         let _send_time = reader.read_i64()?;
 
-        // Update LSN tracking
-        if start_lsn > 0 {
-            self.state.update_lsn(start_lsn);
+        // Update LSN tracking using the server's WAL end position for this message
+        if end_lsn > 0 {
+            self.state.update_received_lsn(end_lsn);
         }
 
         // Check if there's message data remaining
@@ -645,7 +658,7 @@ impl LogicalReplicationStream {
             keepalive.reply_requested
         );
 
-        self.state.update_lsn(keepalive.wal_end);
+        self.state.update_received_lsn(keepalive.wal_end);
 
         if keepalive.reply_requested {
             self.send_feedback()?;
@@ -691,7 +704,7 @@ impl LogicalReplicationStream {
                     } else {
                         ("public".to_string(), relation.full_name())
                     };
-                    let data = self.convert_tuple_to_data(&tuple, relation)?;
+                    let data = tuple_to_data(&tuple, relation)?;
 
                     ChangeEvent {
                         event_type: EventType::Insert {
@@ -719,11 +732,11 @@ impl LogicalReplicationStream {
                     self.relation_metadata(relation_id, key_type)
                 {
                     let old_data = if let Some(old_tuple) = old_tuple {
-                        Some(self.convert_tuple_to_data(&old_tuple, relation)?)
+                        Some(tuple_to_data(&old_tuple, relation)?)
                     } else {
                         None
                     };
-                    let new_data = self.convert_tuple_to_data(&new_tuple, relation)?;
+                    let new_data = tuple_to_data(&new_tuple, relation)?;
 
                     ChangeEvent {
                         event_type: EventType::Update {
@@ -752,7 +765,7 @@ impl LogicalReplicationStream {
                 if let Some((schema_name, table_name, replica_identity, key_columns, relation)) =
                     self.relation_metadata(relation_id, Some(key_type))
                 {
-                    let old_data = self.convert_tuple_to_data(&old_tuple, relation)?;
+                    let old_data = tuple_to_data(&old_tuple, relation)?;
 
                     ChangeEvent {
                         event_type: EventType::Delete {
@@ -919,34 +932,6 @@ impl LogicalReplicationStream {
         };
 
         Ok(Some(event))
-    }
-
-    /// Convert tuple data to a HashMap for ChangeEvent
-    #[inline]
-    fn convert_tuple_to_data(
-        &self,
-        tuple: &TupleData,
-        relation: &RelationInfo,
-    ) -> Result<std::collections::HashMap<String, serde_json::Value>> {
-        let mut data = std::collections::HashMap::with_capacity(tuple.columns.len());
-
-        for (i, column_data) in tuple.columns.iter().enumerate() {
-            if let Some(column_info) = relation.get_column_by_index(i) {
-                let value = if column_data.is_null() {
-                    serde_json::Value::Null
-                } else if let Some(text) = column_data.as_str() {
-                    serde_json::Value::String(text.into_owned())
-                } else {
-                    // For binary data, convert to hex string
-                    let hex_string = hex::encode(column_data.as_bytes());
-                    serde_json::Value::String(format!("\\x{hex_string}"))
-                };
-
-                data.insert(column_info.name.clone(), value);
-            }
-        }
-
-        Ok(data)
     }
 
     /// Check if feedback should be sent and send it
@@ -1665,11 +1650,59 @@ impl<'a> EventStreamRef<'a> {
     }
 }
 
-// Simple hex encoding implementation to avoid adding another dependency
-mod hex {
-    pub fn encode(data: &[u8]) -> String {
-        data.iter().map(|b| format!("{b:02x}")).collect()
+async fn timeout_or_error<T>(
+    duration: Duration,
+    future: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout(duration, future).await {
+        Ok(result) => result,
+        Err(_) => Err(ReplicationError::timeout(format!(
+            "Connection attempt exceeded timeout of {duration:?}"
+        ))),
     }
+}
+
+/// Convert tuple data to a HashMap for ChangeEvent
+#[inline]
+fn tuple_to_data(
+    tuple: &TupleData,
+    relation: &RelationInfo,
+) -> Result<std::collections::HashMap<String, serde_json::Value>> {
+    let mut data = std::collections::HashMap::with_capacity(tuple.columns.len());
+
+    for (i, column_data) in tuple.columns.iter().enumerate() {
+        if column_data.is_unchanged() {
+            continue;
+        }
+        if let Some(column_info) = relation.get_column_by_index(i) {
+            let value = if column_data.is_null() {
+                serde_json::Value::Null
+            } else if let Some(text) = column_data.as_str() {
+                serde_json::Value::String(text.into_owned())
+            } else {
+                // For binary data, convert to hex string
+                let hex_string = hex_encode(column_data.as_bytes());
+                serde_json::Value::String(format!("\\x{hex_string}"))
+            };
+
+            data.insert(column_info.name.clone(), value);
+        }
+    }
+
+    Ok(data)
+}
+
+// Simple hex encoding implementation to avoid adding another dependency
+fn hex_encode(bytes: &[u8]) -> String {
+    const LUT: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+
+    for &byte in bytes {
+        out.push(LUT[(byte >> 4) as usize] as char);
+        out.push(LUT[(byte & 0x0f) as usize] as char);
+    }
+
+    out
 }
 
 #[cfg(test)]
@@ -1705,6 +1738,28 @@ mod tests {
         assert_eq!(config.health_check_interval, Duration::from_secs(60));
     }
 
+    #[tokio::test]
+    async fn test_connection_timeout_exceeded() {
+        let config = ReplicationStreamConfig::new(
+            "test_slot".to_string(),
+            "test_publication".to_string(),
+            2,
+            true,
+            Duration::from_secs(10),
+            Duration::from_millis(1),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        );
+
+        let result = timeout_or_error(config.connection_timeout, async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok::<_, ReplicationError>(())
+        })
+        .await;
+
+        assert!(matches!(result, Err(ReplicationError::Timeout(_))));
+    }
+
     #[test]
     fn test_replication_stream_config_clone() {
         let config1 = create_test_config();
@@ -1729,15 +1784,15 @@ mod tests {
         let mut state = ReplicationState::new();
 
         // Update to a higher LSN
-        state.update_lsn(1000);
+        state.update_received_lsn(1000);
         assert_eq!(state.last_received_lsn, 1000);
 
         // Update to an even higher LSN
-        state.update_lsn(2000);
+        state.update_received_lsn(2000);
         assert_eq!(state.last_received_lsn, 2000);
 
         // Trying to update to a lower LSN should not change it
-        state.update_lsn(500);
+        state.update_received_lsn(500);
         assert_eq!(state.last_received_lsn, 2000);
     }
 
@@ -1747,7 +1802,7 @@ mod tests {
         let feedback_interval = Duration::from_millis(50);
 
         // Update LSN so there's something to send feedback about
-        state.update_lsn(1000);
+        state.update_received_lsn(1000);
 
         // Should send feedback after receiving data (interval has elapsed since creation)
         std::thread::sleep(Duration::from_millis(60));
@@ -1982,11 +2037,42 @@ mod tests {
     }
 
     #[test]
+    fn test_tuple_to_data_skips_unchanged_columns() {
+        let columns = vec![
+            crate::protocol::ColumnInfo {
+                flags: 0,
+                name: "col1".to_string(),
+                type_id: 25,
+                type_modifier: -1,
+            },
+            crate::protocol::ColumnInfo {
+                flags: 0,
+                name: "col2".to_string(),
+                type_id: 25,
+                type_modifier: -1,
+            },
+        ];
+
+        let relation =
+            RelationInfo::new(1, "public".to_string(), "test".to_string(), b'd', columns);
+
+        let tuple = TupleData::new(vec![
+            crate::protocol::ColumnData::unchanged(),
+            crate::protocol::ColumnData::text(b"value".to_vec()),
+        ]);
+
+        let data = tuple_to_data(&tuple, &relation).unwrap();
+        assert_eq!(data.len(), 1);
+        assert_eq!(data.get("col2").unwrap(), "value");
+        assert!(data.get("col1").is_none());
+    }
+
+    #[test]
     fn test_hex_encoding() {
-        assert_eq!(hex::encode(&[0x00, 0x01, 0x02]), "000102");
-        assert_eq!(hex::encode(&[0xff, 0xfe, 0xfd]), "fffefd");
-        assert_eq!(hex::encode(&[]), "");
-        assert_eq!(hex::encode(&[0x12, 0x34, 0x56, 0x78]), "12345678");
+        assert_eq!(hex_encode(&[0x00, 0x01, 0x02]), "000102");
+        assert_eq!(hex_encode(&[0xff, 0xfe, 0xfd]), "fffefd");
+        assert_eq!(hex_encode(&[]), "");
+        assert_eq!(hex_encode(&[0x12, 0x34, 0x56, 0x78]), "12345678");
     }
 
     #[test]
@@ -2282,17 +2368,17 @@ mod tests {
         let mut state = ReplicationState::new();
 
         // Track multiple LSN updates
-        state.update_lsn(100);
+        state.update_received_lsn(100);
         assert_eq!(state.last_received_lsn, 100);
 
-        state.update_lsn(200);
+        state.update_received_lsn(200);
         assert_eq!(state.last_received_lsn, 200);
 
-        state.update_lsn(300);
+        state.update_received_lsn(300);
         assert_eq!(state.last_received_lsn, 300);
 
         // Lower LSN should not update
-        state.update_lsn(150);
+        state.update_received_lsn(150);
         assert_eq!(state.last_received_lsn, 300);
     }
 
@@ -2302,7 +2388,7 @@ mod tests {
         let interval = Duration::from_millis(100);
 
         // Initial state should allow feedback
-        state.update_lsn(1000);
+        state.update_received_lsn(1000);
         std::thread::sleep(Duration::from_millis(110));
         assert!(state.should_send_feedback(interval));
 
@@ -2323,11 +2409,11 @@ mod tests {
 
         // Test with zero LSN
         assert_eq!(state.last_received_lsn, 0);
-        state.update_lsn(0);
+        state.update_received_lsn(0);
         assert_eq!(state.last_received_lsn, 0);
 
         // Update to non-zero
-        state.update_lsn(1);
+        state.update_received_lsn(1);
         assert_eq!(state.last_received_lsn, 1);
     }
 
@@ -2625,21 +2711,21 @@ mod tests {
     #[test]
     fn test_hex_encode_various_inputs() {
         // Empty
-        assert_eq!(hex::encode(&[]), "");
+        assert_eq!(hex_encode(&[]), "");
 
         // Single byte
-        assert_eq!(hex::encode(&[0x00]), "00");
-        assert_eq!(hex::encode(&[0xff]), "ff");
+        assert_eq!(hex_encode(&[0x00]), "00");
+        assert_eq!(hex_encode(&[0xff]), "ff");
 
         // Multiple bytes
-        assert_eq!(hex::encode(&[0x12, 0x34]), "1234");
-        assert_eq!(hex::encode(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
+        assert_eq!(hex_encode(&[0x12, 0x34]), "1234");
+        assert_eq!(hex_encode(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
 
         // All zeros
-        assert_eq!(hex::encode(&[0x00, 0x00, 0x00]), "000000");
+        assert_eq!(hex_encode(&[0x00, 0x00, 0x00]), "000000");
 
         // All ones
-        assert_eq!(hex::encode(&[0xff, 0xff, 0xff]), "ffffff");
+        assert_eq!(hex_encode(&[0xff, 0xff, 0xff]), "ffffff");
     }
 
     #[tokio::test]
@@ -2794,7 +2880,7 @@ mod tests {
         let feedback_interval = Duration::from_millis(50);
 
         // Simulate receiving data
-        state.update_lsn(1000);
+        state.update_received_lsn(1000);
         state.last_flushed_lsn = 900;
         state.last_applied_lsn = 900;
 
@@ -2806,7 +2892,7 @@ mod tests {
         state.mark_feedback_sent();
 
         // Update with more data
-        state.update_lsn(2000);
+        state.update_received_lsn(2000);
         state.last_flushed_lsn = 1500;
         state.last_applied_lsn = 1500;
 
@@ -3186,11 +3272,11 @@ mod tests {
     #[test]
     fn test_hex_encoding_edge_cases() {
         // Test with repeating patterns
-        assert_eq!(hex::encode(&[0xaa, 0xaa, 0xaa]), "aaaaaa");
-        assert_eq!(hex::encode(&[0x55, 0x55, 0x55]), "555555");
+        assert_eq!(hex_encode(&[0xaa, 0xaa, 0xaa]), "aaaaaa");
+        assert_eq!(hex_encode(&[0x55, 0x55, 0x55]), "555555");
 
         // Test with single bits
-        assert_eq!(hex::encode(&[0x01, 0x02, 0x04, 0x08]), "01020408");
-        assert_eq!(hex::encode(&[0x10, 0x20, 0x40, 0x80]), "10204080");
+        assert_eq!(hex_encode(&[0x01, 0x02, 0x04, 0x08]), "01020408");
+        assert_eq!(hex_encode(&[0x10, 0x20, 0x40, 0x80]), "10204080");
     }
 }
