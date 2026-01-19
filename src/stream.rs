@@ -1677,12 +1677,15 @@ fn tuple_to_data(
         if let Some(column_info) = relation.get_column_by_index(i) {
             let value = if column_data.is_null() {
                 serde_json::Value::Null
-            } else if let Some(text) = column_data.as_str() {
+            } else if column_data.is_text() {
+                let text = column_data.as_str().unwrap_or_default();
                 serde_json::Value::String(text.into_owned())
-            } else {
+            } else if column_data.is_binary() {
                 // For binary data, convert to hex string
                 let hex_string = hex_encode(column_data.as_bytes());
                 serde_json::Value::String(format!("\\x{hex_string}"))
+            } else {
+                serde_json::Value::Null
             };
 
             data.insert(column_info.name.clone(), value);
@@ -2065,6 +2068,28 @@ mod tests {
         assert_eq!(data.len(), 1);
         assert_eq!(data.get("col2").unwrap(), "value");
         assert!(data.get("col1").is_none());
+    }
+
+    #[test]
+    fn test_tuple_to_data_empty_text_column() {
+        let columns = vec![crate::protocol::ColumnInfo {
+            flags: 0,
+            name: "col1".to_string(),
+            type_id: 25,
+            type_modifier: -1,
+        }];
+
+        let relation = RelationInfo::new(
+            1,
+            "public".to_string(),
+            "test".to_string(),
+            b'd',
+            columns,
+        );
+
+        let tuple = TupleData::new(vec![crate::protocol::ColumnData::text(Vec::new())]);
+        let data = tuple_to_data(&tuple, &relation).unwrap();
+        assert_eq!(data.get("col1").unwrap(), "");
     }
 
     #[test]
