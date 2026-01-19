@@ -1,8 +1,8 @@
 //! # PostgreSQL Logical Replication Protocol Library
 //!
-//! A platform-agnostic library for parsing and building PostgreSQL logical replication
-//! protocol messages. This library does not include connection management - it focuses
-//! purely on protocol parsing, allowing users to bring their own connection layer.
+//! A platform-agnostic library for parsing and streaming PostgreSQL logical replication
+//! protocol messages. The protocol parser is reusable on its own, and the crate also
+//! includes a libpq-based connection layer for replication streaming.
 //!
 //! ## Features
 //!
@@ -14,7 +14,7 @@
 //! - Thread-safe LSN tracking
 //! - **Truly async, non-blocking I/O** - Tasks properly yield to the executor
 //! - **Graceful cancellation** - All operations support cancellation tokens
-//! - No platform-specific dependencies (no libpq required)
+//! - Protocol parsing is portable; the connection module uses libpq
 //!
 //! ## Async I/O Performance
 //!
@@ -99,7 +99,6 @@ pub mod protocol;
 // High-level stream management
 pub mod stream;
 
-// Optional libpq-specific modules (require tokio)
 pub mod connection;
 pub mod retry;
 

@@ -397,8 +397,6 @@ impl ColumnData {
         }
     }
 
-    /// Legacy method that returns owned String for compatibility
-    /// Prefer `as_str()` for better performance
     #[inline]
     pub fn as_string(&self) -> Option<String> {
         self.as_str().map(|cow| cow.into_owned())
@@ -582,12 +580,6 @@ impl ReplicationState {
                 self.last_flushed_lsn = lsn;
             }
         }
-    }
-
-    /// Legacy method - Update LSN positions (sets only received LSN)
-    #[inline]
-    pub fn update_lsn(&mut self, lsn: XLogRecPtr) {
-        self.update_received_lsn(lsn);
     }
 
     /// Check if the configured feedback interval has elapsed since the last feedback was sent.
@@ -1402,12 +1394,12 @@ mod tests {
     fn test_replication_state() {
         let mut state = ReplicationState::new();
 
-        state.update_lsn(100);
+        state.update_received_lsn(100);
         assert_eq!(state.last_received_lsn, 100);
         assert_eq!(state.last_flushed_lsn, 0);
         assert_eq!(state.last_applied_lsn, 0);
 
-        state.update_lsn(50);
+        state.update_received_lsn(50);
         assert_eq!(state.last_received_lsn, 100);
 
         state.update_flushed_lsn(80);

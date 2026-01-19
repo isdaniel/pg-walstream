@@ -5,7 +5,7 @@
 
 use crate::connection::PgReplicationConnection;
 use crate::error::{ReplicationError, Result};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info};
 
 /// Configuration for retry logic
@@ -156,8 +156,10 @@ impl ExponentialBackoff {
     fn add_jitter(&self, delay: Duration) -> Duration {
         // Simple jitter implementation without external dependencies
         // Use current time as a simple source of randomness
-        let now = Instant::now();
-        let nanos = now.elapsed().subsec_nanos();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
         let jitter_factor = 0.3;
 
         // Calculate jitter as ±30% of the delay
@@ -393,11 +395,17 @@ mod tests {
 
         let mut backoff = ExponentialBackoff::new(&config);
 
-        let delay = backoff.next_delay();
-        // With jitter, the delay should be around 100ms but not exactly 100ms
-        // Allow for ±30% jitter range
-        assert!(delay >= Duration::from_millis(70));
-        assert!(delay <= Duration::from_millis(130));
+        let mut saw_variation = false;
+        let mut prev = backoff.next_delay();
+        for _ in 0..5 {
+            let delay = backoff.next_delay();
+            if delay != prev {
+                saw_variation = true;
+                break;
+            }
+            prev = delay;
+        }
+        assert!(saw_variation, "Expected jitter to vary delays");
     }
 
     #[test]

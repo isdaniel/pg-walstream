@@ -1,7 +1,7 @@
 //! Low-level PostgreSQL connection using libpq-sys
 //!
 //! This module provides safe wrappers around libpq functions for logical replication.
-//! It's an optional feature that requires the `libpq` feature flag.
+//! It relies on libpq and requires the libpq development libraries at build time.
 //!
 //! # Async I/O Architecture
 //!
