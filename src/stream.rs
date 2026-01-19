@@ -2079,13 +2079,8 @@ mod tests {
             type_modifier: -1,
         }];
 
-        let relation = RelationInfo::new(
-            1,
-            "public".to_string(),
-            "test".to_string(),
-            b'd',
-            columns,
-        );
+        let relation =
+            RelationInfo::new(1, "public".to_string(), "test".to_string(), b'd', columns);
 
         let tuple = TupleData::new(vec![crate::protocol::ColumnData::text(Vec::new())]);
         let data = tuple_to_data(&tuple, &relation).unwrap();
