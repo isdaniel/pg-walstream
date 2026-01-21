@@ -111,15 +111,6 @@ cargo run --example pg_basebackup
 4. Extracts and writes files to `./backup/` directory
 5. Generates backup manifest for verification
 
-**Output Structure:**
-```
-backup/
-├── base.tar           # Main database cluster data
-├── pg_wal.tar         # WAL files (if WAL option enabled)
-├── backup_manifest    # Backup verification manifest
-└── tablespaces/       # Additional tablespaces (if any)
-```
-
 **Use Cases:**
 - Setting up physical replication standby servers
 - Point-in-time recovery (PITR) setup
