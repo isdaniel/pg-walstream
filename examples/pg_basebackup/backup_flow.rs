@@ -12,6 +12,7 @@ enum StreamAction {
     Data(Vec<u8>),
     Idle,
     Cancel,
+    Completed,
 }
 
 #[derive(Debug)]
@@ -148,25 +149,45 @@ pub async fn process_backup_stream(
 
     loop {
         // Read data from replication stream, or emit idle heartbeat logs
-        let action = tokio::select! {
-            _ = &mut shutdown => {
-                StreamAction::Cancel
-            }
-            _ = tokio::time::sleep(idle_log_interval) => {
-                StreamAction::Idle
-            }
-            result = conn.get_copy_data_async(cancel_token) => {
-                match result {
-                    Ok(data) => StreamAction::Data(data),
-                    Err(e) => {
-                        let err_msg = e.to_string();
-                        if err_msg.contains("COPY ended") || err_msg.contains("cancelled") {
-                            info!("Backup stream completed");
-                            break;
-                        }
-                        return Err(Box::new(e));
+        let action = {
+            let read_fut = conn.get_copy_data_async(cancel_token);
+            tokio::pin!(read_fut);
+
+            loop {
+                let idle_sleep = tokio::time::sleep(idle_log_interval);
+                tokio::pin!(idle_sleep);
+
+                let action = tokio::select! {
+                    _ = &mut shutdown => {
+                        StreamAction::Cancel
                     }
+                    _ = &mut idle_sleep => {
+                        StreamAction::Idle
+                    }
+                    result = &mut read_fut => {
+                        match result {
+                            Ok(data) => StreamAction::Data(data),
+                            Err(e) => {
+                                let err_msg = e.to_string();
+                                if err_msg.contains("COPY ended") {
+                                    info!("Backup stream completed");
+                                    break StreamAction::Completed;
+                                }
+                                if err_msg.contains("cancelled") && cancel_token.is_cancelled() {
+                                    break StreamAction::Cancel;
+                                }
+                                return Err(Box::new(e));
+                            }
+                        }
+                    }
+                };
+
+                if matches!(action, StreamAction::Idle) {
+                    log_idle_if_needed(last_data_at, &mut last_idle_log_at, idle_log_interval);
+                    continue;
                 }
+
+                break action;
             }
         };
 
@@ -177,8 +198,10 @@ pub async fn process_backup_stream(
                 cancel_token.cancel();
                 break;
             }
+            StreamAction::Completed => {
+                break;
+            }
             StreamAction::Idle => {
-                log_idle_if_needed(last_data_at, &mut last_idle_log_at, idle_log_interval);
                 continue;
             }
             StreamAction::Data(data) => {
@@ -283,17 +306,6 @@ pub async fn process_backup_stream(
                         } else {
                             debug!("Progress update received");
                         }
-                    }
-                    'c' => {
-                        // CopyDone - backup completed
-                        info!("Received CopyDone message");
-                        break;
-                    }
-                    'f' => {
-                        // CopyFail - backup failed
-                        let error_msg = String::from_utf8_lossy(&data[1..]);
-                        error!("Backup failed: {}", error_msg);
-                        return Err(format!("Backup failed: {}", error_msg).into());
                     }
                     _ => {
                         warn!(
