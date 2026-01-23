@@ -141,7 +141,10 @@ pub use protocol::{
 };
 
 // Re-export stream types
-pub use stream::{EventStream, EventStreamRef, LogicalReplicationStream, ReplicationStreamConfig};
+pub use stream::{
+    EventStream, EventStreamRef, LogicalReplicationStream, OriginFilter, ReplicationStreamConfig,
+    StreamingMode,
+};
 
 // Re-export tokio_util for CancellationToken
 pub use tokio_util::sync::CancellationToken;

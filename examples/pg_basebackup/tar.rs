@@ -1,9 +1,303 @@
+use flate2::{Decompress, FlushDecompress, Status};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveCompression {
+    None,
+    Gzip,
+}
+
+#[derive(Debug)]
+enum GzipState {
+    Header,
+    Body,
+    Trailer,
+    Finished,
+}
+
+#[derive(Debug)]
+struct GzipStreamDecoder {
+    decompressor: Decompress,
+    state: GzipState,
+    input: Vec<u8>,
+    cursor: usize,
+}
+
+impl GzipStreamDecoder {
+    fn new() -> Self {
+        Self {
+            decompressor: Decompress::new(false),
+            state: GzipState::Header,
+            input: Vec::with_capacity(64 * 1024),
+            cursor: 0,
+        }
+    }
+
+    fn push(&mut self, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        if !data.is_empty() {
+            self.input.extend_from_slice(data);
+        }
+
+        let mut output = Vec::new();
+
+        loop {
+            match self.state {
+                GzipState::Header => {
+                    if !self.try_parse_header()? {
+                        break;
+                    }
+                }
+                GzipState::Body => {
+                    let decoded = self.decode_body()?;
+                    if decoded.is_empty() {
+                        break;
+                    }
+                    output.extend_from_slice(&decoded);
+                }
+                GzipState::Trailer => {
+                    if !self.try_consume_trailer() {
+                        break;
+                    }
+                }
+                GzipState::Finished => {
+                    if self.cursor >= self.input.len() {
+                        break;
+                    }
+                    self.state = GzipState::Header;
+                }
+            }
+        }
+
+        self.compact_input();
+        Ok(output)
+    }
+
+    fn finish(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if !matches!(self.state, GzipState::Finished) {
+            return Err("Gzip stream ended before trailer was received".into());
+        }
+
+        if self.cursor < self.input.len() {
+            return Err("Trailing compressed bytes found after gzip stream".into());
+        }
+
+        Ok(())
+    }
+
+    fn available(&self) -> usize {
+        self.input.len().saturating_sub(self.cursor)
+    }
+
+    fn try_parse_header(&mut self) -> Result<bool, Box<dyn std::error::Error>> {
+        if self.available() < 10 {
+            return Ok(false);
+        }
+
+        let start = self.cursor;
+        let bytes = &self.input[start..];
+        if bytes[0] != 0x1f || bytes[1] != 0x8b {
+            return Err("Invalid gzip header: missing magic bytes".into());
+        }
+
+        if bytes[2] != 8 {
+            return Err("Unsupported gzip compression method".into());
+        }
+
+        let flags = bytes[3];
+        let mut idx = start + 10;
+
+        if flags & 0x04 != 0 {
+            if self.available() < (idx - start) + 2 {
+                return Ok(false);
+            }
+            let xlen = u16::from_le_bytes([self.input[idx], self.input[idx + 1]]) as usize;
+            idx += 2;
+            if self.available() < (idx - start) + xlen {
+                return Ok(false);
+            }
+            idx += xlen;
+        }
+
+        if flags & 0x08 != 0 {
+            if let Some(pos) = self.find_null(idx) {
+                idx = pos + 1;
+            } else {
+                return Ok(false);
+            }
+        }
+
+        if flags & 0x10 != 0 {
+            if let Some(pos) = self.find_null(idx) {
+                idx = pos + 1;
+            } else {
+                return Ok(false);
+            }
+        }
+
+        if flags & 0x02 != 0 {
+            if self.available() < (idx - start) + 2 {
+                return Ok(false);
+            }
+            idx += 2;
+        }
+
+        self.cursor = idx;
+        self.state = GzipState::Body;
+        Ok(true)
+    }
+
+    fn find_null(&self, from: usize) -> Option<usize> {
+        self.input[from..]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|pos| from + pos)
+    }
+
+    fn decode_body(&mut self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let mut output = Vec::new();
+
+        loop {
+            if self.available() == 0 {
+                break;
+            }
+
+            let mut out_buf = vec![0u8; 64 * 1024];
+            let before_in = self.decompressor.total_in();
+            let before_out = self.decompressor.total_out();
+
+            let status = self.decompressor.decompress(
+                &self.input[self.cursor..],
+                &mut out_buf,
+                FlushDecompress::None,
+            )?;
+
+            let consumed = (self.decompressor.total_in() - before_in) as usize;
+            let produced = (self.decompressor.total_out() - before_out) as usize;
+
+            if consumed == 0 && produced == 0 {
+                break;
+            }
+
+            self.cursor += consumed;
+            if produced > 0 {
+                output.extend_from_slice(&out_buf[..produced]);
+            }
+
+            match status {
+                Status::Ok => continue,
+                Status::BufError => continue,
+                Status::StreamEnd => {
+                    self.state = GzipState::Trailer;
+                    break;
+                }
+            }
+        }
+
+        Ok(output)
+    }
+
+    fn try_consume_trailer(&mut self) -> bool {
+        if self.available() < 8 {
+            return false;
+        }
+
+        self.cursor += 8;
+        self.state = GzipState::Finished;
+        true
+    }
+
+    fn compact_input(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+
+        if self.cursor > 64 * 1024 || self.cursor >= self.input.len() {
+            self.input.drain(0..self.cursor);
+            self.cursor = 0;
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct TarArchiveStream {
+    extractor: TarStreamExtractor,
+    compression: ArchiveCompression,
+    gzip_decoder: Option<GzipStreamDecoder>,
+}
+
+impl TarArchiveStream {
+    pub fn new(
+        output_dir: PathBuf,
+        archive_name: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let compression = if archive_name.ends_with(".tar.gz") {
+            ArchiveCompression::Gzip
+        } else if archive_name.ends_with(".tar") {
+            ArchiveCompression::None
+        } else if archive_name.ends_with(".tar.zst") || archive_name.ends_with(".tar.lz4") {
+            return Err(format!(
+                "Unsupported compression for archive {}. Only .tar and .tar.gz are supported",
+                archive_name
+            )
+            .into());
+        } else {
+            ArchiveCompression::None
+        };
+
+        let gzip_decoder = match compression {
+            ArchiveCompression::Gzip => Some(GzipStreamDecoder::new()),
+            ArchiveCompression::None => None,
+        };
+
+        Ok(Self {
+            extractor: TarStreamExtractor::new(output_dir),
+            compression,
+            gzip_decoder,
+        })
+    }
+
+    pub fn total_bytes(&self) -> u64 {
+        self.extractor.total_bytes()
+    }
+
+    pub fn file_count(&self) -> usize {
+        self.extractor.file_count()
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.extractor.is_complete()
+    }
+
+    pub fn push(&mut self, data: &[u8]) -> Result<bool, Box<dyn std::error::Error>> {
+        match self.compression {
+            ArchiveCompression::None => self.extractor.push(data),
+            ArchiveCompression::Gzip => {
+                let decoder = self
+                    .gzip_decoder
+                    .as_mut()
+                    .ok_or("Missing gzip decoder for compressed archive")?;
+                let decoded = decoder.push(data)?;
+                if decoded.is_empty() {
+                    Ok(false)
+                } else {
+                    self.extractor.push(&decoded)
+                }
+            }
+        }
+    }
+
+    pub fn finish(&mut self) -> Result<bool, Box<dyn std::error::Error>> {
+        if let Some(decoder) = self.gzip_decoder.as_mut() {
+            decoder.finish()?;
+        }
+        self.extractor.finish()
+    }
+}
 
 #[derive(Debug)]
 struct TarHeader {

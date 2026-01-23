@@ -379,17 +379,7 @@ impl std::str::FromStr for Lsn {
     type Err = ReplicationError;
 
     fn from_str(s: &str) -> Result<Self> {
-        let parts: Vec<&str> = s.split('/').collect();
-        if parts.len() != 2 {
-            return Err(ReplicationError::protocol("Invalid LSN format"));
-        }
-
-        let high = u64::from_str_radix(parts[0], 16)
-            .map_err(|_| ReplicationError::protocol("Invalid LSN high part"))?;
-        let low = u64::from_str_radix(parts[1], 16)
-            .map_err(|_| ReplicationError::protocol("Invalid LSN low part"))?;
-
-        Ok(Self((high << 32) | low))
+        parse_lsn(s).map(Self)
     }
 }
 

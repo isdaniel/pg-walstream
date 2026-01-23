@@ -37,7 +37,7 @@
 
 use pg_walstream::{
     CancellationToken, ChangeEvent, EventType, LogicalReplicationStream, Lsn,
-    ReplicationStreamConfig, RetryConfig, SharedLsnFeedback,
+    ReplicationStreamConfig, RetryConfig, SharedLsnFeedback, StreamingMode,
 };
 use std::collections::BTreeMap;
 use std::env;
@@ -266,7 +266,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "safe_consumer_slot".to_string(), // Replication slot name
         "my_publication".to_string(),     // Publication name (must exist)
         2,                                // Protocol version (2 supports streaming)
-        true,                             // Enable streaming of large transactions
+        StreamingMode::On,                // Streaming mode
         Duration::from_secs(10),          // Send feedback every 10 seconds
         Duration::from_secs(30),          // Connection timeout
         Duration::from_secs(60),          // Health check interval

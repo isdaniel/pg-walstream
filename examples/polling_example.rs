@@ -32,6 +32,7 @@
 
 use pg_walstream::{
     CancellationToken, LogicalReplicationStream, ReplicationStreamConfig, RetryConfig,
+    StreamingMode,
 };
 use std::env;
 use std::time::Duration;
@@ -60,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "polling_slot".to_string(),   // Replication slot name
         "my_publication".to_string(), // Publication name (must exist)
         2,                            // Protocol version
-        true,                         // Enable streaming
+        StreamingMode::On,            // Streaming mode
         Duration::from_secs(10),      // Feedback interval
         Duration::from_secs(30),      // Connection timeout
         Duration::from_secs(60),      // Health check interval

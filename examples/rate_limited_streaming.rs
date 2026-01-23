@@ -45,6 +45,7 @@
 use futures::stream;
 use pg_walstream::{
     CancellationToken, EventType, LogicalReplicationStream, ReplicationStreamConfig, RetryConfig,
+    StreamingMode,
 };
 use std::env;
 use std::time::{Duration, Instant};
@@ -85,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "rate_limited_slot".to_string(), // Replication slot name
         "my_publication".to_string(),    // Publication name
         2,                               // Protocol version
-        true,                            // Enable streaming
+        StreamingMode::On,               // Streaming mode
         Duration::from_secs(10),         // Feedback interval
         Duration::from_secs(30),         // Connection timeout
         Duration::from_secs(60),         // Health check interval
