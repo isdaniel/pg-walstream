@@ -48,11 +48,58 @@ pub struct ReplicationStreamConfig {
     pub slot_name: String,
     pub publication_name: String,
     pub protocol_version: u32,
-    pub streaming_enabled: bool,
+    pub streaming_mode: StreamingMode,
+    pub messages: bool,
+    pub binary: bool,
+    pub two_phase: bool,
+    pub origin: Option<OriginFilter>,
     pub feedback_interval: Duration,
     pub connection_timeout: Duration,
     pub health_check_interval: Duration,
     pub retry_config: RetryConfig,
+}
+
+/// Streaming mode for logical replication (pgoutput)
+///
+/// From PostgreSQL docs:
+/// - `off` is the default
+/// - `on` enables streaming of in-progress transactions (protocol v2+)
+/// - `parallel` enables extra per-message data for parallelization (protocol v4+)
+///
+/// See: <https://www.postgresql.org/docs/current/protocol-logical-replication.html>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamingMode {
+    Off,
+    On,
+    Parallel,
+}
+
+impl StreamingMode {
+    #[inline]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            StreamingMode::Off => "off",
+            StreamingMode::On => "on",
+            StreamingMode::Parallel => "parallel",
+        }
+    }
+}
+
+/// Origin filter option for logical replication
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OriginFilter {
+    None,
+    Any,
+}
+
+impl OriginFilter {
+    #[inline]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            OriginFilter::None => "none",
+            OriginFilter::Any => "any",
+        }
+    }
 }
 
 impl ReplicationStreamConfig {
@@ -63,7 +110,8 @@ impl ReplicationStreamConfig {
     /// * `slot_name` - Name of the replication slot to use (will be created if it doesn't exist)
     /// * `publication_name` - Name of the PostgreSQL publication to replicate from
     /// * `protocol_version` - Protocol version (1-4). Version 2+ supports streaming transactions
-    /// * `streaming_enabled` - Enable streaming of large in-progress transactions
+    /// * `streaming_mode` - Streaming mode for logical decoding (off/on/parallel).
+    ///   `on` requires protocol version >= 2; `parallel` requires protocol version >= 4.
     /// * `feedback_interval` - How often to send status feedback to PostgreSQL
     /// * `connection_timeout` - Maximum time to wait for connection establishment
     /// * `health_check_interval` - How often to check connection health
@@ -72,14 +120,14 @@ impl ReplicationStreamConfig {
     /// # Example
     ///
     /// ```
-    /// use pg_walstream::{ReplicationStreamConfig, RetryConfig};
+    /// use pg_walstream::{ReplicationStreamConfig, RetryConfig, StreamingMode};
     /// use std::time::Duration;
     ///
     /// let config = ReplicationStreamConfig::new(
     ///     "my_slot".to_string(),
     ///     "my_publication".to_string(),
     ///     2,
-    ///     true,
+    ///     StreamingMode::On,
     ///     Duration::from_secs(10),
     ///     Duration::from_secs(30),
     ///     Duration::from_secs(60),
@@ -91,7 +139,7 @@ impl ReplicationStreamConfig {
         slot_name: String,
         publication_name: String,
         protocol_version: u32,
-        streaming_enabled: bool,
+        streaming_mode: StreamingMode,
         feedback_interval: Duration,
         connection_timeout: Duration,
         health_check_interval: Duration,
@@ -101,12 +149,51 @@ impl ReplicationStreamConfig {
             slot_name,
             publication_name,
             protocol_version,
-            streaming_enabled,
+            streaming_mode,
+            messages: false,
+            binary: false,
+            two_phase: false,
+            origin: None,
             feedback_interval,
             connection_timeout,
             health_check_interval,
             retry_config,
         }
+    }
+
+    /// Enable or disable logical replication messages (pg_logical_emit_message)
+    #[inline]
+    pub fn with_messages(mut self, enabled: bool) -> Self {
+        self.messages = enabled;
+        self
+    }
+
+    /// Enable or disable binary mode for pgoutput
+    #[inline]
+    pub fn with_binary(mut self, enabled: bool) -> Self {
+        self.binary = enabled;
+        self
+    }
+
+    /// Enable or disable two-phase commit decoding (protocol v3+)
+    #[inline]
+    pub fn with_two_phase(mut self, enabled: bool) -> Self {
+        self.two_phase = enabled;
+        self
+    }
+
+    /// Set origin filtering behavior (none|any)
+    #[inline]
+    pub fn with_origin(mut self, origin: Option<OriginFilter>) -> Self {
+        self.origin = origin;
+        self
+    }
+
+    /// Set streaming mode (off|on|parallel)
+    #[inline]
+    pub fn with_streaming_mode(mut self, mode: StreamingMode) -> Self {
+        self.streaming_mode = mode;
+        self
     }
 }
 
@@ -142,7 +229,7 @@ impl LogicalReplicationStream {
     /// # Example
     ///
     /// ```no_run
-    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig};
+    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig, StreamingMode};
     /// use std::time::Duration;
     ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -150,7 +237,7 @@ impl LogicalReplicationStream {
     ///     "my_slot".to_string(),
     ///     "my_publication".to_string(),
     ///     2,
-    ///     true,
+    ///     StreamingMode::On,
     ///     Duration::from_secs(10),
     ///     Duration::from_secs(30),
     ///     Duration::from_secs(60),
@@ -268,14 +355,14 @@ impl LogicalReplicationStream {
     /// # Example
     ///
     /// ```no_run
-    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig};
+    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig, StreamingMode};
     /// use std::time::Duration;
     ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// let config = ReplicationStreamConfig::new(
     ///     "my_slot".to_string(),
     ///     "my_publication".to_string(),
-    ///     2, true,
+    ///     2, StreamingMode::On,
     ///     Duration::from_secs(10),
     ///     Duration::from_secs(30),
     ///     Duration::from_secs(60),
@@ -298,21 +385,15 @@ impl LogicalReplicationStream {
         self.initialize().await?;
         let start_lsn = start_lsn.unwrap_or(INVALID_XLOG_REC_PTR);
 
-        // Build replication options
-        let proto_version = self.config.protocol_version.to_string();
-        let publication_names = format!("\"{}\"", self.config.publication_name);
-        let mut options = vec![
-            ("proto_version", proto_version.as_str()),
-            ("publication_names", publication_names.as_str()),
-        ];
-
-        if self.config.streaming_enabled {
-            options.push(("streaming", "on"));
-        }
+        let options = self.build_replication_options()?;
 
         // Start replication
+        let options_ref = options
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect::<Vec<_>>();
         self.connection
-            .start_replication(&self.config.slot_name, start_lsn, &options)?;
+            .start_replication(&self.config.slot_name, start_lsn, &options_ref)?;
 
         info!(
             "Logical replication started with LSN: {}",
@@ -341,7 +422,7 @@ impl LogicalReplicationStream {
     /// # Example
     ///
     /// ```no_run
-    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig};
+    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig, StreamingMode};
     /// use tokio_util::sync::CancellationToken;
     /// use std::time::Duration;
     ///
@@ -349,7 +430,7 @@ impl LogicalReplicationStream {
     /// let config = ReplicationStreamConfig::new(
     ///     "my_slot".to_string(),
     ///     "my_publication".to_string(),
-    ///     2, true,
+    ///     2, StreamingMode::On,
     ///     Duration::from_secs(10),
     ///     Duration::from_secs(30),
     ///     Duration::from_secs(60),
@@ -468,19 +549,14 @@ impl LogicalReplicationStream {
         // Restart replication from last known position
         let last_lsn = self.state.last_received_lsn;
 
-        let proto_version = self.config.protocol_version.to_string();
-        let publication_names = format!("\"{}\"", self.config.publication_name);
-        let mut options = vec![
-            ("proto_version", proto_version.as_str()),
-            ("publication_names", publication_names.as_str()),
-        ];
-
-        if self.config.streaming_enabled {
-            options.push(("streaming", "on"));
-        }
+        let options = self.build_replication_options()?;
+        let options_ref = options
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect::<Vec<_>>();
 
         self.connection
-            .start_replication(&self.config.slot_name, last_lsn, &options)?;
+            .start_replication(&self.config.slot_name, last_lsn, &options_ref)?;
 
         info!("Replication connection recovered and restarted");
         Ok(())
@@ -508,7 +584,7 @@ impl LogicalReplicationStream {
     /// # Example
     ///
     /// ```no_run
-    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig};
+    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig, StreamingMode};
     /// use tokio_util::sync::CancellationToken;
     /// use std::time::Duration;
     ///
@@ -516,7 +592,7 @@ impl LogicalReplicationStream {
     /// let config = ReplicationStreamConfig::new(
     ///     "my_slot".to_string(),
     ///     "my_publication".to_string(),
-    ///     2, true,
+    ///     2, StreamingMode::On,
     ///     Duration::from_secs(10),
     ///     Duration::from_secs(30),
     ///     Duration::from_secs(60),
@@ -1154,7 +1230,7 @@ impl LogicalReplicationStream {
     /// # Example
     ///
     /// ```no_run
-    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig};
+    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig, StreamingMode};
     /// use tokio_util::sync::CancellationToken;
     /// use std::time::Duration;
     ///
@@ -1162,7 +1238,7 @@ impl LogicalReplicationStream {
     /// let config = ReplicationStreamConfig::new(
     ///     "my_slot".to_string(),
     ///     "my_publication".to_string(),
-    ///     2, true,
+    ///     2, StreamingMode::On,
     ///     Duration::from_secs(10),
     ///     Duration::from_secs(30),
     ///     Duration::from_secs(60),
@@ -1210,6 +1286,77 @@ impl LogicalReplicationStream {
             cancellation_token,
         }
     }
+
+    fn build_replication_options(&self) -> Result<Vec<(String, String)>> {
+        self.validate_replication_options()?;
+
+        let proto_version = self.config.protocol_version.to_string();
+        let publication_names = format!("\"{}\"", self.config.publication_name);
+        let mut options = vec![
+            ("proto_version".to_string(), proto_version),
+            ("publication_names".to_string(), publication_names),
+        ];
+
+        if !matches!(self.config.streaming_mode, StreamingMode::Off) {
+            options.push((
+                "streaming".to_string(),
+                self.config.streaming_mode.as_str().to_string(),
+            ));
+        }
+
+        if self.config.messages {
+            options.push(("messages".to_string(), "on".to_string()));
+        }
+
+        if self.config.binary {
+            options.push(("binary".to_string(), "on".to_string()));
+        }
+
+        if self.config.two_phase {
+            options.push(("two_phase".to_string(), "on".to_string()));
+        }
+
+        if let Some(origin) = self.config.origin {
+            options.push(("origin".to_string(), origin.as_str().to_string()));
+        }
+
+        Ok(options)
+    }
+
+    fn validate_replication_options(&self) -> Result<()> {
+        match self.config.protocol_version {
+            1 | 2 | 3 | 4 => {}
+            version => {
+                return Err(ReplicationError::config(format!(
+                    "Unsupported protocol version: {version} (expected 1-4)"
+                )))
+            }
+        }
+
+        if matches!(self.config.streaming_mode, StreamingMode::On)
+            && self.config.protocol_version < 2
+        {
+            return Err(ReplicationError::config(
+                "streaming=on requires protocol version >= 2".to_string(),
+            ));
+        }
+
+        if matches!(self.config.streaming_mode, StreamingMode::Parallel)
+            && self.config.protocol_version < 4
+        {
+            return Err(ReplicationError::config(
+                "streaming=parallel requires protocol version >= 4".to_string(),
+            ));
+        }
+
+        if self.config.two_phase && self.config.protocol_version < 3 {
+            return Err(ReplicationError::config(
+                "two_phase requires protocol version >= 3".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 /// Async stream of PostgreSQL replication events (owned version)
@@ -1223,7 +1370,7 @@ impl LogicalReplicationStream {
 /// # Example
 ///
 /// ```no_run
-/// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig};
+/// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig, StreamingMode};
 /// use tokio_util::sync::CancellationToken;
 /// use std::time::Duration;
 ///
@@ -1231,7 +1378,7 @@ impl LogicalReplicationStream {
 /// let config = ReplicationStreamConfig::new(
 ///     "my_slot".to_string(),
 ///     "my_publication".to_string(),
-///     2, true,
+///     2, StreamingMode::On,
 ///     Duration::from_secs(10),
 ///     Duration::from_secs(30),
 ///     Duration::from_secs(60),
@@ -1280,7 +1427,7 @@ impl LogicalReplicationStream {
 /// wrap this with `futures::stream::unfold`:
 ///
 /// ```no_run
-/// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig};
+/// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig, StreamingMode};
 /// use tokio_util::sync::CancellationToken;
 /// use futures::stream::{self, StreamExt};
 /// use std::time::Duration;
@@ -1289,7 +1436,7 @@ impl LogicalReplicationStream {
 /// let config = ReplicationStreamConfig::new(
 ///     "my_slot".to_string(),
 ///     "my_publication".to_string(),
-///     2, true,
+///     2, StreamingMode::On,
 ///     Duration::from_secs(10),
 ///     Duration::from_secs(30),
 ///     Duration::from_secs(60),
@@ -1322,7 +1469,7 @@ impl LogicalReplicationStream {
 /// # Basic Example
 ///
 /// ```no_run
-/// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig};
+/// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig, StreamingMode};
 /// use tokio_util::sync::CancellationToken;
 /// use std::time::Duration;
 ///
@@ -1330,7 +1477,7 @@ impl LogicalReplicationStream {
 /// let config = ReplicationStreamConfig::new(
 ///     "my_slot".to_string(),
 ///     "my_publication".to_string(),
-///     2, true,
+///     2, StreamingMode::On,
 ///     Duration::from_secs(10),
 ///     Duration::from_secs(30),
 ///     Duration::from_secs(60),
@@ -1398,13 +1545,13 @@ impl EventStream {
     /// # Example
     ///
     /// ```no_run
-    /// # use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig};
+    /// # use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig, StreamingMode};
     /// # use tokio_util::sync::CancellationToken;
     /// # use std::time::Duration;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// # let config = ReplicationStreamConfig::new(
     /// #     "my_slot".to_string(), "my_publication".to_string(),
-    /// #     2, true, Duration::from_secs(10), Duration::from_secs(30),
+    /// #     2, StreamingMode::On, Duration::from_secs(10), Duration::from_secs(30),
     /// #     Duration::from_secs(60), RetryConfig::default(),
     /// # );
     /// # let mut stream = LogicalReplicationStream::new("connection_string", config).await?;
@@ -1442,13 +1589,13 @@ impl EventStream {
     /// # Example
     ///
     /// ```no_run
-    /// # use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig};
+    /// # use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig, StreamingMode};
     /// # use tokio_util::sync::CancellationToken;
     /// # use std::time::Duration;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// # let config = ReplicationStreamConfig::new(
     /// #     "my_slot".to_string(), "my_publication".to_string(),
-    /// #     2, true, Duration::from_secs(10), Duration::from_secs(30),
+    /// #     2, StreamingMode::On, Duration::from_secs(10), Duration::from_secs(30),
     /// #     Duration::from_secs(60), RetryConfig::default(),
     /// # );
     /// # let mut stream = LogicalReplicationStream::new("connection_string", config).await?;
@@ -1487,13 +1634,13 @@ impl EventStream {
     /// # Example
     ///
     /// ```no_run
-    /// # use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig};
+    /// # use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig, StreamingMode};
     /// # use tokio_util::sync::CancellationToken;
     /// # use std::time::Duration;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// # let config = ReplicationStreamConfig::new(
     /// #     "my_slot".to_string(), "my_publication".to_string(),
-    /// #     2, true, Duration::from_secs(10), Duration::from_secs(30),
+    /// #     2, StreamingMode::On, Duration::from_secs(10), Duration::from_secs(30),
     /// #     Duration::from_secs(60), RetryConfig::default(),
     /// # );
     /// # let mut stream = LogicalReplicationStream::new("connection_string", config).await?;
@@ -1520,7 +1667,7 @@ impl EventStream {
     /// # Example
     ///
     /// ```no_run
-    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig};
+    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig, StreamingMode};
     /// use tokio_util::sync::CancellationToken;
     /// use std::time::Duration;
     ///
@@ -1528,7 +1675,7 @@ impl EventStream {
     /// let config = ReplicationStreamConfig::new(
     ///     "my_slot".to_string(),
     ///     "my_publication".to_string(),
-    ///     2, true,
+    ///     2, StreamingMode::On,
     ///     Duration::from_secs(10),
     ///     Duration::from_secs(30),
     ///     Duration::from_secs(60),
@@ -1605,7 +1752,7 @@ impl<'a> EventStreamRef<'a> {
     /// # Example
     ///
     /// ```no_run
-    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig};
+    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig, StreamingMode};
     /// use tokio_util::sync::CancellationToken;
     /// use std::time::Duration;
     ///
@@ -1613,7 +1760,7 @@ impl<'a> EventStreamRef<'a> {
     /// let config = ReplicationStreamConfig::new(
     ///     "my_slot".to_string(),
     ///     "my_publication".to_string(),
-    ///     2, true,
+    ///     2, StreamingMode::On,
     ///     Duration::from_secs(10),
     ///     Duration::from_secs(30),
     ///     Duration::from_secs(60),
@@ -1720,7 +1867,7 @@ mod tests {
             "test_slot".to_string(),
             "test_publication".to_string(),
             2,
-            true,
+            StreamingMode::On,
             Duration::from_secs(10),
             Duration::from_secs(30),
             Duration::from_secs(60),
@@ -1735,7 +1882,7 @@ mod tests {
         assert_eq!(config.slot_name, "test_slot");
         assert_eq!(config.publication_name, "test_publication");
         assert_eq!(config.protocol_version, 2);
-        assert!(config.streaming_enabled);
+        assert_eq!(config.streaming_mode, StreamingMode::On);
         assert_eq!(config.feedback_interval, Duration::from_secs(10));
         assert_eq!(config.connection_timeout, Duration::from_secs(30));
         assert_eq!(config.health_check_interval, Duration::from_secs(60));
@@ -1747,7 +1894,7 @@ mod tests {
             "test_slot".to_string(),
             "test_publication".to_string(),
             2,
-            true,
+            StreamingMode::On,
             Duration::from_secs(10),
             Duration::from_millis(1),
             Duration::from_secs(60),
@@ -2338,27 +2485,27 @@ mod tests {
             "slot".to_string(),
             "pub".to_string(),
             1,
-            false,
+            StreamingMode::Off,
             Duration::from_secs(10),
             Duration::from_secs(30),
             Duration::from_secs(60),
             RetryConfig::default(),
         );
         assert_eq!(config_v1.protocol_version, 1);
-        assert!(!config_v1.streaming_enabled);
+        assert_eq!(config_v1.streaming_mode, StreamingMode::Off);
 
         let config_v4 = ReplicationStreamConfig::new(
             "slot".to_string(),
             "pub".to_string(),
             4,
-            true,
+            StreamingMode::Parallel,
             Duration::from_secs(10),
             Duration::from_secs(30),
             Duration::from_secs(60),
             RetryConfig::default(),
         );
         assert_eq!(config_v4.protocol_version, 4);
-        assert!(config_v4.streaming_enabled);
+        assert_eq!(config_v4.streaming_mode, StreamingMode::Parallel);
     }
 
     #[test]
@@ -2367,7 +2514,7 @@ mod tests {
             "slot".to_string(),
             "pub".to_string(),
             2,
-            true,
+            StreamingMode::On,
             Duration::from_millis(500),
             Duration::from_secs(5),
             Duration::from_secs(15),

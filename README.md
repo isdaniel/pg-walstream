@@ -54,7 +54,7 @@ The Stream API provides an ergonomic, iterator-like interface:
 
 ```rust
 use pg_walstream::{
-    LogicalReplicationStream, ReplicationStreamConfig, RetryConfig,
+    LogicalReplicationStream, ReplicationStreamConfig, RetryConfig, StreamingMode,
     SharedLsnFeedback, CancellationToken,
 };
 use std::sync::Arc;
@@ -67,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "my_slot".to_string(),           // Replication slot name
         "my_publication".to_string(),     // Publication name
         2,                                // Protocol version
-        true,                             // Enable streaming
+        StreamingMode::On,                // Streaming mode
         Duration::from_secs(10),          // Feedback interval
         Duration::from_secs(30),          // Connection timeout
         Duration::from_secs(60),          // Health check interval
@@ -117,7 +117,7 @@ For more control, you can use the traditional polling approach:
 
 ```rust
 use pg_walstream::{
-    LogicalReplicationStream, ReplicationStreamConfig, RetryConfig,
+    LogicalReplicationStream, ReplicationStreamConfig, RetryConfig, StreamingMode,
     SharedLsnFeedback, CancellationToken,
 };
 use std::sync::Arc;
@@ -128,7 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = ReplicationStreamConfig::new(
         "my_slot".to_string(),
         "my_publication".to_string(),
-        2, true,
+        2, StreamingMode::On,
         Duration::from_secs(10),
         Duration::from_secs(30),
         Duration::from_secs(60),

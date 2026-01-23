@@ -1,4 +1,4 @@
-use crate::tar::{rewrite_tablespace_symlinks, TarStreamExtractor};
+use crate::tar::{rewrite_tablespace_symlinks, TarArchiveStream};
 use pg_walstream::PgReplicationConnection;
 use std::fs::File;
 use std::io::Write;
@@ -20,7 +20,7 @@ enum BackupStreamMode {
     None,
     Archive {
         name: String,
-        extractor: TarStreamExtractor,
+        extractor: TarArchiveStream,
     },
     Manifest {
         file: File,
@@ -39,7 +39,7 @@ impl BackupTotals {
     fn record_archive(
         &mut self,
         name: &str,
-        extractor: &mut TarStreamExtractor,
+        extractor: &mut TarArchiveStream,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let completed = extractor.finish()?;
         self.bytes += extractor.total_bytes();
@@ -239,9 +239,10 @@ pub async fn process_backup_stream(
                                 );
                             }
 
+                            let extractor = TarArchiveStream::new(archive_dir, &archive_name)?;
                             mode = BackupStreamMode::Archive {
                                 name: archive_name,
-                                extractor: TarStreamExtractor::new(archive_dir),
+                                extractor,
                             };
                             saw_archive = true;
                         } else {
@@ -282,7 +283,8 @@ pub async fn process_backup_stream(
                             }
                             BackupStreamMode::None => {
                                 warn!("Received data before archive start; defaulting to base directory");
-                                let mut extractor = TarStreamExtractor::new(output_dir.clone());
+                                let mut extractor =
+                                    TarArchiveStream::new(output_dir.clone(), "base.tar")?;
                                 let completed = extractor.push(payload)?;
                                 if completed {
                                     totals.record_archive("base.tar", &mut extractor)?;
