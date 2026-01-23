@@ -1,6 +1,7 @@
 use crate::tar::{rewrite_tablespace_symlinks, TarArchiveStream};
 use pg_walstream::PgReplicationConnection;
 use std::fs::File;
+use std::future::Future;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -85,6 +86,219 @@ fn log_idle_if_needed(last_data_at: Instant, last_idle_log_at: &mut Instant, int
     }
 }
 
+fn ensure_empty_output_dir(output_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    if output_dir.exists() {
+        let mut entries = output_dir.read_dir()?;
+        if entries.next().is_some() {
+            return Err(format!(
+                "Backup output directory {} is not empty; remove it or choose a new path",
+                output_dir.display()
+            )
+            .into());
+        }
+    }
+
+    std::fs::create_dir_all(output_dir)?;
+    info!("Writing backup to: {}", output_dir.display());
+    Ok(())
+}
+
+async fn read_stream_action(
+    conn: &mut PgReplicationConnection,
+    cancel_token: &CancellationToken,
+    shutdown: &mut (impl Future<Output = Result<(), std::io::Error>> + Unpin),
+    last_data_at: Instant,
+    last_idle_log_at: &mut Instant,
+    idle_log_interval: Duration,
+) -> Result<StreamAction, Box<dyn std::error::Error>> {
+    let read_fut = conn.get_copy_data_async(cancel_token);
+    tokio::pin!(read_fut);
+
+    loop {
+        let idle_sleep = tokio::time::sleep(idle_log_interval);
+        tokio::pin!(idle_sleep);
+
+        let action = tokio::select! {
+            _ = &mut *shutdown => {
+                StreamAction::Cancel
+            }
+            _ = &mut idle_sleep => {
+                StreamAction::Idle
+            }
+            result = &mut read_fut => {
+                match result {
+                    Ok(data) => StreamAction::Data(data),
+                    Err(e) => {
+                        let err_msg = e.to_string();
+                        if err_msg.contains("COPY ended") {
+                            info!("Backup stream completed");
+                            StreamAction::Completed
+                        } else if err_msg.contains("cancelled") && cancel_token.is_cancelled() {
+                            StreamAction::Cancel
+                        } else {
+                            return Err(Box::new(e));
+                        }
+                    }
+                }
+            }
+        };
+
+        if matches!(action, StreamAction::Idle) {
+            log_idle_if_needed(last_data_at, last_idle_log_at, idle_log_interval);
+            continue;
+        }
+
+        return Ok(action);
+    }
+}
+
+fn start_archive_mode(
+    output_dir: &PathBuf,
+    archive_name: String,
+    spclocation: String,
+    mode: &mut BackupStreamMode,
+    totals: &mut BackupTotals,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let previous_mode = std::mem::replace(mode, BackupStreamMode::None);
+    finish_stream_mode(previous_mode, totals)?;
+
+    let archive_dir = archive_output_dir(output_dir, &archive_name);
+    std::fs::create_dir_all(&archive_dir)?;
+    if spclocation.is_empty() {
+        info!(
+            "Starting archive: {} -> {}",
+            archive_name,
+            archive_dir.display()
+        );
+    } else {
+        info!(
+            "Starting tablespace archive: {} (source: {}) -> {}",
+            archive_name,
+            spclocation,
+            archive_dir.display()
+        );
+    }
+
+    let extractor = TarArchiveStream::new(archive_dir, &archive_name)?;
+    *mode = BackupStreamMode::Archive {
+        name: archive_name,
+        extractor,
+    };
+    Ok(())
+}
+
+fn start_manifest_mode(
+    output_dir: &PathBuf,
+    mode: &mut BackupStreamMode,
+    totals: &mut BackupTotals,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let previous_mode = std::mem::replace(mode, BackupStreamMode::None);
+    finish_stream_mode(previous_mode, totals)?;
+
+    let manifest_path = output_dir.join("backup_manifest");
+    let file = File::create(&manifest_path)?;
+    info!("Writing backup manifest: {}", manifest_path.display());
+    *mode = BackupStreamMode::Manifest {
+        file,
+        bytes_written: 0,
+    };
+    Ok(0)
+}
+
+fn handle_data_chunk(
+    payload: &[u8],
+    output_dir: &PathBuf,
+    mode: &mut BackupStreamMode,
+    totals: &mut BackupTotals,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match mode {
+        BackupStreamMode::Archive { name, extractor } => {
+            let completed = extractor.push(payload)?;
+            if completed {
+                totals.record_archive(name, extractor)?;
+                *mode = BackupStreamMode::None;
+            }
+        }
+        BackupStreamMode::Manifest {
+            file,
+            bytes_written,
+        } => {
+            file.write_all(payload)?;
+            *bytes_written += payload.len() as u64;
+        }
+        BackupStreamMode::None => {
+            warn!("Received data before archive start; defaulting to base directory");
+            let mut extractor = TarArchiveStream::new(output_dir.clone(), "base.tar")?;
+            let completed = extractor.push(payload)?;
+            if completed {
+                totals.record_archive("base.tar", &mut extractor)?;
+            } else {
+                *mode = BackupStreamMode::Archive {
+                    name: "base.tar".to_string(),
+                    extractor,
+                };
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_progress_message(data: &[u8]) {
+    if data.len() >= 9 {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&data[1..9]);
+        let bytes_done = i64::from_be_bytes(buf);
+        debug!("Progress update: {} bytes", bytes_done);
+    } else {
+        debug!("Progress update received");
+    }
+}
+
+fn handle_stream_data(
+    data: Vec<u8>,
+    output_dir: &PathBuf,
+    mode: &mut BackupStreamMode,
+    totals: &mut BackupTotals,
+    saw_archive: &mut bool,
+    saw_manifest: &mut bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if data.is_empty() {
+        return Ok(());
+    }
+
+    match data[0] as char {
+        'n' => {
+            if let Some((archive_name, spclocation)) = parse_new_archive_message(&data[1..]) {
+                start_archive_mode(output_dir, archive_name, spclocation, mode, totals)?;
+                *saw_archive = true;
+            } else {
+                warn!("Unexpected new-archive message received");
+            }
+        }
+        'm' => {
+            start_manifest_mode(output_dir, mode, totals)?;
+            *saw_manifest = true;
+        }
+        'd' => {
+            let payload = &data[1..];
+            handle_data_chunk(payload, output_dir, mode, totals)?;
+            *saw_archive = true;
+        }
+        'p' => {
+            handle_progress_message(&data);
+        }
+        _ => {
+            warn!(
+                "Unknown message type: {} (0x{:02x})",
+                data[0] as char, data[0]
+            );
+        }
+    }
+
+    Ok(())
+}
+
 fn parse_cstring(input: &[u8]) -> Option<(String, usize)> {
     let end = input.iter().position(|&b| b == 0)?;
     let value = String::from_utf8_lossy(&input[..end]).to_string();
@@ -122,19 +336,7 @@ pub async fn process_backup_stream(
     cancel_token: &CancellationToken,
     expect_manifest: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if output_dir.exists() {
-        let mut entries = output_dir.read_dir()?;
-        if entries.next().is_some() {
-            return Err(format!(
-                "Backup output directory {} is not empty; remove it or choose a new path",
-                output_dir.display()
-            )
-            .into());
-        }
-    }
-
-    std::fs::create_dir_all(output_dir)?;
-    info!("Writing backup to: {}", output_dir.display());
+    ensure_empty_output_dir(output_dir)?;
 
     let mut mode = BackupStreamMode::None;
     let mut last_data_at = Instant::now();
@@ -149,47 +351,15 @@ pub async fn process_backup_stream(
 
     loop {
         // Read data from replication stream, or emit idle heartbeat logs
-        let action = {
-            let read_fut = conn.get_copy_data_async(cancel_token);
-            tokio::pin!(read_fut);
-
-            loop {
-                let idle_sleep = tokio::time::sleep(idle_log_interval);
-                tokio::pin!(idle_sleep);
-
-                let action = tokio::select! {
-                    _ = &mut shutdown => {
-                        StreamAction::Cancel
-                    }
-                    _ = &mut idle_sleep => {
-                        StreamAction::Idle
-                    }
-                    result = &mut read_fut => {
-                        match result {
-                            Ok(data) => StreamAction::Data(data),
-                            Err(e) => {
-                                let err_msg = e.to_string();
-                                if err_msg.contains("COPY ended") {
-                                    info!("Backup stream completed");
-                                    break StreamAction::Completed;
-                                }
-                                if err_msg.contains("cancelled") && cancel_token.is_cancelled() {
-                                    break StreamAction::Cancel;
-                                }
-                                return Err(Box::new(e));
-                            }
-                        }
-                    }
-                };
-
-                if matches!(action, StreamAction::Idle) {
-                    log_idle_if_needed(last_data_at, &mut last_idle_log_at, idle_log_interval);
-                    continue;
-                }
-
-                break action;
-            }
-        };
+        let action = read_stream_action(
+            conn,
+            cancel_token,
+            &mut shutdown,
+            last_data_at,
+            &mut last_idle_log_at,
+            idle_log_interval,
+        )
+        .await?;
 
         match action {
             StreamAction::Cancel => {
@@ -205,117 +375,16 @@ pub async fn process_backup_stream(
                 continue;
             }
             StreamAction::Data(data) => {
-                if data.is_empty() {
-                    continue;
-                }
-
                 last_data_at = Instant::now();
                 last_idle_log_at = Instant::now();
-
-                // Check message type
-                match data[0] as char {
-                    'n' => {
-                        // Start of a new archive
-                        let previous_mode = std::mem::replace(&mut mode, BackupStreamMode::None);
-                        finish_stream_mode(previous_mode, &mut totals)?;
-
-                        if let Some((archive_name, spclocation)) =
-                            parse_new_archive_message(&data[1..])
-                        {
-                            let archive_dir = archive_output_dir(output_dir, &archive_name);
-                            std::fs::create_dir_all(&archive_dir)?;
-                            if spclocation.is_empty() {
-                                info!(
-                                    "Starting archive: {} -> {}",
-                                    archive_name,
-                                    archive_dir.display()
-                                );
-                            } else {
-                                info!(
-                                    "Starting tablespace archive: {} (source: {}) -> {}",
-                                    archive_name,
-                                    spclocation,
-                                    archive_dir.display()
-                                );
-                            }
-
-                            let extractor = TarArchiveStream::new(archive_dir, &archive_name)?;
-                            mode = BackupStreamMode::Archive {
-                                name: archive_name,
-                                extractor,
-                            };
-                            saw_archive = true;
-                        } else {
-                            warn!("Malformed new-archive message received");
-                        }
-                    }
-                    'm' => {
-                        // Start of backup manifest stream
-                        let previous_mode = std::mem::replace(&mut mode, BackupStreamMode::None);
-                        finish_stream_mode(previous_mode, &mut totals)?;
-
-                        let manifest_path = output_dir.join("backup_manifest");
-                        let file = File::create(&manifest_path)?;
-                        info!("Writing backup manifest: {}", manifest_path.display());
-                        mode = BackupStreamMode::Manifest {
-                            file,
-                            bytes_written: 0,
-                        };
-                        saw_manifest = true;
-                    }
-                    'd' => {
-                        // Archive or manifest data chunk
-                        let payload = &data[1..];
-                        match &mut mode {
-                            BackupStreamMode::Archive { name, extractor } => {
-                                let completed = extractor.push(payload)?;
-                                if completed {
-                                    totals.record_archive(name, extractor)?;
-                                    mode = BackupStreamMode::None;
-                                }
-                            }
-                            BackupStreamMode::Manifest {
-                                file,
-                                bytes_written,
-                            } => {
-                                file.write_all(payload)?;
-                                *bytes_written += payload.len() as u64;
-                            }
-                            BackupStreamMode::None => {
-                                warn!("Received data before archive start; defaulting to base directory");
-                                let mut extractor =
-                                    TarArchiveStream::new(output_dir.clone(), "base.tar")?;
-                                let completed = extractor.push(payload)?;
-                                if completed {
-                                    totals.record_archive("base.tar", &mut extractor)?;
-                                } else {
-                                    mode = BackupStreamMode::Archive {
-                                        name: "base.tar".to_string(),
-                                        extractor,
-                                    };
-                                }
-                                saw_archive = true;
-                            }
-                        }
-                    }
-                    'p' => {
-                        // Progress report (bytes processed for current tablespace)
-                        if data.len() >= 9 {
-                            let mut buf = [0u8; 8];
-                            buf.copy_from_slice(&data[1..9]);
-                            let bytes_done = i64::from_be_bytes(buf);
-                            debug!("Progress update: {} bytes", bytes_done);
-                        } else {
-                            debug!("Progress update received");
-                        }
-                    }
-                    _ => {
-                        warn!(
-                            "Unknown message type: {} (0x{:02x})",
-                            data[0] as char, data[0]
-                        );
-                    }
-                }
+                handle_stream_data(
+                    data,
+                    output_dir,
+                    &mut mode,
+                    &mut totals,
+                    &mut saw_archive,
+                    &mut saw_manifest,
+                )?;
             }
         }
     }

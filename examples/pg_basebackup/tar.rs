@@ -313,7 +313,7 @@ fn parse_tar_header(header: &[u8]) -> Option<TarHeader> {
         return None;
     }
 
-    // Tar header format (USTAR):
+    // Tar header format (USTAR): https://wiki.osdev.org/USTAR
     // Offset 0-99: filename (null-terminated)
     // Offset 124-135: file size in octal ASCII
     // Offset 156: file type ('0'=regular, '5'=directory, '2'=symlink)

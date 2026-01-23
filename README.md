@@ -268,14 +268,6 @@ The library supports all PostgreSQL logical replication message types:
 - **ROLLBACK_PREPARED**: Rollback prepared transaction
 - **STREAM_PREPARE**: Stream prepare message
 
-The project includes 95 comprehensive unit tests covering:
-- Protocol message parsing
-- Buffer operations
-- LSN tracking and thread safety
-- Error handling
-- Retry logic
-- Type conversions
-
 ## Architecture
 
 ```
