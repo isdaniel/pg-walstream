@@ -526,15 +526,20 @@ impl PgReplicationConnection {
                 unsafe { PQfreemem(buffer as *mut c_void) };
                 Ok(ReadResult::Data(data))
             }
-            0 | -2 => {
-                // 0 : According to libpq docs, 0 means async mode and no data ready
-                // 2 : No complete data available yet, would block
+            0 => {
+                // 0: According to libpq docs, async mode and no data ready
                 Ok(ReadResult::WouldBlock)
             }
             -1 => {
                 // COPY finished - this is a graceful shutdown signal
                 debug!("COPY stream finished (PQgetCopyData returned -1)");
                 Ok(ReadResult::CopyDone)
+            }
+            -2 => {
+                let error_msg = self.last_error_message();
+                Err(ReplicationError::protocol(format!(
+                    "PQgetCopyData error: {error_msg}"
+                )))
             }
             other => Err(ReplicationError::protocol(format!(
                 "Unexpected PQgetCopyData result: {other}"

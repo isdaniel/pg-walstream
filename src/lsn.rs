@@ -12,7 +12,7 @@
 //! we need a thread-safe way to share the committed LSN from consumer back to producer
 //! for accurate feedback to PostgreSQL.
 
-use crate::types::{format_lsn, XLogRecPtr};
+use crate::types::{format_lsn, CachePadded, XLogRecPtr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -42,9 +42,9 @@ use tracing::{debug, info};
 #[derive(Debug)]
 pub struct SharedLsnFeedback {
     /// Last flushed LSN - data written to destination before commit
-    flushed_lsn: AtomicU64,
+    flushed_lsn: CachePadded<AtomicU64>,
     /// Last applied/replayed LSN - data committed to destination
-    applied_lsn: AtomicU64,
+    applied_lsn: CachePadded<AtomicU64>,
 }
 
 impl SharedLsnFeedback {
@@ -64,8 +64,8 @@ impl SharedLsnFeedback {
     /// ```
     pub fn new() -> Self {
         Self {
-            flushed_lsn: AtomicU64::new(0),
-            applied_lsn: AtomicU64::new(0),
+            flushed_lsn: CachePadded::new(AtomicU64::new(0)),
+            applied_lsn: CachePadded::new(AtomicU64::new(0)),
         }
     }
 
@@ -244,8 +244,8 @@ impl Default for SharedLsnFeedback {
 impl Clone for SharedLsnFeedback {
     fn clone(&self) -> Self {
         Self {
-            flushed_lsn: AtomicU64::new(self.flushed_lsn.load(Ordering::Acquire)),
-            applied_lsn: AtomicU64::new(self.applied_lsn.load(Ordering::Acquire)),
+            flushed_lsn: CachePadded::new(AtomicU64::new(self.flushed_lsn.load(Ordering::Acquire))),
+            applied_lsn: CachePadded::new(AtomicU64::new(self.applied_lsn.load(Ordering::Acquire))),
         }
     }
 }
