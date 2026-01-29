@@ -645,6 +645,11 @@ impl LogicalReplicationStream {
                         return Err(e);
                     }
 
+                    if e.is_permanent() {
+                        error!("Permanent error in event processing: {}", e);
+                        return Err(e);
+                    }
+
                     // Check if we've exhausted retry attempts
                     if attempt >= MAX_ATTEMPTS {
                         error!(
@@ -719,7 +724,7 @@ impl LogicalReplicationStream {
         }
 
         // Get the remaining bytes for message parsing
-        let message_data = reader.read_bytes(reader.remaining())?;
+        let message_data = reader.read_bytes_buf(reader.remaining())?;
         let replication_message = self.parser.parse_wal_message(&message_data)?;
         self.convert_to_change_event(replication_message, start_lsn)
     }
