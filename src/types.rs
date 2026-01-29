@@ -85,6 +85,12 @@ impl<T> std::ops::Deref for CachePadded<T> {
     }
 }
 
+impl<T> std::ops::DerefMut for CachePadded<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.value
+    }
+}
+
 /// Convert SystemTime to PostgreSQL timestamp format (microseconds since 2000-01-01)
 ///
 /// PostgreSQL uses a different epoch than Unix (2000-01-01 vs 1970-01-01).
@@ -872,6 +878,21 @@ mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn test_cache_padded_deref_and_mut() {
+        let mut padded = CachePadded::new(10u32);
+        assert_eq!(*padded, 10);
+        *padded = 42;
+        assert_eq!(*padded, 42);
+    }
+
+    #[test]
+    fn test_cache_padded_alignment() {
+        let padded = CachePadded::new(0u8);
+        let addr = (&*padded as *const u8 as usize) % std::mem::align_of::<CachePadded<u8>>();
+        assert_eq!(addr, 0);
+    }
 
     #[test]
     fn test_lsn_parsing() {
