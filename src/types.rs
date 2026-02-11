@@ -243,6 +243,7 @@ pub fn format_lsn(lsn: XLogRecPtr) -> String {
 
 /// PostgreSQL replica identity settings
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum ReplicaIdentity {
     /// Default replica identity (primary key)
     Default,
@@ -317,23 +318,6 @@ impl ReplicaIdentity {
             ReplicaIdentity::Full => b'f',
             ReplicaIdentity::Index => b'i',
         }
-    }
-}
-
-#[cfg(feature = "arbitrary")]
-impl<'a> arbitrary::Arbitrary<'a> for ReplicaIdentity {
-    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        let variant = u.int_in_range(0..=3)?;
-        Ok(match variant {
-            0 => ReplicaIdentity::Default,
-            1 => ReplicaIdentity::Nothing,
-            2 => ReplicaIdentity::Full,
-            _ => ReplicaIdentity::Index,
-        })
-    }
-
-    fn size_hint(_depth: usize) -> (usize, Option<usize>) {
-        (1, Some(1))
     }
 }
 
@@ -1111,5 +1095,101 @@ mod tests {
         let formatted = format_lsn(lsn);
         let parsed = parse_lsn(&formatted).unwrap();
         assert_eq!(parsed, lsn);
+    }
+}
+
+#[cfg(all(test, feature = "arbitrary"))]
+mod arbitrary_tests {
+    use super::*;
+    use arbitrary::{Arbitrary, Unstructured};
+
+    #[test]
+    fn test_cache_padded_arbitrary() {
+        let data: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let mut u = Unstructured::new(data);
+
+        // Generate multiple instances to verify consistency
+        for _ in 0..5 {
+            let result = CachePadded::<u32>::arbitrary(&mut u);
+            assert!(result.is_ok());
+            let padded = result.unwrap();
+            // Verify we can dereference the value
+            let _value: u32 = *padded;
+        }
+    }
+
+    #[test]
+    fn test_cache_padded_arbitrary_with_string() {
+        let data: &[u8] = &[5, b'h', b'e', b'l', b'l', b'o'];
+        let mut u = Unstructured::new(data);
+
+        let result = CachePadded::<String>::arbitrary(&mut u);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_replica_identity_arbitrary() {
+        let data: &[u8] = &[0, 1, 2, 3, 0, 1, 2, 3];
+        let mut u = Unstructured::new(data);
+
+        // Generate multiple instances and verify all variants can be produced
+        let mut seen_variants = std::collections::HashSet::new();
+        for _ in 0..10 {
+            if let Ok(identity) = ReplicaIdentity::arbitrary(&mut u) {
+                seen_variants.insert(identity.to_byte());
+            }
+        }
+
+        // With enough entropy, we should see at least one variant
+        assert!(!seen_variants.is_empty());
+    }
+
+    #[test]
+    fn test_replica_identity_arbitrary_generates_valid_variants() {
+        // Test with various entropy sources to cover different variants
+        let test_data: Vec<Vec<u8>> = vec![
+            (0..50).collect(),
+            (50..100).collect(),
+            (100..150).collect(),
+            (150..200).collect(),
+        ];
+
+        let mut seen = std::collections::HashSet::new();
+        for data in &test_data {
+            let mut u = Unstructured::new(data);
+            for _ in 0..10 {
+                if let Ok(identity) = ReplicaIdentity::arbitrary(&mut u) {
+                    // Verify the generated variant is valid
+                    let byte = identity.to_byte();
+                    assert!(
+                        byte == b'd' || byte == b'n' || byte == b'f' || byte == b'i',
+                        "Generated invalid ReplicaIdentity byte: {}",
+                        byte
+                    );
+                    seen.insert(byte);
+                }
+            }
+        }
+
+        // Should see at least some variants
+        assert!(
+            !seen.is_empty(),
+            "Should generate at least one ReplicaIdentity variant"
+        );
+    }
+
+    #[test]
+    fn test_replica_identity_roundtrip() {
+        let data: &[u8] = &[0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3];
+        let mut u = Unstructured::new(data);
+
+        for _ in 0..4 {
+            if let Ok(identity) = ReplicaIdentity::arbitrary(&mut u) {
+                // Verify roundtrip through byte conversion
+                let byte = identity.to_byte();
+                let recovered = ReplicaIdentity::from_byte(byte);
+                assert_eq!(recovered, Some(identity));
+            }
+        }
     }
 }

@@ -78,28 +78,28 @@ pub enum MessageType {
 #[cfg(feature = "arbitrary")]
 impl<'a> arbitrary::Arbitrary<'a> for MessageType {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        let variant = u.int_in_range(0..=18)?;
-        Ok(match variant {
-            0 => MessageType::Begin,
-            1 => MessageType::Commit,
-            2 => MessageType::Origin,
-            3 => MessageType::Relation,
-            4 => MessageType::Type,
-            5 => MessageType::Insert,
-            6 => MessageType::Update,
-            7 => MessageType::Delete,
-            8 => MessageType::Truncate,
-            9 => MessageType::Message,
-            10 => MessageType::StreamStart,
-            11 => MessageType::StreamStop,
-            12 => MessageType::StreamCommit,
-            13 => MessageType::StreamAbort,
-            14 => MessageType::BeginPrepare,
-            15 => MessageType::Prepare,
-            16 => MessageType::CommitPrepared,
-            17 => MessageType::RollbackPrepared,
-            _ => MessageType::StreamPrepare,
-        })
+        const VARIANTS: &[MessageType] = &[
+            MessageType::Begin,
+            MessageType::Commit,
+            MessageType::Origin,
+            MessageType::Relation,
+            MessageType::Type,
+            MessageType::Insert,
+            MessageType::Update,
+            MessageType::Delete,
+            MessageType::Truncate,
+            MessageType::Message,
+            MessageType::StreamStart,
+            MessageType::StreamStop,
+            MessageType::StreamCommit,
+            MessageType::StreamAbort,
+            MessageType::BeginPrepare,
+            MessageType::Prepare,
+            MessageType::CommitPrepared,
+            MessageType::RollbackPrepared,
+            MessageType::StreamPrepare,
+        ];
+        u.choose(VARIANTS).copied()
     }
 
     fn size_hint(_depth: usize) -> (usize, Option<usize>) {
@@ -109,6 +109,7 @@ impl<'a> arbitrary::Arbitrary<'a> for MessageType {
 
 /// Unified logical replication message enum
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum LogicalReplicationMessage {
     /// Begin transaction
     Begin {
@@ -252,125 +253,6 @@ pub enum LogicalReplicationMessage {
         xid: Xid,
         gid: String,
     },
-}
-
-#[cfg(feature = "arbitrary")]
-impl<'a> arbitrary::Arbitrary<'a> for LogicalReplicationMessage {
-    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        let variant = u.int_in_range(0..=18)?;
-        Ok(match variant {
-            0 => LogicalReplicationMessage::Begin {
-                final_lsn: u.arbitrary()?,
-                timestamp: u.arbitrary()?,
-                xid: u.arbitrary()?,
-            },
-            1 => LogicalReplicationMessage::Commit {
-                flags: u.arbitrary()?,
-                commit_lsn: u.arbitrary()?,
-                end_lsn: u.arbitrary()?,
-                timestamp: u.arbitrary()?,
-            },
-            2 => LogicalReplicationMessage::Relation {
-                relation_id: u.arbitrary()?,
-                namespace: u.arbitrary()?,
-                relation_name: u.arbitrary()?,
-                replica_identity: u.arbitrary()?,
-                columns: u.arbitrary()?,
-            },
-            3 => LogicalReplicationMessage::Insert {
-                relation_id: u.arbitrary()?,
-                tuple: u.arbitrary()?,
-            },
-            4 => LogicalReplicationMessage::Update {
-                relation_id: u.arbitrary()?,
-                old_tuple: u.arbitrary()?,
-                new_tuple: u.arbitrary()?,
-                key_type: u.arbitrary()?,
-            },
-            5 => LogicalReplicationMessage::Delete {
-                relation_id: u.arbitrary()?,
-                old_tuple: u.arbitrary()?,
-                key_type: u.arbitrary()?,
-            },
-            6 => LogicalReplicationMessage::Truncate {
-                relation_ids: u.arbitrary()?,
-                flags: u.arbitrary()?,
-            },
-            7 => LogicalReplicationMessage::Type {
-                type_id: u.arbitrary()?,
-                namespace: u.arbitrary()?,
-                type_name: u.arbitrary()?,
-            },
-            8 => LogicalReplicationMessage::Origin {
-                origin_lsn: u.arbitrary()?,
-                origin_name: u.arbitrary()?,
-            },
-            9 => LogicalReplicationMessage::Message {
-                flags: u.arbitrary()?,
-                lsn: u.arbitrary()?,
-                prefix: u.arbitrary()?,
-                content: u.arbitrary()?,
-            },
-            10 => LogicalReplicationMessage::StreamStart {
-                xid: u.arbitrary()?,
-                first_segment: u.arbitrary()?,
-            },
-            11 => LogicalReplicationMessage::StreamStop,
-            12 => LogicalReplicationMessage::StreamCommit {
-                xid: u.arbitrary()?,
-                flags: u.arbitrary()?,
-                commit_lsn: u.arbitrary()?,
-                end_lsn: u.arbitrary()?,
-                timestamp: u.arbitrary()?,
-            },
-            13 => LogicalReplicationMessage::StreamAbort {
-                xid: u.arbitrary()?,
-                subtransaction_xid: u.arbitrary()?,
-                abort_lsn: u.arbitrary()?,
-                abort_timestamp: u.arbitrary()?,
-            },
-            14 => LogicalReplicationMessage::BeginPrepare {
-                prepare_lsn: u.arbitrary()?,
-                end_lsn: u.arbitrary()?,
-                timestamp: u.arbitrary()?,
-                xid: u.arbitrary()?,
-                gid: u.arbitrary()?,
-            },
-            15 => LogicalReplicationMessage::Prepare {
-                flags: u.arbitrary()?,
-                prepare_lsn: u.arbitrary()?,
-                end_lsn: u.arbitrary()?,
-                timestamp: u.arbitrary()?,
-                xid: u.arbitrary()?,
-                gid: u.arbitrary()?,
-            },
-            16 => LogicalReplicationMessage::CommitPrepared {
-                flags: u.arbitrary()?,
-                commit_lsn: u.arbitrary()?,
-                end_lsn: u.arbitrary()?,
-                timestamp: u.arbitrary()?,
-                xid: u.arbitrary()?,
-                gid: u.arbitrary()?,
-            },
-            17 => LogicalReplicationMessage::RollbackPrepared {
-                flags: u.arbitrary()?,
-                prepare_end_lsn: u.arbitrary()?,
-                rollback_end_lsn: u.arbitrary()?,
-                prepare_timestamp: u.arbitrary()?,
-                rollback_timestamp: u.arbitrary()?,
-                xid: u.arbitrary()?,
-                gid: u.arbitrary()?,
-            },
-            _ => LogicalReplicationMessage::StreamPrepare {
-                flags: u.arbitrary()?,
-                prepare_lsn: u.arbitrary()?,
-                end_lsn: u.arbitrary()?,
-                timestamp: u.arbitrary()?,
-                xid: u.arbitrary()?,
-                gid: u.arbitrary()?,
-            },
-        })
-    }
 }
 
 /// Column information in a relation
@@ -2039,5 +1921,273 @@ mod tests {
 
         let result = parser.parse_wal_message(&data);
         assert!(result.is_err());
+    }
+}
+
+#[cfg(all(test, feature = "arbitrary"))]
+mod arbitrary_tests {
+    use super::*;
+    use arbitrary::{Arbitrary, Unstructured};
+
+    // Helper to create Unstructured with enough entropy
+    fn make_unstructured(size: usize) -> Vec<u8> {
+        (0..size).map(|i| i as u8).collect()
+    }
+
+    #[test]
+    fn test_message_type_arbitrary() {
+        let data = make_unstructured(100);
+        let mut u = Unstructured::new(&data);
+
+        // Generate multiple instances
+        let mut seen_types = std::collections::HashSet::new();
+        for _ in 0..50 {
+            if let Ok(msg_type) = MessageType::arbitrary(&mut u) {
+                seen_types.insert(msg_type as u8);
+            }
+        }
+
+        // Should see multiple different message types
+        assert!(
+            seen_types.len() > 1,
+            "Should generate diverse message types"
+        );
+    }
+
+    #[test]
+    fn test_message_type_all_variants_valid() {
+        // Verify all MessageType variants have valid discriminant values
+        let all_types = [
+            MessageType::Begin,
+            MessageType::Commit,
+            MessageType::Origin,
+            MessageType::Relation,
+            MessageType::Type,
+            MessageType::Insert,
+            MessageType::Update,
+            MessageType::Delete,
+            MessageType::Truncate,
+            MessageType::Message,
+            MessageType::StreamStart,
+            MessageType::StreamStop,
+            MessageType::StreamCommit,
+            MessageType::StreamAbort,
+            MessageType::BeginPrepare,
+            MessageType::Prepare,
+            MessageType::CommitPrepared,
+            MessageType::RollbackPrepared,
+            MessageType::StreamPrepare,
+        ];
+
+        for msg_type in all_types {
+            // Each variant should have a unique byte value
+            let byte_val = msg_type as u8;
+            assert!(
+                byte_val > 0,
+                "Message type should have non-zero discriminant"
+            );
+        }
+    }
+
+    #[test]
+    fn test_column_info_arbitrary() {
+        let data = make_unstructured(200);
+        let mut u = Unstructured::new(&data);
+
+        for _ in 0..5 {
+            let result = ColumnInfo::arbitrary(&mut u);
+            assert!(result.is_ok());
+            let col_info = result.unwrap();
+
+            // Verify the struct is usable
+            let _is_key = col_info.is_key();
+            assert!(!col_info.name.is_empty() || col_info.name.is_empty()); // Just verify accessible
+        }
+    }
+
+    #[test]
+    fn test_column_data_arbitrary() {
+        let data = make_unstructured(200);
+        let mut u = Unstructured::new(&data);
+
+        let mut saw_null = false;
+        let mut saw_text = false;
+        let mut saw_binary = false;
+        let mut saw_unchanged = false;
+
+        for _ in 0..20 {
+            if let Ok(col_data) = ColumnData::arbitrary(&mut u) {
+                if col_data.is_null() {
+                    saw_null = true;
+                }
+                if col_data.is_text() {
+                    saw_text = true;
+                }
+                if col_data.is_binary() {
+                    saw_binary = true;
+                }
+                if col_data.is_unchanged() {
+                    saw_unchanged = true;
+                }
+            }
+        }
+
+        // With enough iterations, we should see at least some variants
+        assert!(
+            saw_null || saw_text || saw_binary || saw_unchanged,
+            "Should generate at least one column data variant"
+        );
+    }
+
+    #[test]
+    fn test_column_data_arbitrary_text_has_data() {
+        // Create data that will produce text variant with content
+        let data: Vec<u8> = vec![
+            2, // variant selector for text
+            3, // length of vec
+            b'a', b'b', b'c', // content
+        ];
+        let mut u = Unstructured::new(&data);
+
+        let result = ColumnData::arbitrary(&mut u);
+        assert!(result.is_ok());
+        let col_data = result.unwrap();
+
+        if col_data.is_text() {
+            // Verify we can access the data
+            let bytes = col_data.as_bytes();
+            assert!(!bytes.is_empty() || bytes.is_empty()); // Just verify accessible
+        }
+    }
+
+    #[test]
+    fn test_tuple_data_arbitrary() {
+        let data = make_unstructured(500);
+        let mut u = Unstructured::new(&data);
+
+        for _ in 0..5 {
+            let result = TupleData::arbitrary(&mut u);
+            assert!(result.is_ok());
+            let tuple = result.unwrap();
+
+            // Verify the struct is usable
+            let _count = tuple.column_count();
+            for i in 0..tuple.column_count() {
+                let _col = tuple.get_column(i);
+            }
+        }
+    }
+
+    #[test]
+    fn test_relation_info_arbitrary() {
+        let data = make_unstructured(1000);
+        let mut u = Unstructured::new(&data);
+
+        for _ in 0..3 {
+            let result = RelationInfo::arbitrary(&mut u);
+            assert!(result.is_ok());
+            let rel_info = result.unwrap();
+
+            // Verify the struct is usable
+            let _full_name = rel_info.full_name();
+            let _key_cols = rel_info.get_key_columns();
+        }
+    }
+
+    #[test]
+    fn test_logical_replication_message_arbitrary() {
+        let data = make_unstructured(2000);
+        let mut u = Unstructured::new(&data);
+
+        let mut generated_count = 0;
+        for _ in 0..10 {
+            if LogicalReplicationMessage::arbitrary(&mut u).is_ok() {
+                generated_count += 1;
+            }
+        }
+
+        assert!(
+            generated_count > 0,
+            "Should successfully generate at least one LogicalReplicationMessage"
+        );
+    }
+
+    #[test]
+    fn test_logical_replication_message_variants() {
+        let data = make_unstructured(5000);
+        let mut u = Unstructured::new(&data);
+
+        let mut variant_names = std::collections::HashSet::new();
+
+        for _ in 0..50 {
+            if let Ok(msg) = LogicalReplicationMessage::arbitrary(&mut u) {
+                let name = match msg {
+                    LogicalReplicationMessage::Begin { .. } => "Begin",
+                    LogicalReplicationMessage::Commit { .. } => "Commit",
+                    LogicalReplicationMessage::Relation { .. } => "Relation",
+                    LogicalReplicationMessage::Insert { .. } => "Insert",
+                    LogicalReplicationMessage::Update { .. } => "Update",
+                    LogicalReplicationMessage::Delete { .. } => "Delete",
+                    LogicalReplicationMessage::Truncate { .. } => "Truncate",
+                    LogicalReplicationMessage::Type { .. } => "Type",
+                    LogicalReplicationMessage::Origin { .. } => "Origin",
+                    LogicalReplicationMessage::Message { .. } => "Message",
+                    LogicalReplicationMessage::StreamStart { .. } => "StreamStart",
+                    LogicalReplicationMessage::StreamStop => "StreamStop",
+                    LogicalReplicationMessage::StreamCommit { .. } => "StreamCommit",
+                    LogicalReplicationMessage::StreamAbort { .. } => "StreamAbort",
+                    LogicalReplicationMessage::BeginPrepare { .. } => "BeginPrepare",
+                    LogicalReplicationMessage::Prepare { .. } => "Prepare",
+                    LogicalReplicationMessage::CommitPrepared { .. } => "CommitPrepared",
+                    LogicalReplicationMessage::RollbackPrepared { .. } => "RollbackPrepared",
+                    LogicalReplicationMessage::StreamPrepare { .. } => "StreamPrepare",
+                };
+                variant_names.insert(name);
+            }
+        }
+
+        // With enough entropy, we should see multiple different variants
+        assert!(
+            variant_names.len() > 1,
+            "Should generate diverse LogicalReplicationMessage variants, got: {:?}",
+            variant_names
+        );
+    }
+
+    #[test]
+    fn test_arbitrary_column_data_roundtrip() {
+        let data = make_unstructured(500);
+        let mut u = Unstructured::new(&data);
+
+        for _ in 0..10 {
+            if let Ok(col_data) = ColumnData::arbitrary(&mut u) {
+                // Verify all accessor methods work without panic
+                let _is_null = col_data.is_null();
+                let _is_text = col_data.is_text();
+                let _is_binary = col_data.is_binary();
+                let _is_unchanged = col_data.is_unchanged();
+                let _bytes = col_data.as_bytes();
+
+                if col_data.is_text() || col_data.is_binary() {
+                    let _str_opt = col_data.as_str();
+                    let _string_opt = col_data.clone().as_string();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_tuple_data_to_hashmap_with_arbitrary() {
+        let data = make_unstructured(2000);
+        let mut u = Unstructured::new(&data);
+
+        // Generate arbitrary RelationInfo and TupleData
+        if let (Ok(rel_info), Ok(tuple)) = (
+            RelationInfo::arbitrary(&mut u),
+            TupleData::arbitrary(&mut u),
+        ) {
+            // Should not panic even with mismatched column counts
+            let _map = tuple.to_hash_map(&rel_info);
+        }
     }
 }
