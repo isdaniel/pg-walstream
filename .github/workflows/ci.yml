@@ -145,21 +145,6 @@ jobs:
         ports:
           - 5432:5432
 
-      mysql:
-        image: mysql:8.0
-        env:
-          MYSQL_ROOT_PASSWORD: test.123
-          MYSQL_DATABASE: cdc_db
-          MYSQL_USER: cdc_user
-          MYSQL_PASSWORD: test.123
-        options: >-
-          --health-cmd="mysqladmin ping"
-          --health-interval=10s
-          --health-timeout=5s
-          --health-retries=3
-        ports:
-          - 3306:3306
-
     steps:
     - uses: actions/checkout@v4
 
