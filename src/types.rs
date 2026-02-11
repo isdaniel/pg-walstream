@@ -91,6 +91,17 @@ impl<T> std::ops::DerefMut for CachePadded<T> {
     }
 }
 
+#[cfg(feature = "arbitrary")]
+impl<'a, T: arbitrary::Arbitrary<'a>> arbitrary::Arbitrary<'a> for CachePadded<T> {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        Ok(CachePadded::new(T::arbitrary(u)?))
+    }
+
+    fn size_hint(depth: usize) -> (usize, Option<usize>) {
+        T::size_hint(depth)
+    }
+}
+
 /// Convert SystemTime to PostgreSQL timestamp format (microseconds since 2000-01-01)
 ///
 /// PostgreSQL uses a different epoch than Unix (2000-01-01 vs 1970-01-01).
@@ -306,6 +317,23 @@ impl ReplicaIdentity {
             ReplicaIdentity::Full => b'f',
             ReplicaIdentity::Index => b'i',
         }
+    }
+}
+
+#[cfg(feature = "arbitrary")]
+impl<'a> arbitrary::Arbitrary<'a> for ReplicaIdentity {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        let variant = u.int_in_range(0..=3)?;
+        Ok(match variant {
+            0 => ReplicaIdentity::Default,
+            1 => ReplicaIdentity::Nothing,
+            2 => ReplicaIdentity::Full,
+            _ => ReplicaIdentity::Index,
+        })
+    }
+
+    fn size_hint(_depth: usize) -> (usize, Option<usize>) {
+        (1, Some(1))
     }
 }
 

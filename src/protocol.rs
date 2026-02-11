@@ -75,6 +75,38 @@ pub enum MessageType {
     StreamPrepare = message_types::STREAM_PREPARE,
 }
 
+#[cfg(feature = "arbitrary")]
+impl<'a> arbitrary::Arbitrary<'a> for MessageType {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        let variant = u.int_in_range(0..=18)?;
+        Ok(match variant {
+            0 => MessageType::Begin,
+            1 => MessageType::Commit,
+            2 => MessageType::Origin,
+            3 => MessageType::Relation,
+            4 => MessageType::Type,
+            5 => MessageType::Insert,
+            6 => MessageType::Update,
+            7 => MessageType::Delete,
+            8 => MessageType::Truncate,
+            9 => MessageType::Message,
+            10 => MessageType::StreamStart,
+            11 => MessageType::StreamStop,
+            12 => MessageType::StreamCommit,
+            13 => MessageType::StreamAbort,
+            14 => MessageType::BeginPrepare,
+            15 => MessageType::Prepare,
+            16 => MessageType::CommitPrepared,
+            17 => MessageType::RollbackPrepared,
+            _ => MessageType::StreamPrepare,
+        })
+    }
+
+    fn size_hint(_depth: usize) -> (usize, Option<usize>) {
+        (1, Some(1))
+    }
+}
+
 /// Unified logical replication message enum
 #[derive(Debug, Clone)]
 pub enum LogicalReplicationMessage {
@@ -222,8 +254,128 @@ pub enum LogicalReplicationMessage {
     },
 }
 
+#[cfg(feature = "arbitrary")]
+impl<'a> arbitrary::Arbitrary<'a> for LogicalReplicationMessage {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        let variant = u.int_in_range(0..=18)?;
+        Ok(match variant {
+            0 => LogicalReplicationMessage::Begin {
+                final_lsn: u.arbitrary()?,
+                timestamp: u.arbitrary()?,
+                xid: u.arbitrary()?,
+            },
+            1 => LogicalReplicationMessage::Commit {
+                flags: u.arbitrary()?,
+                commit_lsn: u.arbitrary()?,
+                end_lsn: u.arbitrary()?,
+                timestamp: u.arbitrary()?,
+            },
+            2 => LogicalReplicationMessage::Relation {
+                relation_id: u.arbitrary()?,
+                namespace: u.arbitrary()?,
+                relation_name: u.arbitrary()?,
+                replica_identity: u.arbitrary()?,
+                columns: u.arbitrary()?,
+            },
+            3 => LogicalReplicationMessage::Insert {
+                relation_id: u.arbitrary()?,
+                tuple: u.arbitrary()?,
+            },
+            4 => LogicalReplicationMessage::Update {
+                relation_id: u.arbitrary()?,
+                old_tuple: u.arbitrary()?,
+                new_tuple: u.arbitrary()?,
+                key_type: u.arbitrary()?,
+            },
+            5 => LogicalReplicationMessage::Delete {
+                relation_id: u.arbitrary()?,
+                old_tuple: u.arbitrary()?,
+                key_type: u.arbitrary()?,
+            },
+            6 => LogicalReplicationMessage::Truncate {
+                relation_ids: u.arbitrary()?,
+                flags: u.arbitrary()?,
+            },
+            7 => LogicalReplicationMessage::Type {
+                type_id: u.arbitrary()?,
+                namespace: u.arbitrary()?,
+                type_name: u.arbitrary()?,
+            },
+            8 => LogicalReplicationMessage::Origin {
+                origin_lsn: u.arbitrary()?,
+                origin_name: u.arbitrary()?,
+            },
+            9 => LogicalReplicationMessage::Message {
+                flags: u.arbitrary()?,
+                lsn: u.arbitrary()?,
+                prefix: u.arbitrary()?,
+                content: u.arbitrary()?,
+            },
+            10 => LogicalReplicationMessage::StreamStart {
+                xid: u.arbitrary()?,
+                first_segment: u.arbitrary()?,
+            },
+            11 => LogicalReplicationMessage::StreamStop,
+            12 => LogicalReplicationMessage::StreamCommit {
+                xid: u.arbitrary()?,
+                flags: u.arbitrary()?,
+                commit_lsn: u.arbitrary()?,
+                end_lsn: u.arbitrary()?,
+                timestamp: u.arbitrary()?,
+            },
+            13 => LogicalReplicationMessage::StreamAbort {
+                xid: u.arbitrary()?,
+                subtransaction_xid: u.arbitrary()?,
+                abort_lsn: u.arbitrary()?,
+                abort_timestamp: u.arbitrary()?,
+            },
+            14 => LogicalReplicationMessage::BeginPrepare {
+                prepare_lsn: u.arbitrary()?,
+                end_lsn: u.arbitrary()?,
+                timestamp: u.arbitrary()?,
+                xid: u.arbitrary()?,
+                gid: u.arbitrary()?,
+            },
+            15 => LogicalReplicationMessage::Prepare {
+                flags: u.arbitrary()?,
+                prepare_lsn: u.arbitrary()?,
+                end_lsn: u.arbitrary()?,
+                timestamp: u.arbitrary()?,
+                xid: u.arbitrary()?,
+                gid: u.arbitrary()?,
+            },
+            16 => LogicalReplicationMessage::CommitPrepared {
+                flags: u.arbitrary()?,
+                commit_lsn: u.arbitrary()?,
+                end_lsn: u.arbitrary()?,
+                timestamp: u.arbitrary()?,
+                xid: u.arbitrary()?,
+                gid: u.arbitrary()?,
+            },
+            17 => LogicalReplicationMessage::RollbackPrepared {
+                flags: u.arbitrary()?,
+                prepare_end_lsn: u.arbitrary()?,
+                rollback_end_lsn: u.arbitrary()?,
+                prepare_timestamp: u.arbitrary()?,
+                rollback_timestamp: u.arbitrary()?,
+                xid: u.arbitrary()?,
+                gid: u.arbitrary()?,
+            },
+            _ => LogicalReplicationMessage::StreamPrepare {
+                flags: u.arbitrary()?,
+                prepare_lsn: u.arbitrary()?,
+                end_lsn: u.arbitrary()?,
+                timestamp: u.arbitrary()?,
+                xid: u.arbitrary()?,
+                gid: u.arbitrary()?,
+            },
+        })
+    }
+}
+
 /// Column information in a relation
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct ColumnInfo {
     /// Column flags (bit 0 = key column)
     pub flags: u8,
@@ -255,6 +407,7 @@ impl ColumnInfo {
 
 /// Tuple (row) data
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct TupleData {
     pub columns: Vec<ColumnData>,
 }
@@ -414,8 +567,32 @@ impl ColumnData {
     }
 }
 
+#[cfg(feature = "arbitrary")]
+impl<'a> arbitrary::Arbitrary<'a> for ColumnData {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        let variant = u.int_in_range(0..=3)?;
+        Ok(match variant {
+            0 => ColumnData::null(),
+            1 => ColumnData::unchanged(),
+            2 => {
+                let data: Vec<u8> = u.arbitrary()?;
+                ColumnData::text(data)
+            }
+            _ => {
+                let data: Vec<u8> = u.arbitrary()?;
+                ColumnData::binary(data)
+            }
+        })
+    }
+
+    fn size_hint(depth: usize) -> (usize, Option<usize>) {
+        <Vec<u8> as arbitrary::Arbitrary>::size_hint(depth)
+    }
+}
+
 /// Information about a relation (table)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct RelationInfo {
     pub relation_id: Oid,
     pub namespace: String,
