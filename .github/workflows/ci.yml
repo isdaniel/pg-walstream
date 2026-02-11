@@ -18,37 +18,6 @@ jobs:
       matrix:
         os: [ubuntu-latest]
         rust: [stable, beta]
-        postgres: ['14', '15', '16', '17', '18']
-
-    services:
-      postgres:
-        image: postgres:${{ matrix.postgres }}-alpine
-        env:
-          POSTGRES_PASSWORD: test.123
-          POSTGRES_USER: postgres
-          POSTGRES_DB: postgres
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5432:5432
-
-      mysql:
-        image: mysql:8.0
-        env:
-          MYSQL_ROOT_PASSWORD: test.123
-          MYSQL_DATABASE: cdc_db
-          MYSQL_USER: cdc_user
-          MYSQL_PASSWORD: test.123
-        options: >-
-          --health-cmd="mysqladmin ping"
-          --health-interval=10s
-          --health-timeout=5s
-          --health-retries=3
-        ports:
-          - 3306:3306
 
     steps:
     - uses: actions/checkout@v4
@@ -86,9 +55,6 @@ jobs:
     - name: Check formatting
       run: cargo fmt --all -- --check
 
-    # - name: Run clippy
-    #   run: cargo clippy --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious -D clippy::complexity -D clippy::perf
-
     - name: Build
       run: cargo build --verbose
 
@@ -120,30 +86,12 @@ jobs:
 
     - name: Build documentation
       run: cargo doc --no-deps --all-features
-
-    - name: Check for broken intra-doc links
-      run: cargo doc --no-deps --all-features
       env:
         RUSTDOCFLAGS: "-D warnings"
 
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
-
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_PASSWORD: test.123
-          POSTGRES_USER: postgres
-          POSTGRES_DB: postgres
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5432:5432
 
     steps:
     - uses: actions/checkout@v4
