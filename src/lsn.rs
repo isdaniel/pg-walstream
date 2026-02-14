@@ -101,7 +101,6 @@ impl SharedLsnFeedback {
     ///
     /// This should be called when data has been written/flushed to the destination
     /// database, but not yet committed (e.g., during batch writes).
-    #[inline(always)]
     pub fn update_flushed_lsn(&self, lsn: XLogRecPtr) {
         if lsn == 0 {
             return;
@@ -135,7 +134,6 @@ impl SharedLsnFeedback {
     /// This should be called when a transaction has been successfully committed
     /// to the destination database. This is the most important LSN as PostgreSQL
     /// uses it to determine which WAL can be recycled.
-    #[inline(always)]
     pub fn update_applied_lsn(&self, lsn: XLogRecPtr) {
         if lsn == 0 {
             return;
@@ -413,5 +411,76 @@ mod tests {
 
         feedback.update_applied_lsn(0); // Should be ignored
         assert_eq!(feedback.get_applied_lsn(), 0);
+    }
+
+    #[test]
+    fn test_default_trait() {
+        let feedback = SharedLsnFeedback::default();
+        assert_eq!(feedback.get_flushed_lsn(), 0);
+        assert_eq!(feedback.get_applied_lsn(), 0);
+        let (f, a) = feedback.get_feedback_lsn();
+        assert_eq!(f, 0);
+        assert_eq!(a, 0);
+    }
+
+    #[test]
+    fn test_log_state() {
+        // Just ensure log_state doesn't panic
+        let feedback = SharedLsnFeedback::new();
+        feedback.update_flushed_lsn(1000);
+        feedback.update_applied_lsn(500);
+        feedback.log_state("test_prefix");
+    }
+
+    #[test]
+    fn test_clone_independence() {
+        let feedback = SharedLsnFeedback::new();
+        feedback.update_flushed_lsn(500);
+        feedback.update_applied_lsn(300);
+
+        let cloned = feedback.clone();
+
+        // Verify cloned has same initial values
+        assert_eq!(cloned.get_flushed_lsn(), 500);
+        assert_eq!(cloned.get_applied_lsn(), 300);
+
+        // Modify original
+        feedback.update_flushed_lsn(1000);
+        feedback.update_applied_lsn(800);
+
+        // Clone should not be affected
+        assert_eq!(cloned.get_flushed_lsn(), 500);
+        assert_eq!(cloned.get_applied_lsn(), 300);
+
+        // Modify clone
+        cloned.update_flushed_lsn(2000);
+        cloned.update_applied_lsn(1500);
+
+        // Original should not be affected
+        assert_eq!(feedback.get_flushed_lsn(), 1000);
+        assert_eq!(feedback.get_applied_lsn(), 800);
+    }
+
+    #[test]
+    fn test_log_state_with_nonzero_lsns() {
+        let feedback = SharedLsnFeedback::new();
+        feedback.update_flushed_lsn(0x16B374D848);
+        feedback.update_applied_lsn(0x16B374D800);
+        feedback.log_state("replication");
+    }
+
+    #[test]
+    fn test_equal_lsn_no_update() {
+        let feedback = SharedLsnFeedback::new();
+        feedback.update_flushed_lsn(100);
+        assert_eq!(feedback.get_flushed_lsn(), 100);
+
+        // Updating with the same value should not change anything
+        feedback.update_flushed_lsn(100);
+        assert_eq!(feedback.get_flushed_lsn(), 100);
+
+        feedback.update_applied_lsn(50);
+        feedback.update_applied_lsn(50);
+        assert_eq!(feedback.get_applied_lsn(), 50);
     }
 }

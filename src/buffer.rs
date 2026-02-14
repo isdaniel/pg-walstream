@@ -612,4 +612,203 @@ mod tests {
         assert!(reader.read_u8().is_err());
         assert!(reader.peek_u8().is_err());
     }
+
+    #[test]
+    fn test_buffer_reader_from_bytes() {
+        let bytes = Bytes::from_static(&[0x01, 0x02, 0x03]);
+        let mut reader = BufferReader::from_bytes(bytes);
+        assert_eq!(reader.read_u8().unwrap(), 0x01);
+        assert_eq!(reader.remaining(), 2);
+    }
+
+    #[test]
+    fn test_buffer_reader_from_vec_full() {
+        let data = vec![0xAA, 0xBB, 0xCC, 0xDD];
+        let mut reader = BufferReader::from_vec(data);
+        assert_eq!(reader.read_u32().unwrap(), 0xAABBCCDD);
+        assert_eq!(reader.remaining(), 0);
+    }
+
+    #[test]
+    fn test_buffer_writer_write_i16() {
+        let mut writer = BufferWriter::new();
+        writer.write_i16(0x1234).unwrap();
+        let data = writer.freeze();
+        assert_eq!(&data[..], &[0x12, 0x34]);
+    }
+
+    #[test]
+    fn test_buffer_writer_write_i32() {
+        let mut writer = BufferWriter::new();
+        writer.write_i32(0x12345678).unwrap();
+        let data = writer.freeze();
+        assert_eq!(&data[..], &[0x12, 0x34, 0x56, 0x78]);
+    }
+
+    #[test]
+    fn test_buffer_writer_write_i64() {
+        let mut writer = BufferWriter::new();
+        writer.write_i64(0x0102030405060708).unwrap();
+        let data = writer.freeze();
+        assert_eq!(&data[..], &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+    }
+
+    #[test]
+    fn test_buffer_writer_write_cstring() {
+        let mut writer = BufferWriter::new();
+        writer.write_cstring("test").unwrap();
+        let data = writer.freeze();
+        assert_eq!(&data[..], b"test\x00");
+    }
+
+    #[test]
+    fn test_buffer_writer_write_string() {
+        let mut writer = BufferWriter::new();
+        writer.write_string("hello").unwrap();
+        let data = writer.freeze();
+        assert_eq!(&data[..], b"hello");
+    }
+
+    #[test]
+    fn test_buffer_writer_reserve() {
+        let mut writer = BufferWriter::new();
+        writer.reserve(1024);
+        assert!(writer.capacity() >= 1024);
+    }
+
+    #[test]
+    fn test_buffer_writer_clear() {
+        let mut writer = BufferWriter::new();
+        writer.write_u8(0x01).unwrap();
+        writer.write_u8(0x02).unwrap();
+        assert_eq!(writer.bytes_written(), 2);
+
+        writer.clear();
+        assert_eq!(writer.bytes_written(), 0);
+        assert_eq!(writer.position(), 0);
+    }
+
+    #[test]
+    fn test_buffer_writer_capacity() {
+        let writer = BufferWriter::with_capacity(256);
+        assert!(writer.capacity() >= 256);
+    }
+
+    #[test]
+    fn test_buffer_writer_as_bytes() {
+        let mut writer = BufferWriter::new();
+        writer.write_u8(0xAA).unwrap();
+        writer.write_u8(0xBB).unwrap();
+        assert_eq!(writer.as_bytes(), &[0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn test_buffer_writer_as_ref() {
+        let mut writer = BufferWriter::new();
+        writer.write_u8(0x01).unwrap();
+        let slice: &[u8] = writer.as_ref();
+        assert_eq!(slice, &[0x01]);
+    }
+
+    #[test]
+    fn test_buffer_writer_default() {
+        let mut writer = BufferWriter::default();
+        writer.write_u8(0xFF).unwrap();
+        assert_eq!(writer.bytes_written(), 1);
+    }
+
+    #[test]
+    fn test_buffer_writer_into_vec() {
+        let mut writer = BufferWriter::new();
+        writer.write_u8(0x01).unwrap();
+        writer.write_u16(0x0203).unwrap();
+        let vec = writer.into_vec();
+        assert_eq!(vec, vec![0x01, 0x02, 0x03]);
+    }
+
+    #[test]
+    fn test_buffer_reader_u64() {
+        let data = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        let mut reader = BufferReader::new(&data);
+        assert_eq!(reader.read_u64().unwrap(), 0x0102030405060708);
+    }
+
+    #[test]
+    fn test_buffer_reader_position() {
+        let data = [0x01, 0x02, 0x03, 0x04];
+        let reader = BufferReader::new(&data);
+        // position returns data.len() which is the remaining bytes
+        assert_eq!(reader.position(), 4);
+    }
+
+    #[test]
+    fn test_buffer_writer_position() {
+        let mut writer = BufferWriter::new();
+        assert_eq!(writer.position(), 0);
+        writer.write_u32(0x12345678).unwrap();
+        assert_eq!(writer.position(), 4);
+    }
+
+    #[test]
+    fn test_buffer_roundtrip_complex() {
+        let mut writer = BufferWriter::new();
+        writer.write_u8(0x42).unwrap();
+        writer.write_u16(0x1234).unwrap();
+        writer.write_u32(0xDEADBEEF).unwrap();
+        writer.write_u64(0xCAFEBABE12345678).unwrap();
+        writer.write_i16(-100).unwrap();
+        writer.write_i32(-200).unwrap();
+        writer.write_i64(-300).unwrap();
+        writer.write_cstring("hello").unwrap();
+        writer.write_bytes(&[0x01, 0x02]).unwrap();
+
+        let data = writer.freeze();
+        let mut reader = BufferReader::from_bytes(data);
+
+        assert_eq!(reader.read_u8().unwrap(), 0x42);
+        assert_eq!(reader.read_u16().unwrap(), 0x1234);
+        assert_eq!(reader.read_u32().unwrap(), 0xDEADBEEF);
+        assert_eq!(reader.read_u64().unwrap(), 0xCAFEBABE12345678);
+        assert_eq!(reader.read_i16().unwrap(), -100);
+        assert_eq!(reader.read_i32().unwrap(), -200);
+        assert_eq!(reader.read_i64().unwrap(), -300);
+        assert_eq!(reader.read_cstring().unwrap(), "hello");
+        assert_eq!(reader.read_bytes(2).unwrap(), vec![0x01, 0x02]);
+        assert_eq!(reader.remaining(), 0);
+    }
+
+    #[test]
+    fn test_buffer_reader_skip_insufficient() {
+        let data = [0x01, 0x02];
+        let mut reader = BufferReader::new(&data);
+        assert!(reader.skip(5).is_err());
+    }
+
+    #[test]
+    fn test_buffer_reader_read_string_insufficient() {
+        let data = [0x01, 0x02];
+        let mut reader = BufferReader::new(&data);
+        assert!(reader.read_string(5).is_err());
+    }
+
+    #[test]
+    fn test_buffer_reader_read_bytes_insufficient() {
+        let data = [0x01];
+        let mut reader = BufferReader::new(&data);
+        assert!(reader.read_bytes(5).is_err());
+    }
+
+    #[test]
+    fn test_buffer_reader_read_bytes_buf_insufficient() {
+        let data = [0x01];
+        let mut reader = BufferReader::new(&data);
+        assert!(reader.read_bytes_buf(5).is_err());
+    }
+
+    #[test]
+    fn test_buffer_reader_skip_message_type_empty() {
+        let data: &[u8] = &[];
+        let mut reader = BufferReader::new(data);
+        assert!(reader.skip_message_type().is_err());
+    }
 }

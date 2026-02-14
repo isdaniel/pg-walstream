@@ -2531,10 +2531,6 @@ mod tests {
         assert_eq!(config.health_check_interval, Duration::from_secs(15));
     }
 
-    // ========================================
-    // ReplicationState Advanced Tests
-    // ========================================
-
     #[test]
     fn test_replication_state_lsn_tracking() {
         let mut state = ReplicationState::new();
@@ -3450,5 +3446,1690 @@ mod tests {
         // Test with single bits
         assert_eq!(hex_encode(&[0x01, 0x02, 0x04, 0x08]), "01020408");
         assert_eq!(hex_encode(&[0x10, 0x20, 0x40, 0x80]), "10204080");
+    }
+
+    #[test]
+    fn test_streaming_mode_as_str_off() {
+        assert_eq!(StreamingMode::Off.as_str(), "off");
+    }
+
+    #[test]
+    fn test_streaming_mode_as_str_on() {
+        assert_eq!(StreamingMode::On.as_str(), "on");
+    }
+
+    #[test]
+    fn test_streaming_mode_as_str_parallel() {
+        assert_eq!(StreamingMode::Parallel.as_str(), "parallel");
+    }
+
+    #[test]
+    fn test_streaming_mode_eq_and_copy() {
+        let a = StreamingMode::On;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        assert_ne!(StreamingMode::Off, StreamingMode::On);
+    }
+
+    #[test]
+    fn test_origin_filter_as_str_none() {
+        assert_eq!(OriginFilter::None.as_str(), "none");
+    }
+
+    #[test]
+    fn test_origin_filter_as_str_any() {
+        assert_eq!(OriginFilter::Any.as_str(), "any");
+    }
+
+    #[test]
+    fn test_origin_filter_eq_and_copy() {
+        let a = OriginFilter::None;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        assert_ne!(OriginFilter::None, OriginFilter::Any);
+    }
+
+    #[test]
+    fn test_config_with_messages() {
+        let config = create_test_config().with_messages(true);
+        assert!(config.messages);
+
+        let config2 = config.with_messages(false);
+        assert!(!config2.messages);
+    }
+
+    #[test]
+    fn test_config_with_binary() {
+        let config = create_test_config().with_binary(true);
+        assert!(config.binary);
+    }
+
+    #[test]
+    fn test_config_with_two_phase() {
+        let config = create_test_config().with_two_phase(true);
+        assert!(config.two_phase);
+    }
+
+    #[test]
+    fn test_config_with_origin_none() {
+        let config = create_test_config().with_origin(Some(OriginFilter::None));
+        assert_eq!(config.origin, Some(OriginFilter::None));
+    }
+
+    #[test]
+    fn test_config_with_origin_any() {
+        let config = create_test_config().with_origin(Some(OriginFilter::Any));
+        assert_eq!(config.origin, Some(OriginFilter::Any));
+    }
+
+    #[test]
+    fn test_config_with_origin_unset() {
+        let config = create_test_config().with_origin(None);
+        assert!(config.origin.is_none());
+    }
+
+    #[test]
+    fn test_config_with_streaming_mode() {
+        let config = create_test_config().with_streaming_mode(StreamingMode::Off);
+        assert_eq!(config.streaming_mode, StreamingMode::Off);
+
+        let config2 = config.with_streaming_mode(StreamingMode::Parallel);
+        assert_eq!(config2.streaming_mode, StreamingMode::Parallel);
+    }
+
+    #[test]
+    fn test_config_builder_chain() {
+        let config = create_test_config()
+            .with_messages(true)
+            .with_binary(true)
+            .with_two_phase(true)
+            .with_origin(Some(OriginFilter::None))
+            .with_streaming_mode(StreamingMode::Parallel);
+
+        assert!(config.messages);
+        assert!(config.binary);
+        assert!(config.two_phase);
+        assert_eq!(config.origin, Some(OriginFilter::None));
+        assert_eq!(config.streaming_mode, StreamingMode::Parallel);
+    }
+
+    #[test]
+    fn test_tuple_to_data_with_binary_column() {
+        use crate::protocol::{ColumnData, ColumnInfo, RelationInfo, TupleData};
+
+        let columns = vec![
+            ColumnInfo::new(0, "binary_col".to_string(), 17, -1), // bytea
+        ];
+        let relation = RelationInfo::new(1, "public".to_string(), "t".to_string(), b'd', columns);
+
+        let tuple = TupleData::new(vec![ColumnData::binary(vec![0xDE, 0xAD, 0xBE, 0xEF])]);
+
+        let data = tuple_to_data(&tuple, &relation).unwrap();
+        let val = data.get("binary_col").unwrap().as_str().unwrap();
+        assert_eq!(val, "\\xdeadbeef");
+    }
+
+    #[test]
+    fn test_tuple_to_data_with_null_column() {
+        use crate::protocol::{ColumnData, ColumnInfo, RelationInfo, TupleData};
+
+        let columns = vec![ColumnInfo::new(0, "nullable".to_string(), 25, -1)];
+        let relation = RelationInfo::new(1, "public".to_string(), "t".to_string(), b'd', columns);
+
+        let tuple = TupleData::new(vec![ColumnData::null()]);
+
+        let data = tuple_to_data(&tuple, &relation).unwrap();
+        assert_eq!(data.get("nullable").unwrap(), &serde_json::Value::Null);
+    }
+
+    #[test]
+    fn test_tuple_to_data_skips_unchanged_columns_detailed() {
+        use crate::protocol::{ColumnData, ColumnInfo, RelationInfo, TupleData};
+
+        let columns = vec![
+            ColumnInfo::new(0, "id".to_string(), 23, -1),
+            ColumnInfo::new(0, "unchanged_col".to_string(), 25, -1),
+            ColumnInfo::new(0, "updated".to_string(), 25, -1),
+        ];
+        let relation = RelationInfo::new(1, "public".to_string(), "t".to_string(), b'd', columns);
+
+        let tuple = TupleData::new(vec![
+            ColumnData::text(b"1".to_vec()),
+            ColumnData::unchanged(),
+            ColumnData::text(b"new_value".to_vec()),
+        ]);
+
+        let data = tuple_to_data(&tuple, &relation).unwrap();
+        assert_eq!(data.len(), 2);
+        assert!(data.contains_key("id"));
+        assert!(!data.contains_key("unchanged_col"));
+        assert!(data.contains_key("updated"));
+    }
+
+    #[test]
+    fn test_tuple_to_data_empty_tuple() {
+        use crate::protocol::{ColumnInfo, RelationInfo, TupleData};
+
+        let columns: Vec<ColumnInfo> = vec![];
+        let relation = RelationInfo::new(1, "public".to_string(), "t".to_string(), b'd', columns);
+        let tuple = TupleData::new(vec![]);
+
+        let data = tuple_to_data(&tuple, &relation).unwrap();
+        assert!(data.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_timeout_or_error_success() {
+        let result = timeout_or_error(Duration::from_secs(5), async {
+            Ok::<_, ReplicationError>(42)
+        })
+        .await;
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn test_timeout_or_error_inner_error() {
+        let result = timeout_or_error(Duration::from_secs(5), async {
+            Err::<i32, _>(ReplicationError::generic("inner error".to_string()))
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("inner error"));
+    }
+
+    #[tokio::test]
+    async fn test_timeout_or_error_timeout() {
+        let result = timeout_or_error(Duration::from_millis(1), async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Ok::<_, ReplicationError>(42)
+        })
+        .await;
+        assert!(matches!(result, Err(ReplicationError::Timeout(_))));
+    }
+
+    #[test]
+    fn test_streaming_mode_debug() {
+        let debug = format!("{:?}", StreamingMode::On);
+        assert_eq!(debug, "On");
+
+        let debug = format!("{:?}", StreamingMode::Off);
+        assert_eq!(debug, "Off");
+
+        let debug = format!("{:?}", StreamingMode::Parallel);
+        assert_eq!(debug, "Parallel");
+    }
+
+    #[test]
+    fn test_origin_filter_debug() {
+        let debug = format!("{:?}", OriginFilter::None);
+        assert_eq!(debug, "None");
+
+        let debug = format!("{:?}", OriginFilter::Any);
+        assert_eq!(debug, "Any");
+    }
+
+    #[test]
+    fn test_config_debug() {
+        let config = create_test_config();
+        let debug = format!("{:?}", config);
+        assert!(debug.contains("test_slot"));
+        assert!(debug.contains("test_publication"));
+    }
+
+    #[test]
+    fn test_config_default_optional_fields() {
+        let config = create_test_config();
+        assert!(!config.messages);
+        assert!(!config.binary);
+        assert!(!config.two_phase);
+        assert!(config.origin.is_none());
+    }
+
+    /// Helper to create a LogicalReplicationStream for testing without a DB connection.
+    /// Only safe for testing methods that don't touch self.connection.
+    fn create_test_stream(config: ReplicationStreamConfig) -> LogicalReplicationStream {
+        use crate::lsn::SharedLsnFeedback;
+        LogicalReplicationStream {
+            connection: PgReplicationConnection::null_for_testing(),
+            parser: LogicalReplicationParser::with_protocol_version(config.protocol_version),
+            state: ReplicationState::new(),
+            config: config.clone(),
+            slot_created: false,
+            retry_handler: ReplicationConnectionRetry::new(
+                config.retry_config,
+                "postgresql://test@localhost/test?replication=database".to_string(),
+            ),
+            last_health_check: Instant::now(),
+            shared_lsn_feedback: SharedLsnFeedback::new_shared(),
+        }
+    }
+
+    #[test]
+    fn test_validate_replication_options_valid_v1() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            1,
+            StreamingMode::Off,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        );
+        let stream = create_test_stream(config);
+        assert!(stream.validate_replication_options().is_ok());
+    }
+
+    #[test]
+    fn test_validate_replication_options_valid_v2_streaming() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            2,
+            StreamingMode::On,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        );
+        let stream = create_test_stream(config);
+        assert!(stream.validate_replication_options().is_ok());
+    }
+
+    #[test]
+    fn test_validate_replication_options_invalid_version() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            5,
+            StreamingMode::Off,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        );
+        let stream = create_test_stream(config);
+        let err = stream.validate_replication_options().unwrap_err();
+        assert!(err.to_string().contains("Unsupported protocol version: 5"));
+    }
+
+    #[test]
+    fn test_validate_streaming_on_requires_v2() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            1,
+            StreamingMode::On,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        );
+        let stream = create_test_stream(config);
+        let err = stream.validate_replication_options().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("streaming=on requires protocol version >= 2"));
+    }
+
+    #[test]
+    fn test_validate_streaming_parallel_requires_v4() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            3,
+            StreamingMode::Parallel,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        );
+        let stream = create_test_stream(config);
+        let err = stream.validate_replication_options().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("streaming=parallel requires protocol version >= 4"));
+    }
+
+    #[test]
+    fn test_validate_two_phase_requires_v3() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            2,
+            StreamingMode::Off,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        )
+        .with_two_phase(true);
+        let stream = create_test_stream(config);
+        let err = stream.validate_replication_options().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("two_phase requires protocol version >= 3"));
+    }
+
+    #[test]
+    fn test_validate_two_phase_v3_ok() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            3,
+            StreamingMode::Off,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        )
+        .with_two_phase(true);
+        let stream = create_test_stream(config);
+        assert!(stream.validate_replication_options().is_ok());
+    }
+
+    #[test]
+    fn test_validate_streaming_parallel_v4_ok() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            4,
+            StreamingMode::Parallel,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        );
+        let stream = create_test_stream(config);
+        assert!(stream.validate_replication_options().is_ok());
+    }
+
+    #[test]
+    fn test_build_replication_options_basic() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            1,
+            StreamingMode::Off,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        );
+        let stream = create_test_stream(config);
+        let options = stream.build_replication_options().unwrap();
+        assert_eq!(options.len(), 2);
+        assert_eq!(options[0].0, "proto_version");
+        assert_eq!(options[0].1, "1");
+        assert_eq!(options[1].0, "publication_names");
+        assert_eq!(options[1].1, "\"pub\"");
+    }
+
+    #[test]
+    fn test_build_replication_options_with_streaming() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            2,
+            StreamingMode::On,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        );
+        let stream = create_test_stream(config);
+        let options = stream.build_replication_options().unwrap();
+        assert!(options.iter().any(|(k, v)| k == "streaming" && v == "on"));
+    }
+
+    #[test]
+    fn test_build_replication_options_with_all_flags() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            4,
+            StreamingMode::Parallel,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        )
+        .with_messages(true)
+        .with_binary(true)
+        .with_two_phase(true)
+        .with_origin(Some(OriginFilter::None));
+
+        let stream = create_test_stream(config);
+        let options = stream.build_replication_options().unwrap();
+
+        assert!(options
+            .iter()
+            .any(|(k, v)| k == "streaming" && v == "parallel"));
+        assert!(options.iter().any(|(k, v)| k == "messages" && v == "on"));
+        assert!(options.iter().any(|(k, v)| k == "binary" && v == "on"));
+        assert!(options.iter().any(|(k, v)| k == "two_phase" && v == "on"));
+        assert!(options.iter().any(|(k, v)| k == "origin" && v == "none"));
+    }
+
+    #[test]
+    fn test_build_replication_options_invalid_version() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            99,
+            StreamingMode::Off,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        );
+        let stream = create_test_stream(config);
+        assert!(stream.build_replication_options().is_err());
+    }
+
+    #[test]
+    fn test_get_key_columns_for_relation_k_type() {
+        use crate::protocol::{ColumnInfo, RelationInfo};
+        let columns = vec![
+            ColumnInfo::new(1, "id".to_string(), 23, -1),    // key
+            ColumnInfo::new(0, "name".to_string(), 25, -1),  // not key
+            ColumnInfo::new(1, "email".to_string(), 25, -1), // key
+        ];
+        let relation =
+            RelationInfo::new(1, "public".to_string(), "users".to_string(), b'd', columns);
+
+        let stream = create_test_stream(create_test_config());
+        let keys = stream.get_key_columns_for_relation(&relation, Some('K'));
+        assert_eq!(keys, vec!["id".to_string(), "email".to_string()]);
+    }
+
+    #[test]
+    fn test_get_key_columns_for_relation_o_type() {
+        use crate::protocol::{ColumnInfo, RelationInfo};
+        let columns = vec![
+            ColumnInfo::new(1, "id".to_string(), 23, -1),
+            ColumnInfo::new(0, "name".to_string(), 25, -1),
+        ];
+        let relation =
+            RelationInfo::new(1, "public".to_string(), "users".to_string(), b'f', columns);
+
+        let stream = create_test_stream(create_test_config());
+        let keys = stream.get_key_columns_for_relation(&relation, Some('O'));
+        // 'O' means full old row, return ALL column names
+        assert_eq!(keys, vec!["id".to_string(), "name".to_string()]);
+    }
+
+    #[test]
+    fn test_get_key_columns_for_relation_none_with_keys() {
+        use crate::protocol::{ColumnInfo, RelationInfo};
+        let columns = vec![
+            ColumnInfo::new(1, "id".to_string(), 23, -1),
+            ColumnInfo::new(0, "name".to_string(), 25, -1),
+        ];
+        let relation =
+            RelationInfo::new(1, "public".to_string(), "users".to_string(), b'd', columns);
+
+        let stream = create_test_stream(create_test_config());
+        let keys = stream.get_key_columns_for_relation(&relation, None);
+        // Falls back to key columns from relation
+        assert_eq!(keys, vec!["id".to_string()]);
+    }
+
+    #[test]
+    fn test_get_key_columns_for_relation_none_no_keys() {
+        use crate::protocol::{ColumnInfo, RelationInfo};
+        let columns = vec![
+            ColumnInfo::new(0, "data1".to_string(), 25, -1),
+            ColumnInfo::new(0, "data2".to_string(), 25, -1),
+        ];
+        let relation = RelationInfo::new(1, "public".to_string(), "t".to_string(), b'n', columns);
+
+        let stream = create_test_stream(create_test_config());
+        let keys = stream.get_key_columns_for_relation(&relation, None);
+        // No key columns, and no flagged key columns, should return empty
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn test_get_key_columns_for_relation_unknown_type() {
+        use crate::protocol::{ColumnInfo, RelationInfo};
+        let columns = vec![
+            ColumnInfo::new(1, "id".to_string(), 23, -1),
+            ColumnInfo::new(0, "name".to_string(), 25, -1),
+        ];
+        let relation =
+            RelationInfo::new(1, "public".to_string(), "users".to_string(), b'd', columns);
+
+        let stream = create_test_stream(create_test_config());
+        let keys = stream.get_key_columns_for_relation(&relation, Some('X'));
+        assert_eq!(keys, vec!["id".to_string()]);
+    }
+
+    #[test]
+    fn test_relation_metadata() {
+        use crate::protocol::{ColumnInfo, RelationInfo};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        let relation = RelationInfo::new(
+            100,
+            "myschema".to_string(),
+            "mytable".to_string(),
+            b'd',
+            vec![
+                ColumnInfo::new(1, "pk_col".to_string(), 23, -1),
+                ColumnInfo::new(0, "data_col".to_string(), 25, -1),
+            ],
+        );
+        stream.state.add_relation(relation);
+
+        let (schema, table, replica_id, key_cols, _rel) =
+            stream.relation_metadata(100, Some('K')).unwrap();
+        assert_eq!(schema, "myschema");
+        assert_eq!(table, "mytable");
+        assert_eq!(replica_id, ReplicaIdentity::Default);
+        assert_eq!(key_cols, vec!["pk_col".to_string()]);
+    }
+
+    #[test]
+    fn test_relation_metadata_missing() {
+        let stream = create_test_stream(create_test_config());
+        assert!(stream.relation_metadata(999, None).is_none());
+    }
+
+    #[test]
+    fn test_convert_to_change_event_begin() {
+        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Begin {
+            final_lsn: 0x1000,
+            timestamp: 0,
+            xid: 42,
+        });
+
+        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        assert!(result.is_some());
+        let event = result.unwrap();
+        match event.event_type {
+            EventType::Begin { transaction_id, .. } => {
+                assert_eq!(transaction_id, 42);
+            }
+            _ => panic!("Expected Begin event"),
+        }
+    }
+
+    #[test]
+    fn test_convert_to_change_event_commit() {
+        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Commit {
+            flags: 0,
+            commit_lsn: 0x2000,
+            end_lsn: 0x2100,
+            timestamp: 0,
+        });
+
+        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        assert!(result.is_some());
+        let event = result.unwrap();
+        match event.event_type {
+            EventType::Commit {
+                commit_lsn,
+                end_lsn,
+                ..
+            } => {
+                assert_eq!(commit_lsn.0, 0x2000);
+                assert_eq!(end_lsn.0, 0x2100);
+            }
+            _ => panic!("Expected Commit event"),
+        }
+    }
+
+    #[test]
+    fn test_convert_to_change_event_relation() {
+        use crate::protocol::ColumnInfo;
+        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Relation {
+            relation_id: 100,
+            namespace: "public".to_string(),
+            relation_name: "test_table".to_string(),
+            replica_identity: b'd',
+            columns: vec![ColumnInfo::new(1, "id".to_string(), 23, -1)],
+        });
+
+        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        // Relation messages return None (they update internal state)
+        assert!(result.is_none());
+        // But the relation should be stored in state
+        assert!(stream.state.get_relation(100).is_some());
+    }
+
+    #[test]
+    fn test_convert_to_change_event_insert() {
+        use crate::protocol::{ColumnData, ColumnInfo, RelationInfo, TupleData};
+        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        // First add a relation
+        let relation = RelationInfo::new(
+            100,
+            "public".to_string(),
+            "users".to_string(),
+            b'd',
+            vec![
+                ColumnInfo::new(1, "id".to_string(), 23, -1),
+                ColumnInfo::new(0, "name".to_string(), 25, -1),
+            ],
+        );
+        stream.state.add_relation(relation);
+
+        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Insert {
+            relation_id: 100,
+            tuple: TupleData::new(vec![
+                ColumnData::text(b"1".to_vec()),
+                ColumnData::text(b"Alice".to_vec()),
+            ]),
+        });
+
+        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        assert!(result.is_some());
+        let event = result.unwrap();
+        match event.event_type {
+            EventType::Insert {
+                schema,
+                table,
+                data,
+                ..
+            } => {
+                assert_eq!(schema, "public");
+                assert_eq!(table, "users");
+                assert_eq!(data.get("id").unwrap(), "1");
+                assert_eq!(data.get("name").unwrap(), "Alice");
+            }
+            _ => panic!("Expected Insert event"),
+        }
+    }
+
+    #[test]
+    fn test_convert_to_change_event_insert_unknown_relation() {
+        use crate::protocol::{ColumnData, TupleData};
+        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Insert {
+            relation_id: 999, // Unknown
+            tuple: TupleData::new(vec![ColumnData::text(b"1".to_vec())]),
+        });
+
+        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_convert_to_change_event_update_with_old() {
+        use crate::protocol::{ColumnData, ColumnInfo, RelationInfo, TupleData};
+        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        let relation = RelationInfo::new(
+            100,
+            "public".to_string(),
+            "users".to_string(),
+            b'd',
+            vec![
+                ColumnInfo::new(1, "id".to_string(), 23, -1),
+                ColumnInfo::new(0, "name".to_string(), 25, -1),
+            ],
+        );
+        stream.state.add_relation(relation);
+
+        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Update {
+            relation_id: 100,
+            old_tuple: Some(TupleData::new(vec![
+                ColumnData::text(b"1".to_vec()),
+                ColumnData::text(b"Old".to_vec()),
+            ])),
+            new_tuple: TupleData::new(vec![
+                ColumnData::text(b"1".to_vec()),
+                ColumnData::text(b"New".to_vec()),
+            ]),
+            key_type: Some('O'),
+        });
+
+        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        assert!(result.is_some());
+        let event = result.unwrap();
+        match event.event_type {
+            EventType::Update {
+                old_data,
+                new_data,
+                key_columns,
+                ..
+            } => {
+                assert!(old_data.is_some());
+                assert_eq!(new_data.get("name").unwrap(), "New");
+                assert_eq!(key_columns, vec!["id".to_string(), "name".to_string()]);
+                // 'O' = all columns
+            }
+            _ => panic!("Expected Update event"),
+        }
+    }
+
+    #[test]
+    fn test_convert_to_change_event_update_unknown_relation() {
+        use crate::protocol::{ColumnData, TupleData};
+        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Update {
+            relation_id: 999,
+            old_tuple: None,
+            new_tuple: TupleData::new(vec![ColumnData::text(b"1".to_vec())]),
+            key_type: None,
+        });
+
+        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_convert_to_change_event_delete() {
+        use crate::protocol::{ColumnData, ColumnInfo, RelationInfo, TupleData};
+        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        let relation = RelationInfo::new(
+            100,
+            "public".to_string(),
+            "users".to_string(),
+            b'd',
+            vec![
+                ColumnInfo::new(1, "id".to_string(), 23, -1),
+                ColumnInfo::new(0, "name".to_string(), 25, -1),
+            ],
+        );
+        stream.state.add_relation(relation);
+
+        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Delete {
+            relation_id: 100,
+            old_tuple: TupleData::new(vec![
+                ColumnData::text(b"1".to_vec()),
+                ColumnData::text(b"Alice".to_vec()),
+            ]),
+            key_type: 'K',
+        });
+
+        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        assert!(result.is_some());
+        let event = result.unwrap();
+        match event.event_type {
+            EventType::Delete {
+                old_data,
+                key_columns,
+                ..
+            } => {
+                assert_eq!(old_data.get("id").unwrap(), "1");
+                assert_eq!(key_columns, vec!["id".to_string()]);
+            }
+            _ => panic!("Expected Delete event"),
+        }
+    }
+
+    #[test]
+    fn test_convert_to_change_event_delete_unknown_relation() {
+        use crate::protocol::{ColumnData, TupleData};
+        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Delete {
+            relation_id: 999,
+            old_tuple: TupleData::new(vec![ColumnData::text(b"1".to_vec())]),
+            key_type: 'K',
+        });
+
+        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_convert_to_change_event_truncate() {
+        use crate::protocol::{ColumnInfo, RelationInfo};
+        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        let relation = RelationInfo::new(
+            100,
+            "public".to_string(),
+            "users".to_string(),
+            b'd',
+            vec![ColumnInfo::new(1, "id".to_string(), 23, -1)],
+        );
+        stream.state.add_relation(relation);
+
+        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Truncate {
+            relation_ids: vec![100, 200], // 200 is unknown
+            flags: 0,
+        });
+
+        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        assert!(result.is_some());
+        let event = result.unwrap();
+        match event.event_type {
+            EventType::Truncate(tables) => {
+                assert_eq!(tables.len(), 1); // Only known relation
+                assert_eq!(tables[0], "public.users");
+            }
+            _ => panic!("Expected Truncate event"),
+        }
+    }
+
+    #[test]
+    fn test_convert_to_change_event_stream_start() {
+        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::StreamStart {
+            xid: 42,
+            first_segment: true,
+        });
+
+        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        assert!(result.is_some());
+        match result.unwrap().event_type {
+            EventType::StreamStart {
+                transaction_id,
+                first_segment,
+            } => {
+                assert_eq!(transaction_id, 42);
+                assert!(first_segment);
+            }
+            _ => panic!("Expected StreamStart"),
+        }
+    }
+
+    #[test]
+    fn test_convert_to_change_event_stream_stop() {
+        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::StreamStop);
+
+        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        assert!(result.is_some());
+        match result.unwrap().event_type {
+            EventType::StreamStop => {}
+            _ => panic!("Expected StreamStop"),
+        }
+    }
+
+    #[test]
+    fn test_convert_to_change_event_stream_commit() {
+        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::StreamCommit {
+            xid: 42,
+            flags: 0,
+            timestamp: 0,
+            commit_lsn: 0x3000,
+            end_lsn: 0x3100,
+        });
+
+        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        assert!(result.is_some());
+        match result.unwrap().event_type {
+            EventType::StreamCommit { transaction_id, .. } => {
+                assert_eq!(transaction_id, 42);
+            }
+            _ => panic!("Expected StreamCommit"),
+        }
+    }
+
+    #[test]
+    fn test_convert_to_change_event_stream_abort() {
+        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::StreamAbort {
+            xid: 42,
+            subtransaction_xid: 43,
+            abort_lsn: Some(0x4000),
+            abort_timestamp: Some(123456),
+        });
+
+        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        assert!(result.is_some());
+        match result.unwrap().event_type {
+            EventType::StreamAbort {
+                transaction_id,
+                subtransaction_xid,
+                abort_lsn,
+                ..
+            } => {
+                assert_eq!(transaction_id, 42);
+                assert_eq!(subtransaction_xid, 43);
+                assert_eq!(abort_lsn.unwrap().0, 0x4000);
+            }
+            _ => panic!("Expected StreamAbort"),
+        }
+    }
+
+    #[test]
+    fn test_convert_to_change_event_unknown_message() {
+        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Origin {
+            origin_lsn: 0x5000,
+            origin_name: "test_origin".to_string(),
+        });
+
+        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        // Origin messages are handled by the catch-all `_ =>` arm
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_current_lsn() {
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+        assert_eq!(stream.current_lsn(), 0);
+
+        stream.state.update_received_lsn(12345);
+        assert_eq!(stream.current_lsn(), 12345);
+    }
+
+    #[test]
+    fn test_stream_stop_method() {
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+        // stop() should succeed without a real connection
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            stream.stop().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_maybe_send_feedback_no_received_lsn() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            1,
+            StreamingMode::Off,
+            Duration::from_millis(1), // Very short interval
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        );
+        let mut stream = create_test_stream(config);
+
+        // No received LSN, feedback should be a no-op (won't crash on null conn)
+        std::thread::sleep(Duration::from_millis(5));
+        stream.maybe_send_feedback();
+        // If this didn't panic, the guard condition in send_feedback works
+    }
+
+    #[test]
+    fn test_relation_metadata_single_part_name() {
+        use crate::protocol::{ColumnInfo, RelationInfo};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        // Relation with no namespace (empty string) - creates single-part full_name
+        let relation = RelationInfo::new(
+            100,
+            "".to_string(),
+            "just_table".to_string(),
+            b'f',
+            vec![ColumnInfo::new(1, "id".to_string(), 23, -1)],
+        );
+        stream.state.add_relation(relation);
+
+        let (schema, table, _ri, _keys, _rel) = stream.relation_metadata(100, None).unwrap();
+        // With empty namespace, full_name is ".just_table", split gives ["", "just_table"]
+        assert_eq!(table, "just_table");
+        // Schema should still work
+        assert_eq!(schema, "");
+    }
+
+    /// Build a synthetic WAL message: 'w' + start_lsn(8) + end_lsn(8) + send_time(8) + payload
+    fn build_wal_message(start_lsn: u64, end_lsn: u64, payload: &[u8]) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.push(b'w');
+        data.extend_from_slice(&start_lsn.to_be_bytes());
+        data.extend_from_slice(&end_lsn.to_be_bytes());
+        data.extend_from_slice(&0i64.to_be_bytes()); // send_time
+        data.extend_from_slice(payload);
+        data
+    }
+
+    /// Build a Begin message payload: 'B' + final_lsn(8) + timestamp(8) + xid(4)
+    fn build_begin_payload(final_lsn: u64, xid: u32) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.push(b'B');
+        data.extend_from_slice(&final_lsn.to_be_bytes());
+        data.extend_from_slice(&0i64.to_be_bytes()); // timestamp
+        data.extend_from_slice(&xid.to_be_bytes());
+        data
+    }
+
+    /// Build a Commit message payload: 'C' + flags(1) + commit_lsn(8) + end_lsn(8) + timestamp(8)
+    fn build_commit_payload(commit_lsn: u64, end_lsn: u64) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.push(b'C');
+        data.push(0u8); // flags
+        data.extend_from_slice(&commit_lsn.to_be_bytes());
+        data.extend_from_slice(&end_lsn.to_be_bytes());
+        data.extend_from_slice(&0i64.to_be_bytes()); // timestamp
+        data
+    }
+
+    #[test]
+    fn test_process_wal_message_too_short() {
+        let mut stream = create_test_stream(create_test_config());
+        let data = vec![b'w'; 10]; // Too short (< 25 bytes)
+        let result = stream.process_wal_message(&data);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too short"));
+    }
+
+    #[test]
+    fn test_process_wal_message_begin() {
+        let mut stream = create_test_stream(create_test_config());
+        let payload = build_begin_payload(0x2000, 42);
+        let data = build_wal_message(0x1000, 0x1500, &payload);
+
+        let result = stream.process_wal_message(&data).unwrap();
+        assert!(result.is_some());
+        let event = result.unwrap();
+        match event.event_type {
+            EventType::Begin { transaction_id, .. } => {
+                assert_eq!(transaction_id, 42);
+            }
+            _ => panic!("Expected Begin event"),
+        }
+        // end_lsn should be tracked
+        assert_eq!(stream.state.last_received_lsn, 0x1500);
+    }
+
+    #[test]
+    fn test_process_wal_message_commit() {
+        let mut stream = create_test_stream(create_test_config());
+        let payload = build_commit_payload(0x2000, 0x2100);
+        let data = build_wal_message(0x1000, 0x1500, &payload);
+
+        let result = stream.process_wal_message(&data).unwrap();
+        assert!(result.is_some());
+        match result.unwrap().event_type {
+            EventType::Commit { .. } => {}
+            _ => panic!("Expected Commit event"),
+        }
+    }
+
+    #[test]
+    fn test_process_wal_message_no_payload() {
+        let mut stream = create_test_stream(create_test_config());
+        // WAL message with header only (no payload after the 25 header bytes)
+        let data = build_wal_message(0x1000, 0x1500, &[]);
+        let result = stream.process_wal_message(&data).unwrap();
+        assert!(result.is_none()); // No message data = None
+    }
+
+    #[test]
+    fn test_process_wal_message_updates_lsn() {
+        let mut stream = create_test_stream(create_test_config());
+        assert_eq!(stream.state.last_received_lsn, 0);
+
+        let payload = build_begin_payload(0x2000, 1);
+        let data = build_wal_message(0x1000, 0x5000, &payload);
+        let _ = stream.process_wal_message(&data);
+
+        assert_eq!(stream.state.last_received_lsn, 0x5000);
+    }
+
+    #[test]
+    fn test_process_wal_message_zero_end_lsn_no_update() {
+        let mut stream = create_test_stream(create_test_config());
+        stream.state.update_received_lsn(0x3000);
+
+        let payload = build_begin_payload(0x2000, 1);
+        let data = build_wal_message(0x1000, 0, &payload); // end_lsn = 0
+        let _ = stream.process_wal_message(&data);
+
+        assert_eq!(stream.state.last_received_lsn, 0x3000); // unchanged
+    }
+
+    /// Build a keepalive message: 'k' + wal_end(8) + server_time(8) + reply(1)
+    fn build_keepalive_message(wal_end: u64, reply_requested: bool) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.push(b'k');
+        data.extend_from_slice(&wal_end.to_be_bytes());
+        data.extend_from_slice(&0i64.to_be_bytes()); // server_time
+        data.push(if reply_requested { 1 } else { 0 });
+        data
+    }
+
+    #[test]
+    fn test_process_keepalive_no_reply() {
+        let mut stream = create_test_stream(create_test_config());
+        let data = build_keepalive_message(0x4000, false);
+        let result = stream.process_keepalive_message(&data);
+        assert!(result.is_ok());
+        assert_eq!(stream.state.last_received_lsn, 0x4000);
+    }
+
+    #[test]
+    fn test_process_keepalive_reply_requested_no_received() {
+        // When received lsn is 0, send_feedback is a no-op (won't crash on null conn)
+        let mut stream = create_test_stream(create_test_config());
+        let data = build_keepalive_message(0, true);
+        let result = stream.process_keepalive_message(&data);
+        // send_feedback returns early if last_received_lsn == 0
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_event_stream_accessors() {
+        use tokio_util::sync::CancellationToken;
+
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+        let cancel_token = CancellationToken::new();
+        let event_stream = stream.into_stream(cancel_token);
+
+        assert_eq!(event_stream.current_lsn(), 0);
+        assert_eq!(event_stream.get_feedback_lsn(), (0, 0));
+
+        // Test inner() accessor
+        let _inner_ref = event_stream.inner();
+    }
+
+    #[test]
+    fn test_event_stream_update_lsn() {
+        use tokio_util::sync::CancellationToken;
+
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+        let cancel_token = CancellationToken::new();
+        let event_stream = stream.into_stream(cancel_token);
+
+        event_stream.update_flushed_lsn(1000);
+        event_stream.update_applied_lsn(2000);
+
+        let (flushed, applied) = event_stream.get_feedback_lsn();
+        // update_applied_lsn(2000) also updates flushed to 2000
+        assert_eq!(flushed, 2000);
+        assert_eq!(applied, 2000);
+    }
+
+    #[test]
+    fn test_event_stream_inner_mut() {
+        use tokio_util::sync::CancellationToken;
+
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+        let cancel_token = CancellationToken::new();
+        let mut event_stream = stream.into_stream(cancel_token);
+
+        // inner_mut should allow mutation
+        event_stream.inner_mut().state.update_received_lsn(5000);
+        assert_eq!(event_stream.current_lsn(), 5000);
+    }
+
+    #[test]
+    fn test_event_stream_ref_accessors() {
+        use tokio_util::sync::CancellationToken;
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+        let cancel_token = CancellationToken::new();
+        let event_stream_ref = stream.stream(cancel_token);
+
+        assert_eq!(event_stream_ref.current_lsn(), 0);
+        let _inner = event_stream_ref.inner();
+    }
+
+    #[test]
+    fn test_event_stream_ref_inner_mut() {
+        use tokio_util::sync::CancellationToken;
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+        let cancel_token = CancellationToken::new();
+        let mut event_stream_ref = stream.stream(cancel_token);
+
+        event_stream_ref.inner_mut().state.update_received_lsn(7000);
+        assert_eq!(event_stream_ref.current_lsn(), 7000);
+    }
+
+    #[test]
+    fn test_process_wal_relation_then_insert() {
+        let mut stream = create_test_stream(create_test_config());
+
+        // Build a Relation payload manually: 'R' + relation_id(4) + namespace\0 + name\0 + replica_id(1) + ncols(2) + columns
+        let mut rel_payload = Vec::new();
+        rel_payload.push(b'R');
+        rel_payload.extend_from_slice(&100u32.to_be_bytes());
+        rel_payload.extend_from_slice(b"public\0");
+        rel_payload.extend_from_slice(b"items\0");
+        rel_payload.push(b'd'); // replica identity
+        rel_payload.extend_from_slice(&2u16.to_be_bytes()); // 2 columns
+                                                            // Column 1: flags(1) + name\0 + type_oid(4) + type_modifier(4)
+        rel_payload.push(1u8); // is_key
+        rel_payload.extend_from_slice(b"id\0");
+        rel_payload.extend_from_slice(&23u32.to_be_bytes()); // int4
+        rel_payload.extend_from_slice(&(-1i32).to_be_bytes());
+        // Column 2
+        rel_payload.push(0u8); // not key
+        rel_payload.extend_from_slice(b"val\0");
+        rel_payload.extend_from_slice(&25u32.to_be_bytes()); // text
+        rel_payload.extend_from_slice(&(-1i32).to_be_bytes());
+
+        let wal = build_wal_message(0x1000, 0x1100, &rel_payload);
+        let result = stream.process_wal_message(&wal).unwrap();
+        assert!(result.is_none()); // Relation => None
+        assert!(stream.state.get_relation(100).is_some());
+
+        // Now build an Insert payload: 'I' + relation_id(4) + 'N' + ncols(2) + columns
+        let mut ins_payload = Vec::new();
+        ins_payload.push(b'I');
+        ins_payload.extend_from_slice(&100u32.to_be_bytes());
+        ins_payload.push(b'N'); // new tuple marker
+        ins_payload.extend_from_slice(&2u16.to_be_bytes()); // 2 columns
+                                                            // Column 1: 't' + len(4) + data  (text column)
+        ins_payload.push(b't');
+        ins_payload.extend_from_slice(&1u32.to_be_bytes());
+        ins_payload.push(b'5');
+        // Column 2: 't' + len(4) + data
+        ins_payload.push(b't');
+        ins_payload.extend_from_slice(&3u32.to_be_bytes());
+        ins_payload.extend_from_slice(b"abc");
+
+        let wal2 = build_wal_message(0x1100, 0x1200, &ins_payload);
+        let result2 = stream.process_wal_message(&wal2).unwrap();
+        assert!(result2.is_some());
+        let event = result2.unwrap();
+        match event.event_type {
+            EventType::Insert {
+                schema,
+                table,
+                data,
+                ..
+            } => {
+                assert_eq!(schema, "public");
+                assert_eq!(table, "items");
+                assert_eq!(data.get("id").unwrap(), "5");
+                assert_eq!(data.get("val").unwrap(), "abc");
+            }
+            _ => panic!("Expected Insert event"),
+        }
+    }
+
+    #[test]
+    fn test_send_feedback_no_received_lsn() {
+        let mut stream = create_test_stream(create_test_config());
+        // send_feedback should return Ok(()) when last_received_lsn is 0
+        let result = stream.send_feedback();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_hex_encode() {
+        assert_eq!(super::hex_encode(&[]), "");
+        assert_eq!(super::hex_encode(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
+        assert_eq!(super::hex_encode(&[0x00, 0xff]), "00ff");
+    }
+
+    #[test]
+    fn test_build_options_origin_any() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            4,
+            StreamingMode::Off,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        )
+        .with_origin(Some(OriginFilter::Any));
+
+        let stream = create_test_stream(config);
+        let options = stream.build_replication_options().unwrap();
+        assert!(options.iter().any(|(k, v)| k == "origin" && v == "any"));
+    }
+
+    #[test]
+    fn test_build_options_no_streaming_mode_off() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            2,
+            StreamingMode::Off,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        );
+
+        let stream = create_test_stream(config);
+        let options = stream.build_replication_options().unwrap();
+        // StreamingMode::Off should NOT produce a "streaming" option
+        assert!(!options.iter().any(|(k, _)| k == "streaming"));
+    }
+
+    #[test]
+    fn test_validate_version_0() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            0,
+            StreamingMode::Off,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        );
+        let stream = create_test_stream(config);
+        let err = stream.validate_replication_options().unwrap_err();
+        assert!(err.to_string().contains("Unsupported protocol version: 0"));
+    }
+
+    #[test]
+    fn test_validate_version_4_with_all_features() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            4,
+            StreamingMode::Parallel,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        )
+        .with_messages(true)
+        .with_binary(true)
+        .with_two_phase(true)
+        .with_origin(Some(OriginFilter::None));
+
+        let stream = create_test_stream(config);
+        assert!(stream.validate_replication_options().is_ok());
+    }
+
+    #[test]
+    fn test_maybe_send_feedback_with_changed_lsn() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            1,
+            StreamingMode::Off,
+            Duration::from_millis(1), // Very short feedback interval
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        );
+        let mut stream = create_test_stream(config);
+
+        // Set received LSN (non-zero)
+        stream.state.update_received_lsn(5000);
+        // Update shared feedback to non-zero
+        stream.shared_lsn_feedback.update_flushed_lsn(3000);
+        stream.shared_lsn_feedback.update_applied_lsn(2000);
+
+        // Wait for feedback interval to pass
+        std::thread::sleep(Duration::from_millis(5));
+
+        // This should attempt to send feedback, but fail silently because of null conn
+        // Covers the maybe_send_feedback paths: get_feedback_lsn, flushed > 0, applied > 0, lsn_has_changed
+        stream.maybe_send_feedback();
+        // If no panic, the error was caught by the warn!() in maybe_send_feedback
+    }
+
+    #[test]
+    fn test_maybe_send_feedback_lsn_not_changed() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            1,
+            StreamingMode::Off,
+            Duration::from_millis(1),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        );
+        let mut stream = create_test_stream(config);
+
+        // Set received LSN
+        stream.state.update_received_lsn(5000);
+        stream.shared_lsn_feedback.update_flushed_lsn(3000);
+        stream.shared_lsn_feedback.update_applied_lsn(2000);
+
+        std::thread::sleep(Duration::from_millis(5));
+        stream.maybe_send_feedback(); // First call - sends (or tries to)
+
+        // Mark the sent LSN values so the next call sees no change
+        stream.state.mark_feedback_sent_with_lsn(3000, 3000);
+
+        std::thread::sleep(Duration::from_millis(5));
+        // Same LSN values, should NOT try to send feedback
+        stream.maybe_send_feedback();
+    }
+
+    #[test]
+    fn test_maybe_send_feedback_zero_shared_lsn() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            1,
+            StreamingMode::Off,
+            Duration::from_millis(1),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        );
+        let mut stream = create_test_stream(config);
+
+        // Non-zero received but zero shared feedback
+        stream.state.update_received_lsn(5000);
+        // shared_lsn_feedback flushed and applied are 0 by default
+
+        std::thread::sleep(Duration::from_millis(5));
+        stream.maybe_send_feedback();
+        // This covers the f == 0 and a == 0 branches
+    }
+
+    #[test]
+    fn test_send_feedback_with_shared_lsn_values() {
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        stream.state.update_received_lsn(10000);
+        stream.shared_lsn_feedback.update_flushed_lsn(8000);
+        stream.shared_lsn_feedback.update_applied_lsn(6000);
+
+        // send_feedback will fail on the null connection, but exercises the LSN logic
+        let result = stream.send_feedback();
+        // It should error because null connection can't send status update
+        assert!(result.is_err());
+
+        // But the local state should have been updated before the error
+        // Actually, send_feedback calls connection.send_standby_status_update first
+        // and updates state after. Since it errors on the BDcall, state won't update.
+    }
+
+    #[test]
+    fn test_send_feedback_applied_greater_than_received() {
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        stream.state.update_received_lsn(5000);
+        // Consumer reports higher LSN than received (edge case, capped)
+        stream.shared_lsn_feedback.update_flushed_lsn(9000);
+        stream.shared_lsn_feedback.update_applied_lsn(9000);
+
+        // Will fail on null conn but exercises the min() capping logic
+        let result = stream.send_feedback();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_convert_to_change_event_message_with_content() {
+        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Message {
+            flags: 1,
+            lsn: 0x6000,
+            prefix: "test_prefix".to_string(),
+            content: b"hello world".to_vec(),
+        });
+
+        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        // LogicalMessage hits the catch-all arm => None
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_convert_to_change_event_type_message() {
+        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Type {
+            type_id: 100,
+            namespace: "pg_catalog".to_string(),
+            type_name: "int4".to_string(),
+        });
+
+        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_convert_update_no_old_tuple() {
+        use crate::protocol::{ColumnData, ColumnInfo, RelationInfo, TupleData};
+        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        let relation = RelationInfo::new(
+            100,
+            "public".to_string(),
+            "users".to_string(),
+            b'd',
+            vec![
+                ColumnInfo::new(1, "id".to_string(), 23, -1),
+                ColumnInfo::new(0, "name".to_string(), 25, -1),
+            ],
+        );
+        stream.state.add_relation(relation);
+
+        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Update {
+            relation_id: 100,
+            old_tuple: None,
+            new_tuple: TupleData::new(vec![
+                ColumnData::text(b"1".to_vec()),
+                ColumnData::text(b"NewName".to_vec()),
+            ]),
+            key_type: None,
+        });
+
+        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        assert!(result.is_some());
+        let event = result.unwrap();
+        match event.event_type {
+            EventType::Update {
+                old_data, new_data, ..
+            } => {
+                assert!(old_data.is_none());
+                assert_eq!(new_data.get("name").unwrap(), "NewName");
+            }
+            _ => panic!("Expected Update event"),
+        }
+    }
+
+    #[test]
+    fn test_convert_truncate_all_unknown() {
+        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Truncate {
+            relation_ids: vec![999],
+            flags: 0,
+        });
+
+        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        assert!(result.is_some());
+        match result.unwrap().event_type {
+            EventType::Truncate(tables) => {
+                assert!(tables.is_empty());
+            }
+            _ => panic!("Expected Truncate event"),
+        }
+    }
+
+    #[test]
+    fn test_maybe_send_feedback_flushed_capped() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            1,
+            StreamingMode::Off,
+            Duration::from_millis(1),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        );
+        let mut stream = create_test_stream(config);
+
+        stream.state.update_received_lsn(0x1000);
+        stream.shared_lsn_feedback.update_flushed_lsn(0x9000);
+        stream.shared_lsn_feedback.update_applied_lsn(0x8000);
+
+        std::thread::sleep(Duration::from_millis(5));
+        stream.maybe_send_feedback();
     }
 }

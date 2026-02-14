@@ -900,6 +900,18 @@ impl Drop for PgReplicationConnection {
 // Make the connection Send by ensuring exclusive access
 unsafe impl Send for PgReplicationConnection {}
 
+#[cfg(test)]
+impl PgReplicationConnection {
+    /// Create a null connection for testing (DO NOT call any methods that touch the DB)
+    pub(crate) fn null_for_testing() -> Self {
+        Self {
+            conn: std::ptr::null_mut(),
+            is_replication_conn: false,
+            async_fd: None,
+        }
+    }
+}
+
 /// Safe wrapper for PostgreSQL result
 pub struct PgResult {
     result: *mut PGresult,
@@ -1089,5 +1101,33 @@ mod tests {
         let input = "line1'quote\nline2'quote";
         let sanitized = sanitize_sql_string_value(input);
         assert_eq!(sanitized, "line1''quote\nline2''quote");
+    }
+
+    #[test]
+    fn test_build_sql_options_empty() {
+        let options: Vec<String> = vec![];
+        let result = PgReplicationConnection::build_sql_options(&options);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_build_sql_options_single() {
+        let options = vec!["proto_version '2'".to_string()];
+        let result = PgReplicationConnection::build_sql_options(&options);
+        assert_eq!(result, " (proto_version '2')");
+    }
+
+    #[test]
+    fn test_build_sql_options_multiple() {
+        let options = vec![
+            "proto_version '2'".to_string(),
+            "publication_names '\"my_pub\"'".to_string(),
+            "streaming 'on'".to_string(),
+        ];
+        let result = PgReplicationConnection::build_sql_options(&options);
+        assert_eq!(
+            result,
+            " (proto_version '2', publication_names '\"my_pub\"', streaming 'on')"
+        );
     }
 }
