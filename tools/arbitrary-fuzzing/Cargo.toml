@@ -1,0 +1,10 @@
+[package]
+name = "pg-walstream-arbitrary-fuzzing"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Demonstrates external arbitrary generation for pg_walstream types (no internal changes needed)"
+
+[dependencies]
+pg_walstream = { path = "../.." }
+arbitrary = { version = "1", features = ["derive"] }
