@@ -1863,4 +1863,982 @@ mod tests {
         let result = parser.parse_wal_message(&data);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_parse_keepalive_message() {
+        // Build a keepalive message: 1 byte type + 8 bytes wal_end + 8 bytes timestamp + 1 byte reply
+        let mut data = vec![b'k']; // message type
+        data.extend_from_slice(&write_u64_be(0x5000)); // wal_end
+        data.extend_from_slice(&write_i64_be(1234567890)); // timestamp
+        data.push(0x01); // reply_requested = true
+
+        let keepalive = parse_keepalive_message(&data).unwrap();
+        assert_eq!(keepalive.wal_end, 0x5000);
+        assert_eq!(keepalive.timestamp, 1234567890);
+        assert!(keepalive.reply_requested);
+    }
+
+    #[test]
+    fn test_parse_keepalive_message_no_reply() {
+        let mut data = vec![b'k'];
+        data.extend_from_slice(&write_u64_be(0x6000));
+        data.extend_from_slice(&write_i64_be(9876543210));
+        data.push(0x00); // reply_requested = false
+
+        let keepalive = parse_keepalive_message(&data).unwrap();
+        assert_eq!(keepalive.wal_end, 0x6000);
+        assert!(!keepalive.reply_requested);
+    }
+
+    #[test]
+    fn test_parse_keepalive_message_too_short() {
+        let data = vec![b'k', 0x00, 0x01]; // Only 3 bytes, need at least 18
+        let result = parse_keepalive_message(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_build_hot_standby_feedback_message() {
+        let message = build_hot_standby_feedback_message(100, 1, 200, 2).unwrap();
+
+        let mut reader = BufferReader::new(&message);
+        let msg_type = reader.read_u8().unwrap();
+        assert_eq!(msg_type, message_types::HOT_STANDBY_FEEDBACK);
+
+        let _timestamp = reader.read_i64().unwrap(); // Timestamp is current time, just verify readable
+        let xmin = reader.read_u32().unwrap();
+        assert_eq!(xmin, 100);
+        let xmin_epoch = reader.read_u32().unwrap();
+        assert_eq!(xmin_epoch, 1);
+        let catalog_xmin = reader.read_u32().unwrap();
+        assert_eq!(catalog_xmin, 200);
+        let catalog_xmin_epoch = reader.read_u32().unwrap();
+        assert_eq!(catalog_xmin_epoch, 2);
+    }
+
+    #[test]
+    fn test_column_data_binary_bytes() {
+        let data = Bytes::from_static(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let col = ColumnData::binary_bytes(data);
+        assert!(col.is_binary());
+        assert!(!col.is_text());
+        assert!(!col.is_null());
+        assert!(!col.is_unchanged());
+        assert_eq!(col.as_bytes(), &[0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn test_column_data_text_bytes() {
+        let data = Bytes::from_static(b"hello");
+        let col = ColumnData::text_bytes(data);
+        assert!(col.is_text());
+        assert_eq!(col.as_str().unwrap().as_ref(), "hello");
+    }
+
+    #[test]
+    fn test_column_data_as_bytes() {
+        let col = ColumnData::text(b"test data".to_vec());
+        assert_eq!(col.as_bytes(), b"test data");
+
+        let null_col = ColumnData::null();
+        assert_eq!(null_col.as_bytes(), b"");
+
+        let unchanged = ColumnData::unchanged();
+        assert_eq!(unchanged.as_bytes(), b"");
+    }
+
+    #[test]
+    fn test_column_data_into_bytes() {
+        let col = ColumnData::text(b"hello world".to_vec());
+        let bytes = col.into_bytes();
+        assert_eq!(&bytes[..], b"hello world");
+    }
+
+    #[test]
+    fn test_column_data_as_str_binary_valid_utf8() {
+        // Binary data that is valid UTF-8
+        let col = ColumnData::binary(b"valid utf8".to_vec());
+        assert_eq!(col.as_str().unwrap().as_ref(), "valid utf8");
+    }
+
+    #[test]
+    fn test_column_data_as_str_binary_invalid_utf8() {
+        // Binary data with invalid UTF-8 should use lossy conversion
+        let col = ColumnData::binary(vec![0xFF, 0xFE, 0x41]);
+        let s = col.as_str().unwrap();
+        assert!(s.contains('A')); // Valid byte 0x41 = 'A'
+    }
+
+    #[test]
+    fn test_column_data_as_str_null() {
+        let col = ColumnData::null();
+        assert!(col.as_str().is_none());
+    }
+
+    #[test]
+    fn test_column_data_as_str_unchanged() {
+        let col = ColumnData::unchanged();
+        assert!(col.as_str().is_none());
+    }
+
+    #[test]
+    fn test_column_data_as_str_empty_text() {
+        let col = ColumnData::text(Vec::new());
+        // Empty text data should return None since data.is_empty()
+        assert!(col.as_str().is_none());
+    }
+
+    #[test]
+    fn test_column_data_as_string() {
+        let col = ColumnData::text(b"hello".to_vec());
+        assert_eq!(col.as_string(), Some("hello".to_string()));
+
+        let null_col = ColumnData::null();
+        assert_eq!(null_col.as_string(), None);
+    }
+
+    #[test]
+    fn test_tuple_data_get_column() {
+        let tuple = TupleData::new(vec![
+            ColumnData::text(b"col1".to_vec()),
+            ColumnData::null(),
+            ColumnData::unchanged(),
+        ]);
+        assert_eq!(tuple.column_count(), 3);
+        assert!(tuple.get_column(0).unwrap().is_text());
+        assert!(tuple.get_column(1).unwrap().is_null());
+        assert!(tuple.get_column(2).unwrap().is_unchanged());
+        assert!(tuple.get_column(3).is_none());
+    }
+
+    #[test]
+    fn test_tuple_data_to_hash_map_with_null() {
+        let columns = vec![
+            ColumnInfo::new(0, "id".to_string(), 23, -1),
+            ColumnInfo::new(0, "name".to_string(), 25, -1),
+        ];
+        let relation = RelationInfo::new(1, "public".to_string(), "t".to_string(), b'd', columns);
+
+        let tuple = TupleData::new(vec![ColumnData::text(b"42".to_vec()), ColumnData::null()]);
+
+        let map = tuple.to_hash_map(&relation);
+        assert_eq!(map.get("id").unwrap(), "42");
+        assert_eq!(map.get("name").unwrap(), &serde_json::Value::Null);
+    }
+
+    #[test]
+    fn test_tuple_data_to_hash_map_with_unchanged() {
+        let columns = vec![
+            ColumnInfo::new(0, "id".to_string(), 23, -1),
+            ColumnInfo::new(0, "name".to_string(), 25, -1),
+        ];
+        let relation = RelationInfo::new(1, "public".to_string(), "t".to_string(), b'd', columns);
+
+        let tuple = TupleData::new(vec![
+            ColumnData::text(b"42".to_vec()),
+            ColumnData::unchanged(), // unchanged TOAST should be skipped
+        ]);
+
+        let map = tuple.to_hash_map(&relation);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get("id").unwrap(), "42");
+        assert!(!map.contains_key("name"));
+    }
+
+    #[test]
+    fn test_tuple_data_to_hash_map_with_binary() {
+        let columns = vec![
+            ColumnInfo::new(0, "data".to_string(), 17, -1), // bytea
+        ];
+        let relation = RelationInfo::new(1, "public".to_string(), "t".to_string(), b'd', columns);
+
+        let tuple = TupleData::new(vec![ColumnData::binary(b"binary data".to_vec())]);
+
+        let map = tuple.to_hash_map(&relation);
+        // Binary valid UTF-8 gets converted via as_str()
+        let val = map.get("data").unwrap();
+        assert!(val.is_string());
+    }
+
+    #[test]
+    fn test_tuple_data_to_hash_map_text_empty_data() {
+        // Text column with empty data - as_str() returns None for empty data
+        let columns = vec![ColumnInfo::new(0, "col".to_string(), 25, -1)];
+        let relation = RelationInfo::new(1, "public".to_string(), "t".to_string(), b'd', columns);
+
+        let col = ColumnData {
+            data_type: 't',
+            data: bytes::Bytes::new(),
+        };
+        let tuple = TupleData::new(vec![col]);
+        let map = tuple.to_hash_map(&relation);
+        // Empty text data: as_str() returns None, so Null
+        assert!(map.get("col").unwrap().is_null());
+    }
+
+    #[test]
+    fn test_tuple_data_to_hash_map_unknown_data_type() {
+        // Unknown data type (e.g., 'x') hits the catch-all arm
+        let columns = vec![ColumnInfo::new(0, "col".to_string(), 25, -1)];
+        let relation = RelationInfo::new(1, "public".to_string(), "t".to_string(), b'd', columns);
+
+        let col = ColumnData {
+            data_type: 'x',
+            data: bytes::Bytes::from_static(&[1, 2, 3]),
+        };
+        let tuple = TupleData::new(vec![col]);
+        let map = tuple.to_hash_map(&relation);
+        assert!(map.get("col").unwrap().is_null());
+    }
+
+    #[test]
+    fn test_tuple_data_to_hash_map_more_columns_than_relation() {
+        // Tuple has more columns than the relation definition
+        let columns = vec![ColumnInfo::new(0, "col1".to_string(), 25, -1)];
+        let relation = RelationInfo::new(1, "public".to_string(), "t".to_string(), b'd', columns);
+
+        // 2 tuple columns but only 1 relation column
+        let tuple = TupleData::new(vec![
+            ColumnData::text(b"val1".to_vec()),
+            ColumnData::text(b"val2".to_vec()),
+        ]);
+        let map = tuple.to_hash_map(&relation);
+        assert_eq!(map.len(), 1); // Only the first column maps
+        assert_eq!(map.get("col1").unwrap(), "val1");
+    }
+
+    #[test]
+    fn test_replication_state_should_send_feedback() {
+        let mut state = ReplicationState::new();
+        let interval = Duration::from_millis(50);
+
+        // Initially should send after a short sleep
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(state.should_send_feedback(interval));
+
+        state.mark_feedback_sent();
+        // Just sent, should not send immediately
+        assert!(!state.should_send_feedback(interval));
+
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(state.should_send_feedback(interval));
+    }
+
+    #[test]
+    fn test_replication_state_lsn_has_changed() {
+        let state = ReplicationState::new();
+
+        // Initially last_sent values are 0
+        assert!(!state.lsn_has_changed(0, 0)); // No change from default
+        assert!(state.lsn_has_changed(100, 0)); // flush changed
+        assert!(state.lsn_has_changed(0, 100)); // applied changed
+        assert!(state.lsn_has_changed(100, 100)); // both changed
+    }
+
+    #[test]
+    fn test_replication_state_mark_feedback_sent_with_lsn() {
+        let mut state = ReplicationState::new();
+
+        state.mark_feedback_sent_with_lsn(500, 300);
+
+        // Now those values should not be considered "changed"
+        assert!(!state.lsn_has_changed(500, 300));
+
+        // But different values should
+        assert!(state.lsn_has_changed(600, 300));
+        assert!(state.lsn_has_changed(500, 400));
+    }
+
+    #[test]
+    fn test_replication_state_default() {
+        let state = ReplicationState::default();
+        assert_eq!(state.last_received_lsn, 0);
+        assert_eq!(state.last_flushed_lsn, 0);
+        assert_eq!(state.last_applied_lsn, 0);
+        assert!(state.relations.is_empty());
+    }
+
+    #[test]
+    fn test_replication_state_applied_updates_flushed() {
+        let mut state = ReplicationState::new();
+        state.update_flushed_lsn(50);
+        assert_eq!(state.last_flushed_lsn, 50);
+
+        // Applied > flushed should update flushed too
+        state.update_applied_lsn(100);
+        assert_eq!(state.last_applied_lsn, 100);
+        assert_eq!(state.last_flushed_lsn, 100);
+
+        // Applied < current flushed should not downgrade flushed
+        state.update_flushed_lsn(200);
+        state.update_applied_lsn(150);
+        assert_eq!(state.last_flushed_lsn, 200); // flushed stays at 200
+        assert_eq!(state.last_applied_lsn, 150);
+    }
+
+    #[test]
+    fn test_replication_state_add_get_relation() {
+        let mut state = ReplicationState::new();
+        let relation = RelationInfo::new(
+            12345,
+            "public".to_string(),
+            "users".to_string(),
+            b'd',
+            vec![ColumnInfo::new(1, "id".to_string(), 23, -1)],
+        );
+
+        state.add_relation(relation);
+        let r = state.get_relation(12345).unwrap();
+        assert_eq!(r.relation_name, "users");
+
+        assert!(state.get_relation(99999).is_none());
+    }
+
+    #[test]
+    fn test_column_info_is_key() {
+        let key_col = ColumnInfo::new(1, "id".to_string(), 23, -1);
+        assert!(key_col.is_key());
+
+        let non_key_col = ColumnInfo::new(0, "name".to_string(), 25, -1);
+        assert!(!non_key_col.is_key());
+
+        // Flag with bit 0 set among other bits
+        let mixed_flags = ColumnInfo::new(0x03, "mixed".to_string(), 23, -1);
+        assert!(mixed_flags.is_key());
+    }
+
+    #[test]
+    fn test_relation_info_get_column_by_name() {
+        let columns = vec![
+            ColumnInfo::new(1, "id".to_string(), 23, -1),
+            ColumnInfo::new(0, "name".to_string(), 25, -1),
+            ColumnInfo::new(0, "email".to_string(), 25, -1),
+        ];
+        let relation =
+            RelationInfo::new(1, "public".to_string(), "users".to_string(), b'd', columns);
+
+        assert_eq!(relation.get_column_by_name("id").unwrap().type_id, 23);
+        assert_eq!(relation.get_column_by_name("name").unwrap().type_id, 25);
+        assert!(relation.get_column_by_name("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_streaming_replication_message() {
+        let msg = LogicalReplicationMessage::Begin {
+            final_lsn: 0x1000,
+            timestamp: 12345,
+            xid: 42,
+        };
+
+        let srm = StreamingReplicationMessage::new(msg.clone());
+        assert!(!srm.is_streaming);
+        assert!(srm.xid.is_none());
+
+        let srm_streaming = StreamingReplicationMessage::new_streaming(msg, 42);
+        assert!(srm_streaming.is_streaming);
+        assert_eq!(srm_streaming.xid, Some(42));
+    }
+
+    #[test]
+    fn test_parse_stream_abort_no_v4() {
+        let mut parser = LogicalReplicationParser::with_protocol_version(2);
+
+        let mut data = vec![message_types::STREAM_ABORT];
+        data.extend_from_slice(&write_u32_be(42)); // xid
+        data.extend_from_slice(&write_u32_be(43)); // subtransaction_xid
+
+        let result = parser.parse_wal_message(&data).unwrap();
+        match result.message {
+            LogicalReplicationMessage::StreamAbort {
+                xid,
+                subtransaction_xid,
+                abort_lsn,
+                abort_timestamp,
+            } => {
+                assert_eq!(xid, 42);
+                assert_eq!(subtransaction_xid, 43);
+                assert!(abort_lsn.is_none());
+                assert!(abort_timestamp.is_none());
+            }
+            _ => panic!("Expected StreamAbort"),
+        }
+    }
+
+    #[test]
+    fn test_parse_stream_abort_v4() {
+        let mut parser = LogicalReplicationParser::with_protocol_version(4);
+
+        let mut data = vec![message_types::STREAM_ABORT];
+        data.extend_from_slice(&write_u32_be(42)); // xid
+        data.extend_from_slice(&write_u32_be(43)); // subtransaction_xid
+        data.extend_from_slice(&write_u64_be(0x9000)); // abort_lsn
+        data.extend_from_slice(&write_i64_be(1234567890)); // abort_timestamp
+
+        let result = parser.parse_wal_message(&data).unwrap();
+        match result.message {
+            LogicalReplicationMessage::StreamAbort {
+                xid,
+                subtransaction_xid,
+                abort_lsn,
+                abort_timestamp,
+            } => {
+                assert_eq!(xid, 42);
+                assert_eq!(subtransaction_xid, 43);
+                assert_eq!(abort_lsn, Some(0x9000));
+                assert_eq!(abort_timestamp, Some(1234567890));
+            }
+            _ => panic!("Expected StreamAbort"),
+        }
+    }
+
+    #[test]
+    fn test_parse_prepare_message() {
+        let mut parser = LogicalReplicationParser::with_protocol_version(3);
+
+        let mut data = vec![message_types::PREPARE];
+        data.push(0x01); // flags
+        data.extend_from_slice(&write_u64_be(0xA000));
+        data.extend_from_slice(&write_u64_be(0xA100));
+        data.extend_from_slice(&write_i64_be(1234567890));
+        data.extend_from_slice(&write_u32_be(50));
+        data.extend_from_slice(&write_cstring("my_prepare"));
+
+        let result = parser.parse_wal_message(&data).unwrap();
+        match result.message {
+            LogicalReplicationMessage::Prepare {
+                flags,
+                prepare_lsn,
+                end_lsn,
+                timestamp,
+                xid,
+                gid,
+            } => {
+                assert_eq!(flags, 0x01);
+                assert_eq!(prepare_lsn, 0xA000);
+                assert_eq!(end_lsn, 0xA100);
+                assert_eq!(timestamp, 1234567890);
+                assert_eq!(xid, 50);
+                assert_eq!(gid, "my_prepare");
+            }
+            _ => panic!("Expected Prepare"),
+        }
+    }
+
+    #[test]
+    fn test_parse_commit_prepared_message() {
+        let mut parser = LogicalReplicationParser::with_protocol_version(3);
+
+        let mut data = vec![message_types::COMMIT_PREPARED];
+        data.push(0x00); // flags
+        data.extend_from_slice(&write_u64_be(0xB000));
+        data.extend_from_slice(&write_u64_be(0xB100));
+        data.extend_from_slice(&write_i64_be(9876543210));
+        data.extend_from_slice(&write_u32_be(60));
+        data.extend_from_slice(&write_cstring("commit_prepared_gid"));
+
+        let result = parser.parse_wal_message(&data).unwrap();
+        match result.message {
+            LogicalReplicationMessage::CommitPrepared {
+                flags,
+                commit_lsn,
+                end_lsn,
+                timestamp,
+                xid,
+                gid,
+            } => {
+                assert_eq!(flags, 0x00);
+                assert_eq!(commit_lsn, 0xB000);
+                assert_eq!(end_lsn, 0xB100);
+                assert_eq!(timestamp, 9876543210);
+                assert_eq!(xid, 60);
+                assert_eq!(gid, "commit_prepared_gid");
+            }
+            _ => panic!("Expected CommitPrepared"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rollback_prepared_message() {
+        let mut parser = LogicalReplicationParser::with_protocol_version(3);
+
+        let mut data = vec![message_types::ROLLBACK_PREPARED];
+        data.push(0x02); // flags
+        data.extend_from_slice(&write_u64_be(0xC000)); // prepare_end_lsn
+        data.extend_from_slice(&write_u64_be(0xC100)); // rollback_end_lsn
+        data.extend_from_slice(&write_i64_be(111111)); // prepare_timestamp
+        data.extend_from_slice(&write_i64_be(222222)); // rollback_timestamp
+        data.extend_from_slice(&write_u32_be(70)); // xid
+        data.extend_from_slice(&write_cstring("rollback_gid"));
+
+        let result = parser.parse_wal_message(&data).unwrap();
+        match result.message {
+            LogicalReplicationMessage::RollbackPrepared {
+                flags,
+                prepare_end_lsn,
+                rollback_end_lsn,
+                prepare_timestamp,
+                rollback_timestamp,
+                xid,
+                gid,
+            } => {
+                assert_eq!(flags, 0x02);
+                assert_eq!(prepare_end_lsn, 0xC000);
+                assert_eq!(rollback_end_lsn, 0xC100);
+                assert_eq!(prepare_timestamp, 111111);
+                assert_eq!(rollback_timestamp, 222222);
+                assert_eq!(xid, 70);
+                assert_eq!(gid, "rollback_gid");
+            }
+            _ => panic!("Expected RollbackPrepared"),
+        }
+    }
+
+    #[test]
+    fn test_parse_stream_prepare_message() {
+        let mut parser = LogicalReplicationParser::with_protocol_version(3);
+
+        let mut data = vec![message_types::STREAM_PREPARE];
+        data.push(0x00); // flags
+        data.extend_from_slice(&write_u64_be(0xD000));
+        data.extend_from_slice(&write_u64_be(0xD100));
+        data.extend_from_slice(&write_i64_be(333333));
+        data.extend_from_slice(&write_u32_be(80));
+        data.extend_from_slice(&write_cstring("stream_prepare_gid"));
+
+        let result = parser.parse_wal_message(&data).unwrap();
+        match result.message {
+            LogicalReplicationMessage::StreamPrepare {
+                flags,
+                prepare_lsn,
+                end_lsn,
+                timestamp,
+                xid,
+                gid,
+            } => {
+                assert_eq!(flags, 0x00);
+                assert_eq!(prepare_lsn, 0xD000);
+                assert_eq!(end_lsn, 0xD100);
+                assert_eq!(timestamp, 333333);
+                assert_eq!(xid, 80);
+                assert_eq!(gid, "stream_prepare_gid");
+            }
+            _ => panic!("Expected StreamPrepare"),
+        }
+    }
+
+    #[test]
+    fn test_parse_type_message() {
+        let mut parser = LogicalReplicationParser::with_protocol_version(1);
+
+        let mut data = vec![message_types::TYPE];
+        data.extend_from_slice(&write_u32_be(12345)); // type_id
+        data.extend_from_slice(&write_cstring("public"));
+        data.extend_from_slice(&write_cstring("my_type"));
+
+        let result = parser.parse_wal_message(&data).unwrap();
+        match result.message {
+            LogicalReplicationMessage::Type {
+                type_id,
+                namespace,
+                type_name,
+            } => {
+                assert_eq!(type_id, 12345);
+                assert_eq!(namespace, "public");
+                assert_eq!(type_name, "my_type");
+            }
+            _ => panic!("Expected Type message"),
+        }
+    }
+
+    #[test]
+    fn test_parse_origin_message() {
+        let mut parser = LogicalReplicationParser::with_protocol_version(1);
+
+        let mut data = vec![message_types::ORIGIN];
+        data.extend_from_slice(&write_u64_be(0xE000)); // origin_lsn
+        data.extend_from_slice(&write_cstring("origin_name"));
+
+        let result = parser.parse_wal_message(&data).unwrap();
+        match result.message {
+            LogicalReplicationMessage::Origin {
+                origin_lsn,
+                origin_name,
+            } => {
+                assert_eq!(origin_lsn, 0xE000);
+                assert_eq!(origin_name, "origin_name");
+            }
+            _ => panic!("Expected Origin message"),
+        }
+    }
+
+    #[test]
+    fn test_parse_logical_message() {
+        let mut parser = LogicalReplicationParser::with_protocol_version(1);
+
+        let mut data = vec![message_types::MESSAGE];
+        data.push(0x01); // flags (transactional)
+        data.extend_from_slice(&write_u64_be(0xF000)); // lsn
+        data.extend_from_slice(&write_cstring("my_prefix"));
+        data.extend_from_slice(&write_u32_be(5)); // content_length
+        data.extend_from_slice(b"hello"); // content
+
+        let result = parser.parse_wal_message(&data).unwrap();
+        match result.message {
+            LogicalReplicationMessage::Message {
+                flags,
+                lsn,
+                prefix,
+                content,
+            } => {
+                assert_eq!(flags, 0x01);
+                assert_eq!(lsn, 0xF000);
+                assert_eq!(prefix, "my_prefix");
+                assert_eq!(content, b"hello");
+            }
+            _ => panic!("Expected Message"),
+        }
+    }
+
+    #[test]
+    fn test_parse_insert_in_streaming_context() {
+        let mut parser = LogicalReplicationParser::with_protocol_version(2);
+
+        // First, start a streaming context
+        let mut stream_start = vec![message_types::STREAM_START];
+        stream_start.extend_from_slice(&write_u32_be(42)); // xid
+        stream_start.push(0x01); // first_segment
+        let _ = parser.parse_wal_message(&stream_start).unwrap();
+
+        // Now parse an INSERT in streaming context (v2+ requires xid prefix)
+        let mut data = vec![message_types::INSERT];
+        data.extend_from_slice(&write_u32_be(42)); // streaming xid
+        data.extend_from_slice(&write_u32_be(12345)); // relation_id
+        data.push(b'N'); // new tuple
+        data.extend_from_slice(&[0x00, 0x01]); // 1 column
+        data.push(b't');
+        data.extend_from_slice(&write_u32_be(4));
+        data.extend_from_slice(b"test");
+
+        let result = parser.parse_wal_message(&data).unwrap();
+        assert!(result.is_streaming);
+        assert_eq!(result.xid, Some(42));
+        match result.message {
+            LogicalReplicationMessage::Insert { relation_id, .. } => {
+                assert_eq!(relation_id, 12345);
+            }
+            _ => panic!("Expected Insert"),
+        }
+    }
+
+    #[test]
+    fn test_parse_update_in_streaming_context() {
+        let mut parser = LogicalReplicationParser::with_protocol_version(2);
+
+        // Start streaming
+        let mut stream_start = vec![message_types::STREAM_START];
+        stream_start.extend_from_slice(&write_u32_be(42));
+        stream_start.push(0x01);
+        let _ = parser.parse_wal_message(&stream_start).unwrap();
+
+        // UPDATE in streaming context
+        let mut data = vec![message_types::UPDATE];
+        data.extend_from_slice(&write_u32_be(42)); // streaming xid
+        data.extend_from_slice(&write_u32_be(12345)); // relation_id
+        data.push(b'N'); // new tuple (no old tuple)
+        data.extend_from_slice(&[0x00, 0x01]);
+        data.push(b't');
+        data.extend_from_slice(&write_u32_be(3));
+        data.extend_from_slice(b"new");
+
+        let result = parser.parse_wal_message(&data).unwrap();
+        assert!(result.is_streaming);
+        match result.message {
+            LogicalReplicationMessage::Update {
+                relation_id,
+                old_tuple,
+                ..
+            } => {
+                assert_eq!(relation_id, 12345);
+                assert!(old_tuple.is_none());
+            }
+            _ => panic!("Expected Update"),
+        }
+    }
+
+    #[test]
+    fn test_parse_delete_in_streaming_context() {
+        let mut parser = LogicalReplicationParser::with_protocol_version(2);
+
+        // Start streaming
+        let mut stream_start = vec![message_types::STREAM_START];
+        stream_start.extend_from_slice(&write_u32_be(42));
+        stream_start.push(0x01);
+        let _ = parser.parse_wal_message(&stream_start).unwrap();
+
+        // DELETE in streaming context
+        let mut data = vec![message_types::DELETE];
+        data.extend_from_slice(&write_u32_be(42)); // streaming xid
+        data.extend_from_slice(&write_u32_be(12345)); // relation_id
+        data.push(b'K'); // key type
+        data.extend_from_slice(&[0x00, 0x01]);
+        data.push(b't');
+        data.extend_from_slice(&write_u32_be(5));
+        data.extend_from_slice(b"value");
+
+        let result = parser.parse_wal_message(&data).unwrap();
+        assert!(result.is_streaming);
+        match result.message {
+            LogicalReplicationMessage::Delete {
+                relation_id,
+                key_type,
+                ..
+            } => {
+                assert_eq!(relation_id, 12345);
+                assert_eq!(key_type, 'K');
+            }
+            _ => panic!("Expected Delete"),
+        }
+    }
+
+    #[test]
+    fn test_parse_truncate_in_streaming_context() {
+        let mut parser = LogicalReplicationParser::with_protocol_version(2);
+
+        // Start streaming
+        let mut stream_start = vec![message_types::STREAM_START];
+        stream_start.extend_from_slice(&write_u32_be(42));
+        stream_start.push(0x01);
+        let _ = parser.parse_wal_message(&stream_start).unwrap();
+
+        // TRUNCATE in streaming context
+        let mut data = vec![message_types::TRUNCATE];
+        data.extend_from_slice(&write_u32_be(42)); // streaming xid
+        data.extend_from_slice(&write_u32_be(1)); // 1 relation
+        data.push(0x00); // flags
+        data.extend_from_slice(&write_u32_be(100));
+
+        let result = parser.parse_wal_message(&data).unwrap();
+        assert!(result.is_streaming);
+        match result.message {
+            LogicalReplicationMessage::Truncate { relation_ids, .. } => {
+                assert_eq!(relation_ids, vec![100]);
+            }
+            _ => panic!("Expected Truncate"),
+        }
+    }
+
+    #[test]
+    fn test_parse_relation_in_streaming_context() {
+        let mut parser = LogicalReplicationParser::with_protocol_version(2);
+
+        // Start streaming
+        let mut stream_start = vec![message_types::STREAM_START];
+        stream_start.extend_from_slice(&write_u32_be(42));
+        stream_start.push(0x01);
+        let _ = parser.parse_wal_message(&stream_start).unwrap();
+
+        // RELATION in streaming context
+        let mut data = vec![message_types::RELATION];
+        data.extend_from_slice(&write_u32_be(42)); // streaming xid
+        data.extend_from_slice(&write_u32_be(12345)); // relation_id
+        data.extend_from_slice(&write_cstring("public"));
+        data.extend_from_slice(&write_cstring("users"));
+        data.push(b'd'); // replica_identity
+        data.extend_from_slice(&[0x00, 0x01]); // 1 column
+        data.push(0x01); // flags
+        data.extend_from_slice(&write_cstring("id"));
+        data.extend_from_slice(&write_u32_be(23));
+        data.extend_from_slice(&write_u32_be(0xFFFFFFFF));
+
+        let result = parser.parse_wal_message(&data).unwrap();
+        assert!(result.is_streaming);
+        match result.message {
+            LogicalReplicationMessage::Relation { relation_id, .. } => {
+                assert_eq!(relation_id, 12345);
+            }
+            _ => panic!("Expected Relation"),
+        }
+    }
+
+    #[test]
+    fn test_parse_type_in_streaming_context() {
+        let mut parser = LogicalReplicationParser::with_protocol_version(2);
+
+        // Start streaming
+        let mut stream_start = vec![message_types::STREAM_START];
+        stream_start.extend_from_slice(&write_u32_be(42));
+        stream_start.push(0x01);
+        let _ = parser.parse_wal_message(&stream_start).unwrap();
+
+        // TYPE in streaming context
+        let mut data = vec![message_types::TYPE];
+        data.extend_from_slice(&write_u32_be(42)); // streaming xid
+        data.extend_from_slice(&write_u32_be(99999)); // type_id
+        data.extend_from_slice(&write_cstring("pg_catalog"));
+        data.extend_from_slice(&write_cstring("custom_type"));
+
+        let result = parser.parse_wal_message(&data).unwrap();
+        assert!(result.is_streaming);
+    }
+
+    #[test]
+    fn test_parse_message_in_streaming_context() {
+        let mut parser = LogicalReplicationParser::with_protocol_version(2);
+
+        // Start streaming
+        let mut stream_start = vec![message_types::STREAM_START];
+        stream_start.extend_from_slice(&write_u32_be(42));
+        stream_start.push(0x01);
+        let _ = parser.parse_wal_message(&stream_start).unwrap();
+
+        // MESSAGE in streaming context
+        let mut data = vec![message_types::MESSAGE];
+        data.extend_from_slice(&write_u32_be(42)); // streaming xid
+        data.push(0x00); // flags
+        data.extend_from_slice(&write_u64_be(0x1000)); // lsn
+        data.extend_from_slice(&write_cstring("prefix"));
+        data.extend_from_slice(&write_u32_be(3)); // content_length
+        data.extend_from_slice(b"msg"); // content
+
+        let result = parser.parse_wal_message(&data).unwrap();
+        assert!(result.is_streaming);
+    }
+
+    #[test]
+    fn test_stream_stop_clears_context() {
+        let mut parser = LogicalReplicationParser::with_protocol_version(2);
+
+        // Start streaming
+        let mut stream_start = vec![message_types::STREAM_START];
+        stream_start.extend_from_slice(&write_u32_be(42));
+        stream_start.push(0x01);
+        let _start_result = parser.parse_wal_message(&stream_start).unwrap();
+
+        // We're now in streaming context
+        assert!(parser.is_streaming());
+
+        // Stop streaming
+        let data = vec![message_types::STREAM_STOP];
+        let _ = parser.parse_wal_message(&data).unwrap();
+        assert!(!parser.is_streaming());
+    }
+
+    #[test]
+    fn test_parse_update_with_old_tuple_o_type() {
+        let mut parser = LogicalReplicationParser::with_protocol_version(1);
+
+        let mut data = vec![message_types::UPDATE];
+        data.extend_from_slice(&write_u32_be(12345)); // relation_id
+
+        // Old tuple with 'O' type (full old row)
+        data.push(b'O');
+        data.extend_from_slice(&[0x00, 0x01]); // 1 column
+        data.push(b't');
+        data.extend_from_slice(&write_u32_be(3));
+        data.extend_from_slice(b"old");
+
+        // New tuple
+        data.push(b'N');
+        data.extend_from_slice(&[0x00, 0x01]);
+        data.push(b't');
+        data.extend_from_slice(&write_u32_be(3));
+        data.extend_from_slice(b"new");
+
+        let result = parser.parse_wal_message(&data).unwrap();
+        match result.message {
+            LogicalReplicationMessage::Update {
+                key_type,
+                old_tuple,
+                ..
+            } => {
+                assert_eq!(key_type, Some('O'));
+                assert!(old_tuple.is_some());
+            }
+            _ => panic!("Expected Update"),
+        }
+    }
+
+    #[test]
+    fn test_parse_update_without_old_tuple() {
+        let mut parser = LogicalReplicationParser::with_protocol_version(1);
+
+        let mut data = vec![message_types::UPDATE];
+        data.extend_from_slice(&write_u32_be(12345)); // relation_id
+
+        // No old tuple, directly new tuple
+        data.push(b'N');
+        data.extend_from_slice(&[0x00, 0x01]);
+        data.push(b't');
+        data.extend_from_slice(&write_u32_be(6));
+        data.extend_from_slice(b"direct");
+
+        let result = parser.parse_wal_message(&data).unwrap();
+        match result.message {
+            LogicalReplicationMessage::Update {
+                key_type,
+                old_tuple,
+                ..
+            } => {
+                assert!(key_type.is_none());
+                assert!(old_tuple.is_none());
+            }
+            _ => panic!("Expected Update"),
+        }
+    }
+
+    #[test]
+    fn test_parse_tuple_with_binary_column() {
+        let mut parser = LogicalReplicationParser::with_protocol_version(1);
+
+        let mut data = vec![message_types::INSERT];
+        data.extend_from_slice(&write_u32_be(12345)); // relation_id
+        data.push(b'N'); // new tuple
+
+        data.extend_from_slice(&[0x00, 0x03]); // 3 columns
+
+        // Column 1: text
+        data.push(b't');
+        data.extend_from_slice(&write_u32_be(4));
+        data.extend_from_slice(b"text");
+
+        // Column 2: binary
+        data.push(b'b');
+        data.extend_from_slice(&write_u32_be(4));
+        data.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+
+        // Column 3: null
+        data.push(b'n');
+
+        let result = parser.parse_wal_message(&data).unwrap();
+        match result.message {
+            LogicalReplicationMessage::Insert { tuple, .. } => {
+                assert_eq!(tuple.column_count(), 3);
+                assert!(tuple.columns[0].is_text());
+                assert!(tuple.columns[1].is_binary());
+                assert!(tuple.columns[2].is_null());
+            }
+            _ => panic!("Expected Insert"),
+        }
+    }
+
+    use std::time::Duration;
+
+    #[test]
+    fn test_replication_state_feedback_workflow() {
+        let mut state = ReplicationState::new();
+        let interval = Duration::from_millis(50);
+
+        state.update_received_lsn(1000);
+
+        // Wait for interval
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(state.should_send_feedback(interval));
+
+        // Mark sent with LSNs
+        state.mark_feedback_sent_with_lsn(500, 300);
+
+        // Check if values are tracked
+        assert!(!state.lsn_has_changed(500, 300));
+        assert!(state.lsn_has_changed(600, 300));
+    }
 }

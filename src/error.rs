@@ -243,6 +243,53 @@ mod tests {
     }
 
     #[test]
+    fn test_connection_alias_display() {
+        let err = ReplicationError::connection("connection lost");
+        assert_eq!(
+            err.to_string(),
+            "Replication connection error: connection lost"
+        );
+    }
+
+    #[test]
+    fn test_replication_connection_display() {
+        let err = ReplicationError::replication_connection("slot error");
+        assert_eq!(err.to_string(), "Replication connection error: slot error");
+        assert!(err.is_transient());
+        assert!(!err.is_permanent());
+    }
+
+    #[test]
+    fn test_replication_slot_display() {
+        let err = ReplicationError::replication_slot("slot not found");
+        assert_eq!(err.to_string(), "Replication slot error: slot not found");
+    }
+
+    #[test]
+    fn test_cancelled_display() {
+        let err = ReplicationError::cancelled("user cancelled");
+        assert_eq!(err.to_string(), "Operation was cancelled: user cancelled");
+    }
+
+    #[test]
+    fn test_config_error_display() {
+        let err = ReplicationError::config("missing field");
+        assert_eq!(err.to_string(), "Configuration error: missing field");
+        assert!(!err.is_transient());
+        assert!(!err.is_permanent());
+        assert!(!err.is_cancelled());
+    }
+
+    #[test]
+    fn test_generic_error_display() {
+        let err = ReplicationError::generic("unknown issue");
+        assert_eq!(err.to_string(), "Replication error: unknown issue");
+        assert!(!err.is_transient());
+        assert!(!err.is_permanent());
+        assert!(!err.is_cancelled());
+    }
+
+    #[test]
     fn test_io_error_conversion() {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
         let err: ReplicationError = io_err.into();

@@ -506,4 +506,131 @@ mod tests {
         assert_eq!(backoff.attempt(), 0);
         assert_eq!(backoff.current_delay, config.initial_delay);
     }
+
+    #[test]
+    fn test_replication_connection_retry_new() {
+        let config = RetryConfig::default();
+        let retry = ReplicationConnectionRetry::new(
+            config,
+            "postgresql://localhost/test?replication=database".to_string(),
+        );
+        assert_eq!(
+            retry.connection_string,
+            "postgresql://localhost/test?replication=database"
+        );
+    }
+
+    #[test]
+    fn test_jitter_stays_within_bounds() {
+        let config = RetryConfig {
+            max_attempts: 50,
+            initial_delay: Duration::from_millis(1000),
+            max_delay: Duration::from_secs(60),
+            multiplier: 1.0, // Keep delay constant so we can measure jitter range
+            max_duration: Duration::from_secs(300),
+            jitter: true,
+        };
+
+        let mut backoff = ExponentialBackoff::new(&config);
+
+        // Run many iterations and check all are within ±30% of 1000ms
+        for _ in 0..20 {
+            let delay = backoff.next_delay();
+            let millis = delay.as_millis() as f64;
+            assert!(
+                millis >= 700.0 && millis <= 1300.0,
+                "Jitter delay {millis}ms is outside ±30% of 1000ms"
+            );
+            // Reset to keep base delay constant
+            backoff.current_delay = Duration::from_millis(1000);
+        }
+    }
+
+    #[test]
+    fn test_retry_config_clone_and_debug() {
+        let config = RetryConfig::default();
+        let cloned = config;
+        assert_eq!(cloned.max_attempts, config.max_attempts);
+        assert_eq!(cloned.initial_delay, config.initial_delay);
+        assert_eq!(cloned.max_delay, config.max_delay);
+
+        // Test Debug impl
+        let debug_str = format!("{:?}", config);
+        assert!(debug_str.contains("RetryConfig"));
+    }
+
+    #[test]
+    fn test_exponential_backoff_clone_debug() {
+        let config = RetryConfig::default();
+        let backoff = ExponentialBackoff::new(&config);
+        let cloned = backoff.clone();
+        assert_eq!(cloned.attempt(), backoff.attempt());
+
+        let debug_str = format!("{:?}", backoff);
+        assert!(debug_str.contains("ExponentialBackoff"));
+    }
+
+    #[test]
+    fn test_max_delay_cap_with_jitter() {
+        let config = RetryConfig {
+            max_attempts: 20,
+            initial_delay: Duration::from_secs(30),
+            max_delay: Duration::from_secs(60),
+            multiplier: 2.0,
+            max_duration: Duration::from_secs(300),
+            jitter: true,
+        };
+
+        let mut backoff = ExponentialBackoff::new(&config);
+
+        // Advance past max delay
+        for _ in 0..10 {
+            let delay = backoff.next_delay();
+            // Even with jitter, delay should not exceed max_delay * 1.3
+            let max_allowed = Duration::from_secs(60).as_millis() as f64 * 1.3;
+            assert!(
+                (delay.as_millis() as f64) <= max_allowed + 1.0,
+                "Delay {:?} exceeds max allowed with jitter",
+                delay
+            );
+        }
+    }
+
+    #[test]
+    fn test_add_jitter_small_delay() {
+        let config = RetryConfig {
+            max_attempts: 5,
+            initial_delay: Duration::from_millis(1),
+            max_delay: Duration::from_secs(60),
+            multiplier: 1.0,
+            max_duration: Duration::from_secs(300),
+            jitter: true,
+        };
+
+        let mut backoff = ExponentialBackoff::new(&config);
+        // Very small delay - jitter should not go negative
+        let delay = backoff.next_delay();
+        assert!(delay.as_millis() <= 2); // 1ms ± 30% = 0.7ms to 1.3ms
+    }
+
+    #[test]
+    fn test_backoff_max_delay_capping() {
+        let config = RetryConfig {
+            max_attempts: 10,
+            initial_delay: Duration::from_secs(50),
+            max_delay: Duration::from_secs(60),
+            multiplier: 2.0,
+            max_duration: Duration::from_secs(300),
+            jitter: false,
+        };
+
+        let mut backoff = ExponentialBackoff::new(&config);
+
+        let d1 = backoff.next_delay(); // 50s
+        assert_eq!(d1, Duration::from_secs(50));
+        let d2 = backoff.next_delay(); // 100s => capped to 60s
+        assert_eq!(d2, Duration::from_secs(60));
+        let d3 = backoff.next_delay(); // still 60s (capped)
+        assert_eq!(d3, Duration::from_secs(60));
+    }
 }

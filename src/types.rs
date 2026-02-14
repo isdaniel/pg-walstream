@@ -1084,4 +1084,406 @@ mod tests {
         let parsed = parse_lsn(&formatted).unwrap();
         assert_eq!(parsed, lsn);
     }
+
+    #[test]
+    fn test_slot_type_as_str() {
+        assert_eq!(SlotType::Logical.as_str(), "LOGICAL");
+        assert_eq!(SlotType::Physical.as_str(), "PHYSICAL");
+    }
+
+    #[test]
+    fn test_slot_type_display() {
+        assert_eq!(format!("{}", SlotType::Logical), "LOGICAL");
+        assert_eq!(format!("{}", SlotType::Physical), "PHYSICAL");
+    }
+
+    #[test]
+    fn test_slot_type_clone_copy_eq() {
+        let s1 = SlotType::Logical;
+        let s2 = s1; // Copy
+        let s3 = s1.clone(); // Clone
+        assert_eq!(s1, s2);
+        assert_eq!(s1, s3);
+        assert_ne!(SlotType::Logical, SlotType::Physical);
+    }
+
+    #[test]
+    fn test_change_event_update() {
+        let mut old_data = std::collections::HashMap::new();
+        old_data.insert("id".to_string(), serde_json::json!(1));
+        let mut new_data = std::collections::HashMap::new();
+        new_data.insert("id".to_string(), serde_json::json!(1));
+        new_data.insert("name".to_string(), serde_json::json!("updated"));
+
+        let event = ChangeEvent::update(
+            "public".to_string(),
+            "users".to_string(),
+            12345,
+            Some(old_data),
+            new_data,
+            ReplicaIdentity::Full,
+            vec!["id".to_string()],
+            Lsn::new(2000),
+        );
+
+        assert_eq!(event.lsn.value(), 2000);
+        match &event.event_type {
+            EventType::Update {
+                schema,
+                table,
+                relation_oid,
+                old_data,
+                new_data,
+                replica_identity,
+                key_columns,
+            } => {
+                assert_eq!(schema, "public");
+                assert_eq!(table, "users");
+                assert_eq!(*relation_oid, 12345);
+                assert!(old_data.is_some());
+                assert_eq!(new_data.len(), 2);
+                assert_eq!(*replica_identity, ReplicaIdentity::Full);
+                assert_eq!(key_columns, &vec!["id".to_string()]);
+            }
+            _ => panic!("Expected Update event"),
+        }
+    }
+
+    #[test]
+    fn test_change_event_delete() {
+        let mut old_data = std::collections::HashMap::new();
+        old_data.insert("id".to_string(), serde_json::json!(1));
+
+        let event = ChangeEvent::delete(
+            "public".to_string(),
+            "users".to_string(),
+            12345,
+            old_data,
+            ReplicaIdentity::Index,
+            vec!["id".to_string()],
+            Lsn::new(3000),
+        );
+
+        assert_eq!(event.lsn.value(), 3000);
+        match &event.event_type {
+            EventType::Delete {
+                schema,
+                table,
+                replica_identity,
+                ..
+            } => {
+                assert_eq!(schema, "public");
+                assert_eq!(table, "users");
+                assert_eq!(*replica_identity, ReplicaIdentity::Index);
+            }
+            _ => panic!("Expected Delete event"),
+        }
+    }
+
+    #[test]
+    fn test_change_event_begin() {
+        let ts = Utc.with_ymd_and_hms(2024, 1, 15, 10, 30, 0).unwrap();
+        let event = ChangeEvent::begin(42, Lsn::new(5000), ts, Lsn::new(4000));
+
+        assert_eq!(event.lsn.value(), 4000);
+        match &event.event_type {
+            EventType::Begin {
+                transaction_id,
+                final_lsn,
+                commit_timestamp,
+            } => {
+                assert_eq!(*transaction_id, 42);
+                assert_eq!(final_lsn.value(), 5000);
+                assert_eq!(*commit_timestamp, ts);
+            }
+            _ => panic!("Expected Begin event"),
+        }
+    }
+
+    #[test]
+    fn test_change_event_commit() {
+        let ts = Utc.with_ymd_and_hms(2024, 1, 15, 10, 30, 0).unwrap();
+        let event = ChangeEvent::commit(ts, Lsn::new(6000), Lsn::new(5000), Lsn::new(5500));
+
+        assert_eq!(event.lsn.value(), 6000);
+        match &event.event_type {
+            EventType::Commit {
+                commit_timestamp,
+                commit_lsn,
+                end_lsn,
+            } => {
+                assert_eq!(*commit_timestamp, ts);
+                assert_eq!(commit_lsn.value(), 5000);
+                assert_eq!(end_lsn.value(), 5500);
+            }
+            _ => panic!("Expected Commit event"),
+        }
+    }
+
+    #[test]
+    fn test_change_event_truncate() {
+        let tables = vec!["public.users".to_string(), "public.orders".to_string()];
+        let event = ChangeEvent::truncate(tables.clone(), Lsn::new(7000));
+
+        assert_eq!(event.lsn.value(), 7000);
+        match &event.event_type {
+            EventType::Truncate(t) => {
+                assert_eq!(t, &tables);
+            }
+            _ => panic!("Expected Truncate event"),
+        }
+    }
+
+    #[test]
+    fn test_change_event_relation() {
+        let event = ChangeEvent::relation(Lsn::new(8000));
+        assert_eq!(event.lsn.value(), 8000);
+        assert!(matches!(event.event_type, EventType::Relation));
+    }
+
+    #[test]
+    fn test_change_event_type_event() {
+        let event = ChangeEvent::type_event(Lsn::new(9000));
+        assert_eq!(event.lsn.value(), 9000);
+        assert!(matches!(event.event_type, EventType::Type));
+    }
+
+    #[test]
+    fn test_change_event_origin() {
+        let event = ChangeEvent::origin(Lsn::new(10000));
+        assert_eq!(event.lsn.value(), 10000);
+        assert!(matches!(event.event_type, EventType::Origin));
+    }
+
+    #[test]
+    fn test_change_event_message() {
+        let event = ChangeEvent::message(Lsn::new(11000));
+        assert_eq!(event.lsn.value(), 11000);
+        assert!(matches!(event.event_type, EventType::Message));
+    }
+
+    #[test]
+    fn test_change_event_with_metadata() {
+        let data = std::collections::HashMap::new();
+        let event = ChangeEvent::insert(
+            "public".to_string(),
+            "test".to_string(),
+            1,
+            data,
+            Lsn::new(100),
+        );
+        assert!(event.metadata.is_none());
+
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("source".to_string(), serde_json::json!("test"));
+        metadata.insert("version".to_string(), serde_json::json!(2));
+
+        let event = event.with_metadata(metadata.clone());
+        assert!(event.metadata.is_some());
+        let m = event.metadata.unwrap();
+        assert_eq!(m.get("source").unwrap(), &serde_json::json!("test"));
+        assert_eq!(m.get("version").unwrap(), &serde_json::json!(2));
+    }
+
+    #[test]
+    fn test_change_event_get_key_columns() {
+        // Insert has no key_columns
+        let data = std::collections::HashMap::new();
+        let insert = ChangeEvent::insert(
+            "public".to_string(),
+            "t".to_string(),
+            1,
+            data.clone(),
+            Lsn::new(100),
+        );
+        assert!(insert.get_key_columns().is_none());
+
+        // Update has key_columns
+        let update = ChangeEvent::update(
+            "public".to_string(),
+            "t".to_string(),
+            1,
+            None,
+            data.clone(),
+            ReplicaIdentity::Default,
+            vec!["id".to_string(), "tenant_id".to_string()],
+            Lsn::new(200),
+        );
+        let keys = update.get_key_columns().unwrap();
+        assert_eq!(keys, &vec!["id".to_string(), "tenant_id".to_string()]);
+
+        // Delete has key_columns
+        let delete = ChangeEvent::delete(
+            "public".to_string(),
+            "t".to_string(),
+            1,
+            data,
+            ReplicaIdentity::Full,
+            vec!["id".to_string()],
+            Lsn::new(300),
+        );
+        let keys = delete.get_key_columns().unwrap();
+        assert_eq!(keys, &vec!["id".to_string()]);
+
+        // Truncate has no key_columns
+        let truncate = ChangeEvent::truncate(vec![], Lsn::new(400));
+        assert!(truncate.get_key_columns().is_none());
+
+        // Begin has no key_columns
+        let ts = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let begin = ChangeEvent::begin(1, Lsn::new(500), ts, Lsn::new(500));
+        assert!(begin.get_key_columns().is_none());
+    }
+
+    #[test]
+    fn test_change_event_get_replica_identity() {
+        let data = std::collections::HashMap::new();
+
+        // Insert has no replica_identity
+        let insert = ChangeEvent::insert(
+            "s".to_string(),
+            "t".to_string(),
+            1,
+            data.clone(),
+            Lsn::new(100),
+        );
+        assert!(insert.get_replica_identity().is_none());
+
+        // Update has replica_identity
+        let update = ChangeEvent::update(
+            "s".to_string(),
+            "t".to_string(),
+            1,
+            None,
+            data.clone(),
+            ReplicaIdentity::Nothing,
+            vec![],
+            Lsn::new(200),
+        );
+        assert_eq!(
+            update.get_replica_identity(),
+            Some(&ReplicaIdentity::Nothing)
+        );
+
+        // Delete has replica_identity
+        let delete = ChangeEvent::delete(
+            "s".to_string(),
+            "t".to_string(),
+            1,
+            data,
+            ReplicaIdentity::Full,
+            vec![],
+            Lsn::new(300),
+        );
+        assert_eq!(delete.get_replica_identity(), Some(&ReplicaIdentity::Full));
+    }
+
+    #[test]
+    fn test_change_event_event_type_str() {
+        let data = std::collections::HashMap::new();
+
+        let insert = ChangeEvent::insert(
+            "s".to_string(),
+            "t".to_string(),
+            1,
+            data.clone(),
+            Lsn::new(100),
+        );
+        assert_eq!(insert.event_type_str(), "insert");
+
+        let update = ChangeEvent::update(
+            "s".to_string(),
+            "t".to_string(),
+            1,
+            None,
+            data.clone(),
+            ReplicaIdentity::Default,
+            vec![],
+            Lsn::new(200),
+        );
+        assert_eq!(update.event_type_str(), "update");
+
+        let delete = ChangeEvent::delete(
+            "s".to_string(),
+            "t".to_string(),
+            1,
+            data,
+            ReplicaIdentity::Default,
+            vec![],
+            Lsn::new(300),
+        );
+        assert_eq!(delete.event_type_str(), "delete");
+
+        let truncate = ChangeEvent::truncate(vec!["t".to_string()], Lsn::new(400));
+        assert_eq!(truncate.event_type_str(), "truncate");
+
+        // "other" for Begin, Commit, Relation, Type, Origin, Message
+        let relation = ChangeEvent::relation(Lsn::new(500));
+        assert_eq!(relation.event_type_str(), "other");
+
+        let ts = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let begin = ChangeEvent::begin(1, Lsn::new(600), ts, Lsn::new(600));
+        assert_eq!(begin.event_type_str(), "other");
+
+        let commit = ChangeEvent::commit(ts, Lsn::new(700), Lsn::new(700), Lsn::new(710));
+        assert_eq!(commit.event_type_str(), "other");
+
+        let origin = ChangeEvent::origin(Lsn::new(800));
+        assert_eq!(origin.event_type_str(), "other");
+
+        let message = ChangeEvent::message(Lsn::new(900));
+        assert_eq!(message.event_type_str(), "other");
+
+        let type_event = ChangeEvent::type_event(Lsn::new(1000));
+        assert_eq!(type_event.event_type_str(), "other");
+    }
+
+    #[test]
+    fn test_format_postgres_timestamp_invalid() {
+        // Very large negative timestamp
+        let result = format_postgres_timestamp(i64::MIN / 2);
+        // Either we get a valid formatted timestamp or "invalid timestamp"
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_lsn_serialize_deserialize() {
+        let lsn = Lsn::new(0x16B374D848);
+        let serialized = serde_json::to_string(&lsn).unwrap();
+        let deserialized: Lsn = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(lsn, deserialized);
+    }
+
+    #[test]
+    fn test_replica_identity_serialize_deserialize() {
+        for identity in [
+            ReplicaIdentity::Default,
+            ReplicaIdentity::Nothing,
+            ReplicaIdentity::Full,
+            ReplicaIdentity::Index,
+        ] {
+            let serialized = serde_json::to_string(&identity).unwrap();
+            let deserialized: ReplicaIdentity = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(identity, deserialized);
+        }
+    }
+
+    #[test]
+    fn test_change_event_serialize_deserialize() {
+        let mut data = std::collections::HashMap::new();
+        data.insert("id".to_string(), serde_json::json!(42));
+
+        let event = ChangeEvent::insert(
+            "public".to_string(),
+            "test".to_string(),
+            12345,
+            data,
+            Lsn::new(1000),
+        );
+
+        let serialized = serde_json::to_string(&event).unwrap();
+        let deserialized: ChangeEvent = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized.lsn, event.lsn);
+        assert_eq!(deserialized.event_type, event.event_type);
+    }
 }
