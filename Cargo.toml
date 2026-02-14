@@ -22,9 +22,11 @@ bytes = "1.11.1"
 tracing = "0.1.44"
 libpq-sys = "0.8"
 thiserror = "2.0.18"
+arbitrary = { version = "1", features = ["derive"], optional = true }
 
 [features]
 default = []
+arbitrary = ["dep:arbitrary"]
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
