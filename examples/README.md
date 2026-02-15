@@ -2,9 +2,18 @@
 
 This directory contains examples demonstrating how to use the `pg_walstream` library to stream PostgreSQL Write-Ahead Log (WAL) changes.
 
+Each example is an **independent binary project** with its own `Cargo.toml`, so example-specific dependencies (e.g. `futures`, `flate2`, `tokio-stream`) do not pollute `pg_walstream`'s `[dev-dependencies]`.
+
+## Running an Example
+
+```bash
+cd examples/<project-name>
+cargo run
+```
+
 ## Examples
 
-### 1. basic_streaming.rs
+### 1. basic-streaming
 
 Demonstrates the high-level Stream API wrapped with `futures::stream::unfold` for Stream trait compatibility.
 
@@ -17,12 +26,13 @@ Demonstrates the high-level Stream API wrapped with `futures::stream::unfold` fo
 
 **Run:**
 ```bash
-cargo run --example basic_streaming
+cd examples/basic-streaming
+cargo run
 ```
 
-### 2. rate_limited_streaming.rs
+### 2. rate-limited-streaming
 
-**NEW**: Demonstrates rate limiting and flow control using futures::Stream combinators.
+Demonstrates rate limiting and flow control using futures::Stream combinators.
 
 **Features:**
 - Rate limiting to prevent overwhelming downstream systems
@@ -34,11 +44,11 @@ cargo run --example basic_streaming
 
 **Run:**
 ```bash
-# Default: 10 events per second
-cargo run --example rate_limited_streaming
+cd examples/rate-limited-streaming
+cargo run
 
 # Custom rate limit
-MAX_EVENTS_PER_SECOND=50 cargo run --example rate_limited_streaming
+MAX_EVENTS_PER_SECOND=50 cargo run
 ```
 
 **Use Cases:**
@@ -48,7 +58,7 @@ MAX_EVENTS_PER_SECOND=50 cargo run --example rate_limited_streaming
 - Controlled batch processing
 - Testing with realistic production loads
 
-### 3. polling_example.rs
+### 3. polling
 
 Shows the lower-level polling API for manual event retrieval.
 
@@ -59,12 +69,13 @@ Shows the lower-level polling API for manual event retrieval.
 
 **Run:**
 ```bash
-cargo run --example polling_example
+cd examples/polling
+cargo run
 ```
 
-### 4. safe_transaction_consumer.rs
+### 4. safe-transaction-consumer
 
-**NEW**: Advanced example demonstrating safe transaction processing with ordered commits.
+Advanced example demonstrating safe transaction processing with ordered commits.
 
 **Features:**
 - Transaction buffering until commit
@@ -77,7 +88,8 @@ cargo run --example polling_example
 
 **Run:**
 ```bash
-cargo run --example safe_transaction_consumer
+cd examples/safe-transaction-consumer
+cargo run
 ```
 
 **Use Cases:**
@@ -86,9 +98,9 @@ cargo run --example safe_transaction_consumer
 - Implementing exactly-once processing semantics
 - Safe CDC (Change Data Capture) pipelines
 
-### 5. pg_basebackup.rs
+### 5. pg-basebackup
 
-**NEW**: Complete implementation of pg_basebackup functionality for creating physical database backups.
+Complete implementation of pg_basebackup functionality for creating physical database backups.
 
 **Features:**
 - Full physical backup of PostgreSQL cluster
@@ -101,7 +113,11 @@ cargo run --example safe_transaction_consumer
 
 **Run:**
 ```bash
-cargo run --example pg_basebackup
+cd examples/pg-basebackup
+cargo run
+
+# Or with custom backup directory:
+BACKUP_DIR="/tmp/pg_basebackup" cargo run
 ```
 
 **What It Does:**
@@ -117,6 +133,16 @@ cargo run --example pg_basebackup
 - Disaster recovery preparation
 - Database migrations and cloning
 - Automated backup solutions
+
+### 6. arbitrary-fuzzing
+
+Demonstrates generating arbitrary `pg_walstream` types for fuzzing **without** modifying the library.
+
+**Run:**
+```bash
+cd examples/arbitrary-fuzzing
+cargo run
+```
 
 ## Prerequisites
 

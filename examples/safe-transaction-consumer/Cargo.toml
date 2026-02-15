@@ -1,0 +1,12 @@
+[package]
+name = "safe-transaction-consumer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Safe transaction consumer example with ordered commit processing"
+
+[dependencies]
+pg_walstream = { path = "../.." }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1.47.2", features = ["full"] }

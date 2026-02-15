@@ -7,4 +7,4 @@ description = "Demonstrates external arbitrary generation for pg_walstream types
 
 [dependencies]
 pg_walstream = { path = "../.." }
-arbitrary = { version = "1", features = ["derive"] }
+arbitrary = { version = "1.4.2", features = ["derive"] }
