@@ -1619,4 +1619,82 @@ mod tests {
         assert_eq!(deserialized.lsn, event.lsn);
         assert_eq!(deserialized.event_type, event.event_type);
     }
+
+    #[test]
+    fn test_cache_padded_deref() {
+        let padded = CachePadded::new(42u64);
+        assert_eq!(*padded, 42);
+    }
+
+    #[test]
+    fn test_cache_padded_deref_mut() {
+        let mut padded = CachePadded::new(String::from("hello"));
+        padded.push_str(" world");
+        assert_eq!(&*padded, "hello world");
+    }
+
+    // ---- RowData::iter coverage ----
+
+    #[test]
+    fn test_rowdata_iter() {
+        let row = RowData::from_pairs(vec![
+            ("a", serde_json::json!(1)),
+            ("b", serde_json::json!("two")),
+            ("c", serde_json::json!(true)),
+        ]);
+        let collected: Vec<_> = row.iter().map(|(k, v)| (k.as_ref(), v.clone())).collect();
+        assert_eq!(collected.len(), 3);
+        assert_eq!(collected[0].0, "a");
+        assert_eq!(collected[0].1, serde_json::json!(1));
+        assert_eq!(collected[2].0, "c");
+        assert_eq!(collected[2].1, serde_json::json!(true));
+    }
+
+    // ---- RowData::into_vec coverage ----
+
+    #[test]
+    fn test_rowdata_into_vec() {
+        let row = RowData::from_pairs(vec![
+            ("x", serde_json::json!(10)),
+            ("y", serde_json::json!(20)),
+        ]);
+        let vec = row.into_vec();
+        assert_eq!(vec.len(), 2);
+        assert_eq!(vec[0].0.as_ref(), "x");
+        assert_eq!(vec[0].1, serde_json::json!(10));
+        assert_eq!(vec[1].0.as_ref(), "y");
+        assert_eq!(vec[1].1, serde_json::json!(20));
+    }
+
+    // ---- RowData::default coverage ----
+
+    #[test]
+    fn test_rowdata_default() {
+        let row = RowData::default();
+        assert!(row.is_empty());
+        assert_eq!(row.len(), 0);
+    }
+
+    #[test]
+    fn test_rowdata_deserialize_invalid_type() {
+        // Feeding a non-object type triggers the `expecting()` method.
+        let err = serde_json::from_str::<RowData>("42").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("a JSON object"),
+            "Error should reference expecting(), got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_rowdata_deserialize_string_gives_error() {
+        let err = serde_json::from_str::<RowData>("\"hello\"").unwrap_err();
+        assert!(err.to_string().contains("a JSON object"));
+    }
+
+    #[test]
+    fn test_rowdata_deserialize_array_gives_error() {
+        let err = serde_json::from_str::<RowData>("[1, 2, 3]").unwrap_err();
+        assert!(err.to_string().contains("a JSON object"));
+    }
 }

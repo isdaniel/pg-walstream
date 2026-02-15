@@ -234,7 +234,7 @@ fn bench_full_pipeline(c: &mut Criterion) {
 }
 
 /// Simulate high-throughput: construct N events from the same relation
-/// (e.g., a burst of INSERTs in one transaction).
+/// (e.g., a burst of INSERT in one transaction).
 fn bench_batch_construction(c: &mut Criterion) {
     let mut group = c.benchmark_group("batch_100_events");
 
