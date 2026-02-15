@@ -1,0 +1,3 @@
+[default.extend-words]
+# "flate2" is a legitimate Rust crate name
+flate = "flate"
