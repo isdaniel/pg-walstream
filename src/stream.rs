@@ -1431,7 +1431,7 @@ impl LogicalReplicationStream {
 /// If you need to use stream combinators from the `futures` crate, you can easily
 /// wrap this with `futures::stream::unfold`:
 ///
-/// ```no_run
+/// ```ignore
 /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig, StreamingMode};
 /// use tokio_util::sync::CancellationToken;
 /// use futures::stream::{self, StreamExt};
