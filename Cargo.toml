@@ -15,7 +15,7 @@ categories = ["database", "parsing", "network-programming"]
 [dependencies]
 tokio = { version = "1.49.0", features = ["io-util", "net", "time", "macros"] }
 tokio-util = { version = "0.7.18", features = ["compat"] }
-serde = { version = "1.0.228", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = "1.0.149"
 chrono = { version = "0.4.43", features = ["serde"] }
 bytes = "1.11.1"
@@ -28,3 +28,8 @@ default = []
 
 [dev-dependencies]
 tokio = { version = "1.47.2", features = ["full"] }
+criterion = { version = "0.8.2", features = ["html_reports"] }
+
+[[bench]]
+name = "rowdata_vs_hashmap"
+harness = false

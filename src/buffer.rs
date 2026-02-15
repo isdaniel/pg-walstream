@@ -199,13 +199,13 @@ impl BufferReader {
             ReplicationError::protocol("Unterminated string in buffer".to_string())
         })?;
 
-        // Read the string bytes
-        let string_bytes = self.data.copy_to_bytes(bytes_to_read);
-        let result = String::from_utf8(string_bytes.to_vec())
-            .map_err(|e| ReplicationError::protocol(format!("Invalid UTF-8 in string: {e}")))?;
+        // Validate UTF-8 on the borrowed slice (zero-copy), then create one owned String
+        let result = std::str::from_utf8(&data_slice[..bytes_to_read])
+            .map_err(|e| ReplicationError::protocol(format!("Invalid UTF-8 in string: {e}")))?
+            .to_owned();
 
-        // Skip null terminator
-        self.data.advance(1);
+        // Advance past the string bytes and the null terminator
+        self.data.advance(bytes_to_read + 1);
 
         Ok(result)
     }
@@ -214,9 +214,10 @@ impl BufferReader {
     #[inline]
     pub fn read_string(&mut self, length: usize) -> Result<String> {
         self.ensure_bytes(length)?;
-        let string_bytes = self.data.copy_to_bytes(length);
-        let result = String::from_utf8(string_bytes.to_vec())
-            .map_err(|e| ReplicationError::protocol(format!("Invalid UTF-8 in string: {e}")))?;
+        let result = std::str::from_utf8(&self.data.chunk()[..length])
+            .map_err(|e| ReplicationError::protocol(format!("Invalid UTF-8 in string: {e}")))?
+            .to_owned();
+        self.data.advance(length);
         Ok(result)
     }
 

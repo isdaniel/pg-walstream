@@ -411,6 +411,7 @@ version = "0.1.0"
 dependencies = [
  "pg_walstream",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]
