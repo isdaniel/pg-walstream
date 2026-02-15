@@ -5,6 +5,7 @@
 
 use crate::error::{ReplicationError, Result};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // PostgreSQL constants
@@ -469,33 +470,194 @@ impl From<Lsn> for u64 {
     }
 }
 
+/// Ordered row data: a list of `(column_name, value)` pairs.
+///
+/// Replaces `HashMap<String, serde_json::Value>` for CDC event payloads.
+/// Column names are `Arc<str>` — zero-cost clones from relation metadata.
+/// Serialises as a JSON object `{"col": value, …}` for wire-format compatibility.
+///
+/// # Example
+///
+/// ```
+/// use pg_walstream::RowData;
+/// use std::sync::Arc;
+///
+/// let mut row = RowData::with_capacity(2);
+/// row.push(Arc::from("id"), serde_json::json!(1));
+/// row.push(Arc::from("name"), serde_json::json!("Alice"));
+///
+/// assert_eq!(row.len(), 2);
+/// assert_eq!(row.get("id"), Some(&serde_json::json!(1)));
+/// ```
+#[derive(Debug, Clone, Eq)]
+pub struct RowData {
+    columns: Vec<(Arc<str>, serde_json::Value)>,
+}
+
+// --- core API ---
+
+impl RowData {
+    /// Create an empty `RowData`.
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            columns: Vec::new(),
+        }
+    }
+
+    /// Create an empty `RowData` with pre-allocated capacity.
+    #[inline]
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            columns: Vec::with_capacity(cap),
+        }
+    }
+
+    /// Append a column.
+    #[inline]
+    pub fn push(&mut self, name: Arc<str>, value: serde_json::Value) {
+        self.columns.push((name, value));
+    }
+
+    /// Number of columns.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.columns.len()
+    }
+
+    /// Returns `true` when there are no columns.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.columns.is_empty()
+    }
+
+    /// Look up a value by column name (linear scan — fast for typical column counts).
+    #[inline]
+    pub fn get(&self, name: &str) -> Option<&serde_json::Value> {
+        self.columns
+            .iter()
+            .find(|(k, _)| k.as_ref() == name)
+            .map(|(_, v)| v)
+    }
+
+    /// Check whether a column exists.
+    #[inline]
+    pub fn contains_key(&self, name: &str) -> bool {
+        self.columns.iter().any(|(k, _)| k.as_ref() == name)
+    }
+
+    /// Iterate over `(&Arc<str>, &Value)` pairs.
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = (&Arc<str>, &serde_json::Value)> {
+        self.columns.iter().map(|(k, v)| (k, v))
+    }
+
+    /// Consume into the inner `Vec`.
+    #[inline]
+    pub fn into_vec(self) -> Vec<(Arc<str>, serde_json::Value)> {
+        self.columns
+    }
+
+    /// Convert to a `HashMap` (allocates — prefer `get` / `iter` for lookups).
+    pub fn into_hash_map(self) -> std::collections::HashMap<String, serde_json::Value> {
+        self.columns
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect()
+    }
+
+    /// Construct from `(&str, Value)` pairs — handy for tests and literals.
+    pub fn from_pairs(pairs: Vec<(&str, serde_json::Value)>) -> Self {
+        Self {
+            columns: pairs.into_iter().map(|(k, v)| (Arc::from(k), v)).collect(),
+        }
+    }
+}
+
+impl Default for RowData {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Order-sensitive equality (columns must match in the same order).
+impl PartialEq for RowData {
+    fn eq(&self, other: &Self) -> bool {
+        self.columns == other.columns
+    }
+}
+// --- serde: serialise as JSON object ---
+
+impl Serialize for RowData {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.columns.len()))?;
+        for (k, v) in &self.columns {
+            map.serialize_entry(k.as_ref(), v)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for RowData {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = RowData;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a JSON object (map of column names to values)")
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> std::result::Result<RowData, M::Error> {
+                let mut cols = Vec::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some((k, v)) = map.next_entry::<String, serde_json::Value>()? {
+                    cols.push((Arc::from(k.as_str()), v));
+                }
+                Ok(RowData { columns: cols })
+            }
+        }
+
+        deserializer.deserialize_map(Visitor)
+    }
+}
+
 /// Represents the type of change event from PostgreSQL logical replication
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventType {
     Insert {
-        schema: String,
-        table: String,
+        schema: Arc<str>,
+        table: Arc<str>,
         relation_oid: u32,
-        data: std::collections::HashMap<String, serde_json::Value>,
+        data: RowData,
     },
     Update {
-        schema: String,
-        table: String,
+        schema: Arc<str>,
+        table: Arc<str>,
         relation_oid: u32,
-        old_data: Option<std::collections::HashMap<String, serde_json::Value>>,
-        new_data: std::collections::HashMap<String, serde_json::Value>,
+        old_data: Option<RowData>,
+        new_data: RowData,
         replica_identity: ReplicaIdentity,
-        key_columns: Vec<String>,
+        key_columns: Vec<Arc<str>>,
     },
     Delete {
-        schema: String,
-        table: String,
+        schema: Arc<str>,
+        table: Arc<str>,
         relation_oid: u32,
-        old_data: std::collections::HashMap<String, serde_json::Value>,
+        old_data: RowData,
         replica_identity: ReplicaIdentity,
-        key_columns: Vec<String>,
+        key_columns: Vec<Arc<str>>,
     },
-    Truncate(Vec<String>),
+    Truncate(Vec<Arc<str>>),
     Begin {
         transaction_id: u32,
         final_lsn: Lsn,
@@ -560,32 +722,33 @@ impl ChangeEvent {
     /// # Example
     ///
     /// ```
-    /// use pg_walstream::{ChangeEvent, Lsn};
-    /// use std::collections::HashMap;
+    /// use pg_walstream::{ChangeEvent, Lsn, RowData};
+    /// use std::sync::Arc;
     ///
-    /// let mut data = HashMap::new();
-    /// data.insert("id".to_string(), serde_json::json!(1));
-    /// data.insert("name".to_string(), serde_json::json!("Alice"));
+    /// let data = RowData::from_pairs(vec![
+    ///     ("id", serde_json::json!(1)),
+    ///     ("name", serde_json::json!("Alice")),
+    /// ]);
     ///
     /// let event = ChangeEvent::insert(
-    ///     "public".to_string(),
-    ///     "users".to_string(),
+    ///     "public",
+    ///     "users",
     ///     12345,
     ///     data,
     ///     Lsn::new(0x16B374D848),
     /// );
     /// ```
     pub fn insert(
-        schema_name: String,
-        table_name: String,
+        schema_name: impl Into<Arc<str>>,
+        table_name: impl Into<Arc<str>>,
         relation_oid: u32,
-        data: std::collections::HashMap<String, serde_json::Value>,
+        data: RowData,
         lsn: Lsn,
     ) -> Self {
         Self {
             event_type: EventType::Insert {
-                schema: schema_name,
-                table: table_name,
+                schema: schema_name.into(),
+                table: table_name.into(),
                 relation_oid,
                 data,
             },
@@ -610,43 +773,45 @@ impl ChangeEvent {
     /// # Example
     ///
     /// ```
-    /// use pg_walstream::{ChangeEvent, ReplicaIdentity, Lsn};
-    /// use std::collections::HashMap;
+    /// use pg_walstream::{ChangeEvent, ReplicaIdentity, Lsn, RowData};
+    /// use std::sync::Arc;
     ///
-    /// let mut old_data = HashMap::new();
-    /// old_data.insert("id".to_string(), serde_json::json!(1));
-    /// old_data.insert("name".to_string(), serde_json::json!("Alice"));
+    /// let old_data = RowData::from_pairs(vec![
+    ///     ("id", serde_json::json!(1)),
+    ///     ("name", serde_json::json!("Alice")),
+    /// ]);
     ///
-    /// let mut new_data = HashMap::new();
-    /// new_data.insert("id".to_string(), serde_json::json!(1));
-    /// new_data.insert("name".to_string(), serde_json::json!("Bob"));
+    /// let new_data = RowData::from_pairs(vec![
+    ///     ("id", serde_json::json!(1)),
+    ///     ("name", serde_json::json!("Bob")),
+    /// ]);
     ///
     /// let event = ChangeEvent::update(
-    ///     "public".to_string(),
-    ///     "users".to_string(),
+    ///     "public",
+    ///     "users",
     ///     12345,
     ///     Some(old_data),
     ///     new_data,
     ///     ReplicaIdentity::Default,
-    ///     vec!["id".to_string()],
+    ///     vec![Arc::from("id")],
     ///     Lsn::new(0x16B374D848),
     /// );
     /// ```
     #[allow(clippy::too_many_arguments)] // Configuration constructor - parameters are all necessary
     pub fn update(
-        schema_name: String,
-        table_name: String,
+        schema_name: impl Into<Arc<str>>,
+        table_name: impl Into<Arc<str>>,
         relation_oid: u32,
-        old_data: Option<std::collections::HashMap<String, serde_json::Value>>,
-        new_data: std::collections::HashMap<String, serde_json::Value>,
+        old_data: Option<RowData>,
+        new_data: RowData,
         replica_identity: ReplicaIdentity,
-        key_columns: Vec<String>,
+        key_columns: Vec<Arc<str>>,
         lsn: Lsn,
     ) -> Self {
         Self {
             event_type: EventType::Update {
-                schema: schema_name,
-                table: table_name,
+                schema: schema_name.into(),
+                table: table_name.into(),
                 relation_oid,
                 old_data,
                 new_data,
@@ -673,36 +838,37 @@ impl ChangeEvent {
     /// # Example
     ///
     /// ```
-    /// use pg_walstream::{ChangeEvent, ReplicaIdentity, Lsn};
-    /// use std::collections::HashMap;
+    /// use pg_walstream::{ChangeEvent, ReplicaIdentity, Lsn, RowData};
+    /// use std::sync::Arc;
     ///
-    /// let mut old_data = HashMap::new();
-    /// old_data.insert("id".to_string(), serde_json::json!(1));
-    /// old_data.insert("name".to_string(), serde_json::json!("Alice"));
+    /// let old_data = RowData::from_pairs(vec![
+    ///     ("id", serde_json::json!(1)),
+    ///     ("name", serde_json::json!("Alice")),
+    /// ]);
     ///
     /// let event = ChangeEvent::delete(
-    ///     "public".to_string(),
-    ///     "users".to_string(),
+    ///     "public",
+    ///     "users",
     ///     12345,
     ///     old_data,
     ///     ReplicaIdentity::Full,
-    ///     vec!["id".to_string()],
+    ///     vec![Arc::from("id")],
     ///     Lsn::new(0x16B374D848),
     /// );
     /// ```
     pub fn delete(
-        schema_name: String,
-        table_name: String,
+        schema_name: impl Into<Arc<str>>,
+        table_name: impl Into<Arc<str>>,
         relation_oid: u32,
-        old_data: std::collections::HashMap<String, serde_json::Value>,
+        old_data: RowData,
         replica_identity: ReplicaIdentity,
-        key_columns: Vec<String>,
+        key_columns: Vec<Arc<str>>,
         lsn: Lsn,
     ) -> Self {
         Self {
             event_type: EventType::Delete {
-                schema: schema_name,
-                table: table_name,
+                schema: schema_name.into(),
+                table: table_name.into(),
                 relation_oid,
                 old_data,
                 replica_identity,
@@ -771,7 +937,7 @@ impl ChangeEvent {
     ///
     /// * `tables` - List of table names that were truncated
     /// * `lsn` - Log Sequence Number for this event
-    pub fn truncate(tables: Vec<String>, lsn: Lsn) -> Self {
+    pub fn truncate(tables: Vec<Arc<str>>, lsn: Lsn) -> Self {
         Self {
             event_type: EventType::Truncate(tables),
             lsn,
@@ -841,7 +1007,7 @@ impl ChangeEvent {
     }
 
     /// Get key columns from UPDATE or DELETE events
-    pub fn get_key_columns(&self) -> Option<&Vec<String>> {
+    pub fn get_key_columns(&self) -> Option<&Vec<Arc<str>>> {
         match &self.event_type {
             EventType::Update { key_columns, .. } => Some(key_columns),
             EventType::Delete { key_columns, .. } => Some(key_columns),
@@ -1030,17 +1196,12 @@ mod tests {
 
     #[test]
     fn test_change_event_insert() {
-        let mut data = std::collections::HashMap::new();
-        data.insert("id".to_string(), serde_json::json!(1));
-        data.insert("name".to_string(), serde_json::json!("test"));
+        let data = RowData::from_pairs(vec![
+            ("id", serde_json::json!(1)),
+            ("name", serde_json::json!("test")),
+        ]);
 
-        let event = ChangeEvent::insert(
-            "public".to_string(),
-            "users".to_string(),
-            12345,
-            data,
-            Lsn::new(0x16B374D848),
-        );
+        let event = ChangeEvent::insert("public", "users", 12345, data, Lsn::new(0x16B374D848));
 
         if let EventType::Insert {
             schema,
@@ -1049,8 +1210,8 @@ mod tests {
             data,
         } = event.event_type
         {
-            assert_eq!(schema, "public");
-            assert_eq!(table, "users");
+            assert_eq!(&*schema, "public");
+            assert_eq!(&*table, "users");
             assert_eq!(relation_oid, 12345);
             assert_eq!(data.get("name").unwrap(), "test");
         } else {
@@ -1109,20 +1270,20 @@ mod tests {
 
     #[test]
     fn test_change_event_update() {
-        let mut old_data = std::collections::HashMap::new();
-        old_data.insert("id".to_string(), serde_json::json!(1));
-        let mut new_data = std::collections::HashMap::new();
-        new_data.insert("id".to_string(), serde_json::json!(1));
-        new_data.insert("name".to_string(), serde_json::json!("updated"));
+        let old_data = RowData::from_pairs(vec![("id", serde_json::json!(1))]);
+        let new_data = RowData::from_pairs(vec![
+            ("id", serde_json::json!(1)),
+            ("name", serde_json::json!("updated")),
+        ]);
 
         let event = ChangeEvent::update(
-            "public".to_string(),
-            "users".to_string(),
+            "public",
+            "users",
             12345,
             Some(old_data),
             new_data,
             ReplicaIdentity::Full,
-            vec!["id".to_string()],
+            vec![Arc::from("id")],
             Lsn::new(2000),
         );
 
@@ -1137,13 +1298,13 @@ mod tests {
                 replica_identity,
                 key_columns,
             } => {
-                assert_eq!(schema, "public");
-                assert_eq!(table, "users");
+                assert_eq!(&**schema, "public");
+                assert_eq!(&**table, "users");
                 assert_eq!(*relation_oid, 12345);
                 assert!(old_data.is_some());
                 assert_eq!(new_data.len(), 2);
                 assert_eq!(*replica_identity, ReplicaIdentity::Full);
-                assert_eq!(key_columns, &vec!["id".to_string()]);
+                assert_eq!(key_columns, &vec![Arc::<str>::from("id")]);
             }
             _ => panic!("Expected Update event"),
         }
@@ -1151,16 +1312,15 @@ mod tests {
 
     #[test]
     fn test_change_event_delete() {
-        let mut old_data = std::collections::HashMap::new();
-        old_data.insert("id".to_string(), serde_json::json!(1));
+        let old_data = RowData::from_pairs(vec![("id", serde_json::json!(1))]);
 
         let event = ChangeEvent::delete(
-            "public".to_string(),
-            "users".to_string(),
+            "public",
+            "users",
             12345,
             old_data,
             ReplicaIdentity::Index,
-            vec!["id".to_string()],
+            vec![Arc::from("id")],
             Lsn::new(3000),
         );
 
@@ -1172,8 +1332,8 @@ mod tests {
                 replica_identity,
                 ..
             } => {
-                assert_eq!(schema, "public");
-                assert_eq!(table, "users");
+                assert_eq!(&**schema, "public");
+                assert_eq!(&**table, "users");
                 assert_eq!(*replica_identity, ReplicaIdentity::Index);
             }
             _ => panic!("Expected Delete event"),
@@ -1222,7 +1382,7 @@ mod tests {
 
     #[test]
     fn test_change_event_truncate() {
-        let tables = vec!["public.users".to_string(), "public.orders".to_string()];
+        let tables: Vec<Arc<str>> = vec![Arc::from("public.users"), Arc::from("public.orders")];
         let event = ChangeEvent::truncate(tables.clone(), Lsn::new(7000));
 
         assert_eq!(event.lsn.value(), 7000);
@@ -1264,14 +1424,8 @@ mod tests {
 
     #[test]
     fn test_change_event_with_metadata() {
-        let data = std::collections::HashMap::new();
-        let event = ChangeEvent::insert(
-            "public".to_string(),
-            "test".to_string(),
-            1,
-            data,
-            Lsn::new(100),
-        );
+        let data = RowData::new();
+        let event = ChangeEvent::insert("public", "test", 1, data, Lsn::new(100));
         assert!(event.metadata.is_none());
 
         let mut metadata = std::collections::HashMap::new();
@@ -1288,42 +1442,39 @@ mod tests {
     #[test]
     fn test_change_event_get_key_columns() {
         // Insert has no key_columns
-        let data = std::collections::HashMap::new();
-        let insert = ChangeEvent::insert(
-            "public".to_string(),
-            "t".to_string(),
-            1,
-            data.clone(),
-            Lsn::new(100),
-        );
+        let data = RowData::new();
+        let insert = ChangeEvent::insert("public", "t", 1, data.clone(), Lsn::new(100));
         assert!(insert.get_key_columns().is_none());
 
         // Update has key_columns
         let update = ChangeEvent::update(
-            "public".to_string(),
-            "t".to_string(),
+            "public",
+            "t",
             1,
             None,
             data.clone(),
             ReplicaIdentity::Default,
-            vec!["id".to_string(), "tenant_id".to_string()],
+            vec![Arc::from("id"), Arc::from("tenant_id")],
             Lsn::new(200),
         );
         let keys = update.get_key_columns().unwrap();
-        assert_eq!(keys, &vec!["id".to_string(), "tenant_id".to_string()]);
+        assert_eq!(
+            keys,
+            &vec![Arc::<str>::from("id"), Arc::<str>::from("tenant_id")]
+        );
 
         // Delete has key_columns
         let delete = ChangeEvent::delete(
-            "public".to_string(),
-            "t".to_string(),
+            "public",
+            "t",
             1,
             data,
             ReplicaIdentity::Full,
-            vec!["id".to_string()],
+            vec![Arc::from("id")],
             Lsn::new(300),
         );
         let keys = delete.get_key_columns().unwrap();
-        assert_eq!(keys, &vec!["id".to_string()]);
+        assert_eq!(keys, &vec![Arc::<str>::from("id")]);
 
         // Truncate has no key_columns
         let truncate = ChangeEvent::truncate(vec![], Lsn::new(400));
@@ -1337,22 +1488,16 @@ mod tests {
 
     #[test]
     fn test_change_event_get_replica_identity() {
-        let data = std::collections::HashMap::new();
+        let data = RowData::new();
 
         // Insert has no replica_identity
-        let insert = ChangeEvent::insert(
-            "s".to_string(),
-            "t".to_string(),
-            1,
-            data.clone(),
-            Lsn::new(100),
-        );
+        let insert = ChangeEvent::insert("s", "t", 1, data.clone(), Lsn::new(100));
         assert!(insert.get_replica_identity().is_none());
 
         // Update has replica_identity
         let update = ChangeEvent::update(
-            "s".to_string(),
-            "t".to_string(),
+            "s",
+            "t",
             1,
             None,
             data.clone(),
@@ -1367,8 +1512,8 @@ mod tests {
 
         // Delete has replica_identity
         let delete = ChangeEvent::delete(
-            "s".to_string(),
-            "t".to_string(),
+            "s",
+            "t",
             1,
             data,
             ReplicaIdentity::Full,
@@ -1380,20 +1525,14 @@ mod tests {
 
     #[test]
     fn test_change_event_event_type_str() {
-        let data = std::collections::HashMap::new();
+        let data = RowData::new();
 
-        let insert = ChangeEvent::insert(
-            "s".to_string(),
-            "t".to_string(),
-            1,
-            data.clone(),
-            Lsn::new(100),
-        );
+        let insert = ChangeEvent::insert("s", "t", 1, data.clone(), Lsn::new(100));
         assert_eq!(insert.event_type_str(), "insert");
 
         let update = ChangeEvent::update(
-            "s".to_string(),
-            "t".to_string(),
+            "s",
+            "t",
             1,
             None,
             data.clone(),
@@ -1404,8 +1543,8 @@ mod tests {
         assert_eq!(update.event_type_str(), "update");
 
         let delete = ChangeEvent::delete(
-            "s".to_string(),
-            "t".to_string(),
+            "s",
+            "t",
             1,
             data,
             ReplicaIdentity::Default,
@@ -1414,7 +1553,7 @@ mod tests {
         );
         assert_eq!(delete.event_type_str(), "delete");
 
-        let truncate = ChangeEvent::truncate(vec!["t".to_string()], Lsn::new(400));
+        let truncate = ChangeEvent::truncate(vec![Arc::from("t")], Lsn::new(400));
         assert_eq!(truncate.event_type_str(), "truncate");
 
         // "other" for Begin, Commit, Relation, Type, Origin, Message
@@ -1470,20 +1609,91 @@ mod tests {
 
     #[test]
     fn test_change_event_serialize_deserialize() {
-        let mut data = std::collections::HashMap::new();
-        data.insert("id".to_string(), serde_json::json!(42));
+        let data = RowData::from_pairs(vec![("id", serde_json::json!(42))]);
 
-        let event = ChangeEvent::insert(
-            "public".to_string(),
-            "test".to_string(),
-            12345,
-            data,
-            Lsn::new(1000),
-        );
+        let event = ChangeEvent::insert("public", "test", 12345, data, Lsn::new(1000));
 
         let serialized = serde_json::to_string(&event).unwrap();
         let deserialized: ChangeEvent = serde_json::from_str(&serialized).unwrap();
         assert_eq!(deserialized.lsn, event.lsn);
         assert_eq!(deserialized.event_type, event.event_type);
+    }
+
+    #[test]
+    fn test_cache_padded_deref() {
+        let padded = CachePadded::new(42u64);
+        assert_eq!(*padded, 42);
+    }
+
+    #[test]
+    fn test_cache_padded_deref_mut() {
+        let mut padded = CachePadded::new(String::from("hello"));
+        padded.push_str(" world");
+        assert_eq!(&*padded, "hello world");
+    }
+
+    // ---- RowData::iter coverage ----
+
+    #[test]
+    fn test_rowdata_iter() {
+        let row = RowData::from_pairs(vec![
+            ("a", serde_json::json!(1)),
+            ("b", serde_json::json!("two")),
+            ("c", serde_json::json!(true)),
+        ]);
+        let collected: Vec<_> = row.iter().map(|(k, v)| (k.as_ref(), v.clone())).collect();
+        assert_eq!(collected.len(), 3);
+        assert_eq!(collected[0].0, "a");
+        assert_eq!(collected[0].1, serde_json::json!(1));
+        assert_eq!(collected[2].0, "c");
+        assert_eq!(collected[2].1, serde_json::json!(true));
+    }
+
+    // ---- RowData::into_vec coverage ----
+
+    #[test]
+    fn test_rowdata_into_vec() {
+        let row = RowData::from_pairs(vec![
+            ("x", serde_json::json!(10)),
+            ("y", serde_json::json!(20)),
+        ]);
+        let vec = row.into_vec();
+        assert_eq!(vec.len(), 2);
+        assert_eq!(vec[0].0.as_ref(), "x");
+        assert_eq!(vec[0].1, serde_json::json!(10));
+        assert_eq!(vec[1].0.as_ref(), "y");
+        assert_eq!(vec[1].1, serde_json::json!(20));
+    }
+
+    // ---- RowData::default coverage ----
+
+    #[test]
+    fn test_rowdata_default() {
+        let row = RowData::default();
+        assert!(row.is_empty());
+        assert_eq!(row.len(), 0);
+    }
+
+    #[test]
+    fn test_rowdata_deserialize_invalid_type() {
+        // Feeding a non-object type triggers the `expecting()` method.
+        let err = serde_json::from_str::<RowData>("42").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("a JSON object"),
+            "Error should reference expecting(), got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_rowdata_deserialize_string_gives_error() {
+        let err = serde_json::from_str::<RowData>("\"hello\"").unwrap_err();
+        assert!(err.to_string().contains("a JSON object"));
+    }
+
+    #[test]
+    fn test_rowdata_deserialize_array_gives_error() {
+        let err = serde_json::from_str::<RowData>("[1, 2, 3]").unwrap_err();
+        assert!(err.to_string().contains("a JSON object"));
     }
 }

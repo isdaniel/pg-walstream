@@ -112,6 +112,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+### Working with Event Data
+
+Events carry row data as `RowData` — an ordered list of `(Arc<str>, Value)` pairs.
+Schema, table, and column names are `Arc<str>` (reference-counted, zero-cost cloning):
+
+```rust
+use pg_walstream::{EventType, RowData};
+
+// Pattern match on event types
+match &event.event_type {
+    EventType::Insert { schema, table, data, .. } => {
+        // schema and table are Arc<str> — Display works directly
+        println!("INSERT into {}.{}", schema, table);
+
+        // Access columns by name
+        if let Some(id) = data.get("id") {
+            println!("  id = {}", id);
+        }
+
+        // Iterate over all columns
+        for (col_name, value) in data.iter() {
+            println!("  {} = {}", col_name, value);
+        }
+    }
+    EventType::Update { old_data, new_data, key_columns, .. } => {
+        // key_columns is Vec<Arc<str>>
+        println!("Key columns: {:?}", key_columns);
+        println!("New data has {} columns", new_data.len());
+    }
+    EventType::Delete { old_data, .. } => {
+        // Convert to HashMap if needed for downstream compatibility
+        let map = old_data.clone().into_hash_map();
+        println!("Deleted row: {:?}", map);
+    }
+    _ => {}
+}
+```
+
 ### Using the Polling API 
 
 For more control, you can use the traditional polling approach:
@@ -300,6 +338,8 @@ The library supports all PostgreSQL logical replication message types:
 ## Performance Considerations
 
 - **Zero-Copy**: Uses `bytes::Bytes` for efficient buffer management
+- **Arc-shared column metadata**: Column names, schema, and table names use `Arc<str>` — cloning is a single atomic increment instead of a heap allocation per event
+- **RowData (ordered Vec)**: Row payloads use `RowData` (a `Vec<(Arc<str>, Value)>`) instead of `HashMap<String, Value>`, eliminating per-event hashing overhead and extra allocations
 - **Atomic Operations**: Thread-safe LSN tracking with minimal overhead
 - **Connection Pooling**: Reusable connection with automatic retry
 - **Streaming Support**: Handle large transactions without memory issues
