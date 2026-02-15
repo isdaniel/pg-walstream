@@ -123,6 +123,7 @@ pub use types::{
     Oid,
     ReplicaIdentity,
     ReplicationSlotOptions,
+    RowData,
     SlotType,
     TimestampTz,
     // Type aliases matching PostgreSQL types

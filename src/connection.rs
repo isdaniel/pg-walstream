@@ -1130,4 +1130,35 @@ mod tests {
             " (proto_version '2', publication_names '\"my_pub\"', streaming 'on')"
         );
     }
+
+    #[test]
+    fn test_ensure_replication_mode_fails_when_not_replication() {
+        let conn = PgReplicationConnection::null_for_testing();
+        let err = conn.ensure_replication_mode().unwrap_err();
+        assert!(
+            err.to_string().contains("not in replication mode"),
+            "Expected replication mode error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_is_alive_returns_false_for_null_conn() {
+        let conn = PgReplicationConnection::null_for_testing();
+        assert!(!conn.is_alive());
+    }
+
+    #[test]
+    fn test_close_replication_connection_null_conn() {
+        // Exercises the `else` branch: "Connection already closed or was never initialized"
+        let mut conn = PgReplicationConnection::null_for_testing();
+        conn.close_replication_connection(); // should not panic
+        assert!(conn.conn.is_null());
+    }
+
+    #[test]
+    fn test_drop_null_conn_does_not_panic() {
+        // Exercises Drop impl with a null connection
+        let conn = PgReplicationConnection::null_for_testing();
+        drop(conn); // should not panic
+    }
 }

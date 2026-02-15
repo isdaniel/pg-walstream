@@ -178,14 +178,14 @@ fn main() {
         "Should produce diverse LogicalReplicationMessage variants"
     );
 
-    // --- TupleData.to_hash_map roundtrip ---
-    println!("\n--- TupleData.to_hash_map roundtrip ---");
+    // --- TupleData.to_row_data roundtrip ---
+    println!("\n--- TupleData.to_row_data roundtrip ---");
     if let (Ok(ri), Ok(td)) = (
         generators::arbitrary_relation_info(&mut u),
         generators::arbitrary_tuple_data(&mut u),
     ) {
-        let map = td.to_hash_map(&ri);
-        println!("  HashMap entries: {}", map.len());
+        let row = td.to_row_data(&ri);
+        println!("  RowData entries: {}", row.len());
     }
 
     println!("All pg_walstream types can be fuzz-generated externally.");

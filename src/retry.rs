@@ -538,7 +538,7 @@ mod tests {
             let delay = backoff.next_delay();
             let millis = delay.as_millis() as f64;
             assert!(
-                millis >= 700.0 && millis <= 1300.0,
+                (700.0..=1300.0).contains(&millis),
                 "Jitter delay {millis}ms is outside ±30% of 1000ms"
             );
             // Reset to keep base delay constant

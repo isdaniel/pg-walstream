@@ -8,12 +8,13 @@
 use crate::buffer::{BufferReader, BufferWriter};
 use crate::error::{ReplicationError, Result};
 use crate::types::{
-    format_lsn, system_time_to_postgres_timestamp, Oid, TimestampTz, XLogRecPtr, Xid,
+    format_lsn, system_time_to_postgres_timestamp, Oid, RowData, TimestampTz, XLogRecPtr, Xid,
 };
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::debug;
 
@@ -228,7 +229,7 @@ pub struct ColumnInfo {
     /// Column flags (bit 0 = key column)
     pub flags: u8,
     /// Column name
-    pub name: String,
+    pub name: Arc<str>,
     /// PostgreSQL type OID
     pub type_id: Oid,
     /// Type modifier
@@ -240,7 +241,7 @@ impl ColumnInfo {
     pub fn new(flags: u8, name: String, type_id: Oid, type_modifier: i32) -> Self {
         Self {
             flags,
-            name,
+            name: Arc::from(name),
             type_id,
             type_modifier,
         }
@@ -277,9 +278,9 @@ impl TupleData {
         self.columns.len()
     }
 
-    /// Convert to a HashMap with column names as keys
-    pub fn to_hash_map(&self, relation: &RelationInfo) -> HashMap<String, serde_json::Value> {
-        let mut map = HashMap::with_capacity(self.columns.len());
+    /// Convert to a RowData with column names from the relation
+    pub fn to_row_data(&self, relation: &RelationInfo) -> RowData {
+        let mut data = RowData::with_capacity(self.columns.len());
 
         for (i, col_data) in self.columns.iter().enumerate() {
             if let Some(column_info) = relation.get_column_by_index(i) {
@@ -295,11 +296,20 @@ impl TupleData {
                     'u' => continue, // Skip unchanged TOAST values
                     _ => serde_json::Value::Null,
                 };
-                map.insert(column_info.name.clone(), value);
+                data.push(Arc::clone(&column_info.name), value);
             }
         }
 
-        map
+        data
+    }
+
+    /// Convert to a HashMap with column names as keys (legacy convenience method)
+    #[deprecated(
+        since = "0.4.0",
+        note = "use `to_row_data` instead for better performance"
+    )]
+    pub fn to_hash_map(&self, relation: &RelationInfo) -> HashMap<String, serde_json::Value> {
+        self.to_row_data(relation).into_hash_map()
     }
 }
 
@@ -418,8 +428,8 @@ impl ColumnData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelationInfo {
     pub relation_id: Oid,
-    pub namespace: String,
-    pub relation_name: String,
+    pub namespace: Arc<str>,
+    pub relation_name: Arc<str>,
     pub replica_identity: u8,
     pub columns: Vec<ColumnInfo>,
 }
@@ -435,8 +445,8 @@ impl RelationInfo {
     ) -> Self {
         Self {
             relation_id,
-            namespace,
-            relation_name,
+            namespace: Arc::from(namespace),
+            relation_name: Arc::from(relation_name),
             replica_identity,
             columns,
         }
@@ -451,7 +461,7 @@ impl RelationInfo {
     /// Get column by name
     #[inline]
     pub fn get_column_by_name(&self, name: &str) -> Option<&ColumnInfo> {
-        self.columns.iter().find(|col| col.name == name)
+        self.columns.iter().find(|col| &*col.name == name)
     }
 
     /// Get column by index
@@ -1387,7 +1397,7 @@ mod tests {
 
         assert_eq!(relation.full_name(), "public.users");
         assert_eq!(relation.get_key_columns().len(), 1);
-        assert_eq!(relation.get_key_columns()[0].name, "id");
+        assert_eq!(&*relation.get_key_columns()[0].name, "id");
     }
 
     #[test]
@@ -1583,9 +1593,9 @@ mod tests {
                 assert_eq!(relation_name, "users");
                 assert_eq!(replica_identity, b'd');
                 assert_eq!(columns.len(), 2);
-                assert_eq!(columns[0].name, "id");
+                assert_eq!(&*columns[0].name, "id");
                 assert!(columns[0].is_key());
-                assert_eq!(columns[1].name, "name");
+                assert_eq!(&*columns[1].name, "name");
                 assert!(!columns[1].is_key());
             }
             _ => panic!("Expected Relation message"),
@@ -2189,7 +2199,7 @@ mod tests {
 
         state.add_relation(relation);
         let r = state.get_relation(12345).unwrap();
-        assert_eq!(r.relation_name, "users");
+        assert_eq!(&*r.relation_name, "users");
 
         assert!(state.get_relation(99999).is_none());
     }

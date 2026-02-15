@@ -15,16 +15,16 @@
 
 use crate::error::{ReplicationError, Result};
 use crate::lsn::SharedLsnFeedback;
-use crate::types::{ChangeEvent, EventType, Lsn, ReplicaIdentity};
+use crate::types::{ChangeEvent, EventType, Lsn, ReplicaIdentity, RowData};
 use crate::{
     format_lsn, parse_keepalive_message, postgres_timestamp_to_chrono, BufferReader,
     LogicalReplicationMessage, LogicalReplicationParser, PgReplicationConnection, RelationInfo,
     ReplicationConnectionRetry, ReplicationState, RetryConfig, StreamingReplicationMessage,
     TupleData, XLogRecPtr, INVALID_XLOG_REC_PTR,
 };
+use std::sync::Arc;
 
 use std::future::Future;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -778,13 +778,8 @@ impl LogicalReplicationStream {
 
             LogicalReplicationMessage::Insert { relation_id, tuple } => {
                 if let Some(relation) = self.state.get_relation(relation_id) {
-                    let full_name = relation.full_name();
-                    let parts: Vec<&str> = full_name.split('.').collect();
-                    let (schema_name, table_name) = if parts.len() >= 2 {
-                        (parts[0].to_string(), parts[1].to_string())
-                    } else {
-                        ("public".to_string(), relation.full_name())
-                    };
+                    let schema_name = Arc::clone(&relation.namespace);
+                    let table_name = Arc::clone(&relation.relation_name);
                     let data = tuple_to_data(&tuple, relation)?;
 
                     ChangeEvent {
@@ -922,7 +917,7 @@ impl LogicalReplicationStream {
                             relation.full_name(),
                             flags
                         );
-                        truncate_tables.push(relation.full_name());
+                        truncate_tables.push(Arc::<str>::from(relation.full_name()));
                     }
                 }
 
@@ -1116,7 +1111,7 @@ impl LogicalReplicationStream {
         &self,
         relation: &RelationInfo,
         key_type: Option<char>,
-    ) -> Vec<String> {
+    ) -> Vec<Arc<str>> {
         // Get key columns based on the relation's replica identity and key_type from protocol
         match key_type {
             Some('K') => {
@@ -1124,7 +1119,7 @@ impl LogicalReplicationStream {
                 relation
                     .get_key_columns()
                     .iter()
-                    .map(|col| col.name.clone())
+                    .map(|col| Arc::clone(&col.name))
                     .collect()
             }
             Some('O') => {
@@ -1132,16 +1127,16 @@ impl LogicalReplicationStream {
                 relation
                     .columns
                     .iter()
-                    .map(|col| col.name.clone())
+                    .map(|col| Arc::clone(&col.name))
                     .collect()
             }
             None => {
                 // No old tuple data - means REPLICA IDENTITY NOTHING or DEFAULT without changes to key columns
                 // Fall back to using any available key columns from relation info
-                let key_cols: Vec<String> = relation
+                let key_cols: Vec<Arc<str>> = relation
                     .get_key_columns()
                     .iter()
-                    .map(|col| col.name.clone())
+                    .map(|col| Arc::clone(&col.name))
                     .collect();
                 if key_cols.is_empty() {
                     // Try to infer primary key from column flags or use all columns as last resort
@@ -1149,7 +1144,7 @@ impl LogicalReplicationStream {
                         .columns
                         .iter()
                         .filter(|col| col.is_key())
-                        .map(|col| col.name.clone())
+                        .map(|col| Arc::clone(&col.name))
                         .collect()
                 } else {
                     key_cols
@@ -1160,27 +1155,29 @@ impl LogicalReplicationStream {
                 relation
                     .get_key_columns()
                     .iter()
-                    .map(|col| col.name.clone())
+                    .map(|col| Arc::clone(&col.name))
                     .collect()
             }
         }
     }
 
     /// Extract schema/table name, replica identity, and key columns for a relation
+    #[allow(clippy::type_complexity)]
     fn relation_metadata(
         &self,
         relation_id: u32,
         key_type: Option<char>,
-    ) -> Option<(String, String, ReplicaIdentity, Vec<String>, &RelationInfo)> {
+    ) -> Option<(
+        Arc<str>,
+        Arc<str>,
+        ReplicaIdentity,
+        Vec<Arc<str>>,
+        &RelationInfo,
+    )> {
         let relation = self.state.get_relation(relation_id)?;
-        let full_name = relation.full_name();
-        let parts: Vec<&str> = full_name.split('.').collect();
 
-        let (schema_name, table_name) = if parts.len() >= 2 {
-            (parts[0].to_string(), parts[1].to_string())
-        } else {
-            ("public".to_string(), relation.full_name())
-        };
+        let schema_name = Arc::clone(&relation.namespace);
+        let table_name = Arc::clone(&relation.relation_name);
 
         let replica_identity = ReplicaIdentity::from_byte(relation.replica_identity)
             .unwrap_or(ReplicaIdentity::Default);
@@ -1330,7 +1327,7 @@ impl LogicalReplicationStream {
 
     fn validate_replication_options(&self) -> Result<()> {
         match self.config.protocol_version {
-            1 | 2 | 3 | 4 => {}
+            1..=4 => {}
             version => {
                 return Err(ReplicationError::config(format!(
                     "Unsupported protocol version: {version} (expected 1-4)"
@@ -1814,13 +1811,10 @@ async fn timeout_or_error<T>(
     }
 }
 
-/// Convert tuple data to a HashMap for ChangeEvent
+/// Convert tuple data to a RowData for ChangeEvent
 #[inline]
-fn tuple_to_data(
-    tuple: &TupleData,
-    relation: &RelationInfo,
-) -> Result<std::collections::HashMap<String, serde_json::Value>> {
-    let mut data = std::collections::HashMap::with_capacity(tuple.columns.len());
+fn tuple_to_data(tuple: &TupleData, relation: &RelationInfo) -> Result<RowData> {
+    let mut data = RowData::with_capacity(tuple.columns.len());
 
     for (i, column_data) in tuple.columns.iter().enumerate() {
         if column_data.is_unchanged() {
@@ -1840,7 +1834,7 @@ fn tuple_to_data(
                 serde_json::Value::Null
             };
 
-            data.insert(column_info.name.clone(), value);
+            data.push(Arc::clone(&column_info.name), value);
         }
     }
 
@@ -1863,8 +1857,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{parse_lsn, ReplicaIdentity};
-    use std::collections::HashMap;
+    use crate::types::{parse_lsn, ReplicaIdentity, RowData};
 
     /// Helper function to create a test configuration
     fn create_test_config() -> ReplicationStreamConfig {
@@ -1979,13 +1972,13 @@ mod tests {
         let columns = vec![
             crate::protocol::ColumnInfo {
                 flags: 1,
-                name: "id".to_string(),
+                name: Arc::from("id"),
                 type_id: 23,
                 type_modifier: -1,
             },
             crate::protocol::ColumnInfo {
                 flags: 0,
-                name: "name".to_string(),
+                name: Arc::from("name"),
                 type_id: 25,
                 type_modifier: -1,
             },
@@ -2000,8 +1993,8 @@ mod tests {
         );
 
         assert_eq!(relation.relation_id, 16384);
-        assert_eq!(relation.namespace, "public");
-        assert_eq!(relation.relation_name, "users");
+        assert_eq!(&*relation.namespace, "public");
+        assert_eq!(&*relation.relation_name, "users");
         assert_eq!(relation.columns.len(), 2);
     }
 
@@ -2023,13 +2016,13 @@ mod tests {
         let columns = vec![
             crate::protocol::ColumnInfo {
                 flags: 1,
-                name: "id".to_string(),
+                name: Arc::from("id"),
                 type_id: 23,
                 type_modifier: -1,
             },
             crate::protocol::ColumnInfo {
                 flags: 0,
-                name: "name".to_string(),
+                name: Arc::from("name"),
                 type_id: 25,
                 type_modifier: -1,
             },
@@ -2045,7 +2038,7 @@ mod tests {
 
         // Valid index
         assert!(relation.get_column_by_index(0).is_some());
-        assert_eq!(relation.get_column_by_index(0).unwrap().name, "id");
+        assert_eq!(&*relation.get_column_by_index(0).unwrap().name, "id");
 
         // Invalid index
         assert!(relation.get_column_by_index(10).is_none());
@@ -2056,13 +2049,13 @@ mod tests {
         let columns = vec![
             crate::protocol::ColumnInfo {
                 flags: 1, // Key column
-                name: "id".to_string(),
+                name: Arc::from("id"),
                 type_id: 23,
                 type_modifier: -1,
             },
             crate::protocol::ColumnInfo {
                 flags: 0, // Non-key column
-                name: "name".to_string(),
+                name: Arc::from("name"),
                 type_id: 25,
                 type_modifier: -1,
             },
@@ -2078,22 +2071,17 @@ mod tests {
 
         let key_columns = relation.get_key_columns();
         assert_eq!(key_columns.len(), 1);
-        assert_eq!(key_columns[0].name, "id");
+        assert_eq!(&*key_columns[0].name, "id");
     }
 
     #[test]
     fn test_change_event_insert_creation() {
-        let mut data = HashMap::new();
-        data.insert("id".to_string(), serde_json::json!(1));
-        data.insert("name".to_string(), serde_json::json!("Alice"));
+        let data = RowData::from_pairs(vec![
+            ("id", serde_json::json!(1)),
+            ("name", serde_json::json!("Alice")),
+        ]);
 
-        let event = ChangeEvent::insert(
-            "public".to_string(),
-            "users".to_string(),
-            16384,
-            data.clone(),
-            Lsn::new(1000),
-        );
+        let event = ChangeEvent::insert("public", "users", 16384, data.clone(), Lsn::new(1000));
 
         match event.event_type {
             EventType::Insert {
@@ -2102,8 +2090,8 @@ mod tests {
                 relation_oid,
                 data: event_data,
             } => {
-                assert_eq!(schema, "public");
-                assert_eq!(table, "users");
+                assert_eq!(&*schema, "public");
+                assert_eq!(&*table, "users");
                 assert_eq!(relation_oid, 16384);
                 assert_eq!(event_data.len(), 2);
             }
@@ -2115,22 +2103,24 @@ mod tests {
 
     #[test]
     fn test_change_event_update_creation() {
-        let mut old_data = HashMap::new();
-        old_data.insert("id".to_string(), serde_json::json!(1));
-        old_data.insert("name".to_string(), serde_json::json!("Alice"));
+        let old_data = RowData::from_pairs(vec![
+            ("id", serde_json::json!(1)),
+            ("name", serde_json::json!("Alice")),
+        ]);
 
-        let mut new_data = HashMap::new();
-        new_data.insert("id".to_string(), serde_json::json!(1));
-        new_data.insert("name".to_string(), serde_json::json!("Bob"));
+        let new_data = RowData::from_pairs(vec![
+            ("id", serde_json::json!(1)),
+            ("name", serde_json::json!("Bob")),
+        ]);
 
         let event = ChangeEvent::update(
-            "public".to_string(),
-            "users".to_string(),
+            "public",
+            "users",
             16384,
             Some(old_data),
             new_data,
             ReplicaIdentity::Default,
-            vec!["id".to_string()],
+            vec![Arc::from("id")],
             Lsn::new(2000),
         );
 
@@ -2144,8 +2134,8 @@ mod tests {
                 replica_identity,
                 key_columns,
             } => {
-                assert_eq!(schema, "public");
-                assert_eq!(table, "users");
+                assert_eq!(&*schema, "public");
+                assert_eq!(&*table, "users");
                 assert_eq!(relation_oid, 16384);
                 assert!(old_data.is_some());
                 assert_eq!(new_data.len(), 2);
@@ -2158,16 +2148,15 @@ mod tests {
 
     #[test]
     fn test_change_event_delete_creation() {
-        let mut old_data = HashMap::new();
-        old_data.insert("id".to_string(), serde_json::json!(1));
+        let old_data = RowData::from_pairs(vec![("id", serde_json::json!(1))]);
 
         let event = ChangeEvent::delete(
-            "public".to_string(),
-            "users".to_string(),
+            "public",
+            "users",
             16384,
             old_data,
             ReplicaIdentity::Default,
-            vec!["id".to_string()],
+            vec![Arc::from("id")],
             Lsn::new(3000),
         );
 
@@ -2180,8 +2169,8 @@ mod tests {
                 replica_identity,
                 key_columns,
             } => {
-                assert_eq!(schema, "public");
-                assert_eq!(table, "users");
+                assert_eq!(&*schema, "public");
+                assert_eq!(&*table, "users");
                 assert_eq!(relation_oid, 16384);
                 assert_eq!(old_data.len(), 1);
                 assert_eq!(replica_identity, ReplicaIdentity::Default);
@@ -2196,13 +2185,13 @@ mod tests {
         let columns = vec![
             crate::protocol::ColumnInfo {
                 flags: 0,
-                name: "col1".to_string(),
+                name: Arc::from("col1"),
                 type_id: 25,
                 type_modifier: -1,
             },
             crate::protocol::ColumnInfo {
                 flags: 0,
-                name: "col2".to_string(),
+                name: Arc::from("col2"),
                 type_id: 25,
                 type_modifier: -1,
             },
@@ -2219,14 +2208,14 @@ mod tests {
         let data = tuple_to_data(&tuple, &relation).unwrap();
         assert_eq!(data.len(), 1);
         assert_eq!(data.get("col2").unwrap(), "value");
-        assert!(data.get("col1").is_none());
+        assert!(!data.contains_key("col1"));
     }
 
     #[test]
     fn test_tuple_to_data_empty_text_column() {
         let columns = vec![crate::protocol::ColumnInfo {
             flags: 0,
-            name: "col1".to_string(),
+            name: Arc::from("col1"),
             type_id: 25,
             type_modifier: -1,
         }];
@@ -2609,19 +2598,19 @@ mod tests {
         let columns = vec![
             crate::protocol::ColumnInfo {
                 flags: 1,
-                name: "id1".to_string(),
+                name: Arc::from("id1"),
                 type_id: 23,
                 type_modifier: -1,
             },
             crate::protocol::ColumnInfo {
                 flags: 1,
-                name: "id2".to_string(),
+                name: Arc::from("id2"),
                 type_id: 23,
                 type_modifier: -1,
             },
             crate::protocol::ColumnInfo {
                 flags: 0,
-                name: "data".to_string(),
+                name: Arc::from("data"),
                 type_id: 25,
                 type_modifier: -1,
             },
@@ -2637,8 +2626,8 @@ mod tests {
 
         let key_columns = relation.get_key_columns();
         assert_eq!(key_columns.len(), 2);
-        assert_eq!(key_columns[0].name, "id1");
-        assert_eq!(key_columns[1].name, "id2");
+        assert_eq!(&*key_columns[0].name, "id1");
+        assert_eq!(&*key_columns[1].name, "id2");
     }
 
     #[test]
@@ -2664,9 +2653,10 @@ mod tests {
 
     #[test]
     fn test_change_event_with_null_values() {
-        let mut data = HashMap::new();
-        data.insert("id".to_string(), serde_json::json!(1));
-        data.insert("nullable_field".to_string(), serde_json::json!(null));
+        let data = RowData::from_pairs(vec![
+            ("id", serde_json::json!(1)),
+            ("nullable_field", serde_json::json!(null)),
+        ]);
 
         let event = ChangeEvent::insert(
             "public".to_string(),
@@ -2690,11 +2680,11 @@ mod tests {
 
     #[test]
     fn test_change_event_update_without_old_data() {
-        let new_data = HashMap::new();
+        let new_data = RowData::new();
 
         let event = ChangeEvent::update(
-            "public".to_string(),
-            "users".to_string(),
+            "public",
+            "users",
             12345,
             None, // No old data
             new_data,
@@ -2718,31 +2708,19 @@ mod tests {
 
     #[test]
     fn test_change_event_with_large_lsn() {
-        let data = HashMap::new();
+        let data = RowData::new();
         let large_lsn = 0xFFFFFFFF_FFFFFFFFu64;
 
-        let event = ChangeEvent::insert(
-            "public".to_string(),
-            "test".to_string(),
-            1,
-            data,
-            Lsn::new(large_lsn),
-        );
+        let event = ChangeEvent::insert("public", "test", 1, data, Lsn::new(large_lsn));
 
         assert_eq!(event.lsn.value(), large_lsn);
     }
 
     #[test]
     fn test_change_event_metadata_field() {
-        let data = HashMap::new();
+        let data = RowData::new();
 
-        let event = ChangeEvent::insert(
-            "public".to_string(),
-            "test".to_string(),
-            1,
-            data,
-            Lsn::new(1000),
-        );
+        let event = ChangeEvent::insert("public", "test", 1, data, Lsn::new(1000));
 
         // Verify metadata field exists and is initially None
         assert!(event.metadata.is_none());
@@ -2986,14 +2964,15 @@ mod tests {
     #[test]
     fn test_full_change_event_lifecycle() {
         // Test complete lifecycle: insert -> update -> delete
-        let mut insert_data = HashMap::new();
-        insert_data.insert("id".to_string(), serde_json::json!(1));
-        insert_data.insert("name".to_string(), serde_json::json!("Alice"));
-        insert_data.insert("email".to_string(), serde_json::json!("alice@example.com"));
+        let insert_data = RowData::from_pairs(vec![
+            ("id", serde_json::json!(1)),
+            ("name", serde_json::json!("Alice")),
+            ("email", serde_json::json!("alice@example.com")),
+        ]);
 
         let insert_event = ChangeEvent::insert(
-            "public".to_string(),
-            "users".to_string(),
+            "public",
+            "users",
             16384,
             insert_data.clone(),
             Lsn::new(1000),
@@ -3002,36 +2981,35 @@ mod tests {
         assert_eq!(insert_event.lsn.value(), 1000);
 
         // Update event
-        let mut update_data = insert_data.clone();
-        update_data.insert(
-            "email".to_string(),
-            serde_json::json!("alice.new@example.com"),
-        );
+        let update_data = RowData::from_pairs(vec![
+            ("id", serde_json::json!(1)),
+            ("name", serde_json::json!("Alice")),
+            ("email", serde_json::json!("alice.new@example.com")),
+        ]);
 
         let update_event = ChangeEvent::update(
-            "public".to_string(),
-            "users".to_string(),
+            "public",
+            "users",
             16384,
             Some(insert_data.clone()),
             update_data,
             ReplicaIdentity::Default,
-            vec!["id".to_string()],
+            vec![Arc::from("id")],
             Lsn::new(2000),
         );
 
         assert_eq!(update_event.lsn.value(), 2000);
 
         // Delete event
-        let mut delete_key = HashMap::new();
-        delete_key.insert("id".to_string(), serde_json::json!(1));
+        let delete_key = RowData::from_pairs(vec![("id", serde_json::json!(1))]);
 
         let delete_event = ChangeEvent::delete(
-            "public".to_string(),
-            "users".to_string(),
+            "public",
+            "users",
             16384,
             delete_key,
             ReplicaIdentity::Default,
-            vec!["id".to_string()],
+            vec![Arc::from("id")],
             Lsn::new(3000),
         );
 
@@ -3077,31 +3055,31 @@ mod tests {
         let columns = vec![
             crate::protocol::ColumnInfo {
                 flags: 1,
-                name: "user_id".to_string(),
+                name: Arc::from("user_id"),
                 type_id: 20, // bigint
                 type_modifier: -1,
             },
             crate::protocol::ColumnInfo {
                 flags: 1,
-                name: "tenant_id".to_string(),
+                name: Arc::from("tenant_id"),
                 type_id: 23, // int4
                 type_modifier: -1,
             },
             crate::protocol::ColumnInfo {
                 flags: 0,
-                name: "created_at".to_string(),
+                name: Arc::from("created_at"),
                 type_id: 1184, // timestamptz
                 type_modifier: -1,
             },
             crate::protocol::ColumnInfo {
                 flags: 0,
-                name: "data".to_string(),
+                name: Arc::from("data"),
                 type_id: 3802, // jsonb
                 type_modifier: -1,
             },
             crate::protocol::ColumnInfo {
                 flags: 0,
-                name: "metadata".to_string(),
+                name: Arc::from("metadata"),
                 type_id: 25, // text
                 type_modifier: -1,
             },
@@ -3120,12 +3098,15 @@ mod tests {
 
         let key_columns = relation.get_key_columns();
         assert_eq!(key_columns.len(), 2);
-        assert_eq!(key_columns[0].name, "user_id");
-        assert_eq!(key_columns[1].name, "tenant_id");
+        assert_eq!(&*key_columns[0].name, "user_id");
+        assert_eq!(&*key_columns[1].name, "tenant_id");
 
         // Test column lookup
-        assert_eq!(relation.get_column_by_index(2).unwrap().name, "created_at");
-        assert_eq!(relation.get_column_by_index(3).unwrap().name, "data");
+        assert_eq!(
+            &*relation.get_column_by_index(2).unwrap().name,
+            "created_at"
+        );
+        assert_eq!(&*relation.get_column_by_index(3).unwrap().name, "data");
         assert!(relation.get_column_by_index(10).is_none());
     }
 
@@ -3158,9 +3139,10 @@ mod tests {
         let table = "orders".to_string();
 
         // Create multiple event types for same relation
-        let mut insert_data = HashMap::new();
-        insert_data.insert("order_id".to_string(), serde_json::json!(100));
-        insert_data.insert("amount".to_string(), serde_json::json!(99.99));
+        let insert_data = RowData::from_pairs(vec![
+            ("order_id", serde_json::json!(100)),
+            ("amount", serde_json::json!(99.99)),
+        ]);
 
         let insert = ChangeEvent::insert(
             schema.clone(),
@@ -3170,8 +3152,10 @@ mod tests {
             Lsn::new(1000),
         );
 
-        let mut update_data = insert_data.clone();
-        update_data.insert("amount".to_string(), serde_json::json!(89.99));
+        let update_data = RowData::from_pairs(vec![
+            ("order_id", serde_json::json!(100)),
+            ("amount", serde_json::json!(89.99)),
+        ]);
 
         let update = ChangeEvent::update(
             schema.clone(),
@@ -3180,7 +3164,7 @@ mod tests {
             Some(insert_data.clone()),
             update_data,
             ReplicaIdentity::Full,
-            vec!["order_id".to_string()],
+            vec![Arc::from("order_id")],
             Lsn::new(2000),
         );
 
@@ -3190,7 +3174,7 @@ mod tests {
             relation_oid,
             insert_data,
             ReplicaIdentity::Full,
-            vec!["order_id".to_string()],
+            vec![Arc::from("order_id")],
             Lsn::new(3000),
         );
 
@@ -3223,14 +3207,14 @@ mod tests {
 
     #[test]
     fn test_empty_table_and_schema_names() {
-        let data = HashMap::new();
+        let data = RowData::new();
 
-        let event = ChangeEvent::insert("".to_string(), "".to_string(), 0, data, Lsn::new(0));
+        let event = ChangeEvent::insert("", "", 0, data, Lsn::new(0));
 
         match event.event_type {
             EventType::Insert { schema, table, .. } => {
-                assert_eq!(schema, "");
-                assert_eq!(table, "");
+                assert_eq!(&*schema, "");
+                assert_eq!(&*table, "");
             }
             _ => panic!("Expected insert"),
         }
@@ -3240,7 +3224,7 @@ mod tests {
     fn test_very_long_table_names() {
         let long_schema = "a".repeat(100);
         let long_table = "b".repeat(100);
-        let data = HashMap::new();
+        let data = RowData::new();
 
         let event = ChangeEvent::insert(
             long_schema.clone(),
@@ -3252,8 +3236,8 @@ mod tests {
 
         match event.event_type {
             EventType::Insert { schema, table, .. } => {
-                assert_eq!(schema, long_schema);
-                assert_eq!(table, long_table);
+                assert_eq!(&*schema, long_schema.as_str());
+                assert_eq!(&*table, long_table.as_str());
             }
             _ => panic!("Expected insert"),
         }
@@ -3261,11 +3245,11 @@ mod tests {
 
     #[test]
     fn test_special_characters_in_names() {
-        let data = HashMap::new();
+        let data = RowData::new();
 
         let event = ChangeEvent::insert(
-            "test-schema_123".to_string(),
-            "test_table$with#special@chars".to_string(),
+            "test-schema_123",
+            "test_table$with#special@chars",
             12345,
             data,
             Lsn::new(1000),
@@ -3288,7 +3272,7 @@ mod tests {
         for i in 0..100 {
             columns.push(crate::protocol::ColumnInfo {
                 flags: if i < 5 { 1 } else { 0 }, // First 5 are keys
-                name: format!("col_{i}"),
+                name: Arc::from(format!("col_{i}")),
                 type_id: 23,
                 type_modifier: -1,
             });
@@ -3308,8 +3292,8 @@ mod tests {
         assert_eq!(key_columns.len(), 5);
 
         // Test accessing first and last columns
-        assert_eq!(relation.get_column_by_index(0).unwrap().name, "col_0");
-        assert_eq!(relation.get_column_by_index(99).unwrap().name, "col_99");
+        assert_eq!(&*relation.get_column_by_index(0).unwrap().name, "col_0");
+        assert_eq!(&*relation.get_column_by_index(99).unwrap().name, "col_99");
         assert!(relation.get_column_by_index(100).is_none());
     }
 
@@ -3362,20 +3346,12 @@ mod tests {
 
     #[test]
     fn test_event_with_unicode_data() {
-        let mut data = HashMap::new();
-        data.insert("name".to_string(), serde_json::json!("Alice 中文 émoji 😀"));
-        data.insert(
-            "description".to_string(),
-            serde_json::json!("Test with ñ, ü, ö"),
-        );
+        let data = RowData::from_pairs(vec![
+            ("name", serde_json::json!("Alice 中文 émoji 😀")),
+            ("description", serde_json::json!("Test with ñ, ü, ö")),
+        ]);
 
-        let event = ChangeEvent::insert(
-            "public".to_string(),
-            "users".to_string(),
-            12345,
-            data.clone(),
-            Lsn::new(1000),
-        );
+        let event = ChangeEvent::insert("public", "users", 12345, data.clone(), Lsn::new(1000));
 
         match event.event_type {
             EventType::Insert {
@@ -3940,7 +3916,7 @@ mod tests {
 
         let stream = create_test_stream(create_test_config());
         let keys = stream.get_key_columns_for_relation(&relation, Some('K'));
-        assert_eq!(keys, vec!["id".to_string(), "email".to_string()]);
+        assert_eq!(keys, vec![Arc::from("id"), Arc::from("email")]);
     }
 
     #[test]
@@ -3956,7 +3932,7 @@ mod tests {
         let stream = create_test_stream(create_test_config());
         let keys = stream.get_key_columns_for_relation(&relation, Some('O'));
         // 'O' means full old row, return ALL column names
-        assert_eq!(keys, vec!["id".to_string(), "name".to_string()]);
+        assert_eq!(keys, vec![Arc::from("id"), Arc::from("name")]);
     }
 
     #[test]
@@ -3972,7 +3948,7 @@ mod tests {
         let stream = create_test_stream(create_test_config());
         let keys = stream.get_key_columns_for_relation(&relation, None);
         // Falls back to key columns from relation
-        assert_eq!(keys, vec!["id".to_string()]);
+        assert_eq!(keys, vec![Arc::from("id")]);
     }
 
     #[test]
@@ -4002,7 +3978,7 @@ mod tests {
 
         let stream = create_test_stream(create_test_config());
         let keys = stream.get_key_columns_for_relation(&relation, Some('X'));
-        assert_eq!(keys, vec!["id".to_string()]);
+        assert_eq!(keys, vec![Arc::from("id")]);
     }
 
     #[test]
@@ -4026,10 +4002,10 @@ mod tests {
 
         let (schema, table, replica_id, key_cols, _rel) =
             stream.relation_metadata(100, Some('K')).unwrap();
-        assert_eq!(schema, "myschema");
-        assert_eq!(table, "mytable");
+        assert_eq!(&*schema, "myschema");
+        assert_eq!(&*table, "mytable");
         assert_eq!(replica_id, ReplicaIdentity::Default);
-        assert_eq!(key_cols, vec!["pk_col".to_string()]);
+        assert_eq!(key_cols, vec![Arc::from("pk_col")]);
     }
 
     #[test]
@@ -4154,8 +4130,8 @@ mod tests {
                 data,
                 ..
             } => {
-                assert_eq!(schema, "public");
-                assert_eq!(table, "users");
+                assert_eq!(&*schema, "public");
+                assert_eq!(&*table, "users");
                 assert_eq!(data.get("id").unwrap(), "1");
                 assert_eq!(data.get("name").unwrap(), "Alice");
             }
@@ -4225,7 +4201,7 @@ mod tests {
             } => {
                 assert!(old_data.is_some());
                 assert_eq!(new_data.get("name").unwrap(), "New");
-                assert_eq!(key_columns, vec!["id".to_string(), "name".to_string()]);
+                assert_eq!(key_columns, vec![Arc::from("id"), Arc::from("name")]);
                 // 'O' = all columns
             }
             _ => panic!("Expected Update event"),
@@ -4290,7 +4266,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(old_data.get("id").unwrap(), "1");
-                assert_eq!(key_columns, vec!["id".to_string()]);
+                assert_eq!(key_columns, vec![Arc::from("id")]);
             }
             _ => panic!("Expected Delete event"),
         }
@@ -4342,7 +4318,7 @@ mod tests {
         match event.event_type {
             EventType::Truncate(tables) => {
                 assert_eq!(tables.len(), 1); // Only known relation
-                assert_eq!(tables[0], "public.users");
+                assert_eq!(&*tables[0], "public.users");
             }
             _ => panic!("Expected Truncate event"),
         }
@@ -4524,9 +4500,9 @@ mod tests {
 
         let (schema, table, _ri, _keys, _rel) = stream.relation_metadata(100, None).unwrap();
         // With empty namespace, full_name is ".just_table", split gives ["", "just_table"]
-        assert_eq!(table, "just_table");
+        assert_eq!(&*table, "just_table");
         // Schema should still work
-        assert_eq!(schema, "");
+        assert_eq!(&*schema, "");
     }
 
     /// Build a synthetic WAL message: 'w' + start_lsn(8) + end_lsn(8) + send_time(8) + payload
@@ -4793,8 +4769,8 @@ mod tests {
                 data,
                 ..
             } => {
-                assert_eq!(schema, "public");
-                assert_eq!(table, "items");
+                assert_eq!(&*schema, "public");
+                assert_eq!(&*table, "items");
                 assert_eq!(data.get("id").unwrap(), "5");
                 assert_eq!(data.get("val").unwrap(), "abc");
             }
