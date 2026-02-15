@@ -1,0 +1,13 @@
+[package]
+name = "polling-example"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Polling-based PostgreSQL WAL streaming example"
+
+[dependencies]
+pg_walstream = { path = "../.." }
+tokio-util = { version = "0.7.18", features = ["compat"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1.47.2", features = ["full"] }

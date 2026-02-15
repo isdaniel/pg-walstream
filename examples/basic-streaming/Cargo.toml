@@ -1,0 +1,13 @@
+[package]
+name = "basic-streaming"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Basic PostgreSQL WAL streaming example with futures::Stream"
+
+[dependencies]
+pg_walstream = { path = "../.." }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1.47.2", features = ["full"] }
+futures = "0.3.31"
+tokio-stream = { version = "0.1.18", features = ["time"] }

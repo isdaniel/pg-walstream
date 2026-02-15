@@ -60,9 +60,7 @@
 //! └── tablespaces/       # Additional tablespace tar files (if any)
 //! ```
 
-#[path = "pg_basebackup/backup_flow.rs"]
 mod backup_flow;
-#[path = "pg_basebackup/tar.rs"]
 mod tar;
 
 use backup_flow::process_backup_stream;
