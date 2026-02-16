@@ -238,7 +238,7 @@ fn bench_full_pipeline(c: &mut Criterion) {
 fn bench_batch_construction(c: &mut Criterion) {
     let mut group = c.benchmark_group("batch_100_events");
 
-    for n_cols in [5, 10, 20] {
+    for n_cols in [5, 10, 20, 50] {
         let names = shared_column_names(n_cols);
 
         group.bench_with_input(

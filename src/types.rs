@@ -583,10 +583,13 @@ impl Default for RowData {
 // Order-sensitive equality (columns must match in the same order).
 impl PartialEq for RowData {
     fn eq(&self, other: &Self) -> bool {
-        self.columns == other.columns
+        if self.columns.len() != other.columns.len() {
+            return false;
+        }
+        
+        self.columns.iter().all(|(k, v)| other.get(k.as_ref()) == Some(v))
     }
 }
-
 // --- serde: serialise as JSON object ---
 
 impl Serialize for RowData {
