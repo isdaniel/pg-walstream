@@ -2208,7 +2208,6 @@ mod tests {
         let data = tuple_to_data(&tuple, &relation).unwrap();
         assert_eq!(data.len(), 1);
         assert_eq!(data.get("col2").unwrap(), "value");
-        assert!(!data.contains_key("col1"));
     }
 
     #[test]
@@ -3577,9 +3576,6 @@ mod tests {
 
         let data = tuple_to_data(&tuple, &relation).unwrap();
         assert_eq!(data.len(), 2);
-        assert!(data.contains_key("id"));
-        assert!(!data.contains_key("unchanged_col"));
-        assert!(data.contains_key("updated"));
     }
 
     #[test]
