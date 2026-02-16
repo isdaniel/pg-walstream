@@ -5,6 +5,7 @@
 
 use crate::error::{ReplicationError, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -540,26 +541,8 @@ impl RowData {
             .map(|(_, v)| v)
     }
 
-    /// Check whether a column exists.
-    #[inline]
-    pub fn contains_key(&self, name: &str) -> bool {
-        self.columns.iter().any(|(k, _)| k.as_ref() == name)
-    }
-
-    /// Iterate over `(&Arc<str>, &Value)` pairs.
-    #[inline]
-    pub fn iter(&self) -> impl Iterator<Item = (&Arc<str>, &serde_json::Value)> {
-        self.columns.iter().map(|(k, v)| (k, v))
-    }
-
-    /// Consume into the inner `Vec`.
-    #[inline]
-    pub fn into_vec(self) -> Vec<(Arc<str>, serde_json::Value)> {
-        self.columns
-    }
-
     /// Convert to a `HashMap` (allocates — prefer `get` / `iter` for lookups).
-    pub fn into_hash_map(self) -> std::collections::HashMap<String, serde_json::Value> {
+    pub fn into_hash_map(self) -> HashMap<String, serde_json::Value> {
         self.columns
             .into_iter()
             .map(|(k, v)| (k.to_string(), v))
@@ -567,6 +550,7 @@ impl RowData {
     }
 
     /// Construct from `(&str, Value)` pairs — handy for tests and literals.
+    #[inline]
     pub fn from_pairs(pairs: Vec<(&str, serde_json::Value)>) -> Self {
         Self {
             columns: pairs.into_iter().map(|(k, v)| (Arc::from(k), v)).collect(),
@@ -1630,39 +1614,6 @@ mod tests {
         let mut padded = CachePadded::new(String::from("hello"));
         padded.push_str(" world");
         assert_eq!(&*padded, "hello world");
-    }
-
-    // ---- RowData::iter coverage ----
-
-    #[test]
-    fn test_rowdata_iter() {
-        let row = RowData::from_pairs(vec![
-            ("a", serde_json::json!(1)),
-            ("b", serde_json::json!("two")),
-            ("c", serde_json::json!(true)),
-        ]);
-        let collected: Vec<_> = row.iter().map(|(k, v)| (k.as_ref(), v.clone())).collect();
-        assert_eq!(collected.len(), 3);
-        assert_eq!(collected[0].0, "a");
-        assert_eq!(collected[0].1, serde_json::json!(1));
-        assert_eq!(collected[2].0, "c");
-        assert_eq!(collected[2].1, serde_json::json!(true));
-    }
-
-    // ---- RowData::into_vec coverage ----
-
-    #[test]
-    fn test_rowdata_into_vec() {
-        let row = RowData::from_pairs(vec![
-            ("x", serde_json::json!(10)),
-            ("y", serde_json::json!(20)),
-        ]);
-        let vec = row.into_vec();
-        assert_eq!(vec.len(), 2);
-        assert_eq!(vec[0].0.as_ref(), "x");
-        assert_eq!(vec[0].1, serde_json::json!(10));
-        assert_eq!(vec[1].0.as_ref(), "y");
-        assert_eq!(vec[1].1, serde_json::json!(20));
     }
 
     // ---- RowData::default coverage ----
