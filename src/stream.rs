@@ -15,7 +15,9 @@
 
 use crate::error::{ReplicationError, Result};
 use crate::lsn::SharedLsnFeedback;
-use crate::types::{ChangeEvent, EventType, Lsn, ReplicaIdentity, RowData};
+use crate::types::{
+    ChangeEvent, EventType, Lsn, ReplicaIdentity, ReplicationSlotOptions, RowData, SlotType,
+};
 use crate::{
     format_lsn, parse_keepalive_message, postgres_timestamp_to_chrono, BufferReader,
     LogicalReplicationMessage, LogicalReplicationParser, PgReplicationConnection, RelationInfo,
@@ -40,6 +42,8 @@ pub struct LogicalReplicationStream {
     last_health_check: Instant,
     /// Shared LSN feedback for communication with consumer. This allows the consumer to update flushed/applied LSN after commits
     pub shared_lsn_feedback: Arc<SharedLsnFeedback>,
+    /// The snapshot name exported when the replication slot was created with `EXPORT_SNAPSHOT`.
+    exported_snapshot_name: Option<String>,
 }
 
 /// Configuration for the replication stream
@@ -57,6 +61,8 @@ pub struct ReplicationStreamConfig {
     pub connection_timeout: Duration,
     pub health_check_interval: Duration,
     pub retry_config: RetryConfig,
+    pub slot_options: ReplicationSlotOptions,
+    pub slot_type: SlotType,
 }
 
 /// Streaming mode for logical replication (pgoutput)
@@ -158,6 +164,11 @@ impl ReplicationStreamConfig {
             connection_timeout,
             health_check_interval,
             retry_config,
+            slot_options: ReplicationSlotOptions {
+                snapshot: Some("nothing".to_string()),
+                ..Default::default()
+            },
+            slot_type: SlotType::Logical,
         }
     }
 
@@ -193,6 +204,50 @@ impl ReplicationStreamConfig {
     #[inline]
     pub fn with_streaming_mode(mut self, mode: StreamingMode) -> Self {
         self.streaming_mode = mode;
+        self
+    }
+
+    /// Set replication slot creation options
+    ///
+    /// This allows customizing how the replication slot is created, including:
+    /// - `temporary`: Create a temporary slot (dropped when connection ends)
+    /// - `snapshot`: Control snapshot export behavior (`"export"`, `"use"`, `"nothing"`)
+    /// - `two_phase`: Enable two-phase commit support for the slot
+    /// - `failover`: Enable failover synchronization
+    ///
+    /// # Example: Temporary slot with exported snapshot
+    ///
+    /// ```
+    /// use pg_walstream::{ReplicationStreamConfig, ReplicationSlotOptions, RetryConfig, StreamingMode};
+    /// use std::time::Duration;
+    ///
+    /// let config = ReplicationStreamConfig::new(
+    ///     "my_temp_slot".to_string(),
+    ///     "my_publication".to_string(),
+    ///     2,
+    ///     StreamingMode::On,
+    ///     Duration::from_secs(10),
+    ///     Duration::from_secs(30),
+    ///     Duration::from_secs(60),
+    ///     RetryConfig::default(),
+    /// ).with_slot_options(ReplicationSlotOptions {
+    ///     temporary: true,
+    ///     snapshot: Some("export".to_string()),
+    ///     ..Default::default()
+    /// });
+    /// ```
+    #[inline]
+    pub fn with_slot_options(mut self, options: ReplicationSlotOptions) -> Self {
+        self.slot_options = options;
+        self
+    }
+
+    /// Set the replication slot type (default: `SlotType::Logical`)
+    ///
+    /// Use `SlotType::Physical` for physical replication slots that stream raw WAL data without logical decoding.
+    #[inline]
+    pub fn with_slot_type(mut self, slot_type: SlotType) -> Self {
+        self.slot_type = slot_type;
         self
     }
 }
@@ -283,6 +338,7 @@ impl LogicalReplicationStream {
             retry_handler,
             last_health_check,
             shared_lsn_feedback,
+            exported_snapshot_name: None,
         })
     }
 
@@ -309,11 +365,26 @@ impl LogicalReplicationStream {
 
         info!("Creating replication slot: {}", self.config.slot_name);
 
-        match self
-            .connection
-            .create_replication_slot(&self.config.slot_name, "pgoutput")
-        {
-            Ok(_) => {
+        let output_plugin = match self.config.slot_type {
+            SlotType::Logical => Some("pgoutput"),
+            SlotType::Physical => None,
+        };
+
+        match self.connection.create_replication_slot_with_options(
+            &self.config.slot_name,
+            self.config.slot_type,
+            output_plugin,
+            &self.config.slot_options,
+        ) {
+            Ok(result) => {
+                // Extract the exported snapshot name if available
+                // CREATE_REPLICATION_SLOT returns: slot_name(0), consistent_point(1), snapshot_name(2), output_plugin(3)
+                if let Some(snapshot_name) = result.get_value(0, 2) {
+                    if !snapshot_name.is_empty() {
+                        info!("Exported snapshot name: {}", snapshot_name);
+                        self.exported_snapshot_name = Some(snapshot_name);
+                    }
+                }
                 info!("Replication slot created successfully");
                 self.slot_created = true;
             }
@@ -543,7 +614,13 @@ impl LogicalReplicationStream {
         // Re-initialize the connection
         self.connection.identify_system()?;
 
-        // Ensure replication slot still exists (it should, but let's be safe)
+        // Temporary slots are dropped when the connection dies, so we must
+        // recreate them on recovery.
+        if self.config.slot_options.temporary {
+            self.slot_created = false;
+        }
+
+        // Ensure replication slot still exists (recreate if temporary)
         self.ensure_replication_slot().await?;
 
         // Restart replication from last known position
@@ -1202,6 +1279,24 @@ impl LogicalReplicationStream {
     /// Get the current LSN position
     pub fn current_lsn(&self) -> XLogRecPtr {
         self.state.last_received_lsn
+    }
+
+    /// Returns the exported snapshot name from slot creation, if available.
+    ///
+    /// When the replication slot is created with `snapshot: Some("export")` (i.e. `EXPORT_SNAPSHOT`), PostgreSQL returns a snapshot identifier that can be
+    /// used with `SET TRANSACTION SNAPSHOT` on a separate connection to read a consistent snapshot of the database at the slot's starting LSN.
+    ///
+    /// Returns `None` if no snapshot was exported (e.g. `NOEXPORT_SNAPSHOT`) or if the slot has not yet been created.
+    pub fn exported_snapshot_name(&self) -> Option<&str> {
+        self.exported_snapshot_name.as_deref()
+    }
+
+    /// Returns `true` if this stream's replication slot is configured as temporary.
+    ///
+    /// Temporary slots are automatically dropped when the replication connection
+    /// is closed. This means that on reconnection, the slot will be recreated.
+    pub fn is_temporary_slot(&self) -> bool {
+        self.config.slot_options.temporary
     }
 
     /// Convert into an async stream of change events
@@ -1884,6 +1979,7 @@ mod tests {
         assert_eq!(config.feedback_interval, Duration::from_secs(10));
         assert_eq!(config.connection_timeout, Duration::from_secs(30));
         assert_eq!(config.health_check_interval, Duration::from_secs(60));
+        assert!(matches!(config.slot_type, SlotType::Logical));
     }
 
     #[tokio::test]
@@ -3513,19 +3609,33 @@ mod tests {
     }
 
     #[test]
+    fn test_config_with_slot_type_logical() {
+        let config = create_test_config().with_slot_type(SlotType::Logical);
+        assert!(matches!(config.slot_type, SlotType::Logical));
+    }
+
+    #[test]
+    fn test_config_with_slot_type_physical() {
+        let config = create_test_config().with_slot_type(SlotType::Physical);
+        assert!(matches!(config.slot_type, SlotType::Physical));
+    }
+
+    #[test]
     fn test_config_builder_chain() {
         let config = create_test_config()
             .with_messages(true)
             .with_binary(true)
             .with_two_phase(true)
             .with_origin(Some(OriginFilter::None))
-            .with_streaming_mode(StreamingMode::Parallel);
+            .with_streaming_mode(StreamingMode::Parallel)
+            .with_slot_type(SlotType::Physical);
 
         assert!(config.messages);
         assert!(config.binary);
         assert!(config.two_phase);
         assert_eq!(config.origin, Some(OriginFilter::None));
         assert_eq!(config.streaming_mode, StreamingMode::Parallel);
+        assert!(matches!(config.slot_type, SlotType::Physical));
     }
 
     #[test]
@@ -3673,6 +3783,7 @@ mod tests {
             ),
             last_health_check: Instant::now(),
             shared_lsn_feedback: SharedLsnFeedback::new_shared(),
+            exported_snapshot_name: None,
         }
     }
 
