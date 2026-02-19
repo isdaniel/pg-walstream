@@ -49,7 +49,8 @@
 //!     let config = ReplicationStreamConfig::new(
 //!         "my_slot".to_string(),
 //!         "my_publication".to_string(),
-//!         2, true,
+//!         2,
+//!         StreamingMode::On,
 //!         Duration::from_secs(10),
 //!         Duration::from_secs(30),
 //!         Duration::from_secs(60),

@@ -19,6 +19,7 @@ A high-performance Rust library for PostgreSQL logical and physical replication 
 - **Thread-Safe LSN Tracking**: Atomic LSN feedback for producer-consumer patterns
 - **Connection Management**: Built-in connection handling with exponential backoff retry logic
 - **Type-Safe API**: Strongly typed message parsing with comprehensive error handling
+- **Configurable Slot Options**: Temporary slots, snapshot export, two-phase, and failover support
 
 ## Installation
 
@@ -55,8 +56,8 @@ The Stream API provides an ergonomic, iterator-like interface:
 
 ```rust
 use pg_walstream::{
-    LogicalReplicationStream, ReplicationStreamConfig, RetryConfig, StreamingMode,
-    SharedLsnFeedback, CancellationToken,
+    LogicalReplicationStream, ReplicationStreamConfig, ReplicationSlotOptions,
+    RetryConfig, StreamingMode, SharedLsnFeedback, CancellationToken,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -73,7 +74,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Duration::from_secs(30),          // Connection timeout
         Duration::from_secs(60),          // Health check interval
         RetryConfig::default(),           // Retry configuration
-    );
+    )
+    // Optional: configure slot creation options
+    .with_slot_options(ReplicationSlotOptions {
+        temporary: true,
+        snapshot: Some("export".to_string()),
+        ..Default::default()
+    });
 
     // Create and initialize the stream
     let mut stream = LogicalReplicationStream::new(
@@ -82,6 +89,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ).await?;
     
     stream.start(None).await?;
+
+    // If the slot was created with EXPORT_SNAPSHOT, use the snapshot name on a SEPARATE regular connection to read the initial table state:
+    //   BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+    //   SET TRANSACTION SNAPSHOT '<snapshot_name>';
+    //   COPY my_table TO STDOUT;   -- or SELECT * FROM my_table
+    //   COMMIT;
+    if let Some(snapshot_name) = stream.exported_snapshot_name() {
+        println!("Exported snapshot: {}", snapshot_name);
+    }
 
     // Create cancellation token for graceful shutdown
     let cancel_token = CancellationToken::new();
@@ -111,6 +127,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+> **Note:** The exported snapshot is only valid while the transaction that created the
+> replication slot is still open. You must read the snapshot **before** consuming WAL events
+> or closing the replication connection. Temporary slots are automatically recreated on
+> connection recovery.
 
 ### Working with Event Data
 
@@ -205,6 +226,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+
 ## LSN Tracking
 
 Thread-safe LSN tracking for feedback to PostgreSQL:
@@ -265,15 +287,19 @@ The library provides two methods for creating replication slots:
 
 #### Replication Slot Options
 
-- **`temporary`** (`bool`): Create a temporary slot that is not saved to disk and is dropped on error or session end. Default: `false`
-- **`two_phase`** (`bool`): Enable two-phase commit support for logical slots. This allows the slot to receive prepared transaction events. Requires PostgreSQL 15+. Default: `None`
-- **`reserve_wal`** (`bool`): Reserve WAL immediately for physical slots. Prevents WAL files from being removed before the slot is active. Default: `None`
-- **`snapshot`** (`Option<String>`): Control snapshot behavior for logical slots:
-  - `"export"` - Export the snapshot for use by other sessions
-  - `"use"` - Use an existing snapshot
-  - `"nothing"` - Don't export or use a snapshot
-  - Default: `None`
-- **`failover`** (`bool`): Enable the slot for failover synchronization. When enabled, the slot will be synchronized to standby servers for high availability. Requires PostgreSQL 16+. Default: `None`
+The library automatically selects the correct `CREATE_REPLICATION_SLOT` SQL syntax based on the connected PostgreSQL server version:
+- **PG14**: Legacy positional keyword syntax (`EXPORT_SNAPSHOT`, `NOEXPORT_SNAPSHOT`, `USE_SNAPSHOT`, `TWO_PHASE`, `RESERVE_WAL`)
+- **PG15+**: Modern parenthesized options syntax (`(SNAPSHOT 'export', TWO_PHASE true, ...)`)
+
+| Option | Description | PG Version |
+|--------|-------------|------------|
+| `temporary` | Temporary slot (not persisted to disk, dropped on disconnect) | 14+ |
+| `two_phase` | Enable two-phase commit for logical slots | 14+  |
+| `reserve_wal` | Reserve WAL immediately for physical slots | 14+  |
+| `snapshot` | Snapshot behavior: `"export"`, `"use"`, or `"nothing"` | 14+ |
+| `failover` | Enable slot synchronization to standbys for HA | 16+ |
+
+> **Note:** : If both `two_phase` and `snapshot` are set, `two_phase` takes priority. The `failover` option is not available on PG14 and will return an error.
 
 ## Message Types
 
