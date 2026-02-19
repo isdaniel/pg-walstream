@@ -67,6 +67,21 @@ fn quote_sql_string_value(value: &str) -> String {
     format!("'{}'", sanitize_sql_string_value(value))
 }
 
+/// Quote a SQL identifier by escaping internal double quotes and wrapping in double quotes.
+///
+/// In PostgreSQL, identifiers wrapped in double quotes must have any internal
+/// double quotes escaped by doubling them (e.g., `"` becomes `""`).
+///
+/// # Examples
+/// ```ignore
+/// assert_eq!(quote_sql_identifier("my_slot"), r#""my_slot""#);
+/// assert_eq!(quote_sql_identifier(r#"a"b"#), r#""a""b""#);
+/// ```
+#[inline]
+fn quote_sql_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
 pub use crate::types::INVALID_XLOG_REC_PTR;
 
 /// Result of attempting to read from libpq's internal buffer
@@ -297,21 +312,23 @@ impl PgReplicationConnection {
         start_lsn: XLogRecPtr,
         options: &[(&str, &str)],
     ) -> Result<()> {
+        let quoted_slot = quote_sql_identifier(slot_name);
         let mut options_str = String::new();
         for (i, (key, value)) in options.iter().enumerate() {
             if i > 0 {
                 options_str.push_str(", ");
             }
+            let quoted_key = quote_sql_identifier(key);
             let sanitized_value = sanitize_sql_string_value(value);
-            options_str.push_str(&format!("\"{key}\" '{sanitized_value}'"));
+            options_str.push_str(&format!("{quoted_key} '{sanitized_value}'"));
         }
 
         let start_replication_sql = if start_lsn == INVALID_XLOG_REC_PTR {
-            format!("START_REPLICATION SLOT \"{slot_name}\" LOGICAL 0/0 ({options_str})")
+            format!("START_REPLICATION SLOT {quoted_slot} LOGICAL 0/0 ({options_str})")
         } else {
             format!(
-                "START_REPLICATION SLOT \"{}\" LOGICAL {} ({})",
-                slot_name,
+                "START_REPLICATION SLOT {} LOGICAL {} ({})",
+                quoted_slot,
                 format_lsn(start_lsn),
                 options_str
             )
@@ -646,19 +663,28 @@ impl PgReplicationConnection {
         output_plugin: Option<&str>,
         options: &ReplicationSlotOptions,
     ) -> Result<String> {
-        let mut sql = format!("CREATE_REPLICATION_SLOT \"{}\" ", slot_name);
+        let mut parts: Vec<&str> = Vec::new();
+
+        // Quoted slot name — owned, kept alive for the borrow.
+        let quoted_slot = quote_sql_identifier(slot_name);
+
+        parts.push("CREATE_REPLICATION_SLOT");
+        parts.push(&quoted_slot);
 
         if options.temporary {
-            sql.push_str("TEMPORARY ");
+            parts.push("TEMPORARY");
         }
 
-        sql.push_str(slot_type.as_str());
-        sql.push(' ');
+        parts.push(slot_type.as_str());
+
+        // Owned strings that may be needed below; declared here so
+        // borrows into `parts` remain valid until the join.
+        let quoted_plugin: String;
 
         match slot_type {
             SlotType::Physical => {
                 if options.reserve_wal {
-                    sql.push_str("RESERVE_WAL ");
+                    parts.push("RESERVE_WAL");
                 }
             }
             SlotType::Logical => {
@@ -667,16 +693,17 @@ impl PgReplicationConnection {
                         "Output plugin required for LOGICAL slots".to_string(),
                     )
                 })?;
-                sql.push_str(&format!("\"{}\" ", plugin));
+                quoted_plugin = quote_sql_identifier(plugin);
+                parts.push(&quoted_plugin);
 
                 // Only ONE of TWO_PHASE / snapshot keywords is allowed.
                 if options.two_phase {
-                    sql.push_str("TWO_PHASE ");
+                    parts.push("TWO_PHASE");
                 } else if let Some(ref snapshot) = options.snapshot {
                     match snapshot.as_str() {
-                        "export" => sql.push_str("EXPORT_SNAPSHOT "),
-                        "nothing" => sql.push_str("NOEXPORT_SNAPSHOT "),
-                        "use" => sql.push_str("USE_SNAPSHOT "),
+                        "export" => parts.push("EXPORT_SNAPSHOT"),
+                        "nothing" => parts.push("NOEXPORT_SNAPSHOT"),
+                        "use" => parts.push("USE_SNAPSHOT"),
                         other => {
                             return Err(ReplicationError::config(format!(
                                 "Invalid snapshot option '{}': \
@@ -688,13 +715,12 @@ impl PgReplicationConnection {
                 }
 
                 if options.failover {
-                    sql.push_str("FAILOVER ");
+                    parts.push("FAILOVER");
                 }
             }
         }
 
-        // Trim trailing space and add semicolon
-        Ok(format!("{};", sql.trim_end()))
+        Ok(format!("{};", parts.join(" ")))
     }
 
     /// Alter a replication slot (logical slots only)
@@ -721,7 +747,8 @@ impl PgReplicationConnection {
         }
 
         let options_str = Self::build_sql_options(&opts);
-        let alter_slot_sql = format!("ALTER_REPLICATION_SLOT \"{}\"{};", slot_name, options_str);
+        let quoted_slot = quote_sql_identifier(slot_name);
+        let alter_slot_sql = format!("ALTER_REPLICATION_SLOT {}{};", quoted_slot, options_str);
 
         debug!("Altering replication slot: {}", alter_slot_sql);
         let result = self.exec(&alter_slot_sql)?;
@@ -739,7 +766,8 @@ impl PgReplicationConnection {
         let mut sql = String::from("START_REPLICATION ");
 
         if let Some(slot) = slot_name {
-            sql.push_str(&format!("SLOT \"{}\" ", slot));
+            let quoted_slot = quote_sql_identifier(slot);
+            sql.push_str(&format!("SLOT {} ", quoted_slot));
         }
 
         sql.push_str("PHYSICAL ");
@@ -1405,6 +1433,66 @@ mod tests {
         assert!(
             err.to_string().contains("Output plugin required"),
             "Expected plugin error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_quote_sql_identifier_simple() {
+        assert_eq!(quote_sql_identifier("my_slot"), r#""my_slot""#);
+    }
+
+    #[test]
+    fn test_quote_sql_identifier_with_double_quote() {
+        assert_eq!(quote_sql_identifier(r#"a"b"#), r#""a""b""#);
+    }
+
+    #[test]
+    fn test_quote_sql_identifier_multiple_quotes() {
+        assert_eq!(quote_sql_identifier(r#"a""b"#), r#""a""""b""#);
+    }
+
+    #[test]
+    fn test_quote_sql_identifier_empty() {
+        assert_eq!(quote_sql_identifier(""), r#""""#);
+    }
+
+    #[test]
+    fn test_quote_sql_identifier_special_chars() {
+        assert_eq!(
+            quote_sql_identifier("slot; DROP TABLE users; --"),
+            r#""slot; DROP TABLE users; --""#
+        );
+    }
+
+    #[test]
+    fn test_slot_sql_slot_name_injection() {
+        let opts = ReplicationSlotOptions::default();
+        let sql = PgReplicationConnection::build_create_slot_sql(
+            r#"evil"PHYSICAL"#,
+            SlotType::Logical,
+            Some("test_decoding"),
+            &opts,
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            r#"CREATE_REPLICATION_SLOT "evil""PHYSICAL" LOGICAL "test_decoding";"#
+        );
+    }
+
+    #[test]
+    fn test_slot_sql_plugin_name_injection() {
+        let opts = ReplicationSlotOptions::default();
+        let sql = PgReplicationConnection::build_create_slot_sql(
+            "safe_slot",
+            SlotType::Logical,
+            Some(r#"bad"plugin"#),
+            &opts,
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            r#"CREATE_REPLICATION_SLOT "safe_slot" LOGICAL "bad""plugin";"#
         );
     }
 }

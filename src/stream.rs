@@ -5215,4 +5215,230 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
         stream.maybe_send_feedback();
     }
+
+    // ---- Coverage: with_slot_options builder ----
+
+    #[test]
+    fn test_config_with_slot_options_builder() {
+        let options = ReplicationSlotOptions {
+            temporary: true,
+            snapshot: Some("export".to_string()),
+            two_phase: true,
+            reserve_wal: false,
+            failover: true,
+        };
+        let config = create_test_config().with_slot_options(options);
+        assert!(config.slot_options.temporary);
+        assert_eq!(config.slot_options.snapshot, Some("export".to_string()));
+        assert!(config.slot_options.two_phase);
+        assert!(!config.slot_options.reserve_wal);
+        assert!(config.slot_options.failover);
+    }
+
+    #[test]
+    fn test_config_with_slot_options_default() {
+        let config = create_test_config().with_slot_options(ReplicationSlotOptions::default());
+        assert!(!config.slot_options.temporary);
+        assert!(config.slot_options.snapshot.is_none());
+        assert!(!config.slot_options.two_phase);
+        assert!(!config.slot_options.reserve_wal);
+        assert!(!config.slot_options.failover);
+    }
+
+    // ---- Coverage: exported_snapshot_name / is_temporary_slot ----
+
+    #[test]
+    fn test_exported_snapshot_name_none() {
+        let stream = create_test_stream(create_test_config());
+        assert!(stream.exported_snapshot_name().is_none());
+    }
+
+    #[test]
+    fn test_exported_snapshot_name_some() {
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+        stream.exported_snapshot_name = Some("00000001-00000001-1".to_string());
+        assert_eq!(stream.exported_snapshot_name(), Some("00000001-00000001-1"));
+    }
+
+    #[test]
+    fn test_is_temporary_slot_false() {
+        let stream = create_test_stream(create_test_config());
+        assert!(!stream.is_temporary_slot());
+    }
+
+    #[test]
+    fn test_is_temporary_slot_true() {
+        let config = create_test_config().with_slot_options(ReplicationSlotOptions {
+            temporary: true,
+            ..Default::default()
+        });
+        let stream = create_test_stream(config);
+        assert!(stream.is_temporary_slot());
+    }
+
+    // ---- Coverage: send_feedback with zero shared LSN (else branches) ----
+
+    #[test]
+    fn test_send_feedback_zero_shared_lsn() {
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+        stream.state.update_received_lsn(5000);
+        // shared_lsn_feedback flushed and applied are 0 by default
+        // This exercises the else branches (flushed_lsn = 0, applied_lsn = 0)
+        let result = stream.send_feedback();
+        // Errors because null connection can't send status, but the LSN logic is covered
+        assert!(result.is_err());
+    }
+
+    // ---- Coverage: full config builder chain with slot_options ----
+
+    #[test]
+    fn test_config_full_builder_chain_with_all_fields() {
+        let config = create_test_config()
+            .with_messages(true)
+            .with_binary(true)
+            .with_two_phase(true)
+            .with_origin(Some(OriginFilter::None))
+            .with_streaming_mode(StreamingMode::Parallel)
+            .with_slot_type(SlotType::Physical)
+            .with_slot_options(ReplicationSlotOptions {
+                temporary: true,
+                reserve_wal: true,
+                ..Default::default()
+            });
+
+        assert!(config.messages);
+        assert!(config.binary);
+        assert!(config.two_phase);
+        assert_eq!(config.origin, Some(OriginFilter::None));
+        assert_eq!(config.streaming_mode, StreamingMode::Parallel);
+        assert!(matches!(config.slot_type, SlotType::Physical));
+        assert!(config.slot_options.temporary);
+        assert!(config.slot_options.reserve_wal);
+    }
+
+    // ---- Coverage: process_keepalive with reply_requested and valid received LSN ----
+
+    #[test]
+    fn test_process_keepalive_reply_with_valid_lsn() {
+        let mut stream = create_test_stream(create_test_config());
+        // Set a non-zero received LSN so send_feedback doesn't short-circuit
+        stream.state.update_received_lsn(0x2000);
+        let data = build_keepalive_message(0x3000, true);
+        // Will attempt send_feedback, which errors on null conn — but keepalive should still succeed
+        // because process_keepalive calls send_feedback which returns Err, and that propagates
+        let result = stream.process_keepalive_message(&data);
+        // send_feedback on null connection will error
+        assert!(result.is_err());
+    }
+
+    // ---- Coverage: convert_to_change_event StreamAbort without optional fields ----
+
+    #[test]
+    fn test_convert_to_change_event_stream_abort_no_optionals() {
+        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::StreamAbort {
+            xid: 99,
+            subtransaction_xid: 100,
+            abort_lsn: None,
+            abort_timestamp: None,
+        });
+
+        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        assert!(result.is_some());
+        match result.unwrap().event_type {
+            EventType::StreamAbort {
+                transaction_id,
+                subtransaction_xid,
+                abort_lsn,
+                ..
+            } => {
+                assert_eq!(transaction_id, 99);
+                assert_eq!(subtransaction_xid, 100);
+                assert!(abort_lsn.is_none());
+            }
+            _ => panic!("Expected StreamAbort"),
+        }
+    }
+
+    // ---- Coverage: convert_to_change_event insert with key_type in update ----
+
+    #[test]
+    fn test_convert_to_change_event_update_key_type_k() {
+        use crate::protocol::{ColumnData, ColumnInfo, RelationInfo, TupleData};
+        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        let relation = RelationInfo::new(
+            100,
+            "public".to_string(),
+            "users".to_string(),
+            b'd',
+            vec![
+                ColumnInfo::new(1, "id".to_string(), 23, -1),
+                ColumnInfo::new(0, "name".to_string(), 25, -1),
+            ],
+        );
+        stream.state.add_relation(relation);
+
+        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Update {
+            relation_id: 100,
+            old_tuple: Some(TupleData::new(vec![ColumnData::text(b"1".to_vec())])),
+            new_tuple: TupleData::new(vec![
+                ColumnData::text(b"1".to_vec()),
+                ColumnData::text(b"Updated".to_vec()),
+            ]),
+            key_type: Some('K'),
+        });
+
+        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        assert!(result.is_some());
+        let event = result.unwrap();
+        match event.event_type {
+            EventType::Update { key_columns, .. } => {
+                // 'K' => only flagged key columns
+                assert_eq!(key_columns, vec![Arc::from("id")]);
+            }
+            _ => panic!("Expected Update event"),
+        }
+    }
+
+    // ---- Coverage: EventStream/EventStreamRef exported_snapshot_name ----
+
+    #[test]
+    fn test_event_stream_exported_snapshot() {
+        use tokio_util::sync::CancellationToken;
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+        stream.exported_snapshot_name = Some("snap-123".to_string());
+
+        let cancel_token = CancellationToken::new();
+        let event_stream = stream.into_stream(cancel_token);
+        assert_eq!(
+            event_stream.inner().exported_snapshot_name(),
+            Some("snap-123")
+        );
+    }
+
+    #[test]
+    fn test_event_stream_is_temporary() {
+        use tokio_util::sync::CancellationToken;
+
+        let config = create_test_config().with_slot_options(ReplicationSlotOptions {
+            temporary: true,
+            ..Default::default()
+        });
+        let stream = create_test_stream(config);
+        let cancel_token = CancellationToken::new();
+        let event_stream = stream.into_stream(cancel_token);
+        assert!(event_stream.inner().is_temporary_slot());
+    }
 }
