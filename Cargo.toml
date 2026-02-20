@@ -1,6 +1,6 @@
 [package]
 name = "pg_walstream"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 authors = ["danielshih <dog830228@gmail.com>"]
 license = "BSD-3-Clause"
