@@ -16,8 +16,8 @@
 
 use pg_walstream::{
     CancellationToken, ChangeEvent, EventType, LogicalReplicationStream, Lsn,
-    PgReplicationConnection, ReplicationStreamConfig, RetryConfig, SharedLsnFeedback,
-    StreamingMode,
+    PgReplicationConnection, ReplicationSlotOptions, ReplicationStreamConfig, RetryConfig,
+    SharedLsnFeedback, StreamingMode,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -72,6 +72,10 @@ fn safe_config(slot_name: &str) -> ReplicationStreamConfig {
         Duration::from_secs(60),
         RetryConfig::default(),
     )
+    .with_slot_options(ReplicationSlotOptions {
+        temporary: true,
+        ..Default::default()
+    })
 }
 
 // ─── Minimal transaction buffer (mirrors the example's SafeReplicationConsumer) ─

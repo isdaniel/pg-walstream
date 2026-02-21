@@ -19,7 +19,7 @@
 
 use pg_walstream::{
     CancellationToken, EventType, LogicalReplicationStream, PgReplicationConnection,
-    ReplicationStreamConfig, RetryConfig, StreamingMode,
+    ReplicationSlotOptions, ReplicationStreamConfig, RetryConfig, StreamingMode,
 };
 use std::time::{Duration, Instant};
 
@@ -67,6 +67,10 @@ fn rate_config(slot_name: &str) -> ReplicationStreamConfig {
         Duration::from_secs(60),
         RetryConfig::default(),
     )
+    .with_slot_options(ReplicationSlotOptions {
+        temporary: true,
+        ..Default::default()
+    })
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
