@@ -87,9 +87,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "postgresql://postgres:password@localhost:5432/mydb?replication=database",
         config,
     ).await?;
-    
-    stream.start(None).await?;
 
+    // Step 1: Create the replication slot
+    stream.ensure_replication_slot().await?;
+
+    // Step 2: Use the exported snapshot on a SEPARATE regular connection
     // If the slot was created with EXPORT_SNAPSHOT, use the snapshot name on a SEPARATE regular connection to read the initial table state:
     //   BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
     //   SET TRANSACTION SNAPSHOT '<snapshot_name>';
@@ -98,6 +100,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(snapshot_name) = stream.exported_snapshot_name() {
         println!("Exported snapshot: {}", snapshot_name);
     }
+
+    // Step 3: Begin streaming
+    stream.start(None).await?;
 
     // Create cancellation token for graceful shutdown
     let cancel_token = CancellationToken::new();
@@ -128,10 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-> **Note:** The exported snapshot is only valid while the transaction that created the
-> replication slot is still open. You must read the snapshot **before** consuming WAL events
-> or closing the replication connection. Temporary slots are automatically recreated on
-> connection recovery.
+> **Note:** The exported snapshot is only valid between `ensure_replication_slot()` and `start()`. Once `START_REPLICATION` is issued, PostgreSQL destroys the snapshot, you must read the snapshot on a separate connection **before** calling `start()`.
 
 ### Working with Event Data
 

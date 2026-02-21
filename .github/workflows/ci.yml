@@ -128,3 +128,78 @@ jobs:
         files: lcov.info
         fail_ci_if_error: false
         token: ${{ secrets.CODECOV_TOKEN }}
+
+  integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: test
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test_walstream
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libpq-dev pkg-config libssl-dev
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+        key: ${{ runner.os }}-cargo-integration-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-integration-
+
+    - name: Configure PostgreSQL for logical replication
+      env:
+        PGPASSWORD: postgres
+      run: |
+        psql -h localhost -U postgres -d test_walstream -c "ALTER SYSTEM SET wal_level = 'logical';"
+        psql -h localhost -U postgres -d test_walstream -c "ALTER SYSTEM SET max_replication_slots = 4;"
+        psql -h localhost -U postgres -d test_walstream -c "ALTER SYSTEM SET max_wal_senders = 4;"
+        # Restart PostgreSQL container to apply wal_level change (requires restart)
+        docker restart ${{ job.services.postgres.id }}
+        # Wait for PostgreSQL to be ready after restart
+        for i in $(seq 1 30); do
+          pg_isready -h localhost -p 5432 -U postgres && break
+          echo "Waiting for PostgreSQL after restart... ($i/30)"
+          sleep 2
+        done
+
+    - name: Verify PostgreSQL logical replication config
+      env:
+        PGPASSWORD: postgres
+      run: |
+        psql -h localhost -U postgres -d test_walstream -c "SHOW wal_level;"
+        psql -h localhost -U postgres -d test_walstream -c "SHOW max_replication_slots;"
+        psql -h localhost -U postgres -d test_walstream -c "SHOW max_wal_senders;"
+
+    - name: Run integration tests
+      env:
+        DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/test_walstream?replication=database"
+        DATABASE_URL_REGULAR: "postgresql://postgres:postgres@localhost:5432/test_walstream"
+        RUST_BACKTRACE: 1
+      run: |
+        cargo test --test snapshot_export -- --ignored --nocapture
+        cargo test --test rate_limited_streaming -- --ignored --nocapture
+        cargo test --test safe_transaction_consumer -- --ignored --nocapture

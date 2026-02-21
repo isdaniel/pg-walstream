@@ -357,8 +357,38 @@ impl LogicalReplicationStream {
         Ok(())
     }
 
-    /// Ensure the replication slot exists
-    async fn ensure_replication_slot(&mut self) -> Result<()> {
+    /// Ensure the replication slot exists, creating it if necessary.
+    ///
+    /// When the slot is created with `snapshot: Some("export")` (i.e. `EXPORT_SNAPSHOT`),
+    /// PostgreSQL returns a snapshot identifier that can be retrieved via
+    /// [`exported_snapshot_name()`](Self::exported_snapshot_name). This snapshot can be
+    /// imported by a **separate regular connection** using
+    /// `SET TRANSACTION SNAPSHOT '<snapshot_id>'` to perform a consistent read of the
+    /// database at the slot's starting LSN.
+    ///
+    /// **Important:** The exported snapshot is only valid between this call and
+    /// [`start()`](Self::start). Once `start()` issues `START_REPLICATION`, PostgreSQL
+    /// destroys the exported snapshot. You **must** read the snapshot on a separate
+    /// connection before calling `start()`.
+    ///
+    /// If the slot already exists, this is a no-op.
+    ///
+    /// # Initial Snapshot Workflow
+    ///
+    /// ```text
+    /// Connection 1 (replication):          Connection 2 (snapshot read):
+    /// ensure_replication_slot()
+    ///   → CREATE_REPLICATION_SLOT ...
+    ///     EXPORT_SNAPSHOT
+    ///   → snapshot_id available
+    ///                                      BEGIN TRANSACTION
+    ///                                        ISOLATION LEVEL REPEATABLE READ;
+    ///                                      SET TRANSACTION SNAPSHOT '<snapshot_id>';
+    ///                                      -- read initial table state
+    ///                                      COMMIT;
+    /// start(None)
+    ///   → START_REPLICATION ...
+    pub async fn ensure_replication_slot(&mut self) -> Result<()> {
         if self.slot_created {
             return Ok(());
         }
@@ -405,8 +435,7 @@ impl LogicalReplicationStream {
     /// Start the replication stream
     ///
     /// This initializes the replication slot (creating it if necessary) and begins
-    /// streaming changes from PostgreSQL.
-    ///
+    /// streaming changes from PostgreSQL.    ///
     /// # Arguments
     ///
     /// * `start_lsn` - Optional LSN to start replication from. If `None`, starts from
@@ -1283,10 +1312,19 @@ impl LogicalReplicationStream {
 
     /// Returns the exported snapshot name from slot creation, if available.
     ///
-    /// When the replication slot is created with `snapshot: Some("export")` (i.e. `EXPORT_SNAPSHOT`), PostgreSQL returns a snapshot identifier that can be
-    /// used with `SET TRANSACTION SNAPSHOT` on a separate connection to read a consistent snapshot of the database at the slot's starting LSN.
+    /// When the replication slot is created with `snapshot: Some("export")` (i.e. `EXPORT_SNAPSHOT`),
+    /// PostgreSQL returns a snapshot identifier that can be used with
+    /// `SET TRANSACTION SNAPSHOT` on a separate connection to read a consistent snapshot
+    /// of the database at the slot's starting LSN.
     ///
-    /// Returns `None` if no snapshot was exported (e.g. `NOEXPORT_SNAPSHOT`) or if the slot has not yet been created.
+    /// **Important:** This snapshot is only valid between
+    /// [`ensure_replication_slot()`](Self::ensure_replication_slot) and
+    /// [`start()`](Self::start). Once `START_REPLICATION` is issued, PostgreSQL
+    /// destroys the snapshot. You must read the snapshot on a separate connection
+    /// **before** calling `start()`.
+    ///
+    /// Returns `None` if no snapshot was exported (e.g. `NOEXPORT_SNAPSHOT`) or if
+    /// the slot has not yet been created.
     pub fn exported_snapshot_name(&self) -> Option<&str> {
         self.exported_snapshot_name.as_deref()
     }
