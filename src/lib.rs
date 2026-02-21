@@ -61,7 +61,12 @@
 //!         "postgresql://postgres:password@localhost:5432/mydb?replication=database",
 //!         config,
 //!     ).await?;
-//!     
+//!
+//!     // Optional: create the slot first to use the exported snapshot
+//!     // for an initial consistent table read (before start() destroys it).
+//!     // stream.ensure_replication_slot().await?;
+//!     // if let Some(snap) = stream.exported_snapshot_name() { /* read snapshot */ }
+//!
 //!     stream.start(None).await?;
 //!
 //!     let cancel_token = CancellationToken::new();
