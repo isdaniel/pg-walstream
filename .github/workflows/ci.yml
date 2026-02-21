@@ -200,6 +200,6 @@ jobs:
         DATABASE_URL_REGULAR: "postgresql://postgres:postgres@localhost:5432/test_walstream"
         RUST_BACKTRACE: 1
       run: |
-        cargo test --test snapshot_export -- --ignored --nocapture
-        cargo test --test rate_limited_streaming -- --ignored --nocapture
-        cargo test --test safe_transaction_consumer -- --ignored --nocapture
+        cargo test --test snapshot_export -- --ignored --nocapture --test-threads=1
+        cargo test --test rate_limited_streaming -- --ignored --nocapture --test-threads=1
+        cargo test --test safe_transaction_consumer -- --ignored --nocapture --test-threads=1
