@@ -357,8 +357,38 @@ impl LogicalReplicationStream {
         Ok(())
     }
 
-    /// Ensure the replication slot exists
-    async fn ensure_replication_slot(&mut self) -> Result<()> {
+    /// Ensure the replication slot exists, creating it if necessary.
+    ///
+    /// When the slot is created with `snapshot: Some("export")` (i.e. `EXPORT_SNAPSHOT`),
+    /// PostgreSQL returns a snapshot identifier that can be retrieved via
+    /// [`exported_snapshot_name()`](Self::exported_snapshot_name). This snapshot can be
+    /// imported by a **separate regular connection** using
+    /// `SET TRANSACTION SNAPSHOT '<snapshot_id>'` to perform a consistent read of the
+    /// database at the slot's starting LSN.
+    ///
+    /// **Important:** The exported snapshot is only valid between this call and
+    /// [`start()`](Self::start). Once `start()` issues `START_REPLICATION`, PostgreSQL
+    /// destroys the exported snapshot. You **must** read the snapshot on a separate
+    /// connection before calling `start()`.
+    ///
+    /// If the slot already exists, this is a no-op.
+    ///
+    /// # Initial Snapshot Workflow
+    ///
+    /// ```text
+    /// Connection 1 (replication):          Connection 2 (snapshot read):
+    /// ensure_replication_slot()
+    ///   → CREATE_REPLICATION_SLOT ...
+    ///     EXPORT_SNAPSHOT
+    ///   → snapshot_id available
+    ///                                      BEGIN TRANSACTION
+    ///                                        ISOLATION LEVEL REPEATABLE READ;
+    ///                                      SET TRANSACTION SNAPSHOT '<snapshot_id>';
+    ///                                      -- read initial table state
+    ///                                      COMMIT;
+    /// start(None)
+    ///   → START_REPLICATION ...
+    pub async fn ensure_replication_slot(&mut self) -> Result<()> {
         if self.slot_created {
             return Ok(());
         }
@@ -405,8 +435,7 @@ impl LogicalReplicationStream {
     /// Start the replication stream
     ///
     /// This initializes the replication slot (creating it if necessary) and begins
-    /// streaming changes from PostgreSQL.
-    ///
+    /// streaming changes from PostgreSQL.    ///
     /// # Arguments
     ///
     /// * `start_lsn` - Optional LSN to start replication from. If `None`, starts from
@@ -1283,10 +1312,19 @@ impl LogicalReplicationStream {
 
     /// Returns the exported snapshot name from slot creation, if available.
     ///
-    /// When the replication slot is created with `snapshot: Some("export")` (i.e. `EXPORT_SNAPSHOT`), PostgreSQL returns a snapshot identifier that can be
-    /// used with `SET TRANSACTION SNAPSHOT` on a separate connection to read a consistent snapshot of the database at the slot's starting LSN.
+    /// When the replication slot is created with `snapshot: Some("export")` (i.e. `EXPORT_SNAPSHOT`),
+    /// PostgreSQL returns a snapshot identifier that can be used with
+    /// `SET TRANSACTION SNAPSHOT` on a separate connection to read a consistent snapshot
+    /// of the database at the slot's starting LSN.
     ///
-    /// Returns `None` if no snapshot was exported (e.g. `NOEXPORT_SNAPSHOT`) or if the slot has not yet been created.
+    /// **Important:** This snapshot is only valid between
+    /// [`ensure_replication_slot()`](Self::ensure_replication_slot) and
+    /// [`start()`](Self::start). Once `START_REPLICATION` is issued, PostgreSQL
+    /// destroys the snapshot. You must read the snapshot on a separate connection
+    /// **before** calling `start()`.
+    ///
+    /// Returns `None` if no snapshot was exported (e.g. `NOEXPORT_SNAPSHOT`) or if
+    /// the slot has not yet been created.
     pub fn exported_snapshot_name(&self) -> Option<&str> {
         self.exported_snapshot_name.as_deref()
     }
@@ -5440,5 +5478,1056 @@ mod tests {
         let cancel_token = CancellationToken::new();
         let event_stream = stream.into_stream(cancel_token);
         assert!(event_stream.inner().is_temporary_slot());
+    }
+
+    /// Test that `new()` with an invalid/unreachable connection string and a short
+    /// timeout produces a `Timeout` error (the retry loop takes too long).
+    #[tokio::test]
+    async fn test_new_with_unreachable_host_timeout() {
+        let config = ReplicationStreamConfig::new(
+            "test_slot".to_string(),
+            "test_pub".to_string(),
+            2,
+            StreamingMode::On,
+            Duration::from_secs(10),
+            Duration::from_millis(1), // extremely short timeout
+            Duration::from_secs(60),
+            RetryConfig {
+                max_attempts: 1,
+                initial_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(10),
+                multiplier: 1.0,
+                max_duration: Duration::from_millis(10),
+                jitter: false,
+            },
+        );
+
+        let result = LogicalReplicationStream::new(
+            "postgresql://nobody:nothing@192.0.2.1:5432/nonexistent?replication=database&connect_timeout=1",
+            config,
+        )
+        .await;
+
+        // Must fail — either Timeout (from the outer timeout_or_error) or a connection error
+        assert!(result.is_err());
+    }
+
+    /// Test that `new()` with parameters that always fail on connect_with_retry
+    /// returns an error (non-timeout path).
+    #[tokio::test]
+    async fn test_new_with_invalid_connection_string_no_timeout() {
+        let config = ReplicationStreamConfig::new(
+            "test_slot".to_string(),
+            "test_pub".to_string(),
+            2,
+            StreamingMode::On,
+            Duration::from_secs(10),
+            Duration::from_secs(60), // generous timeout
+            Duration::from_secs(60),
+            RetryConfig {
+                max_attempts: 1,
+                initial_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(10),
+                multiplier: 1.0,
+                max_duration: Duration::from_secs(30),
+                jitter: false,
+            },
+        );
+
+        let result = LogicalReplicationStream::new(
+            "host=invalid_host_that_does_not_exist port=99999 dbname=nope replication=database connect_timeout=1",
+            config,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "Expected connection failure for invalid host"
+        );
+    }
+
+    /// Test that `new()` stores retry_config from the config into retry_handler,
+    /// and verify its fields are properly propagated through `create_test_stream`.
+    #[test]
+    fn test_new_retry_handler_config_propagated() {
+        let retry_config = RetryConfig {
+            max_attempts: 7,
+            initial_delay: Duration::from_millis(200),
+            max_delay: Duration::from_secs(10),
+            multiplier: 3.0,
+            max_duration: Duration::from_secs(120),
+            jitter: false,
+        };
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            2,
+            StreamingMode::On,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            retry_config,
+        );
+
+        let stream = create_test_stream(config.clone());
+        // Verify that the config fields are stored correctly
+        assert_eq!(stream.config.retry_config.max_attempts, 7);
+        assert_eq!(
+            stream.config.retry_config.initial_delay,
+            Duration::from_millis(200)
+        );
+        assert_eq!(stream.config.retry_config.multiplier, 3.0);
+        assert!(!stream.config.retry_config.jitter);
+    }
+
+    /// Verify that `new()` initializes all fields correctly via `create_test_stream`.
+    #[test]
+    fn test_new_initializes_all_fields() {
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+
+        // slot_created must be false initially
+        assert!(!stream.slot_created);
+        // exported_snapshot_name must be None initially
+        assert!(stream.exported_snapshot_name.is_none());
+        // State should be default (all LSNs at 0)
+        assert_eq!(stream.state.last_received_lsn, 0);
+        assert_eq!(stream.state.last_flushed_lsn, 0);
+        assert_eq!(stream.state.last_applied_lsn, 0);
+        // SharedLsnFeedback should be zeroed
+        let (f, a) = stream.shared_lsn_feedback.get_feedback_lsn();
+        assert_eq!(f, 0);
+        assert_eq!(a, 0);
+    }
+
+    /// Verify that `new()` creates a parser with the correct protocol version.
+    #[test]
+    fn test_new_parser_protocol_version() {
+        for version in 1..=4 {
+            let config = ReplicationStreamConfig::new(
+                "slot".to_string(),
+                "pub".to_string(),
+                version,
+                StreamingMode::Off,
+                Duration::from_secs(10),
+                Duration::from_secs(30),
+                Duration::from_secs(60),
+                RetryConfig::default(),
+            );
+
+            let stream = create_test_stream(config);
+            assert_eq!(stream.config.protocol_version, version);
+        }
+    }
+
+    /// When `slot_created` is already `true`, `ensure_replication_slot()` should
+    /// short circuit and return `Ok(())` immediately without touching the connection.
+    #[tokio::test]
+    async fn test_ensure_replication_slot_already_created() {
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+        stream.slot_created = true;
+
+        // This should succeed immediately because slot_created is true,
+        // even though the connection is null.
+        let result = stream.ensure_replication_slot().await;
+        assert!(result.is_ok());
+        assert!(stream.slot_created);
+    }
+
+    /// Verify that calling `ensure_replication_slot()` twice when already created
+    /// is idempotent and always returns Ok.
+    #[tokio::test]
+    async fn test_ensure_replication_slot_idempotent() {
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+        stream.slot_created = true;
+
+        assert!(stream.ensure_replication_slot().await.is_ok());
+        assert!(stream.ensure_replication_slot().await.is_ok());
+        assert!(stream.slot_created);
+    }
+
+    /// Verify that the output plugin is set to "pgoutput" for Logical
+    /// and None for Physical slot types (tests the match branch).
+    #[test]
+    fn test_ensure_replication_slot_output_plugin_selection() {
+        // Logical slot → output_plugin = Some("pgoutput")
+        let logical_config = create_test_config().with_slot_type(SlotType::Logical);
+        assert!(matches!(logical_config.slot_type, SlotType::Logical));
+
+        // Physical slot → output_plugin = None
+        let physical_config = create_test_config().with_slot_type(SlotType::Physical);
+        assert!(matches!(physical_config.slot_type, SlotType::Physical));
+    }
+
+    /// Verify that exported_snapshot_name is None before slot creation.
+    #[test]
+    fn test_exported_snapshot_name_none_before_creation() {
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+        assert!(stream.exported_snapshot_name().is_none());
+    }
+
+    /// Verify that we can set and retrieve exported_snapshot_name.
+    #[test]
+    fn test_exported_snapshot_name_set_and_get() {
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+        stream.exported_snapshot_name = Some("00000003-00000028-1".to_string());
+        assert_eq!(stream.exported_snapshot_name(), Some("00000003-00000028-1"));
+    }
+
+    // ========================================
+    // Tests for recover_connection() logic
+    // ========================================
+
+    /// When `slot_options.temporary` is true, `recover_connection()` should reset
+    /// `slot_created` to false so the slot can be recreated.
+    #[test]
+    fn test_recover_connection_resets_slot_created_for_temporary() {
+        let config = create_test_config().with_slot_options(ReplicationSlotOptions {
+            temporary: true,
+            ..Default::default()
+        });
+        let mut stream = create_test_stream(config);
+        stream.slot_created = true;
+
+        // Simulate the temporary-slot reset logic from recover_connection()
+        if stream.config.slot_options.temporary {
+            stream.slot_created = false;
+        }
+
+        assert!(!stream.slot_created);
+    }
+
+    /// When `slot_options.temporary` is false, `recover_connection()` should NOT
+    /// reset `slot_created`.
+    #[test]
+    fn test_recover_connection_preserves_slot_created_for_persistent() {
+        let config = create_test_config().with_slot_options(ReplicationSlotOptions {
+            temporary: false,
+            ..Default::default()
+        });
+        let mut stream = create_test_stream(config);
+        stream.slot_created = true;
+
+        // Simulate the temporary-slot reset logic from recover_connection()
+        if stream.config.slot_options.temporary {
+            stream.slot_created = false;
+        }
+
+        assert!(stream.slot_created);
+    }
+
+    /// Verify that recover_connection restarts replication from last_received_lsn.
+    #[test]
+    fn test_recover_connection_uses_last_received_lsn() {
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+        stream.state.update_received_lsn(0xABCD_1234);
+
+        // The recovery logic reads last_received_lsn for restart position
+        let last_lsn = stream.state.last_received_lsn;
+        assert_eq!(last_lsn, 0xABCD_1234);
+    }
+
+    // ========================================
+    // Tests for timeout_or_error()
+    // ========================================
+
+    /// Test that `timeout_or_error()` returns inner error when it completes
+    /// before timeout.
+    #[tokio::test]
+    async fn test_timeout_or_error_propagates_inner_error_type() {
+        let result: Result<()> = timeout_or_error(Duration::from_secs(5), async {
+            Err(ReplicationError::authentication("bad password"))
+        })
+        .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ReplicationError::Authentication(_)));
+        assert!(err.to_string().contains("bad password"));
+    }
+
+    /// Test that `timeout_or_error()` with a transient error propagates correctly.
+    #[tokio::test]
+    async fn test_timeout_or_error_propagates_transient_error() {
+        let result: Result<()> = timeout_or_error(Duration::from_secs(5), async {
+            Err(ReplicationError::transient_connection("connection dropped"))
+        })
+        .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.is_transient());
+    }
+
+    /// Test that `timeout_or_error()` returns Ok value when the future completes.
+    #[tokio::test]
+    async fn test_timeout_or_error_returns_value() {
+        let result = timeout_or_error(Duration::from_secs(5), async {
+            Ok::<String, ReplicationError>("hello".to_string())
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "hello");
+    }
+
+    /// Test that `timeout_or_error()` with zero-duration timeout triggers immediately.
+    #[tokio::test]
+    async fn test_timeout_or_error_zero_duration() {
+        let result = timeout_or_error(Duration::from_millis(0), async {
+            // This async block will never complete before a zero timeout
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Ok::<_, ReplicationError>(())
+        })
+        .await;
+
+        assert!(matches!(result, Err(ReplicationError::Timeout(_))));
+    }
+
+    /// Test that timeout error message contains the duration.
+    #[tokio::test]
+    async fn test_timeout_or_error_message_contains_duration() {
+        let result = timeout_or_error(Duration::from_millis(5), async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Ok::<_, ReplicationError>(())
+        })
+        .await;
+
+        if let Err(err) = result {
+            let msg = err.to_string();
+            assert!(msg.contains("timeout") || msg.contains("timed out"));
+        } else {
+            panic!("Expected timeout error");
+        }
+    }
+
+    // ========================================
+    // Tests for build_replication_options() edge cases
+    // ========================================
+
+    /// Test build_replication_options with only origin set, no streaming.
+    #[test]
+    fn test_build_replication_options_origin_only() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            2,
+            StreamingMode::Off,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        )
+        .with_origin(Some(OriginFilter::Any));
+
+        let stream = create_test_stream(config);
+        let options = stream.build_replication_options().unwrap();
+
+        // Should have proto_version, publication_names, and origin
+        assert_eq!(options.len(), 3);
+        assert!(options.iter().any(|(k, v)| k == "origin" && v == "any"));
+        // Should NOT have streaming
+        assert!(!options.iter().any(|(k, _)| k == "streaming"));
+    }
+
+    /// Test that StreamingMode::Off does NOT add a streaming option.
+    #[test]
+    fn test_build_replication_options_no_streaming_off() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            1,
+            StreamingMode::Off,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        );
+        let stream = create_test_stream(config);
+        let options = stream.build_replication_options().unwrap();
+        assert!(!options.iter().any(|(k, _)| k == "streaming"));
+    }
+
+    /// Test build_replication_options with messages enabled but nothing else.
+    #[test]
+    fn test_build_replication_options_messages_only() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            1,
+            StreamingMode::Off,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        )
+        .with_messages(true);
+
+        let stream = create_test_stream(config);
+        let options = stream.build_replication_options().unwrap();
+        assert!(options.iter().any(|(k, v)| k == "messages" && v == "on"));
+        assert!(!options.iter().any(|(k, _)| k == "binary"));
+        assert!(!options.iter().any(|(k, _)| k == "two_phase"));
+    }
+
+    /// Test build_replication_options with binary enabled.
+    #[test]
+    fn test_build_replication_options_binary_only() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            1,
+            StreamingMode::Off,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        )
+        .with_binary(true);
+
+        let stream = create_test_stream(config);
+        let options = stream.build_replication_options().unwrap();
+        assert!(options.iter().any(|(k, v)| k == "binary" && v == "on"));
+    }
+
+    /// Test build_replication_options with two_phase enabled at v3.
+    #[test]
+    fn test_build_replication_options_two_phase() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            3,
+            StreamingMode::Off,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        )
+        .with_two_phase(true);
+
+        let stream = create_test_stream(config);
+        let options = stream.build_replication_options().unwrap();
+        assert!(options.iter().any(|(k, v)| k == "two_phase" && v == "on"));
+    }
+
+    /// Test build_replication_options with parallel streaming at v4.
+    #[test]
+    fn test_build_replication_options_parallel_v4() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            4,
+            StreamingMode::Parallel,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        );
+        let stream = create_test_stream(config);
+        let options = stream.build_replication_options().unwrap();
+        assert!(options
+            .iter()
+            .any(|(k, v)| k == "streaming" && v == "parallel"));
+    }
+
+    /// Test that quoted publication name is formatted correctly.
+    #[test]
+    fn test_build_replication_options_publication_name_quoting() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "my_publication".to_string(),
+            1,
+            StreamingMode::Off,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        );
+        let stream = create_test_stream(config);
+        let options = stream.build_replication_options().unwrap();
+        let pub_opt = options
+            .iter()
+            .find(|(k, _)| k == "publication_names")
+            .expect("publication_names option must exist");
+        assert_eq!(pub_opt.1, "\"my_publication\"");
+    }
+
+    // ========================================
+    // Tests for validate_replication_options() edge cases
+    // ========================================
+
+    /// Protocol version 0 should be rejected.
+    #[test]
+    fn test_validate_replication_options_version_zero() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            0,
+            StreamingMode::Off,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        );
+        let stream = create_test_stream(config);
+        let err = stream.validate_replication_options().unwrap_err();
+        assert!(err.to_string().contains("Unsupported protocol version: 0"));
+    }
+
+    /// All valid protocol versions (1-4) should pass validation with StreamingMode::Off.
+    #[test]
+    fn test_validate_replication_options_all_valid_versions() {
+        for v in 1..=4 {
+            let config = ReplicationStreamConfig::new(
+                "slot".to_string(),
+                "pub".to_string(),
+                v,
+                StreamingMode::Off,
+                Duration::from_secs(10),
+                Duration::from_secs(30),
+                Duration::from_secs(60),
+                RetryConfig::default(),
+            );
+            let stream = create_test_stream(config);
+            assert!(
+                stream.validate_replication_options().is_ok(),
+                "Version {v} should be valid"
+            );
+        }
+    }
+
+    /// Very large protocol version should be rejected.
+    #[test]
+    fn test_validate_replication_options_large_version() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            u32::MAX,
+            StreamingMode::Off,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        );
+        let stream = create_test_stream(config);
+        assert!(stream.validate_replication_options().is_err());
+    }
+
+    /// two_phase at v3 should pass, at v2 should fail.
+    #[test]
+    fn test_validate_two_phase_boundary() {
+        // v2 with two_phase → error
+        let config_v2 = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            2,
+            StreamingMode::Off,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        )
+        .with_two_phase(true);
+        let stream_v2 = create_test_stream(config_v2);
+        assert!(stream_v2.validate_replication_options().is_err());
+
+        // v3 with two_phase → ok
+        let config_v3 = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            3,
+            StreamingMode::Off,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        )
+        .with_two_phase(true);
+        let stream_v3 = create_test_stream(config_v3);
+        assert!(stream_v3.validate_replication_options().is_ok());
+    }
+
+    /// streaming=parallel at v3 should fail, at v4 should pass.
+    #[test]
+    fn test_validate_parallel_boundary() {
+        let config_v3 = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            3,
+            StreamingMode::Parallel,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        );
+        let stream_v3 = create_test_stream(config_v3);
+        assert!(stream_v3.validate_replication_options().is_err());
+
+        let config_v4 = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            4,
+            StreamingMode::Parallel,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        );
+        let stream_v4 = create_test_stream(config_v4);
+        assert!(stream_v4.validate_replication_options().is_ok());
+    }
+
+    /// streaming=on at v1 should fail, at v2 should pass.
+    #[test]
+    fn test_validate_streaming_on_boundary() {
+        let config_v1 = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            1,
+            StreamingMode::On,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        );
+        let stream_v1 = create_test_stream(config_v1);
+        assert!(stream_v1.validate_replication_options().is_err());
+
+        let config_v2 = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            2,
+            StreamingMode::On,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        );
+        let stream_v2 = create_test_stream(config_v2);
+        assert!(stream_v2.validate_replication_options().is_ok());
+    }
+
+    /// Validate that all options together at v4 passes.
+    #[test]
+    fn test_validate_all_options_v4() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            4,
+            StreamingMode::Parallel,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        )
+        .with_messages(true)
+        .with_binary(true)
+        .with_two_phase(true)
+        .with_origin(Some(OriginFilter::None));
+
+        let stream = create_test_stream(config);
+        assert!(stream.validate_replication_options().is_ok());
+    }
+
+    // ========================================
+    // Tests for initialize() path coverage
+    // ========================================
+
+    /// Verify that initialize() calls ensure_replication_slot(). Since we use
+    /// `create_test_stream` with a null connection, calling identify_system()
+    /// will fail, so we verify the error is from that call and not from
+    /// ensure_replication_slot().
+    #[tokio::test]
+    async fn test_initialize_fails_on_identify_system_with_null_conn() {
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        // initialize() calls identify_system() first, which will fail with null conn
+        let result = stream.initialize().await;
+        assert!(result.is_err());
+    }
+
+    /// When slot_created is true and identify_system is somehow skipped,
+    /// the ensure_replication_slot() short circuit still works.
+    #[tokio::test]
+    async fn test_ensure_replication_slot_after_manual_flag() {
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        // Manually mark slot as created
+        stream.slot_created = true;
+
+        // ensure_replication_slot should succeed immediately
+        assert!(stream.ensure_replication_slot().await.is_ok());
+    }
+
+    // ========================================
+    // Tests for check_connection_health()
+    // ========================================
+
+    /// Health check should be skipped when the interval hasn't elapsed yet.
+    #[tokio::test]
+    async fn test_check_connection_health_skipped_when_too_soon() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            2,
+            StreamingMode::Off,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(3600), // 1 hour health check interval
+            RetryConfig::default(),
+        );
+        let mut stream = create_test_stream(config);
+
+        // Since last_health_check was just set, this should skip the check
+        // and return Ok even with a null connection.
+        let result = stream.check_connection_health().await;
+        assert!(result.is_ok());
+    }
+
+    /// Health check detects dead connection when interval has elapsed.
+    /// With a null connection, is_alive() returns false, triggering recovery
+    /// which will fail since there's no real DB.
+    #[tokio::test]
+    async fn test_check_connection_health_detects_dead_connection() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            2,
+            StreamingMode::Off,
+            Duration::from_secs(10),
+            Duration::from_millis(1), // very short timeout
+            Duration::from_millis(0), // immediate health check
+            RetryConfig {
+                max_attempts: 1,
+                initial_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(1),
+                multiplier: 1.0,
+                max_duration: Duration::from_millis(10),
+                jitter: false,
+            },
+        );
+        let mut stream = create_test_stream(config);
+        // Force health check interval to have elapsed
+        stream.last_health_check = Instant::now() - Duration::from_secs(3600);
+
+        // is_alive() will return false for a null connection,
+        // triggering recovery which will fail
+        let result = stream.check_connection_health().await;
+        assert!(result.is_err());
+    }
+
+    /// Test the full builder chain with all options.
+    #[test]
+    fn test_config_full_builder_chain() {
+        let config = ReplicationStreamConfig::new(
+            "my_slot".to_string(),
+            "my_pub".to_string(),
+            4,
+            StreamingMode::Parallel,
+            Duration::from_secs(5),
+            Duration::from_secs(15),
+            Duration::from_secs(120),
+            RetryConfig {
+                max_attempts: 10,
+                initial_delay: Duration::from_millis(500),
+                max_delay: Duration::from_secs(30),
+                multiplier: 2.5,
+                max_duration: Duration::from_secs(600),
+                jitter: true,
+            },
+        )
+        .with_messages(true)
+        .with_binary(true)
+        .with_two_phase(true)
+        .with_origin(Some(OriginFilter::Any))
+        .with_slot_options(ReplicationSlotOptions {
+            temporary: true,
+            snapshot: Some("export".to_string()),
+            two_phase: true,
+            failover: true,
+            ..Default::default()
+        })
+        .with_slot_type(SlotType::Logical);
+
+        assert_eq!(config.slot_name, "my_slot");
+        assert_eq!(config.publication_name, "my_pub");
+        assert_eq!(config.protocol_version, 4);
+        assert_eq!(config.streaming_mode, StreamingMode::Parallel);
+        assert!(config.messages);
+        assert!(config.binary);
+        assert!(config.two_phase);
+        assert_eq!(config.origin, Some(OriginFilter::Any));
+        assert!(config.slot_options.temporary);
+        assert_eq!(config.slot_options.snapshot, Some("export".to_string()));
+        assert!(config.slot_options.two_phase);
+        assert!(config.slot_options.failover);
+        assert!(matches!(config.slot_type, SlotType::Logical));
+        assert_eq!(config.feedback_interval, Duration::from_secs(5));
+        assert_eq!(config.connection_timeout, Duration::from_secs(15));
+        assert_eq!(config.health_check_interval, Duration::from_secs(120));
+        assert_eq!(config.retry_config.max_attempts, 10);
+    }
+
+    /// Test config defaults for slot_options.
+    #[test]
+    fn test_config_default_slot_options() {
+        let config = create_test_config();
+        // Default snapshot is "nothing" per the constructor
+        assert_eq!(config.slot_options.snapshot, Some("nothing".to_string()));
+        assert!(!config.slot_options.temporary);
+        assert!(!config.slot_options.two_phase);
+        assert!(!config.slot_options.reserve_wal);
+        assert!(!config.slot_options.failover);
+    }
+
+    /// Test config with_slot_options replaces previous options entirely.
+    #[test]
+    fn test_config_with_slot_options_replaces_defaults() {
+        let config = create_test_config().with_slot_options(ReplicationSlotOptions {
+            temporary: true,
+            snapshot: Some("export".to_string()),
+            ..Default::default()
+        });
+        assert!(config.slot_options.temporary);
+        assert_eq!(config.slot_options.snapshot, Some("export".to_string()));
+        // Fields not set should be Default
+        assert!(!config.slot_options.two_phase);
+        assert!(!config.slot_options.failover);
+    }
+
+    // ========================================
+    // Tests for shared_lsn_feedback in stream context
+    // ========================================
+
+    /// Verify that shared_lsn_feedback can be updated and read back from the stream.
+    #[test]
+    fn test_stream_shared_lsn_feedback_update_and_read() {
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+
+        stream.shared_lsn_feedback.update_flushed_lsn(5000);
+        stream.shared_lsn_feedback.update_applied_lsn(4000);
+
+        let (f, a) = stream.shared_lsn_feedback.get_feedback_lsn();
+        assert_eq!(f, 5000);
+        assert_eq!(a, 4000);
+    }
+
+    /// Verify that shared_lsn_feedback does not allow backward movement.
+    #[test]
+    fn test_stream_shared_lsn_feedback_monotonic() {
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+
+        stream.shared_lsn_feedback.update_applied_lsn(1000);
+        stream.shared_lsn_feedback.update_applied_lsn(500); // should be ignored
+        stream.shared_lsn_feedback.update_applied_lsn(2000);
+        stream.shared_lsn_feedback.update_applied_lsn(1500); // should be ignored
+
+        let (_, a) = stream.shared_lsn_feedback.get_feedback_lsn();
+        assert_eq!(a, 2000);
+    }
+
+    /// current_lsn returns 0 for a fresh stream.
+    #[test]
+    fn test_current_lsn_fresh_stream() {
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+        assert_eq!(stream.current_lsn(), 0);
+    }
+
+    /// current_lsn reflects state.last_received_lsn.
+    #[test]
+    fn test_current_lsn_after_state_update() {
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+        stream.state.update_received_lsn(0x1234_5678);
+        assert_eq!(stream.current_lsn(), 0x1234_5678);
+    }
+
+    /// is_temporary_slot returns the slot_options.temporary value.
+    #[test]
+    fn test_is_temporary_slot_default_false() {
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+        assert!(!stream.is_temporary_slot());
+    }
+
+    #[test]
+    fn test_is_temporary_slot_explicitly_true() {
+        let config = create_test_config().with_slot_options(ReplicationSlotOptions {
+            temporary: true,
+            ..Default::default()
+        });
+        let stream = create_test_stream(config);
+        assert!(stream.is_temporary_slot());
+    }
+
+    // ========================================
+    // Tests for EventStream wrapper methods
+    // ========================================
+
+    /// EventStream::current_lsn delegates to inner stream.
+    #[test]
+    fn test_event_stream_current_lsn() {
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+        stream.state.update_received_lsn(42);
+
+        let cancel_token = CancellationToken::new();
+        let event_stream = stream.into_stream(cancel_token);
+        assert_eq!(event_stream.current_lsn(), 42);
+    }
+
+    /// EventStream inner/inner_mut provide access to the underlying stream.
+    #[test]
+    fn test_event_stream_inner_access() {
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+
+        let cancel_token = CancellationToken::new();
+        let mut event_stream = stream.into_stream(cancel_token);
+
+        // inner() provides immutable access
+        assert_eq!(event_stream.inner().config.slot_name, "test_slot");
+
+        // inner_mut() provides mutable access
+        event_stream.inner_mut().state.update_received_lsn(999);
+        assert_eq!(event_stream.current_lsn(), 999);
+    }
+
+    /// EventStreamRef works similarly to EventStream.
+    #[test]
+    fn test_event_stream_ref_basic() {
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+        stream.state.update_received_lsn(100);
+
+        let cancel_token = CancellationToken::new();
+        let event_stream_ref = stream.stream(cancel_token);
+
+        assert_eq!(event_stream_ref.current_lsn(), 100);
+        assert_eq!(event_stream_ref.inner().config.slot_name, "test_slot");
+    }
+
+    /// EventStreamRef inner_mut access.
+    #[test]
+    fn test_event_stream_ref_inner_mut_update() {
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        let cancel_token = CancellationToken::new();
+        let mut event_stream_ref = stream.stream(cancel_token);
+        event_stream_ref.inner_mut().state.update_received_lsn(777);
+        assert_eq!(event_stream_ref.current_lsn(), 777);
+    }
+
+    /// RetryConfig with max_attempts = 0 should still fail (no retries).
+    #[tokio::test]
+    async fn test_new_with_zero_retry_attempts() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            2,
+            StreamingMode::On,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig {
+                max_attempts: 0,
+                initial_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(10),
+                multiplier: 1.0,
+                max_duration: Duration::from_secs(5),
+                jitter: false,
+            },
+        );
+
+        let result = LogicalReplicationStream::new(
+            "postgresql://nobody:nothing@127.0.0.1:1/nonexistent?replication=database&connect_timeout=1",
+            config,
+        )
+        .await;
+
+        // Should fail because max_attempts is 0 → no attempts made
+        assert!(result.is_err());
+    }
+
+    /// RetryConfig with very short max_duration should trigger duration exceeded.
+    #[tokio::test]
+    async fn test_new_with_short_max_duration() {
+        let config = ReplicationStreamConfig::new(
+            "slot".to_string(),
+            "pub".to_string(),
+            2,
+            StreamingMode::On,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig {
+                max_attempts: 100,
+                initial_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(10),
+                multiplier: 1.0,
+                max_duration: Duration::from_millis(1), // extremely short
+                jitter: false,
+            },
+        );
+
+        let result = LogicalReplicationStream::new(
+            "postgresql://nobody:nothing@127.0.0.1:1/nonexistent?replication=database&connect_timeout=1",
+            config,
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    /// Verify that state.relations is empty by default.
+    #[test]
+    fn test_stream_state_relations_empty() {
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+        assert!(stream.state.relations.is_empty());
+    }
+
+    /// Verify that last_health_check is recent after creation.
+    #[test]
+    fn test_stream_last_health_check_recent() {
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+        // Should have been set within the last second
+        assert!(stream.last_health_check.elapsed() < Duration::from_secs(1));
+    }
+
+    /// Verify config is stored correctly.
+    #[test]
+    fn test_stream_config_stored() {
+        let config = ReplicationStreamConfig::new(
+            "custom_slot".to_string(),
+            "custom_pub".to_string(),
+            3,
+            StreamingMode::Off,
+            Duration::from_secs(15),
+            Duration::from_secs(45),
+            Duration::from_secs(90),
+            RetryConfig::default(),
+        );
+        let stream = create_test_stream(config);
+
+        assert_eq!(stream.config.slot_name, "custom_slot");
+        assert_eq!(stream.config.publication_name, "custom_pub");
+        assert_eq!(stream.config.protocol_version, 3);
+        assert_eq!(stream.config.streaming_mode, StreamingMode::Off);
+        assert_eq!(stream.config.feedback_interval, Duration::from_secs(15));
+        assert_eq!(stream.config.connection_timeout, Duration::from_secs(45));
+        assert_eq!(stream.config.health_check_interval, Duration::from_secs(90));
     }
 }

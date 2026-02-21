@@ -30,6 +30,18 @@ default = []
 tokio = { version = "1.47.2", features = ["full"] }
 criterion = { version = "0.8.2", features = ["html_reports"] }
 
+[[test]]
+name = "snapshot_export"
+path = "integration-tests/snapshot_export.rs"
+
+[[test]]
+name = "rate_limited_streaming"
+path = "integration-tests/rate_limited_streaming.rs"
+
+[[test]]
+name = "safe_transaction_consumer"
+path = "integration-tests/safe_transaction_consumer.rs"
+
 [[bench]]
 name = "rowdata_vs_hashmap"
 harness = false
