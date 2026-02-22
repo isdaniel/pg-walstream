@@ -44,7 +44,6 @@ use std::env;
 use std::time::Duration;
 use tracing::{error, info, Level};
 use tracing_subscriber;
-use pg_walstream::ReplicationSlotOptions;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -73,21 +72,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Duration::from_secs(30),      // Connection timeout
         Duration::from_secs(60),      // Health check interval
         RetryConfig::default(),       // Use default retry strategy
-    ).with_slot_options(ReplicationSlotOptions {
-        temporary: true,
-        snapshot: Some("export".to_string()),
-        ..Default::default()
-    });
+    );
 
     info!("Creating replication stream...");
 
     // Create and initialize the stream
     let mut stream = LogicalReplicationStream::new(&connection_string, config).await?;
-    stream.ensure_replication_slot().await?;
+
     info!("Stream created successfully");
-    if let Some(snapshot_name) = stream.exported_snapshot_name() {
-        info!("Exported snapshot: {snapshot_name}");
-    }
+
     // Start replication from the latest position (None = latest)
     stream.start(None).await?;
 
