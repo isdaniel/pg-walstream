@@ -568,7 +568,7 @@ impl LogicalReplicationStream {
             }
 
             // Send proactive feedback if enough time has passed
-            self.maybe_send_feedback();
+            self.maybe_send_feedback().await;
 
             // Get data from replication stream
             let data = self
@@ -585,13 +585,13 @@ impl LogicalReplicationStream {
                     // WAL data message
                     if let Some(event) = self.process_wal_message(&data)? {
                         // Send feedback after processing WAL data
-                        self.maybe_send_feedback();
+                        self.maybe_send_feedback().await;
                         return Ok(event);
                     }
                 }
                 'k' => {
                     // Keepalive message
-                    self.process_keepalive_message(&data)?;
+                    self.process_keepalive_message(&data).await?;
                 }
                 _ => {
                     warn!("Received unknown message type: {}", data[0] as char);
@@ -836,7 +836,7 @@ impl LogicalReplicationStream {
     }
 
     /// Process a keepalive message
-    fn process_keepalive_message(&mut self, data: &[u8]) -> Result<()> {
+    async fn process_keepalive_message(&mut self, data: &[u8]) -> Result<()> {
         let keepalive = parse_keepalive_message(data)?;
 
         debug!(
@@ -848,7 +848,7 @@ impl LogicalReplicationStream {
         self.state.update_received_lsn(keepalive.wal_end);
 
         if keepalive.reply_requested {
-            self.send_feedback()?;
+            self.send_feedback().await?;
         }
 
         Ok(())
@@ -1122,7 +1122,7 @@ impl LogicalReplicationStream {
     /// interval has elapsed AND the LSN values have actually changed. This avoids
     /// unnecessary status updates and reduces network overhead.
     #[inline]
-    pub fn maybe_send_feedback(&mut self) {
+    pub async fn maybe_send_feedback(&mut self) {
         // Check if enough time has elapsed
         if !self
             .state
@@ -1146,7 +1146,7 @@ impl LogicalReplicationStream {
 
         // Only send feedback if LSN values have changed
         if self.state.lsn_has_changed(flushed_lsn, applied_lsn) {
-            if let Err(e) = self.send_feedback() {
+            if let Err(e) = self.send_feedback().await {
                 warn!("Failed to send feedback: {}", e);
             }
         }
@@ -1165,7 +1165,7 @@ impl LogicalReplicationStream {
     ///
     /// The method tracks the last sent LSN values to enable intelligent throttling
     /// and avoid sending redundant status updates.
-    pub fn send_feedback(&mut self) -> Result<()> {
+    pub async fn send_feedback(&mut self) -> Result<()> {
         if self.state.last_received_lsn == 0 {
             return Ok(());
         }
@@ -1192,12 +1192,14 @@ impl LogicalReplicationStream {
             self.state.last_applied_lsn = applied_lsn;
         }
 
-        self.connection.send_standby_status_update(
-            self.state.last_received_lsn,
-            flushed_lsn,
-            applied_lsn,
-            false, // Don't request reply
-        )?;
+        self.connection
+            .send_standby_status_update(
+                self.state.last_received_lsn,
+                flushed_lsn,
+                applied_lsn,
+                false, // Don't request reply
+            )
+            .await?;
 
         // Record the LSN values we sent for intelligent throttling
         self.state
@@ -1301,7 +1303,15 @@ impl LogicalReplicationStream {
 
     /// Stop the replication stream
     pub async fn stop(&mut self) -> Result<()> {
-        // The connection will be closed when dropped
+        if let Err(e) = self.send_feedback().await {
+            warn!("Failed to send final feedback: {}", e);
+        }
+
+        info!(
+            "Stopping logical replication stream (last received LSN: {})",
+            format_lsn(self.current_lsn())
+        );
+
         Ok(())
     }
 
@@ -4595,19 +4605,16 @@ mod tests {
         assert_eq!(stream.current_lsn(), 12345);
     }
 
-    #[test]
-    fn test_stream_stop_method() {
+    #[tokio::test]
+    async fn test_stream_stop_method() {
         let config = create_test_config();
         let mut stream = create_test_stream(config);
-        // stop() should succeed without a real connection
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            stream.stop().await.unwrap();
-        });
+        // stop() performs async I/O (sends final feedback)
+        stream.stop().await.unwrap();
     }
 
-    #[test]
-    fn test_maybe_send_feedback_no_received_lsn() {
+    #[tokio::test]
+    async fn test_maybe_send_feedback_no_received_lsn() {
         let config = ReplicationStreamConfig::new(
             "slot".to_string(),
             "pub".to_string(),
@@ -4621,8 +4628,8 @@ mod tests {
         let mut stream = create_test_stream(config);
 
         // No received LSN, feedback should be a no-op (won't crash on null conn)
-        std::thread::sleep(Duration::from_millis(5));
-        stream.maybe_send_feedback();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        stream.maybe_send_feedback().await;
         // If this didn't panic, the guard condition in send_feedback works
     }
 
@@ -4767,21 +4774,21 @@ mod tests {
         data
     }
 
-    #[test]
-    fn test_process_keepalive_no_reply() {
+    #[tokio::test]
+    async fn test_process_keepalive_no_reply() {
         let mut stream = create_test_stream(create_test_config());
         let data = build_keepalive_message(0x4000, false);
-        let result = stream.process_keepalive_message(&data);
+        let result = stream.process_keepalive_message(&data).await;
         assert!(result.is_ok());
         assert_eq!(stream.state.last_received_lsn, 0x4000);
     }
 
-    #[test]
-    fn test_process_keepalive_reply_requested_no_received() {
+    #[tokio::test]
+    async fn test_process_keepalive_reply_requested_no_received() {
         // When received lsn is 0, send_feedback is a no-op (won't crash on null conn)
         let mut stream = create_test_stream(create_test_config());
         let data = build_keepalive_message(0, true);
-        let result = stream.process_keepalive_message(&data);
+        let result = stream.process_keepalive_message(&data).await;
         // send_feedback returns early if last_received_lsn == 0
         assert!(result.is_ok());
     }
@@ -4923,11 +4930,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_send_feedback_no_received_lsn() {
+    #[tokio::test]
+    async fn test_send_feedback_no_received_lsn() {
         let mut stream = create_test_stream(create_test_config());
         // send_feedback should return Ok(()) when last_received_lsn is 0
-        let result = stream.send_feedback();
+        let result = stream.send_feedback().await;
         assert!(result.is_ok());
     }
 
@@ -5014,8 +5021,8 @@ mod tests {
         assert!(stream.validate_replication_options().is_ok());
     }
 
-    #[test]
-    fn test_maybe_send_feedback_with_changed_lsn() {
+    #[tokio::test]
+    async fn test_maybe_send_feedback_with_changed_lsn() {
         let config = ReplicationStreamConfig::new(
             "slot".to_string(),
             "pub".to_string(),
@@ -5035,16 +5042,16 @@ mod tests {
         stream.shared_lsn_feedback.update_applied_lsn(2000);
 
         // Wait for feedback interval to pass
-        std::thread::sleep(Duration::from_millis(5));
+        tokio::time::sleep(Duration::from_millis(5)).await;
 
         // This should attempt to send feedback, but fail silently because of null conn
         // Covers the maybe_send_feedback paths: get_feedback_lsn, flushed > 0, applied > 0, lsn_has_changed
-        stream.maybe_send_feedback();
+        stream.maybe_send_feedback().await;
         // If no panic, the error was caught by the warn!() in maybe_send_feedback
     }
 
-    #[test]
-    fn test_maybe_send_feedback_lsn_not_changed() {
+    #[tokio::test]
+    async fn test_maybe_send_feedback_lsn_not_changed() {
         let config = ReplicationStreamConfig::new(
             "slot".to_string(),
             "pub".to_string(),
@@ -5062,19 +5069,19 @@ mod tests {
         stream.shared_lsn_feedback.update_flushed_lsn(3000);
         stream.shared_lsn_feedback.update_applied_lsn(2000);
 
-        std::thread::sleep(Duration::from_millis(5));
-        stream.maybe_send_feedback(); // First call - sends (or tries to)
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        stream.maybe_send_feedback().await; // First call - sends (or tries to)
 
         // Mark the sent LSN values so the next call sees no change
         stream.state.mark_feedback_sent_with_lsn(3000, 3000);
 
-        std::thread::sleep(Duration::from_millis(5));
+        tokio::time::sleep(Duration::from_millis(5)).await;
         // Same LSN values, should NOT try to send feedback
-        stream.maybe_send_feedback();
+        stream.maybe_send_feedback().await;
     }
 
-    #[test]
-    fn test_maybe_send_feedback_zero_shared_lsn() {
+    #[tokio::test]
+    async fn test_maybe_send_feedback_zero_shared_lsn() {
         let config = ReplicationStreamConfig::new(
             "slot".to_string(),
             "pub".to_string(),
@@ -5091,13 +5098,13 @@ mod tests {
         stream.state.update_received_lsn(5000);
         // shared_lsn_feedback flushed and applied are 0 by default
 
-        std::thread::sleep(Duration::from_millis(5));
-        stream.maybe_send_feedback();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        stream.maybe_send_feedback().await;
         // This covers the f == 0 and a == 0 branches
     }
 
-    #[test]
-    fn test_send_feedback_with_shared_lsn_values() {
+    #[tokio::test]
+    async fn test_send_feedback_with_shared_lsn_values() {
         let config = create_test_config();
         let mut stream = create_test_stream(config);
 
@@ -5106,7 +5113,7 @@ mod tests {
         stream.shared_lsn_feedback.update_applied_lsn(6000);
 
         // send_feedback will fail on the null connection, but exercises the LSN logic
-        let result = stream.send_feedback();
+        let result = stream.send_feedback().await;
         // It should error because null connection can't send status update
         assert!(result.is_err());
 
@@ -5115,8 +5122,8 @@ mod tests {
         // and updates state after. Since it errors on the BDcall, state won't update.
     }
 
-    #[test]
-    fn test_send_feedback_applied_greater_than_received() {
+    #[tokio::test]
+    async fn test_send_feedback_applied_greater_than_received() {
         let config = create_test_config();
         let mut stream = create_test_stream(config);
 
@@ -5126,7 +5133,7 @@ mod tests {
         stream.shared_lsn_feedback.update_applied_lsn(9000);
 
         // Will fail on null conn but exercises the min() capping logic
-        let result = stream.send_feedback();
+        let result = stream.send_feedback().await;
         assert!(result.is_err());
     }
 
@@ -5232,8 +5239,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_maybe_send_feedback_flushed_capped() {
+    #[tokio::test]
+    async fn test_maybe_send_feedback_flushed_capped() {
         let config = ReplicationStreamConfig::new(
             "slot".to_string(),
             "pub".to_string(),
@@ -5250,8 +5257,8 @@ mod tests {
         stream.shared_lsn_feedback.update_flushed_lsn(0x9000);
         stream.shared_lsn_feedback.update_applied_lsn(0x8000);
 
-        std::thread::sleep(Duration::from_millis(5));
-        stream.maybe_send_feedback();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        stream.maybe_send_feedback().await;
     }
 
     // ---- Coverage: with_slot_options builder ----
@@ -5317,14 +5324,14 @@ mod tests {
 
     // ---- Coverage: send_feedback with zero shared LSN (else branches) ----
 
-    #[test]
-    fn test_send_feedback_zero_shared_lsn() {
+    #[tokio::test]
+    async fn test_send_feedback_zero_shared_lsn() {
         let config = create_test_config();
         let mut stream = create_test_stream(config);
         stream.state.update_received_lsn(5000);
         // shared_lsn_feedback flushed and applied are 0 by default
         // This exercises the else branches (flushed_lsn = 0, applied_lsn = 0)
-        let result = stream.send_feedback();
+        let result = stream.send_feedback().await;
         // Errors because null connection can't send status, but the LSN logic is covered
         assert!(result.is_err());
     }
@@ -5358,15 +5365,15 @@ mod tests {
 
     // ---- Coverage: process_keepalive with reply_requested and valid received LSN ----
 
-    #[test]
-    fn test_process_keepalive_reply_with_valid_lsn() {
+    #[tokio::test]
+    async fn test_process_keepalive_reply_with_valid_lsn() {
         let mut stream = create_test_stream(create_test_config());
         // Set a non-zero received LSN so send_feedback doesn't short-circuit
         stream.state.update_received_lsn(0x2000);
         let data = build_keepalive_message(0x3000, true);
         // Will attempt send_feedback, which errors on null conn — but keepalive should still succeed
         // because process_keepalive calls send_feedback which returns Err, and that propagates
-        let result = stream.process_keepalive_message(&data);
+        let result = stream.process_keepalive_message(&data).await;
         // send_feedback on null connection will error
         assert!(result.is_err());
     }
@@ -6529,5 +6536,74 @@ mod tests {
         assert_eq!(stream.config.feedback_interval, Duration::from_secs(15));
         assert_eq!(stream.config.connection_timeout, Duration::from_secs(45));
         assert_eq!(stream.config.health_check_interval, Duration::from_secs(90));
+    }
+
+    #[tokio::test]
+    async fn test_stop_returns_ok_with_default_state() {
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        let result = stream.stop().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_stop_preserves_current_lsn() {
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        // Simulate having received some WAL data
+        stream.state.update_received_lsn(0x16B374D848);
+
+        let result = stream.stop().await;
+        assert!(result.is_ok());
+
+        // LSN should still be accessible after stop
+        assert_eq!(stream.current_lsn(), 0x16B374D848);
+    }
+
+    #[tokio::test]
+    async fn test_stop_with_shared_lsn_feedback_set() {
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        // Simulate consumer having updated feedback LSNs
+        stream.shared_lsn_feedback.update_flushed_lsn(5000);
+        stream.shared_lsn_feedback.update_applied_lsn(5000);
+        stream.state.update_received_lsn(10000);
+
+        let result = stream.stop().await;
+        assert!(result.is_ok());
+
+        // Feedback values should still be intact after stop
+        let (flushed, applied) = stream.shared_lsn_feedback.get_feedback_lsn();
+        assert_eq!(flushed, 5000);
+        assert_eq!(applied, 5000);
+    }
+
+    #[tokio::test]
+    async fn test_stop_can_be_called_multiple_times() {
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+        stream.state.update_received_lsn(1000);
+
+        // Calling stop() multiple times should always succeed
+        assert!(stream.stop().await.is_ok());
+        assert!(stream.stop().await.is_ok());
+        assert!(stream.stop().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_stop_with_high_lsn_value() {
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        // Use a large LSN value near u64 max
+        let high_lsn: u64 = 0xFFFF_FFFF_FFFF_FFFE;
+        stream.state.update_received_lsn(high_lsn);
+
+        let result = stream.stop().await;
+        assert!(result.is_ok());
+        assert_eq!(stream.current_lsn(), high_lsn);
     }
 }
