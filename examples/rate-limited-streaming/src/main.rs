@@ -49,7 +49,7 @@ use pg_walstream::{
 };
 use std::env;
 use std::time::{Duration, Instant};
-use tokio_stream::StreamExt as TokioStreamExt;
+use tokio_stream::StreamExt;
 use tracing::{error, info, warn, Level};
 use tracing_subscriber;
 
@@ -148,7 +148,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Use tokio_stream's throttle combinator to rate limit the stream
-    let mut rate_limited_stream = Box::pin(pg_stream.throttle(delay_between_events));
+    let mut rate_limited_stream = std::pin::pin!(pg_stream.throttle(delay_between_events));
 
     // Statistics
     let mut event_count = 0;
@@ -158,7 +158,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start_time = Instant::now();
 
     // Process events with rate limiting applied by stream combinator
-    while let Some(result) = TokioStreamExt::next(&mut rate_limited_stream).await {
+    while let Some(result) = rate_limited_stream.next().await {
         match result {
             Ok(event) => {
                 event_count += 1;
