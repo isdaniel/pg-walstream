@@ -347,7 +347,7 @@ impl PgReplicationConnection {
     }
 
     /// Send feedback to the server (standby status update)
-    pub fn send_standby_status_update(
+    pub async fn send_standby_status_update(
         &self,
         received_lsn: XLogRecPtr,
         flushed_lsn: XLogRecPtr,
@@ -369,7 +369,7 @@ impl PgReplicationConnection {
         buffer.write_u8(if reply_requested { 1 } else { 0 })?;
 
         let reply_data = buffer.freeze();
-        self.put_copy_data_and_flush(&reply_data)?;
+        self.put_copy_data_and_flush(&reply_data).await?;
 
         info!(
             "Sent standby status update: received={}, flushed={}, applied={}, reply_requested={}",
@@ -573,8 +573,11 @@ impl PgReplicationConnection {
         Ok(())
     }
 
-    /// Helper: Send data via COPY protocol and flush
-    fn put_copy_data_and_flush(&self, data: &[u8]) -> Result<()> {
+    /// Helper: Send data via COPY protocol and flush (async, non-blocking)
+    ///
+    /// Uses `AsyncFd::writable()` to avoid blocking the executor thread while
+    /// waiting for the socket to become writable during `PQflush`.
+    async fn put_copy_data_and_flush(&self, data: &[u8]) -> Result<()> {
         let result = unsafe {
             PQputCopyData(
                 self.conn,
@@ -590,15 +593,31 @@ impl PgReplicationConnection {
             )));
         }
 
-        let flush_result = unsafe { PQflush(self.conn) };
-        if flush_result != 0 {
-            let error_msg = self.last_error_message();
-            return Err(ReplicationError::protocol(format!(
-                "Failed to flush connection: {error_msg}"
-            )));
+        // Flush loop: PQflush returns 0 on success, 1 if data remains (wait for writable), -1 on error.  We use async_fd.writable() so the executor thread is released while waiting for the OS socket to become writable.
+        loop {
+            let flush_result = unsafe { PQflush(self.conn) };
+            match flush_result {
+                0 => return Ok(()),
+                1 => {
+                    // Data still pending – wait for the socket to become writable.
+                    let async_fd = self.async_fd.as_ref().ok_or_else(|| {
+                        ReplicationError::protocol("AsyncFd not initialized".to_string())
+                    })?;
+                    let mut guard = async_fd.writable().await.map_err(|e| {
+                        ReplicationError::protocol(format!(
+                            "Failed to wait for socket writability: {e}"
+                        ))
+                    })?;
+                    guard.clear_ready();
+                }
+                _ => {
+                    let error_msg = self.last_error_message();
+                    return Err(ReplicationError::protocol(format!(
+                        "Failed to flush connection: {error_msg}"
+                    )));
+                }
+            }
         }
-
-        Ok(())
     }
 
     /// Helper: Build SQL options string from key-value pairs
@@ -794,7 +813,7 @@ impl PgReplicationConnection {
     }
 
     /// Send hot standby feedback message to the server
-    pub fn send_hot_standby_feedback(
+    pub async fn send_hot_standby_feedback(
         &self,
         xmin: u32,
         xmin_epoch: u32,
@@ -806,7 +825,7 @@ impl PgReplicationConnection {
         let feedback_data =
             build_hot_standby_feedback_message(xmin, xmin_epoch, catalog_xmin, catalog_xmin_epoch)?;
 
-        self.put_copy_data_and_flush(&feedback_data)?;
+        self.put_copy_data_and_flush(&feedback_data).await?;
 
         debug!(
             "Sent hot standby feedback: xmin={}, catalog_xmin={}",
