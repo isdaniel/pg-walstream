@@ -1300,7 +1300,7 @@ impl LogicalReplicationStream {
     }
 
     /// Stop the replication stream
-    pub async fn stop(&mut self) -> Result<()> {
+    pub fn stop(&mut self) -> Result<()> {
         if let Err(e) = self.send_feedback() {
             warn!("Failed to send final feedback: {}", e);
         }
@@ -4607,11 +4607,8 @@ mod tests {
     fn test_stream_stop_method() {
         let config = create_test_config();
         let mut stream = create_test_stream(config);
-        // stop() should succeed without a real connection
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            stream.stop().await.unwrap();
-        });
+        // stop() is synchronous — no runtime needed
+        stream.stop().unwrap();
     }
 
     #[test]
@@ -6539,41 +6536,32 @@ mod tests {
         assert_eq!(stream.config.health_check_interval, Duration::from_secs(90));
     }
 
-    #[tokio::test]
-    async fn test_stop_returns_ok_with_default_state() {
+    #[test]
+    fn test_stop_returns_ok_with_default_state() {
         let config = create_test_config();
         let mut stream = create_test_stream(config);
 
-        let result = stream.stop().await;
+        let result = stream.stop();
         assert!(result.is_ok());
     }
 
-    #[tokio::test]
-    async fn test_stop_returns_ok_with_zero_lsn() {
-        let config = create_test_config();
-        let stream = create_test_stream(config);
-
-        // Fresh stream should have LSN 0
-        assert_eq!(stream.current_lsn(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_stop_preserves_current_lsn() {
+    #[test]
+    fn test_stop_preserves_current_lsn() {
         let config = create_test_config();
         let mut stream = create_test_stream(config);
 
         // Simulate having received some WAL data
         stream.state.update_received_lsn(0x16B374D848);
 
-        let result = stream.stop().await;
+        let result = stream.stop();
         assert!(result.is_ok());
 
         // LSN should still be accessible after stop
         assert_eq!(stream.current_lsn(), 0x16B374D848);
     }
 
-    #[tokio::test]
-    async fn test_stop_with_shared_lsn_feedback_set() {
+    #[test]
+    fn test_stop_with_shared_lsn_feedback_set() {
         let config = create_test_config();
         let mut stream = create_test_stream(config);
 
@@ -6582,7 +6570,7 @@ mod tests {
         stream.shared_lsn_feedback.update_applied_lsn(5000);
         stream.state.update_received_lsn(10000);
 
-        let result = stream.stop().await;
+        let result = stream.stop();
         assert!(result.is_ok());
 
         // Feedback values should still be intact after stop
@@ -6591,20 +6579,20 @@ mod tests {
         assert_eq!(applied, 5000);
     }
 
-    #[tokio::test]
-    async fn test_stop_can_be_called_multiple_times() {
+    #[test]
+    fn test_stop_can_be_called_multiple_times() {
         let config = create_test_config();
         let mut stream = create_test_stream(config);
         stream.state.update_received_lsn(1000);
 
         // Calling stop() multiple times should always succeed
-        assert!(stream.stop().await.is_ok());
-        assert!(stream.stop().await.is_ok());
-        assert!(stream.stop().await.is_ok());
+        assert!(stream.stop().is_ok());
+        assert!(stream.stop().is_ok());
+        assert!(stream.stop().is_ok());
     }
 
-    #[tokio::test]
-    async fn test_stop_with_high_lsn_value() {
+    #[test]
+    fn test_stop_with_high_lsn_value() {
         let config = create_test_config();
         let mut stream = create_test_stream(config);
 
@@ -6612,7 +6600,7 @@ mod tests {
         let high_lsn: u64 = 0xFFFF_FFFF_FFFF_FFFE;
         stream.state.update_received_lsn(high_lsn);
 
-        let result = stream.stop().await;
+        let result = stream.stop();
         assert!(result.is_ok());
         assert_eq!(stream.current_lsn(), high_lsn);
     }
