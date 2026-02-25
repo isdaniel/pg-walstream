@@ -1218,7 +1218,7 @@ async fn test_json_special_values() {
     let unicode = find_col(&inserts[3], "data");
     let unicode_str = unicode.as_str().unwrap();
     assert!(
-        unicode_str.contains("café") || unicode_str.contains("caf"),
+        unicode_str.contains("café"),
         "should contain unicode text: {unicode_str}"
     );
 

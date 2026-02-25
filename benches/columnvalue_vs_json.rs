@@ -226,8 +226,6 @@ fn bench_round_trip(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 // 5. Payload size comparison (one-shot, informational)
 // ---------------------------------------------------------------------------
-
-/// Print payload sizes so benchmark output includes size context.
 fn bench_payload_size(c: &mut Criterion) {
     let mut group = c.benchmark_group("payload_size");
 

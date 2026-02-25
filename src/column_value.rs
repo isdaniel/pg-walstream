@@ -298,7 +298,7 @@ impl<'de> Deserialize<'de> for ColumnValue {
                     // Decode hex to binary
                     match hex_decode(hex) {
                         Ok(bytes) => Ok(ColumnValue::Binary(Bytes::from(bytes))),
-                        Err(_) => Ok(ColumnValue::Text(Bytes::copy_from_slice(v.as_bytes()))),
+                        Err(e) => Err(E::custom(format!("invalid hex string: {e}"))),
                     }
                 } else {
                     Ok(ColumnValue::Text(Bytes::copy_from_slice(v.as_bytes())))
@@ -696,5 +696,298 @@ mod tests {
         assert_eq!(hex_decode("").unwrap(), Vec::<u8>::new());
         assert!(hex_decode("0").is_err()); // odd length
         assert!(hex_decode("zz").is_err()); // invalid chars
+    }
+
+    // --- Additional coverage tests ---
+
+    #[test]
+    fn test_hex_nibble_uppercase() {
+        // Exercise the b'A'..=b'F' branch in hex_nibble
+        assert_eq!(
+            hex_decode("DEADBEEF").unwrap(),
+            vec![0xde, 0xad, 0xbe, 0xef]
+        );
+        assert_eq!(hex_decode("FF00").unwrap(), vec![0xff, 0x00]);
+        // Mixed case
+        assert_eq!(
+            hex_decode("aAbBcCdDeEfF").unwrap(),
+            vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]
+        );
+    }
+
+    #[test]
+    fn test_hex_decode_invalid_second_char() {
+        // The second nibble of a pair is invalid — exercises the low nibble error path
+        assert!(hex_decode("0z").is_err());
+        assert!(hex_decode("a!").is_err());
+    }
+
+    #[test]
+    fn test_column_value_decode_unknown_tag() {
+        use crate::buffer::BufferReader;
+
+        let data = [0xFF]; // Unknown tag byte
+        let mut reader = BufferReader::new(&data);
+        let result = ColumnValue::decode(&mut reader);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("Unknown ColumnValue tag"),
+            "got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_column_value_display_invalid_utf8() {
+        // Text variant with invalid UTF-8 bytes exercises the Err(_) Display branch
+        let v = ColumnValue::Text(Bytes::from_static(&[0xff, 0xfe, 0xfd]));
+        let displayed = format!("{v}");
+        assert!(displayed.contains("invalid utf-8"), "got: {displayed}");
+        assert!(displayed.contains("3 bytes"), "got: {displayed}");
+    }
+
+    #[test]
+    fn test_column_value_partial_eq_ref_str() {
+        // Exercises the PartialEq<&str> impl (via &&str)
+        let v = ColumnValue::text("hello");
+        assert!(v == "hello");
+        assert!(v != "world");
+
+        let null = ColumnValue::Null;
+        assert!(null != "hello");
+
+        let binary = ColumnValue::binary_bytes(Bytes::from_static(b"hello"));
+        assert!(binary != "hello");
+    }
+
+    #[test]
+    fn test_column_value_serialize_non_utf8_text() {
+        // Text with invalid UTF-8 should fall back to hex encoding
+        let v = ColumnValue::Text(Bytes::from_static(&[0xff, 0xfe]));
+        let json = serde_json::to_string(&v).unwrap();
+        assert_eq!(json, r#""\\xfffe""#);
+
+        // Round-trip: it deserializes back as Binary (due to \x prefix)
+        let back: ColumnValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.as_bytes(), &[0xff, 0xfe]);
+    }
+
+    #[test]
+    fn test_column_value_deserialize_invalid_hex() {
+        // \x prefix followed by invalid hex chars triggers the Err path in visit_str
+        let json = r#""\\xZZZZ""#;
+        let result = serde_json::from_str::<ColumnValue>(json);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("invalid hex string"), "got: {err_msg}");
+    }
+
+    #[test]
+    fn test_column_value_deserialize_expecting() {
+        // Feeding an unexpected type (integer) should trigger the expecting() method
+        let result = serde_json::from_str::<ColumnValue>("42");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_column_value_as_str_binary() {
+        // Binary variant returns None from as_str()
+        let v = ColumnValue::binary_bytes(Bytes::from_static(b"data"));
+        assert_eq!(v.as_str(), None);
+    }
+
+    #[test]
+    fn test_column_value_as_str_invalid_utf8() {
+        // Text with invalid UTF-8 returns None from as_str()
+        let v = ColumnValue::Text(Bytes::from_static(&[0xff, 0xfe]));
+        assert_eq!(v.as_str(), None);
+    }
+
+    #[test]
+    fn test_column_value_is_null_all_variants() {
+        assert!(ColumnValue::Null.is_null());
+        assert!(!ColumnValue::text("x").is_null());
+        assert!(!ColumnValue::binary_bytes(Bytes::from_static(b"x")).is_null());
+    }
+
+    #[test]
+    fn test_column_value_encode_decode_empty_text() {
+        use crate::buffer::BufferReader;
+
+        let v = ColumnValue::text("");
+        let mut buf = BytesMut::new();
+        v.encode(&mut buf);
+
+        let frozen = buf.freeze();
+        let mut reader = BufferReader::new(&frozen);
+        let decoded = ColumnValue::decode(&mut reader).unwrap();
+        assert_eq!(decoded, v);
+        assert_eq!(decoded.as_str(), Some(""));
+    }
+
+    #[test]
+    fn test_column_value_encode_decode_empty_binary() {
+        use crate::buffer::BufferReader;
+
+        let v = ColumnValue::binary_bytes(Bytes::new());
+        let mut buf = BytesMut::new();
+        v.encode(&mut buf);
+
+        let frozen = buf.freeze();
+        let mut reader = BufferReader::new(&frozen);
+        let decoded = ColumnValue::decode(&mut reader).unwrap();
+        assert_eq!(decoded, v);
+        assert_eq!(decoded.as_bytes(), &[] as &[u8]);
+    }
+
+    #[test]
+    fn test_column_value_clone() {
+        let original = ColumnValue::text("cloned");
+        let cloned = original.clone();
+        assert_eq!(original, cloned);
+
+        let original = ColumnValue::binary_bytes(Bytes::from_static(&[1, 2, 3]));
+        let cloned = original.clone();
+        assert_eq!(original, cloned);
+
+        let original = ColumnValue::Null;
+        let cloned = original.clone();
+        assert_eq!(original, cloned);
+    }
+
+    #[test]
+    fn test_column_value_debug() {
+        // Exercises the derive(Debug) impl
+        let v = ColumnValue::text("debug_test");
+        let debug = format!("{v:?}");
+        assert!(debug.contains("Text"), "got: {debug}");
+
+        let v = ColumnValue::Null;
+        let debug = format!("{v:?}");
+        assert!(debug.contains("Null"), "got: {debug}");
+
+        let v = ColumnValue::binary_bytes(Bytes::from_static(&[0xab]));
+        let debug = format!("{v:?}");
+        assert!(debug.contains("Binary"), "got: {debug}");
+    }
+
+    #[test]
+    fn test_rowdata_from_pairs_empty() {
+        let row = RowData::from_pairs(vec![]);
+        assert!(row.is_empty());
+        assert_eq!(row.len(), 0);
+        assert!(row.get("anything").is_none());
+    }
+
+    #[test]
+    fn test_rowdata_iter_with_values() {
+        let row = RowData::from_pairs(vec![
+            ("a", ColumnValue::text("1")),
+            ("b", ColumnValue::Null),
+            ("c", ColumnValue::binary_bytes(Bytes::from_static(&[0xff]))),
+        ]);
+        let items: Vec<_> = row.iter().collect();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].0.as_ref(), "a");
+        assert_eq!(items[1].0.as_ref(), "b");
+        assert!(items[1].1.is_null());
+        assert_eq!(items[2].0.as_ref(), "c");
+    }
+
+    #[test]
+    fn test_rowdata_equality_order_sensitive() {
+        let row1 = RowData::from_pairs(vec![
+            ("a", ColumnValue::text("1")),
+            ("b", ColumnValue::text("2")),
+        ]);
+        let row2 = RowData::from_pairs(vec![
+            ("b", ColumnValue::text("2")),
+            ("a", ColumnValue::text("1")),
+        ]);
+        // Different order → not equal
+        assert_ne!(row1, row2);
+
+        // Same order → equal
+        let row3 = RowData::from_pairs(vec![
+            ("a", ColumnValue::text("1")),
+            ("b", ColumnValue::text("2")),
+        ]);
+        assert_eq!(row1, row3);
+    }
+
+    #[test]
+    fn test_rowdata_encode_decode_empty() {
+        use crate::buffer::BufferReader;
+
+        let row = RowData::new();
+        let mut buf = BytesMut::new();
+        row.encode(&mut buf);
+
+        let frozen = buf.freeze();
+        let mut reader = BufferReader::new(&frozen);
+        let decoded = RowData::decode(&mut reader).unwrap();
+        assert_eq!(decoded, row);
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn test_rowdata_encode_decode_with_null_values() {
+        use crate::buffer::BufferReader;
+
+        let row = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("1")),
+            ("description", ColumnValue::Null),
+            (
+                "data",
+                ColumnValue::binary_bytes(Bytes::from_static(&[0x01, 0x02])),
+            ),
+            ("empty_text", ColumnValue::text("")),
+        ]);
+
+        let mut buf = BytesMut::new();
+        row.encode(&mut buf);
+
+        let frozen = buf.freeze();
+        let mut reader = BufferReader::new(&frozen);
+        let decoded = RowData::decode(&mut reader).unwrap();
+        assert_eq!(decoded, row);
+    }
+
+    #[test]
+    fn test_rowdata_serde_with_null_and_binary() {
+        let row = RowData::from_pairs(vec![
+            ("name", ColumnValue::text("Alice")),
+            ("middle", ColumnValue::Null),
+            (
+                "blob",
+                ColumnValue::binary_bytes(Bytes::from_static(&[0xca, 0xfe])),
+            ),
+        ]);
+        let json = serde_json::to_string(&row).unwrap();
+        let back: RowData = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.len(), row.len());
+        assert_eq!(back.get("name").and_then(|v| v.as_str()), Some("Alice"));
+        assert!(back.get("middle").map(|v| v.is_null()).unwrap_or(false));
+        assert_eq!(
+            back.get("blob").map(|v| v.as_bytes()),
+            Some(&[0xca, 0xfe][..])
+        );
+    }
+
+    #[test]
+    fn test_rowdata_debug() {
+        let row = RowData::from_pairs(vec![("x", ColumnValue::text("y"))]);
+        let debug = format!("{row:?}");
+        assert!(debug.contains("RowData"), "got: {debug}");
+    }
+
+    #[test]
+    fn test_rowdata_clone() {
+        let row = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("1")),
+            ("val", ColumnValue::Null),
+        ]);
+        let cloned = row.clone();
+        assert_eq!(row, cloned);
     }
 }

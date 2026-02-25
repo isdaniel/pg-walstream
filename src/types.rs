@@ -1273,6 +1273,7 @@ fn micros_to_chrono(micros: i64) -> chrono::DateTime<chrono::Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use chrono::{TimeZone, Utc};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1846,5 +1847,682 @@ mod tests {
         let mut padded = CachePadded::new(String::from("hello"));
         padded.push_str(" world");
         assert_eq!(&*padded, "hello world");
+    }
+
+    // --- Encode / Decode round-trip tests ---
+
+    /// Helper: encode a ChangeEvent, then decode it and assert equality.
+    fn assert_encode_decode_round_trip(event: &ChangeEvent) {
+        let mut buf = BytesMut::new();
+        event.encode(&mut buf);
+        let decoded = ChangeEvent::decode(&buf).expect("decode failed");
+        assert_eq!(decoded.lsn, event.lsn);
+        assert_eq!(decoded.event_type, event.event_type);
+        // Compare metadata (HashMap doesn't impl Eq but we can check the content)
+        assert_eq!(
+            decoded.metadata.is_some(),
+            event.metadata.is_some(),
+            "metadata presence mismatch"
+        );
+        if let (Some(a), Some(b)) = (&decoded.metadata, &event.metadata) {
+            assert_eq!(a.len(), b.len());
+            for (k, v) in b {
+                assert_eq!(a.get(k), Some(v));
+            }
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_insert() {
+        let data = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("42")),
+            ("name", ColumnValue::text("Alice")),
+            ("bio", ColumnValue::Null),
+        ]);
+        let event = ChangeEvent::insert("public", "users", 12345, data, Lsn::new(0x100));
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_insert_with_metadata() {
+        let data = RowData::from_pairs(vec![("x", ColumnValue::text("1"))]);
+        let mut meta = HashMap::new();
+        meta.insert("source".to_string(), "unit-test".to_string());
+        meta.insert("version".to_string(), "3".to_string());
+        let event =
+            ChangeEvent::insert("myschema", "mytable", 99, data, Lsn::new(500)).with_metadata(meta);
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_update_with_old_data() {
+        let old = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("1")),
+            ("val", ColumnValue::text("old")),
+        ]);
+        let new = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("1")),
+            ("val", ColumnValue::text("new")),
+        ]);
+        let event = ChangeEvent::update(
+            "public",
+            "items",
+            555,
+            Some(old),
+            new,
+            ReplicaIdentity::Full,
+            vec![Arc::from("id")],
+            Lsn::new(2000),
+        );
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_update_without_old_data() {
+        let new = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("1")),
+            ("val", ColumnValue::text("updated")),
+        ]);
+        let event = ChangeEvent::update(
+            "public",
+            "items",
+            555,
+            None,
+            new,
+            ReplicaIdentity::Default,
+            vec![Arc::from("id"), Arc::from("tenant")],
+            Lsn::new(2100),
+        );
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_delete() {
+        let old = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("99")),
+            ("name", ColumnValue::text("deleted")),
+        ]);
+        let event = ChangeEvent::delete(
+            "public",
+            "users",
+            777,
+            old,
+            ReplicaIdentity::Index,
+            vec![Arc::from("id")],
+            Lsn::new(3000),
+        );
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_truncate() {
+        let tables = vec![Arc::from("public.a"), Arc::from("public.b")];
+        let event = ChangeEvent::truncate(tables, Lsn::new(4000));
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_truncate_empty() {
+        let event = ChangeEvent::truncate(vec![], Lsn::new(4100));
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_begin() {
+        let ts = Utc.with_ymd_and_hms(2024, 6, 15, 12, 30, 45).unwrap();
+        let event = ChangeEvent::begin(12345, Lsn::new(5000), ts, Lsn::new(4900));
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_commit() {
+        let ts = Utc.with_ymd_and_hms(2024, 6, 15, 12, 31, 0).unwrap();
+        let event = ChangeEvent::commit(ts, Lsn::new(6000), Lsn::new(5900), Lsn::new(6100));
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_stream_start() {
+        let event = ChangeEvent {
+            event_type: EventType::StreamStart {
+                transaction_id: 42,
+                first_segment: true,
+            },
+            lsn: Lsn::new(7000),
+            metadata: None,
+        };
+        assert_encode_decode_round_trip(&event);
+
+        // second segment
+        let event2 = ChangeEvent {
+            event_type: EventType::StreamStart {
+                transaction_id: 42,
+                first_segment: false,
+            },
+            lsn: Lsn::new(7001),
+            metadata: None,
+        };
+        assert_encode_decode_round_trip(&event2);
+    }
+
+    #[test]
+    fn test_encode_decode_stream_stop() {
+        let event = ChangeEvent {
+            event_type: EventType::StreamStop,
+            lsn: Lsn::new(7500),
+            metadata: None,
+        };
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_stream_commit() {
+        let ts = Utc.with_ymd_and_hms(2024, 8, 1, 0, 0, 0).unwrap();
+        let event = ChangeEvent {
+            event_type: EventType::StreamCommit {
+                transaction_id: 99,
+                commit_lsn: Lsn::new(8000),
+                end_lsn: Lsn::new(8100),
+                commit_timestamp: ts,
+            },
+            lsn: Lsn::new(7900),
+            metadata: None,
+        };
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_stream_abort_with_all_fields() {
+        let ts = Utc.with_ymd_and_hms(2024, 9, 1, 12, 0, 0).unwrap();
+        let event = ChangeEvent {
+            event_type: EventType::StreamAbort {
+                transaction_id: 50,
+                subtransaction_xid: 51,
+                abort_lsn: Some(Lsn::new(9000)),
+                abort_timestamp: Some(ts),
+            },
+            lsn: Lsn::new(8900),
+            metadata: None,
+        };
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_stream_abort_without_optional_fields() {
+        let event = ChangeEvent {
+            event_type: EventType::StreamAbort {
+                transaction_id: 50,
+                subtransaction_xid: 0,
+                abort_lsn: None,
+                abort_timestamp: None,
+            },
+            lsn: Lsn::new(8950),
+            metadata: None,
+        };
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_relation() {
+        let event = ChangeEvent::relation(Lsn::new(10000));
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_type() {
+        let event = ChangeEvent::type_event(Lsn::new(10100));
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_origin() {
+        let event = ChangeEvent::origin(Lsn::new(10200));
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_message() {
+        let event = ChangeEvent::message(Lsn::new(10300));
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_decode_unknown_event_tag() {
+        // Build a minimal buffer with valid LSN, no-metadata, then unknown tag
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&100u64.to_be_bytes()); // LSN
+        buf.extend_from_slice(&[0u8]); // no metadata
+        buf.extend_from_slice(&[0xFE]); // unknown event tag
+        let result = ChangeEvent::decode(&buf);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("Unknown ChangeEvent tag"),
+            "got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_encode_decode_insert_with_binary_data() {
+        let data = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("1")),
+            (
+                "blob",
+                ColumnValue::binary_bytes(Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef])),
+            ),
+            ("empty", ColumnValue::Null),
+        ]);
+        let event = ChangeEvent::insert("public", "blobs", 999, data, Lsn::new(11000));
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_update_all_replica_identities() {
+        for ri in [
+            ReplicaIdentity::Default,
+            ReplicaIdentity::Nothing,
+            ReplicaIdentity::Full,
+            ReplicaIdentity::Index,
+        ] {
+            let new = RowData::from_pairs(vec![("x", ColumnValue::text("1"))]);
+            let event =
+                ChangeEvent::update("s", "t", 1, None, new, ri.clone(), vec![], Lsn::new(12000));
+            assert_encode_decode_round_trip(&event);
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_delete_all_replica_identities() {
+        for ri in [
+            ReplicaIdentity::Default,
+            ReplicaIdentity::Nothing,
+            ReplicaIdentity::Full,
+            ReplicaIdentity::Index,
+        ] {
+            let old = RowData::from_pairs(vec![("k", ColumnValue::text("v"))]);
+            let event = ChangeEvent::delete(
+                "s",
+                "t",
+                1,
+                old,
+                ri.clone(),
+                vec![Arc::from("k")],
+                Lsn::new(13000),
+            );
+            assert_encode_decode_round_trip(&event);
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_metadata_empty_hashmap() {
+        let data = RowData::from_pairs(vec![("a", ColumnValue::text("b"))]);
+        let event =
+            ChangeEvent::insert("s", "t", 1, data, Lsn::new(14000)).with_metadata(HashMap::new());
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_micros_to_chrono_zero() {
+        // Zero micros = Unix epoch
+        let dt = micros_to_chrono(0);
+        assert_eq!(dt, Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn test_micros_to_chrono_negative() {
+        // Negative micros = before Unix epoch
+        let dt = micros_to_chrono(-1_000_000);
+        assert_eq!(dt, Utc.with_ymd_and_hms(1969, 12, 31, 23, 59, 59).unwrap());
+    }
+
+    #[test]
+    fn test_micros_to_chrono_with_subsecond() {
+        let dt = micros_to_chrono(1_500_000); // 1.5 seconds
+        assert_eq!(dt.timestamp(), 1);
+        assert_eq!(dt.timestamp_subsec_micros(), 500_000);
+    }
+
+    #[test]
+    fn test_change_event_serde_round_trip_update() {
+        let old = RowData::from_pairs(vec![("id", ColumnValue::text("1"))]);
+        let new = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("1")),
+            ("v", ColumnValue::text("updated")),
+        ]);
+        let event = ChangeEvent::update(
+            "public",
+            "t",
+            1,
+            Some(old),
+            new,
+            ReplicaIdentity::Full,
+            vec![Arc::from("id")],
+            Lsn::new(100),
+        );
+        let json = serde_json::to_string(&event).unwrap();
+        let back: ChangeEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type, event.event_type);
+    }
+
+    #[test]
+    fn test_change_event_serde_round_trip_delete() {
+        let old = RowData::from_pairs(vec![("id", ColumnValue::text("1"))]);
+        let event = ChangeEvent::delete(
+            "public",
+            "t",
+            1,
+            old,
+            ReplicaIdentity::Index,
+            vec![Arc::from("id")],
+            Lsn::new(200),
+        );
+        let json = serde_json::to_string(&event).unwrap();
+        let back: ChangeEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type, event.event_type);
+    }
+
+    #[test]
+    fn test_change_event_serde_round_trip_begin() {
+        let ts = Utc.with_ymd_and_hms(2024, 3, 15, 8, 0, 0).unwrap();
+        let event = ChangeEvent::begin(1, Lsn::new(300), ts, Lsn::new(300));
+        let json = serde_json::to_string(&event).unwrap();
+        let back: ChangeEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type, event.event_type);
+    }
+
+    #[test]
+    fn test_change_event_serde_round_trip_commit() {
+        let ts = Utc.with_ymd_and_hms(2024, 3, 15, 8, 0, 0).unwrap();
+        let event = ChangeEvent::commit(ts, Lsn::new(400), Lsn::new(400), Lsn::new(410));
+        let json = serde_json::to_string(&event).unwrap();
+        let back: ChangeEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type, event.event_type);
+    }
+
+    #[test]
+    fn test_change_event_serde_round_trip_truncate() {
+        let event = ChangeEvent::truncate(vec![Arc::from("t1"), Arc::from("t2")], Lsn::new(500));
+        let json = serde_json::to_string(&event).unwrap();
+        let back: ChangeEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type, event.event_type);
+    }
+
+    #[test]
+    fn test_change_event_serde_round_trip_streaming_events() {
+        let ts = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+
+        // StreamStart
+        let event = ChangeEvent {
+            event_type: EventType::StreamStart {
+                transaction_id: 10,
+                first_segment: true,
+            },
+            lsn: Lsn::new(600),
+            metadata: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: ChangeEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type, event.event_type);
+
+        // StreamStop
+        let event = ChangeEvent {
+            event_type: EventType::StreamStop,
+            lsn: Lsn::new(700),
+            metadata: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: ChangeEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type, event.event_type);
+
+        // StreamCommit
+        let event = ChangeEvent {
+            event_type: EventType::StreamCommit {
+                transaction_id: 10,
+                commit_lsn: Lsn::new(800),
+                end_lsn: Lsn::new(810),
+                commit_timestamp: ts,
+            },
+            lsn: Lsn::new(800),
+            metadata: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: ChangeEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type, event.event_type);
+
+        // StreamAbort with optional fields
+        let event = ChangeEvent {
+            event_type: EventType::StreamAbort {
+                transaction_id: 10,
+                subtransaction_xid: 11,
+                abort_lsn: Some(Lsn::new(900)),
+                abort_timestamp: Some(ts),
+            },
+            lsn: Lsn::new(900),
+            metadata: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: ChangeEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type, event.event_type);
+
+        // StreamAbort without optional fields
+        let event = ChangeEvent {
+            event_type: EventType::StreamAbort {
+                transaction_id: 10,
+                subtransaction_xid: 0,
+                abort_lsn: None,
+                abort_timestamp: None,
+            },
+            lsn: Lsn::new(950),
+            metadata: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: ChangeEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type, event.event_type);
+    }
+
+    #[test]
+    fn test_change_event_serde_round_trip_with_metadata() {
+        let data = RowData::from_pairs(vec![("id", ColumnValue::text("1"))]);
+        let mut meta = HashMap::new();
+        meta.insert("key1".to_string(), "val1".to_string());
+        meta.insert("key2".to_string(), "val2".to_string());
+        let event = ChangeEvent::insert("s", "t", 1, data, Lsn::new(1000)).with_metadata(meta);
+        let json = serde_json::to_string(&event).unwrap();
+        let back: ChangeEvent = serde_json::from_str(&json).unwrap();
+        assert!(back.metadata.is_some());
+        let m = back.metadata.unwrap();
+        assert_eq!(m.get("key1").unwrap(), "val1");
+        assert_eq!(m.get("key2").unwrap(), "val2");
+    }
+
+    #[test]
+    fn test_change_event_serde_round_trip_simple_events() {
+        for event in [
+            ChangeEvent::relation(Lsn::new(1100)),
+            ChangeEvent::type_event(Lsn::new(1200)),
+            ChangeEvent::origin(Lsn::new(1300)),
+            ChangeEvent::message(Lsn::new(1400)),
+        ] {
+            let json = serde_json::to_string(&event).unwrap();
+            let back: ChangeEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                back.event_type, event.event_type,
+                "Failed for {:?}",
+                event.event_type
+            );
+        }
+    }
+
+    #[test]
+    fn test_lsn_zero() {
+        let lsn = Lsn::new(0);
+        assert_eq!(lsn.value(), 0);
+        assert_eq!(format!("{lsn}"), "0/0");
+
+        let parsed: Lsn = "0/0".parse().unwrap();
+        assert_eq!(parsed, lsn);
+    }
+
+    #[test]
+    fn test_lsn_max() {
+        let lsn = Lsn::new(u64::MAX);
+        let formatted = format!("{lsn}");
+        let parsed: Lsn = formatted.parse().unwrap();
+        assert_eq!(parsed, lsn);
+    }
+
+    #[test]
+    fn test_lsn_serde_zero_and_max() {
+        for val in [0u64, 1, u64::MAX / 2, u64::MAX] {
+            let lsn = Lsn::new(val);
+            let json = serde_json::to_string(&lsn).unwrap();
+            let back: Lsn = serde_json::from_str(&json).unwrap();
+            assert_eq!(lsn, back);
+        }
+    }
+
+    #[test]
+    fn test_lsn_equality_and_hash() {
+        use std::collections::HashSet;
+        let a = Lsn::new(100);
+        let b = Lsn::new(100);
+        let c = Lsn::new(200);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+
+        // Lsn doesn't impl Hash, but does impl Copy + Eq
+        let x = a;
+        assert_eq!(x, a);
+        let _ = HashSet::<u64>::new(); // type check only
+    }
+
+    #[test]
+    fn test_replica_identity_debug_clone() {
+        let ri = ReplicaIdentity::Full;
+        let cloned = ri.clone();
+        assert_eq!(ri, cloned);
+        let debug = format!("{ri:?}");
+        assert!(debug.contains("Full"), "got: {debug}");
+    }
+
+    #[test]
+    fn test_replica_identity_round_trip_byte() {
+        for byte in [b'd', b'n', b'f', b'i'] {
+            let ri = ReplicaIdentity::from_byte(byte).unwrap();
+            assert_eq!(ri.to_byte(), byte);
+        }
+    }
+
+    #[test]
+    fn test_base_backup_options_default() {
+        let opts = BaseBackupOptions::default();
+        assert!(opts.label.is_none());
+        assert!(opts.target.is_none());
+        assert!(!opts.progress);
+        assert!(!opts.wal);
+        assert!(!opts.wait);
+        assert!(opts.compression.is_none());
+        assert!(opts.max_rate.is_none());
+        assert!(!opts.tablespace_map);
+        assert!(!opts.verify_checksums);
+        assert!(opts.manifest.is_none());
+        assert!(!opts.incremental);
+    }
+
+    #[test]
+    fn test_replication_slot_options_default() {
+        let opts = ReplicationSlotOptions::default();
+        assert!(!opts.temporary);
+        assert!(!opts.two_phase);
+        assert!(!opts.reserve_wal);
+        assert!(opts.snapshot.is_none());
+        assert!(!opts.failover);
+    }
+
+    #[test]
+    fn test_change_event_clone() {
+        let data = RowData::from_pairs(vec![("id", ColumnValue::text("1"))]);
+        let event = ChangeEvent::insert("s", "t", 1, data, Lsn::new(100));
+        let cloned = event.clone();
+        assert_eq!(cloned.lsn, event.lsn);
+        assert_eq!(cloned.event_type, event.event_type);
+    }
+
+    #[test]
+    fn test_change_event_debug() {
+        let data = RowData::from_pairs(vec![("id", ColumnValue::text("1"))]);
+        let event = ChangeEvent::insert("s", "t", 1, data, Lsn::new(100));
+        let debug = format!("{event:?}");
+        assert!(debug.contains("Insert"), "got: {debug}");
+        assert!(debug.contains("Lsn"), "got: {debug}");
+    }
+
+    #[test]
+    fn test_event_type_debug_all_variants() {
+        let data = RowData::new();
+        let ts = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+
+        let variants: Vec<EventType> = vec![
+            EventType::Insert {
+                schema: Arc::from("s"),
+                table: Arc::from("t"),
+                relation_oid: 1,
+                data: data.clone(),
+            },
+            EventType::Update {
+                schema: Arc::from("s"),
+                table: Arc::from("t"),
+                relation_oid: 1,
+                old_data: None,
+                new_data: data.clone(),
+                replica_identity: ReplicaIdentity::Default,
+                key_columns: vec![],
+            },
+            EventType::Delete {
+                schema: Arc::from("s"),
+                table: Arc::from("t"),
+                relation_oid: 1,
+                old_data: data.clone(),
+                replica_identity: ReplicaIdentity::Default,
+                key_columns: vec![],
+            },
+            EventType::Truncate(vec![]),
+            EventType::Begin {
+                transaction_id: 1,
+                final_lsn: Lsn::new(1),
+                commit_timestamp: ts,
+            },
+            EventType::Commit {
+                commit_timestamp: ts,
+                commit_lsn: Lsn::new(1),
+                end_lsn: Lsn::new(2),
+            },
+            EventType::StreamStart {
+                transaction_id: 1,
+                first_segment: true,
+            },
+            EventType::StreamStop,
+            EventType::StreamCommit {
+                transaction_id: 1,
+                commit_lsn: Lsn::new(1),
+                end_lsn: Lsn::new(2),
+                commit_timestamp: ts,
+            },
+            EventType::StreamAbort {
+                transaction_id: 1,
+                subtransaction_xid: 0,
+                abort_lsn: None,
+                abort_timestamp: None,
+            },
+            EventType::Relation,
+            EventType::Type,
+            EventType::Origin,
+            EventType::Message,
+        ];
+
+        for v in &variants {
+            let debug = format!("{v:?}");
+            assert!(!debug.is_empty());
+        }
     }
 }
