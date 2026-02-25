@@ -95,6 +95,7 @@
 
 // Core modules
 pub mod buffer;
+pub mod column_value;
 pub mod error;
 pub mod types;
 
@@ -113,11 +114,13 @@ pub use buffer::{BufferReader, BufferWriter};
 pub use error::{ReplicationError, Result};
 pub use lsn::SharedLsnFeedback;
 
+// Re-export column value types
+pub use column_value::{ColumnValue, RowData};
+
 // Re-export type aliases and utilities
 pub use types::{
     // Utility functions
     format_lsn,
-    format_postgres_timestamp,
     parse_lsn,
     postgres_timestamp_to_chrono,
     system_time_to_postgres_timestamp,
@@ -129,7 +132,6 @@ pub use types::{
     Oid,
     ReplicaIdentity,
     ReplicationSlotOptions,
-    RowData,
     SlotType,
     TimestampTz,
     // Type aliases matching PostgreSQL types

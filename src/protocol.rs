@@ -6,9 +6,10 @@
 //! - <https://www.postgresql.org/docs/current/protocol-logical-replication.html>
 
 use crate::buffer::{BufferReader, BufferWriter};
+use crate::column_value::{ColumnValue, RowData};
 use crate::error::{ReplicationError, Result};
 use crate::types::{
-    format_lsn, system_time_to_postgres_timestamp, Oid, RowData, TimestampTz, XLogRecPtr, Xid,
+    format_lsn, system_time_to_postgres_timestamp, Oid, TimestampTz, XLogRecPtr, Xid,
 };
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -278,38 +279,28 @@ impl TupleData {
         self.columns.len()
     }
 
-    /// Convert to a RowData with column names from the relation
+    /// Convert to a [`RowData`] with column names from the relation.
+    ///
+    /// Text columns are stored as [`ColumnValue::Text`] with zero-copy `Bytes`,
+    /// binary columns as [`ColumnValue::Binary`], and null / unknown as
+    /// [`ColumnValue::Null`].  Unchanged TOAST columns are skipped.
     pub fn to_row_data(&self, relation: &RelationInfo) -> RowData {
         let mut data = RowData::with_capacity(self.columns.len());
 
         for (i, col_data) in self.columns.iter().enumerate() {
             if let Some(column_info) = relation.get_column_by_index(i) {
                 let value = match col_data.data_type {
-                    'n' => serde_json::Value::Null,
-                    't' | 'b' => {
-                        // Use as_str() which returns Cow for zero-copy when possible
-                        match col_data.as_str() {
-                            Some(s) => serde_json::Value::String(s.into_owned()),
-                            None => serde_json::Value::Null,
-                        }
-                    }
+                    'n' => ColumnValue::Null,
+                    't' => ColumnValue::text_bytes(col_data.raw_bytes()),
+                    'b' => ColumnValue::binary_bytes(col_data.raw_bytes()),
                     'u' => continue, // Skip unchanged TOAST values
-                    _ => serde_json::Value::Null,
+                    _ => ColumnValue::Null,
                 };
                 data.push(Arc::clone(&column_info.name), value);
             }
         }
 
         data
-    }
-
-    /// Convert to a HashMap with column names as keys (legacy convenience method)
-    #[deprecated(
-        since = "0.4.0",
-        note = "use `to_row_data` instead for better performance"
-    )]
-    pub fn to_hash_map(&self, relation: &RelationInfo) -> HashMap<String, serde_json::Value> {
-        self.to_row_data(relation).into_hash_map()
     }
 }
 
@@ -416,6 +407,12 @@ impl ColumnData {
     #[inline(always)]
     pub fn as_bytes(&self) -> &[u8] {
         &self.data
+    }
+
+    /// Get the underlying `Bytes` handle (cheap ref-counted clone).
+    #[inline(always)]
+    pub fn raw_bytes(&self) -> bytes::Bytes {
+        self.data.clone()
     }
 
     #[inline(always)]
@@ -1368,6 +1365,7 @@ pub fn build_hot_standby_feedback_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::column_value::ColumnValue;
 
     #[test]
     fn test_column_data_creation() {
@@ -1808,10 +1806,10 @@ mod tests {
             ColumnData::text(b"Alice".to_vec()),
         ]);
 
-        let map = tuple.to_hash_map(&relation);
-        assert_eq!(map.len(), 2);
-        assert_eq!(map.get("id").unwrap(), "42");
-        assert_eq!(map.get("name").unwrap(), "Alice");
+        let row = tuple.to_row_data(&relation);
+        assert_eq!(row.len(), 2);
+        assert_eq!(row.get("id").unwrap(), "42");
+        assert_eq!(row.get("name").unwrap(), "Alice");
     }
 
     #[test]
@@ -2031,9 +2029,9 @@ mod tests {
 
         let tuple = TupleData::new(vec![ColumnData::text(b"42".to_vec()), ColumnData::null()]);
 
-        let map = tuple.to_hash_map(&relation);
-        assert_eq!(map.get("id").unwrap(), "42");
-        assert_eq!(map.get("name").unwrap(), &serde_json::Value::Null);
+        let row = tuple.to_row_data(&relation);
+        assert_eq!(row.get("id").unwrap(), "42");
+        assert_eq!(row.get("name").unwrap(), &ColumnValue::Null);
     }
 
     #[test]
@@ -2049,10 +2047,10 @@ mod tests {
             ColumnData::unchanged(), // unchanged TOAST should be skipped
         ]);
 
-        let map = tuple.to_hash_map(&relation);
-        assert_eq!(map.len(), 1);
-        assert_eq!(map.get("id").unwrap(), "42");
-        assert!(!map.contains_key("name"));
+        let row = tuple.to_row_data(&relation);
+        assert_eq!(row.len(), 1);
+        assert_eq!(row.get("id").unwrap(), "42");
+        assert!(row.get("name").is_none());
     }
 
     #[test]
@@ -2064,15 +2062,14 @@ mod tests {
 
         let tuple = TupleData::new(vec![ColumnData::binary(b"binary data".to_vec())]);
 
-        let map = tuple.to_hash_map(&relation);
-        // Binary valid UTF-8 gets converted via as_str()
-        let val = map.get("data").unwrap();
-        assert!(val.is_string());
+        let row = tuple.to_row_data(&relation);
+        let val = row.get("data").unwrap();
+        assert!(matches!(val, ColumnValue::Binary(_)));
     }
 
     #[test]
     fn test_tuple_data_to_hash_map_text_empty_data() {
-        // Text column with empty data - as_str() returns None for empty data
+        // Text column with empty data
         let columns = vec![ColumnInfo::new(0, "col".to_string(), 25, -1)];
         let relation = RelationInfo::new(1, "public".to_string(), "t".to_string(), b'd', columns);
 
@@ -2081,9 +2078,10 @@ mod tests {
             data: bytes::Bytes::new(),
         };
         let tuple = TupleData::new(vec![col]);
-        let map = tuple.to_hash_map(&relation);
-        // Empty text data: as_str() returns None, so Null
-        assert!(map.get("col").unwrap().is_null());
+        let row = tuple.to_row_data(&relation);
+        // Empty text data yields Text(empty Bytes)
+        let val = row.get("col").unwrap();
+        assert!(matches!(val, ColumnValue::Text(_)));
     }
 
     #[test]
@@ -2097,8 +2095,8 @@ mod tests {
             data: bytes::Bytes::from_static(&[1, 2, 3]),
         };
         let tuple = TupleData::new(vec![col]);
-        let map = tuple.to_hash_map(&relation);
-        assert!(map.get("col").unwrap().is_null());
+        let row = tuple.to_row_data(&relation);
+        assert!(row.get("col").unwrap().is_null());
     }
 
     #[test]
@@ -2112,9 +2110,9 @@ mod tests {
             ColumnData::text(b"val1".to_vec()),
             ColumnData::text(b"val2".to_vec()),
         ]);
-        let map = tuple.to_hash_map(&relation);
-        assert_eq!(map.len(), 1); // Only the first column maps
-        assert_eq!(map.get("col1").unwrap(), "val1");
+        let row = tuple.to_row_data(&relation);
+        assert_eq!(row.len(), 1); // Only the first column maps
+        assert_eq!(row.get("col1").unwrap(), "val1");
     }
 
     #[test]

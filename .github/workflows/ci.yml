@@ -237,6 +237,11 @@ jobs:
 
         cargo test --test safe_transaction_consumer -- --ignored --nocapture --test-threads=1
 
+        PGPASSWORD=postgres psql -h localhost -U postgres -d test_walstream \
+          -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_type = 'logical';" || true
+
+        cargo test --test complex_types -- --ignored --nocapture --test-threads=1
+
   publish:
     name: Publish to crates.io
     runs-on: ubuntu-latest
