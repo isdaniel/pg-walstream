@@ -10,7 +10,6 @@
 //!   - `serialize`    — Encode event to bytes: serde_json vs binary
 //!   - `deserialize`  — Decode bytes back to event: serde_json vs binary
 //!   - `round_trip`   — Full encode → decode cycle
-//!   - `payload_size` — Output size comparison (printed, not timed)
 //!   - `pipeline`     — Realistic CDC: construct → clone → lookup → serialize
 //!
 //! Run:
@@ -224,45 +223,7 @@ fn bench_round_trip(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Payload size comparison (one-shot, informational)
-// ---------------------------------------------------------------------------
-fn bench_payload_size(c: &mut Criterion) {
-    let mut group = c.benchmark_group("payload_size");
-
-    for n_cols in COLUMN_COUNTS {
-        let names = shared_column_names(n_cols);
-        let new_event = build_new_event(&names);
-
-        let mut binary_buf = bytes::BytesMut::with_capacity(256);
-        new_event.encode(&mut binary_buf);
-
-        // Bench building the payloads so criterion records something
-        group.bench_with_input(
-            BenchmarkId::new("json_serde", n_cols),
-            &new_event,
-            |b, event| {
-                b.iter(|| black_box(serde_json::to_vec(event).unwrap().len()));
-            },
-        );
-
-        group.bench_with_input(
-            BenchmarkId::new("binary_encode", n_cols),
-            &new_event,
-            |b, event| {
-                b.iter(|| {
-                    let mut buf = bytes::BytesMut::with_capacity(256);
-                    event.encode(&mut buf);
-                    black_box(buf.len());
-                });
-            },
-        );
-    }
-
-    group.finish();
-}
-
-// ---------------------------------------------------------------------------
-// 6. Realistic CDC pipeline: construct → clone → lookup → serialize
+// 5. Realistic CDC pipeline: construct → clone → lookup → serialize
 // ---------------------------------------------------------------------------
 
 /// End-to-end CDC simulation: construct event, clone it, look up 3 columns,
@@ -322,7 +283,6 @@ criterion_group!(
     bench_serialize,
     bench_deserialize,
     bench_round_trip,
-    bench_payload_size,
     bench_pipeline,
 );
 criterion_main!(benches);

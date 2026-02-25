@@ -24,7 +24,7 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
 
 /// Decode a hex string to bytes. Returns `Err` on invalid hex.
 fn hex_decode(hex: &str) -> std::result::Result<Vec<u8>, &'static str> {
-    if !hex.len().is_multiple_of(2) {
+    if hex.len() % 2 != 0 {
         return Err("odd hex length");
     }
     let mut out = Vec::with_capacity(hex.len() / 2);

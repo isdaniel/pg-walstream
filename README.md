@@ -137,11 +137,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### Working with Event Data
 
-Events carry row data as `RowData` — an ordered list of `(Arc<str>, Value)` pairs.
+Events carry row data as [`RowData`] — an ordered list of `(Arc<str>, ColumnValue)` pairs.
+[`ColumnValue`] is a lightweight enum (`Null | Text(Bytes) | Binary(Bytes)`) that preserves
+the raw PostgreSQL wire representation with zero-copy semantics.
 Schema, table, and column names are `Arc<str>` (reference-counted, zero-cost cloning):
 
 ```rust
-use pg_walstream::{EventType, RowData};
+use pg_walstream::{EventType, RowData, ColumnValue};
 
 // Pattern match on event types
 match &event.event_type {
@@ -367,7 +369,9 @@ The library supports all PostgreSQL logical replication message types:
 
 - **Zero-Copy**: Uses `bytes::Bytes` for efficient buffer management
 - **Arc-shared column metadata**: Column names, schema, and table names use `Arc<str>` — cloning is a single atomic increment instead of a heap allocation per event
-- **RowData (ordered Vec)**: Row payloads use `RowData` (a `Vec<(Arc<str>, Value)>`) instead of `HashMap<String, Value>`, eliminating per-event hashing overhead and extra allocations
+- **RowData (ordered Vec)**: Row payloads use `RowData` (a `Vec<(Arc<str>, ColumnValue)>`) instead of `HashMap<String, serde_json::Value>`, eliminating per-event hashing overhead and extra allocations
+- **ColumnValue (Null | Text | Binary)**: Preserves the raw PostgreSQL wire representation without intermediate JSON parsing or allocation. Each variant holds zero-copy `Bytes`
+- **Binary Wire Format**: `ChangeEvent::encode` / `ChangeEvent::decode` provide a compact binary serialization that is significantly faster and smaller than `serde_json`, ideal for inter-process or network transport
 - **Atomic Operations**: Thread-safe LSN tracking with minimal overhead
 - **Connection Pooling**: Reusable connection with automatic retry
 - **Streaming Support**: Handle large transactions without memory issues
