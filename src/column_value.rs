@@ -10,6 +10,7 @@ use crate::error::{ReplicationError, Result};
 use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use serde::ser::SerializeMap;
 
 /// Encode a byte slice as lowercase hex string.
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
@@ -61,11 +62,11 @@ fn hex_nibble(b: u8) -> Option<u8> {
 /// | `0x01`   | `Text` — followed by u32-len + data |
 /// | `0x02`   | `Binary` — followed by u32-len + data |
 ///
-/// # Serde
-///
 /// When serialised with [`serde`], `Text` values emit a JSON string,
-/// `Binary` values emit a hex-prefixed string (`"\\xdeadbeef"`),
+/// `Binary` values emit a tagged JSON object `{"$binary": "deadbeef"}`,
 /// and `Null` emits JSON `null`.
+///
+/// The tagged-object format is unambiguous: a `Text` value whose content happens to look like hex will always round-trip correctly.
 ///
 /// # Example
 ///
@@ -246,14 +247,16 @@ impl Serialize for ColumnValue {
             Self::Text(b) => match std::str::from_utf8(b) {
                 Ok(s) => serializer.serialize_str(s),
                 Err(_) => {
-                    // Fall back to hex for non-UTF-8 text
-                    let hex = hex_encode(b);
-                    serializer.serialize_str(&format!("\\x{hex}"))
+                    // Non-UTF-8 text cannot be represented as a JSON string, Emit the tagged binary form so the bytes survive round-trip.
+                    let mut map = serializer.serialize_map(Some(1))?;
+                    map.serialize_entry("$binary", &hex_encode(b))?;
+                    map.end()
                 }
             },
             Self::Binary(b) => {
-                let hex = hex_encode(b);
-                serializer.serialize_str(&format!("\\x{hex}"))
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("$binary", &hex_encode(b))?;
+                map.end()
             }
         }
     }
@@ -269,7 +272,7 @@ impl<'de> Deserialize<'de> for ColumnValue {
             type Value = ColumnValue;
 
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("a string, null, or hex-encoded binary")
+                f.write_str(r#"a string, null, or {"$binary": "hex..."}"#)
             }
 
             fn visit_none<E: serde::de::Error>(self) -> std::result::Result<ColumnValue, E> {
@@ -284,7 +287,6 @@ impl<'de> Deserialize<'de> for ColumnValue {
                 self,
                 deserializer: D,
             ) -> std::result::Result<ColumnValue, D::Error> {
-                // Recurse into the inner value
                 deserializer.deserialize_any(self)
             }
 
@@ -292,15 +294,26 @@ impl<'de> Deserialize<'de> for ColumnValue {
                 self,
                 v: &str,
             ) -> std::result::Result<ColumnValue, E> {
-                if let Some(hex) = v.strip_prefix("\\x") {
-                    // Decode hex to binary
-                    match hex_decode(hex) {
-                        Ok(bytes) => Ok(ColumnValue::Binary(Bytes::from(bytes))),
-                        Err(e) => Err(E::custom(format!("invalid hex string: {e}"))),
-                    }
-                } else {
-                    Ok(ColumnValue::Text(Bytes::copy_from_slice(v.as_bytes())))
+                Ok(ColumnValue::Text(Bytes::copy_from_slice(v.as_bytes())))
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> std::result::Result<ColumnValue, M::Error> {
+                use serde::de::Error;
+                let key: String = map
+                    .next_key()?
+                    .ok_or_else(|| M::Error::custom("expected \"$binary\" key in tagged object"))?;
+                if key != "$binary" {
+                    return Err(M::Error::custom(format!(
+                        r#"unknown key "{key}", expected "$binary""#
+                    )));
                 }
+                let hex: String = map.next_value()?;
+                let bytes = hex_decode(&hex)
+                    .map_err(|e| M::Error::custom(format!("invalid hex in $binary: {e}")))?;
+                Ok(ColumnValue::Binary(Bytes::from(bytes)))
             }
         }
 
@@ -759,24 +772,24 @@ mod tests {
 
     #[test]
     fn test_column_value_serialize_non_utf8_text() {
-        // Text with invalid UTF-8 should fall back to hex encoding
+        // Text with invalid UTF-8 falls back to tagged binary object
         let v = ColumnValue::Text(Bytes::from_static(&[0xff, 0xfe]));
         let json = serde_json::to_string(&v).unwrap();
-        assert_eq!(json, r#""\\xfffe""#);
+        assert_eq!(json, r#"{"$binary":"fffe"}"#);
 
-        // Round-trip: it deserializes back as Binary (due to \x prefix)
+        // Round-trip: deserializes back as Binary (raw bytes preserved)
         let back: ColumnValue = serde_json::from_str(&json).unwrap();
         assert_eq!(back.as_bytes(), &[0xff, 0xfe]);
     }
 
     #[test]
     fn test_column_value_deserialize_invalid_hex() {
-        // \x prefix followed by invalid hex chars triggers the Err path in visit_str
-        let json = r#""\\xZZZZ""#;
+        // $binary with invalid hex chars triggers an error
+        let json = r#"{"$binary":"ZZZZ"}"#;
         let result = serde_json::from_str::<ColumnValue>(json);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("invalid hex string"), "got: {err_msg}");
+        assert!(err_msg.contains("invalid hex"), "got: {err_msg}");
     }
 
     #[test]
@@ -969,6 +982,84 @@ mod tests {
             back.get("blob").map(|v| v.as_bytes()),
             Some(&[0xca, 0xfe][..])
         );
+    }
+
+    #[test]
+    fn test_text_starting_with_backslash_x_round_trips_as_text() {
+        // Text that happens to start with literal `\x` followed by valid hex must survive a JSON round-trip as Text, not be silently reinterpreted as Binary.
+        let original = ColumnValue::text(r"\x4142");
+        let json = serde_json::to_string(&original).unwrap();
+        let back: ColumnValue = serde_json::from_str(&json).unwrap();
+
+        // The variant must stay Text, not become Binary
+        assert_eq!(
+            back.as_str(),
+            Some(r"\x4142"),
+            "Text was corrupted into Binary on JSON round-trip"
+        );
+        assert_eq!(original, back);
+    }
+
+    #[test]
+    fn test_text_with_hex_prefix_and_odd_length_round_trips() {
+        // Odd-length hex after `\x` — still valid text content
+        let original = ColumnValue::text(r"\xABC");
+        let json = serde_json::to_string(&original).unwrap();
+        let back: ColumnValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.as_str(), Some(r"\xABC"));
+        assert_eq!(original, back);
+    }
+
+    #[test]
+    fn test_binary_round_trips_unambiguously() {
+        // Binary values must round-trip as Binary, not collide with Text
+        let original = ColumnValue::binary_bytes(Bytes::from_static(&[0x41, 0x42]));
+        let json = serde_json::to_string(&original).unwrap();
+        let back: ColumnValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.as_bytes(), &[0x41, 0x42]);
+        assert_eq!(original, back);
+    }
+
+    #[test]
+    fn test_binary_and_text_do_not_collide_in_json() {
+        // The _serialized_ forms of Binary([0x41, 0x42]) and Text(r"\x4142")
+        // must be different JSON values so they decode to the correct variant.
+        let binary = ColumnValue::binary_bytes(Bytes::from_static(&[0x41, 0x42]));
+        let text = ColumnValue::text(r"\x4142");
+
+        let binary_json = serde_json::to_string(&binary).unwrap();
+        let text_json = serde_json::to_string(&text).unwrap();
+
+        assert_ne!(
+            binary_json, text_json,
+            "Binary and Text produce identical JSON — deserialization will be ambiguous"
+        );
+    }
+
+    #[test]
+    fn test_rowdata_with_hex_like_text_round_trips() {
+        // End-to-end: a RowData containing a text column that looks like hex must survive JSON round-trip without corruption.
+        let row = RowData::from_pairs(vec![
+            ("hash", ColumnValue::text(r"\xdeadbeef")),
+            (
+                "blob",
+                ColumnValue::binary_bytes(Bytes::from_static(&[0xca, 0xfe])),
+            ),
+            ("name", ColumnValue::text("Alice")),
+        ]);
+        let json = serde_json::to_string(&row).unwrap();
+        let back: RowData = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(
+            back.get("hash").and_then(|v| v.as_str()),
+            Some(r"\xdeadbeef"),
+            "Text column 'hash' was corrupted to Binary"
+        );
+        assert_eq!(
+            back.get("blob").map(|v| v.as_bytes()),
+            Some(&[0xca, 0xfe][..])
+        );
+        assert_eq!(back.get("name").and_then(|v| v.as_str()), Some("Alice"));
     }
 
     #[test]
