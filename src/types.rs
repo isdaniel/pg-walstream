@@ -3,11 +3,14 @@
 //! This module provides type aliases for PostgreSQL types and utility functions
 //! for working with LSN (Log Sequence Numbers) and timestamps.
 
+use crate::buffer::BufferReader;
 use crate::error::{ReplicationError, Result};
+use crate::protocol::message_types;
+use bytes::BytesMut;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // PostgreSQL constants
 /// Seconds from Unix epoch (1970-01-01) to PostgreSQL epoch (2000-01-01)
@@ -129,17 +132,6 @@ pub fn system_time_to_postgres_timestamp(time: SystemTime) -> TimestampTz {
 
     // Convert from Unix epoch to PostgreSQL epoch
     unix_micros - PG_EPOCH_OFFSET_SECS * 1_000_000
-}
-
-/// Convert PostgreSQL timestamp to formatted string
-pub fn format_postgres_timestamp(timestamp: TimestampTz) -> String {
-    let unix_micros = timestamp + PG_EPOCH_OFFSET_SECS * 1_000_000;
-    let unix_secs = unix_micros / 1_000_000;
-
-    match SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(unix_secs as u64)) {
-        Some(_) => format!("timestamp={unix_secs}"),
-        None => "invalid timestamp".to_string(),
-    }
 }
 
 /// Convert PostgreSQL timestamp (microseconds since 2000-01-01) into `chrono::DateTime<Utc>`.
@@ -471,149 +463,12 @@ impl From<Lsn> for u64 {
     }
 }
 
-/// Ordered row data: a list of `(column_name, value)` pairs.
-///
-/// Replaces `HashMap<String, serde_json::Value>` for CDC event payloads.
-/// Column names are `Arc<str>` — zero-cost clones from relation metadata.
-/// Serialises as a JSON object `{"col": value, …}` for wire-format compatibility.
-///
-/// # Example
-///
-/// ```
-/// use pg_walstream::RowData;
-/// use std::sync::Arc;
-///
-/// let mut row = RowData::with_capacity(2);
-/// row.push(Arc::from("id"), serde_json::json!(1));
-/// row.push(Arc::from("name"), serde_json::json!("Alice"));
-///
-/// assert_eq!(row.len(), 2);
-/// assert_eq!(row.get("id"), Some(&serde_json::json!(1)));
-/// ```
-#[derive(Debug, Clone, Eq)]
-pub struct RowData {
-    columns: Vec<(Arc<str>, serde_json::Value)>,
-}
+// Re-export ColumnValue and RowData from their dedicated module.
+pub use crate::column_value::{ColumnValue, RowData};
 
-// --- core API ---
-
-impl RowData {
-    /// Create an empty `RowData`.
-    #[inline]
-    pub fn new() -> Self {
-        Self {
-            columns: Vec::new(),
-        }
-    }
-
-    /// Create an empty `RowData` with pre-allocated capacity.
-    #[inline]
-    pub fn with_capacity(cap: usize) -> Self {
-        Self {
-            columns: Vec::with_capacity(cap),
-        }
-    }
-
-    /// Append a column.
-    #[inline]
-    pub fn push(&mut self, name: Arc<str>, value: serde_json::Value) {
-        self.columns.push((name, value));
-    }
-
-    /// Number of columns.
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.columns.len()
-    }
-
-    /// Returns `true` when there are no columns.
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.columns.is_empty()
-    }
-
-    /// Look up a value by column name (linear scan — fast for typical column counts).
-    #[inline]
-    pub fn get(&self, name: &str) -> Option<&serde_json::Value> {
-        self.columns
-            .iter()
-            .find(|(k, _)| k.as_ref() == name)
-            .map(|(_, v)| v)
-    }
-
-    /// Convert to a `HashMap` (allocates — prefer `get` / `iter` for lookups).
-    pub fn into_hash_map(self) -> HashMap<String, serde_json::Value> {
-        self.columns
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v))
-            .collect()
-    }
-
-    /// Construct from `(&str, Value)` pairs — handy for tests and literals.
-    #[inline]
-    pub fn from_pairs(pairs: Vec<(&str, serde_json::Value)>) -> Self {
-        Self {
-            columns: pairs.into_iter().map(|(k, v)| (Arc::from(k), v)).collect(),
-        }
-    }
-}
-
-impl Default for RowData {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// Order-sensitive equality (columns must match in the same order).
-impl PartialEq for RowData {
-    fn eq(&self, other: &Self) -> bool {
-        self.columns == other.columns
-    }
-}
-// --- serde: serialise as JSON object ---
-
-impl Serialize for RowData {
-    fn serialize<S: serde::Serializer>(
-        &self,
-        serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap;
-        let mut map = serializer.serialize_map(Some(self.columns.len()))?;
-        for (k, v) in &self.columns {
-            map.serialize_entry(k.as_ref(), v)?;
-        }
-        map.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for RowData {
-    fn deserialize<D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> std::result::Result<Self, D::Error> {
-        struct Visitor;
-
-        impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = RowData;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("a JSON object (map of column names to values)")
-            }
-
-            fn visit_map<M: serde::de::MapAccess<'de>>(
-                self,
-                mut map: M,
-            ) -> std::result::Result<RowData, M::Error> {
-                let mut cols = Vec::with_capacity(map.size_hint().unwrap_or(0));
-                while let Some((k, v)) = map.next_entry::<String, serde_json::Value>()? {
-                    cols.push((Arc::from(k.as_str()), v));
-                }
-                Ok(RowData { columns: cols })
-            }
-        }
-
-        deserializer.deserialize_map(Visitor)
-    }
-}
+// NOTE: The old ColumnValue enum, RowData struct, hex helpers, and their
+// serde / binary-encode impls now live in `src/column_value.rs`.
+// They are re-exported above so downstream code is unaffected.
 
 /// Represents the type of change event from PostgreSQL logical replication
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -688,8 +543,8 @@ pub struct ChangeEvent {
     /// LSN (Log Sequence Number) position
     pub lsn: Lsn,
 
-    /// Additional metadata
-    pub metadata: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// Additional user-defined metadata (key-value string pairs).
+    pub metadata: Option<HashMap<String, String>>,
 }
 
 impl ChangeEvent {
@@ -706,12 +561,12 @@ impl ChangeEvent {
     /// # Example
     ///
     /// ```
-    /// use pg_walstream::{ChangeEvent, Lsn, RowData};
+    /// use pg_walstream::{ChangeEvent, ColumnValue, Lsn, RowData};
     /// use std::sync::Arc;
     ///
     /// let data = RowData::from_pairs(vec![
-    ///     ("id", serde_json::json!(1)),
-    ///     ("name", serde_json::json!("Alice")),
+    ///     ("id", ColumnValue::text("1")),
+    ///     ("name", ColumnValue::text("Alice")),
     /// ]);
     ///
     /// let event = ChangeEvent::insert(
@@ -757,17 +612,17 @@ impl ChangeEvent {
     /// # Example
     ///
     /// ```
-    /// use pg_walstream::{ChangeEvent, ReplicaIdentity, Lsn, RowData};
+    /// use pg_walstream::{ChangeEvent, ColumnValue, ReplicaIdentity, Lsn, RowData};
     /// use std::sync::Arc;
     ///
     /// let old_data = RowData::from_pairs(vec![
-    ///     ("id", serde_json::json!(1)),
-    ///     ("name", serde_json::json!("Alice")),
+    ///     ("id", ColumnValue::text("1")),
+    ///     ("name", ColumnValue::text("Alice")),
     /// ]);
     ///
     /// let new_data = RowData::from_pairs(vec![
-    ///     ("id", serde_json::json!(1)),
-    ///     ("name", serde_json::json!("Bob")),
+    ///     ("id", ColumnValue::text("1")),
+    ///     ("name", ColumnValue::text("Bob")),
     /// ]);
     ///
     /// let event = ChangeEvent::update(
@@ -822,12 +677,12 @@ impl ChangeEvent {
     /// # Example
     ///
     /// ```
-    /// use pg_walstream::{ChangeEvent, ReplicaIdentity, Lsn, RowData};
+    /// use pg_walstream::{ChangeEvent, ColumnValue, ReplicaIdentity, Lsn, RowData};
     /// use std::sync::Arc;
     ///
     /// let old_data = RowData::from_pairs(vec![
-    ///     ("id", serde_json::json!(1)),
-    ///     ("name", serde_json::json!("Alice")),
+    ///     ("id", ColumnValue::text("1")),
+    ///     ("name", ColumnValue::text("Alice")),
     /// ]);
     ///
     /// let event = ChangeEvent::delete(
@@ -982,10 +837,7 @@ impl ChangeEvent {
     }
 
     /// Set metadata for this event
-    pub fn with_metadata(
-        mut self,
-        metadata: std::collections::HashMap<String, serde_json::Value>,
-    ) -> Self {
+    pub fn with_metadata(mut self, metadata: HashMap<String, String>) -> Self {
         self.metadata = Some(metadata);
         self
     }
@@ -1021,11 +873,407 @@ impl ChangeEvent {
             _ => "other",
         }
     }
+
+    // ---- binary wire format (encode / decode) ----
+    /// For efficient transport over the network, we provide a compact binary encoding of `ChangeEvent`.
+    ///
+    /// The format is:
+    /// ```text
+    /// [1 byte  event tag]
+    /// [8 bytes LSN (big-endian u64)]
+    /// [1 byte  has_metadata flag]
+    /// [if has_metadata: u16 entry count, then for each: u16+name, u16+value]
+    /// [variable event-specific payload]
+    /// ```
+    ///
+    /// This is significantly faster than JSON for both encoding and decoding,
+    /// and produces a smaller payload.
+    pub fn encode(&self, buf: &mut BytesMut) {
+        // LSN
+        buf.extend_from_slice(&self.lsn.0.to_be_bytes());
+
+        // Metadata
+        match &self.metadata {
+            None => buf.extend_from_slice(&[0u8]),
+            Some(m) => {
+                buf.extend_from_slice(&[1u8]);
+                buf.extend_from_slice(&(m.len() as u16).to_be_bytes());
+                for (k, v) in m {
+                    let kb = k.as_bytes();
+                    buf.extend_from_slice(&(kb.len() as u16).to_be_bytes());
+                    buf.extend_from_slice(kb);
+                    let vb = v.as_bytes();
+                    buf.extend_from_slice(&(vb.len() as u16).to_be_bytes());
+                    buf.extend_from_slice(vb);
+                }
+            }
+        }
+
+        // Event payload
+        match &self.event_type {
+            EventType::Insert {
+                schema,
+                table,
+                relation_oid,
+                data,
+            } => {
+                buf.extend_from_slice(&[message_types::INSERT]);
+                encode_arc_str(buf, schema);
+                encode_arc_str(buf, table);
+                buf.extend_from_slice(&relation_oid.to_be_bytes());
+                data.encode(buf);
+            }
+            EventType::Update {
+                schema,
+                table,
+                relation_oid,
+                old_data,
+                new_data,
+                replica_identity,
+                key_columns,
+            } => {
+                buf.extend_from_slice(&[message_types::UPDATE]);
+                encode_arc_str(buf, schema);
+                encode_arc_str(buf, table);
+                buf.extend_from_slice(&relation_oid.to_be_bytes());
+                // old_data: present flag + data
+                match old_data {
+                    None => buf.extend_from_slice(&[0u8]),
+                    Some(d) => {
+                        buf.extend_from_slice(&[1u8]);
+                        d.encode(buf);
+                    }
+                }
+                new_data.encode(buf);
+                buf.extend_from_slice(&[replica_identity.to_byte()]);
+                buf.extend_from_slice(&(key_columns.len() as u16).to_be_bytes());
+                for kc in key_columns {
+                    encode_arc_str(buf, kc);
+                }
+            }
+            EventType::Delete {
+                schema,
+                table,
+                relation_oid,
+                old_data,
+                replica_identity,
+                key_columns,
+            } => {
+                buf.extend_from_slice(&[message_types::DELETE]);
+                encode_arc_str(buf, schema);
+                encode_arc_str(buf, table);
+                buf.extend_from_slice(&relation_oid.to_be_bytes());
+                old_data.encode(buf);
+                buf.extend_from_slice(&[replica_identity.to_byte()]);
+                buf.extend_from_slice(&(key_columns.len() as u16).to_be_bytes());
+                for kc in key_columns {
+                    encode_arc_str(buf, kc);
+                }
+            }
+            EventType::Truncate(tables) => {
+                buf.extend_from_slice(&[message_types::TRUNCATE]);
+                buf.extend_from_slice(&(tables.len() as u16).to_be_bytes());
+                for t in tables {
+                    encode_arc_str(buf, t);
+                }
+            }
+            EventType::Begin {
+                transaction_id,
+                final_lsn,
+                commit_timestamp,
+            } => {
+                buf.extend_from_slice(&[message_types::BEGIN]);
+                buf.extend_from_slice(&transaction_id.to_be_bytes());
+                buf.extend_from_slice(&final_lsn.0.to_be_bytes());
+                buf.extend_from_slice(&commit_timestamp.timestamp_micros().to_be_bytes());
+            }
+            EventType::Commit {
+                commit_timestamp,
+                commit_lsn,
+                end_lsn,
+            } => {
+                buf.extend_from_slice(&[message_types::COMMIT]);
+                buf.extend_from_slice(&commit_timestamp.timestamp_micros().to_be_bytes());
+                buf.extend_from_slice(&commit_lsn.0.to_be_bytes());
+                buf.extend_from_slice(&end_lsn.0.to_be_bytes());
+            }
+            EventType::StreamStart {
+                transaction_id,
+                first_segment,
+            } => {
+                buf.extend_from_slice(&[message_types::STREAM_START]);
+                buf.extend_from_slice(&transaction_id.to_be_bytes());
+                buf.extend_from_slice(&[u8::from(*first_segment)]);
+            }
+            EventType::StreamStop => {
+                buf.extend_from_slice(&[message_types::STREAM_STOP]);
+            }
+            EventType::StreamCommit {
+                transaction_id,
+                commit_lsn,
+                end_lsn,
+                commit_timestamp,
+            } => {
+                buf.extend_from_slice(&[message_types::STREAM_COMMIT]);
+                buf.extend_from_slice(&transaction_id.to_be_bytes());
+                buf.extend_from_slice(&commit_lsn.0.to_be_bytes());
+                buf.extend_from_slice(&end_lsn.0.to_be_bytes());
+                buf.extend_from_slice(&commit_timestamp.timestamp_micros().to_be_bytes());
+            }
+            EventType::StreamAbort {
+                transaction_id,
+                subtransaction_xid,
+                abort_lsn,
+                abort_timestamp,
+            } => {
+                buf.extend_from_slice(&[message_types::STREAM_ABORT]);
+                buf.extend_from_slice(&transaction_id.to_be_bytes());
+                buf.extend_from_slice(&subtransaction_xid.to_be_bytes());
+                match abort_lsn {
+                    None => buf.extend_from_slice(&[0u8]),
+                    Some(l) => {
+                        buf.extend_from_slice(&[1u8]);
+                        buf.extend_from_slice(&l.0.to_be_bytes());
+                    }
+                }
+                match abort_timestamp {
+                    None => buf.extend_from_slice(&[0u8]),
+                    Some(ts) => {
+                        buf.extend_from_slice(&[1u8]);
+                        buf.extend_from_slice(&ts.timestamp_micros().to_be_bytes());
+                    }
+                }
+            }
+            EventType::Relation => buf.extend_from_slice(&[message_types::RELATION]),
+            EventType::Type => buf.extend_from_slice(&[message_types::TYPE]),
+            EventType::Origin => buf.extend_from_slice(&[message_types::ORIGIN]),
+            EventType::Message => buf.extend_from_slice(&[message_types::MESSAGE]),
+        }
+    }
+
+    /// Decode a `ChangeEvent` from binary data produced by [`encode`](Self::encode).
+    pub fn decode(data: &[u8]) -> Result<Self> {
+        let mut reader = BufferReader::new(data);
+
+        // LSN
+        let lsn = Lsn(reader.read_u64()?);
+
+        // Metadata
+        let has_meta = reader.read_u8()?;
+        let metadata = if has_meta != 0 {
+            let count = reader.read_u16()? as usize;
+            let mut m = HashMap::with_capacity(count);
+            for _ in 0..count {
+                let k = decode_string(&mut reader)?;
+                let v = decode_string(&mut reader)?;
+                m.insert(k, v);
+            }
+            Some(m)
+        } else {
+            None
+        };
+
+        // Event tag
+        let tag = reader.read_u8()?;
+        let event_type = match tag {
+            message_types::INSERT => {
+                let schema = decode_arc_str(&mut reader)?;
+                let table = decode_arc_str(&mut reader)?;
+                let relation_oid = reader.read_u32()?;
+                let data = RowData::decode(&mut reader)?;
+                EventType::Insert {
+                    schema,
+                    table,
+                    relation_oid,
+                    data,
+                }
+            }
+            message_types::UPDATE => {
+                let schema = decode_arc_str(&mut reader)?;
+                let table = decode_arc_str(&mut reader)?;
+                let relation_oid = reader.read_u32()?;
+                let has_old = reader.read_u8()?;
+                let old_data = if has_old != 0 {
+                    Some(RowData::decode(&mut reader)?)
+                } else {
+                    None
+                };
+                let new_data = RowData::decode(&mut reader)?;
+                let ri_byte = reader.read_u8()?;
+                let replica_identity = ReplicaIdentity::from_byte(ri_byte).ok_or_else(|| {
+                    ReplicationError::protocol(format!(
+                        "Unknown replica identity byte: 0x{ri_byte:02x}"
+                    ))
+                })?;
+                let kc_count = reader.read_u16()? as usize;
+                let mut key_columns = Vec::with_capacity(kc_count);
+                for _ in 0..kc_count {
+                    key_columns.push(decode_arc_str(&mut reader)?);
+                }
+                EventType::Update {
+                    schema,
+                    table,
+                    relation_oid,
+                    old_data,
+                    new_data,
+                    replica_identity,
+                    key_columns,
+                }
+            }
+            message_types::DELETE => {
+                let schema = decode_arc_str(&mut reader)?;
+                let table = decode_arc_str(&mut reader)?;
+                let relation_oid = reader.read_u32()?;
+                let old_data = RowData::decode(&mut reader)?;
+                let ri_byte = reader.read_u8()?;
+                let replica_identity = ReplicaIdentity::from_byte(ri_byte).ok_or_else(|| {
+                    ReplicationError::protocol(format!(
+                        "Unknown replica identity byte: 0x{ri_byte:02x}"
+                    ))
+                })?;
+                let kc_count = reader.read_u16()? as usize;
+                let mut key_columns = Vec::with_capacity(kc_count);
+                for _ in 0..kc_count {
+                    key_columns.push(decode_arc_str(&mut reader)?);
+                }
+                EventType::Delete {
+                    schema,
+                    table,
+                    relation_oid,
+                    old_data,
+                    replica_identity,
+                    key_columns,
+                }
+            }
+            message_types::TRUNCATE => {
+                let count = reader.read_u16()? as usize;
+                let mut tables = Vec::with_capacity(count);
+                for _ in 0..count {
+                    tables.push(decode_arc_str(&mut reader)?);
+                }
+                EventType::Truncate(tables)
+            }
+            message_types::BEGIN => {
+                let transaction_id = reader.read_u32()?;
+                let final_lsn = Lsn(reader.read_u64()?);
+                let ts_micros = reader.read_i64()?;
+                let commit_timestamp = micros_to_chrono(ts_micros);
+                EventType::Begin {
+                    transaction_id,
+                    final_lsn,
+                    commit_timestamp,
+                }
+            }
+            message_types::COMMIT => {
+                let ts_micros = reader.read_i64()?;
+                let commit_timestamp = micros_to_chrono(ts_micros);
+                let commit_lsn = Lsn(reader.read_u64()?);
+                let end_lsn = Lsn(reader.read_u64()?);
+                EventType::Commit {
+                    commit_timestamp,
+                    commit_lsn,
+                    end_lsn,
+                }
+            }
+            message_types::STREAM_START => {
+                let transaction_id = reader.read_u32()?;
+                let first_segment = reader.read_u8()? != 0;
+                EventType::StreamStart {
+                    transaction_id,
+                    first_segment,
+                }
+            }
+            message_types::STREAM_STOP => EventType::StreamStop,
+            message_types::STREAM_COMMIT => {
+                let transaction_id = reader.read_u32()?;
+                let commit_lsn = Lsn(reader.read_u64()?);
+                let end_lsn = Lsn(reader.read_u64()?);
+                let ts_micros = reader.read_i64()?;
+                let commit_timestamp = micros_to_chrono(ts_micros);
+                EventType::StreamCommit {
+                    transaction_id,
+                    commit_lsn,
+                    end_lsn,
+                    commit_timestamp,
+                }
+            }
+            message_types::STREAM_ABORT => {
+                let transaction_id = reader.read_u32()?;
+                let subtransaction_xid = reader.read_u32()?;
+                let has_lsn = reader.read_u8()?;
+                let abort_lsn = if has_lsn != 0 {
+                    Some(Lsn(reader.read_u64()?))
+                } else {
+                    None
+                };
+                let has_ts = reader.read_u8()?;
+                let abort_timestamp = if has_ts != 0 {
+                    Some(micros_to_chrono(reader.read_i64()?))
+                } else {
+                    None
+                };
+                EventType::StreamAbort {
+                    transaction_id,
+                    subtransaction_xid,
+                    abort_lsn,
+                    abort_timestamp,
+                }
+            }
+            message_types::RELATION => EventType::Relation,
+            message_types::TYPE => EventType::Type,
+            message_types::ORIGIN => EventType::Origin,
+            message_types::MESSAGE => EventType::Message,
+            _ => {
+                return Err(ReplicationError::protocol(format!(
+                    "Unknown ChangeEvent tag: 0x{tag:02x}"
+                )));
+            }
+        };
+
+        Ok(Self {
+            event_type,
+            lsn,
+            metadata,
+        })
+    }
+}
+
+#[inline]
+fn encode_arc_str(buf: &mut BytesMut, s: &Arc<str>) {
+    let b = s.as_bytes();
+    buf.extend_from_slice(&(b.len() as u16).to_be_bytes());
+    buf.extend_from_slice(b);
+}
+
+fn decode_arc_str(reader: &mut BufferReader) -> Result<Arc<str>> {
+    let len = reader.read_u16()? as usize;
+    let bytes = reader.read_bytes(len)?;
+    let s = std::str::from_utf8(&bytes)
+        .map_err(|e| ReplicationError::protocol(format!("Invalid UTF-8 in wire format: {e}")))?;
+    Ok(Arc::from(s))
+}
+
+fn decode_string(reader: &mut BufferReader) -> Result<String> {
+    let len = reader.read_u16()? as usize;
+    let bytes = reader.read_bytes(len)?;
+    String::from_utf8(bytes)
+        .map_err(|e| ReplicationError::protocol(format!("Invalid UTF-8 in wire format: {e}")))
+}
+
+/// Convert Unix timestamp microseconds to chrono DateTime.
+fn micros_to_chrono(micros: i64) -> chrono::DateTime<chrono::Utc> {
+    use chrono::{TimeZone, Utc};
+    let secs = micros.div_euclid(1_000_000);
+    let subsec_nanos = (micros.rem_euclid(1_000_000) as u32) * 1000;
+    Utc.timestamp_opt(secs, subsec_nanos)
+        .single()
+        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use chrono::{TimeZone, Utc};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1089,14 +1337,6 @@ mod tests {
         // Allow slight difference due to truncation to microseconds
         let diff = (dt.timestamp_micros() - chrono_now.timestamp_micros()).abs();
         assert!(diff < 2, "Round trip difference too large: {diff}");
-    }
-
-    #[test]
-    fn test_format_postgres_timestamp() {
-        let ts = 0; // PostgreSQL epoch
-        let formatted = format_postgres_timestamp(ts);
-        assert!(formatted.contains("timestamp="));
-        assert!(formatted.contains("946684800")); // Unix timestamp for 2000-01-01
     }
 
     #[test]
@@ -1181,8 +1421,8 @@ mod tests {
     #[test]
     fn test_change_event_insert() {
         let data = RowData::from_pairs(vec![
-            ("id", serde_json::json!(1)),
-            ("name", serde_json::json!("test")),
+            ("id", ColumnValue::text("1")),
+            ("name", ColumnValue::text("test")),
         ]);
 
         let event = ChangeEvent::insert("public", "users", 12345, data, Lsn::new(0x16B374D848));
@@ -1243,6 +1483,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::clone_on_copy)]
     fn test_slot_type_clone_copy_eq() {
         let s1 = SlotType::Logical;
         let s2 = s1; // Copy
@@ -1254,10 +1495,10 @@ mod tests {
 
     #[test]
     fn test_change_event_update() {
-        let old_data = RowData::from_pairs(vec![("id", serde_json::json!(1))]);
+        let old_data = RowData::from_pairs(vec![("id", ColumnValue::text("1"))]);
         let new_data = RowData::from_pairs(vec![
-            ("id", serde_json::json!(1)),
-            ("name", serde_json::json!("updated")),
+            ("id", ColumnValue::text("1")),
+            ("name", ColumnValue::text("updated")),
         ]);
 
         let event = ChangeEvent::update(
@@ -1296,7 +1537,7 @@ mod tests {
 
     #[test]
     fn test_change_event_delete() {
-        let old_data = RowData::from_pairs(vec![("id", serde_json::json!(1))]);
+        let old_data = RowData::from_pairs(vec![("id", ColumnValue::text("1"))]);
 
         let event = ChangeEvent::delete(
             "public",
@@ -1412,15 +1653,15 @@ mod tests {
         let event = ChangeEvent::insert("public", "test", 1, data, Lsn::new(100));
         assert!(event.metadata.is_none());
 
-        let mut metadata = std::collections::HashMap::new();
-        metadata.insert("source".to_string(), serde_json::json!("test"));
-        metadata.insert("version".to_string(), serde_json::json!(2));
+        let mut metadata = HashMap::new();
+        metadata.insert("source".to_string(), "test".to_string());
+        metadata.insert("version".to_string(), "2".to_string());
 
         let event = event.with_metadata(metadata.clone());
         assert!(event.metadata.is_some());
         let m = event.metadata.unwrap();
-        assert_eq!(m.get("source").unwrap(), &serde_json::json!("test"));
-        assert_eq!(m.get("version").unwrap(), &serde_json::json!(2));
+        assert_eq!(m.get("source").unwrap(), "test");
+        assert_eq!(m.get("version").unwrap(), "2");
     }
 
     #[test]
@@ -1562,14 +1803,6 @@ mod tests {
     }
 
     #[test]
-    fn test_format_postgres_timestamp_invalid() {
-        // Very large negative timestamp
-        let result = format_postgres_timestamp(i64::MIN / 2);
-        // Either we get a valid formatted timestamp or "invalid timestamp"
-        assert!(!result.is_empty());
-    }
-
-    #[test]
     fn test_lsn_serialize_deserialize() {
         let lsn = Lsn::new(0x16B374D848);
         let serialized = serde_json::to_string(&lsn).unwrap();
@@ -1593,7 +1826,7 @@ mod tests {
 
     #[test]
     fn test_change_event_serialize_deserialize() {
-        let data = RowData::from_pairs(vec![("id", serde_json::json!(42))]);
+        let data = RowData::from_pairs(vec![("id", ColumnValue::text("42"))]);
 
         let event = ChangeEvent::insert("public", "test", 12345, data, Lsn::new(1000));
 
@@ -1616,35 +1849,680 @@ mod tests {
         assert_eq!(&*padded, "hello world");
     }
 
-    // ---- RowData::default coverage ----
+    // --- Encode / Decode round-trip tests ---
 
-    #[test]
-    fn test_rowdata_default() {
-        let row = RowData::default();
-        assert!(row.is_empty());
-        assert_eq!(row.len(), 0);
+    /// Helper: encode a ChangeEvent, then decode it and assert equality.
+    fn assert_encode_decode_round_trip(event: &ChangeEvent) {
+        let mut buf = BytesMut::new();
+        event.encode(&mut buf);
+        let decoded = ChangeEvent::decode(&buf).expect("decode failed");
+        assert_eq!(decoded.lsn, event.lsn);
+        assert_eq!(decoded.event_type, event.event_type);
+        // Compare metadata (HashMap doesn't impl Eq but we can check the content)
+        assert_eq!(
+            decoded.metadata.is_some(),
+            event.metadata.is_some(),
+            "metadata presence mismatch"
+        );
+        if let (Some(a), Some(b)) = (&decoded.metadata, &event.metadata) {
+            assert_eq!(a.len(), b.len());
+            for (k, v) in b {
+                assert_eq!(a.get(k), Some(v));
+            }
+        }
     }
 
     #[test]
-    fn test_rowdata_deserialize_invalid_type() {
-        // Feeding a non-object type triggers the `expecting()` method.
-        let err = serde_json::from_str::<RowData>("42").unwrap_err();
-        let msg = err.to_string();
+    fn test_encode_decode_insert() {
+        let data = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("42")),
+            ("name", ColumnValue::text("Alice")),
+            ("bio", ColumnValue::Null),
+        ]);
+        let event = ChangeEvent::insert("public", "users", 12345, data, Lsn::new(0x100));
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_insert_with_metadata() {
+        let data = RowData::from_pairs(vec![("x", ColumnValue::text("1"))]);
+        let mut meta = HashMap::new();
+        meta.insert("source".to_string(), "unit-test".to_string());
+        meta.insert("version".to_string(), "3".to_string());
+        let event =
+            ChangeEvent::insert("myschema", "mytable", 99, data, Lsn::new(500)).with_metadata(meta);
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_update_with_old_data() {
+        let old = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("1")),
+            ("val", ColumnValue::text("old")),
+        ]);
+        let new = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("1")),
+            ("val", ColumnValue::text("new")),
+        ]);
+        let event = ChangeEvent::update(
+            "public",
+            "items",
+            555,
+            Some(old),
+            new,
+            ReplicaIdentity::Full,
+            vec![Arc::from("id")],
+            Lsn::new(2000),
+        );
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_update_without_old_data() {
+        let new = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("1")),
+            ("val", ColumnValue::text("updated")),
+        ]);
+        let event = ChangeEvent::update(
+            "public",
+            "items",
+            555,
+            None,
+            new,
+            ReplicaIdentity::Default,
+            vec![Arc::from("id"), Arc::from("tenant")],
+            Lsn::new(2100),
+        );
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_delete() {
+        let old = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("99")),
+            ("name", ColumnValue::text("deleted")),
+        ]);
+        let event = ChangeEvent::delete(
+            "public",
+            "users",
+            777,
+            old,
+            ReplicaIdentity::Index,
+            vec![Arc::from("id")],
+            Lsn::new(3000),
+        );
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_truncate() {
+        let tables = vec![Arc::from("public.a"), Arc::from("public.b")];
+        let event = ChangeEvent::truncate(tables, Lsn::new(4000));
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_truncate_empty() {
+        let event = ChangeEvent::truncate(vec![], Lsn::new(4100));
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_begin() {
+        let ts = Utc.with_ymd_and_hms(2024, 6, 15, 12, 30, 45).unwrap();
+        let event = ChangeEvent::begin(12345, Lsn::new(5000), ts, Lsn::new(4900));
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_commit() {
+        let ts = Utc.with_ymd_and_hms(2024, 6, 15, 12, 31, 0).unwrap();
+        let event = ChangeEvent::commit(ts, Lsn::new(6000), Lsn::new(5900), Lsn::new(6100));
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_stream_start() {
+        let event = ChangeEvent {
+            event_type: EventType::StreamStart {
+                transaction_id: 42,
+                first_segment: true,
+            },
+            lsn: Lsn::new(7000),
+            metadata: None,
+        };
+        assert_encode_decode_round_trip(&event);
+
+        // second segment
+        let event2 = ChangeEvent {
+            event_type: EventType::StreamStart {
+                transaction_id: 42,
+                first_segment: false,
+            },
+            lsn: Lsn::new(7001),
+            metadata: None,
+        };
+        assert_encode_decode_round_trip(&event2);
+    }
+
+    #[test]
+    fn test_encode_decode_stream_stop() {
+        let event = ChangeEvent {
+            event_type: EventType::StreamStop,
+            lsn: Lsn::new(7500),
+            metadata: None,
+        };
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_stream_commit() {
+        let ts = Utc.with_ymd_and_hms(2024, 8, 1, 0, 0, 0).unwrap();
+        let event = ChangeEvent {
+            event_type: EventType::StreamCommit {
+                transaction_id: 99,
+                commit_lsn: Lsn::new(8000),
+                end_lsn: Lsn::new(8100),
+                commit_timestamp: ts,
+            },
+            lsn: Lsn::new(7900),
+            metadata: None,
+        };
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_stream_abort_with_all_fields() {
+        let ts = Utc.with_ymd_and_hms(2024, 9, 1, 12, 0, 0).unwrap();
+        let event = ChangeEvent {
+            event_type: EventType::StreamAbort {
+                transaction_id: 50,
+                subtransaction_xid: 51,
+                abort_lsn: Some(Lsn::new(9000)),
+                abort_timestamp: Some(ts),
+            },
+            lsn: Lsn::new(8900),
+            metadata: None,
+        };
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_stream_abort_without_optional_fields() {
+        let event = ChangeEvent {
+            event_type: EventType::StreamAbort {
+                transaction_id: 50,
+                subtransaction_xid: 0,
+                abort_lsn: None,
+                abort_timestamp: None,
+            },
+            lsn: Lsn::new(8950),
+            metadata: None,
+        };
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_relation() {
+        let event = ChangeEvent::relation(Lsn::new(10000));
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_type() {
+        let event = ChangeEvent::type_event(Lsn::new(10100));
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_origin() {
+        let event = ChangeEvent::origin(Lsn::new(10200));
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_message() {
+        let event = ChangeEvent::message(Lsn::new(10300));
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_decode_unknown_event_tag() {
+        // Build a minimal buffer with valid LSN, no-metadata, then unknown tag
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&100u64.to_be_bytes()); // LSN
+        buf.extend_from_slice(&[0u8]); // no metadata
+        buf.extend_from_slice(&[0xFE]); // unknown event tag
+        let result = ChangeEvent::decode(&buf);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
         assert!(
-            msg.contains("a JSON object"),
-            "Error should reference expecting(), got: {msg}"
+            err_msg.contains("Unknown ChangeEvent tag"),
+            "got: {err_msg}"
         );
     }
 
     #[test]
-    fn test_rowdata_deserialize_string_gives_error() {
-        let err = serde_json::from_str::<RowData>("\"hello\"").unwrap_err();
-        assert!(err.to_string().contains("a JSON object"));
+    fn test_encode_decode_insert_with_binary_data() {
+        let data = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("1")),
+            (
+                "blob",
+                ColumnValue::binary_bytes(Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef])),
+            ),
+            ("empty", ColumnValue::Null),
+        ]);
+        let event = ChangeEvent::insert("public", "blobs", 999, data, Lsn::new(11000));
+        assert_encode_decode_round_trip(&event);
     }
 
     #[test]
-    fn test_rowdata_deserialize_array_gives_error() {
-        let err = serde_json::from_str::<RowData>("[1, 2, 3]").unwrap_err();
-        assert!(err.to_string().contains("a JSON object"));
+    fn test_encode_decode_update_all_replica_identities() {
+        for ri in [
+            ReplicaIdentity::Default,
+            ReplicaIdentity::Nothing,
+            ReplicaIdentity::Full,
+            ReplicaIdentity::Index,
+        ] {
+            let new = RowData::from_pairs(vec![("x", ColumnValue::text("1"))]);
+            let event =
+                ChangeEvent::update("s", "t", 1, None, new, ri.clone(), vec![], Lsn::new(12000));
+            assert_encode_decode_round_trip(&event);
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_delete_all_replica_identities() {
+        for ri in [
+            ReplicaIdentity::Default,
+            ReplicaIdentity::Nothing,
+            ReplicaIdentity::Full,
+            ReplicaIdentity::Index,
+        ] {
+            let old = RowData::from_pairs(vec![("k", ColumnValue::text("v"))]);
+            let event = ChangeEvent::delete(
+                "s",
+                "t",
+                1,
+                old,
+                ri.clone(),
+                vec![Arc::from("k")],
+                Lsn::new(13000),
+            );
+            assert_encode_decode_round_trip(&event);
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_metadata_empty_hashmap() {
+        let data = RowData::from_pairs(vec![("a", ColumnValue::text("b"))]);
+        let event =
+            ChangeEvent::insert("s", "t", 1, data, Lsn::new(14000)).with_metadata(HashMap::new());
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_micros_to_chrono_zero() {
+        // Zero micros = Unix epoch
+        let dt = micros_to_chrono(0);
+        assert_eq!(dt, Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn test_micros_to_chrono_negative() {
+        // Negative micros = before Unix epoch
+        let dt = micros_to_chrono(-1_000_000);
+        assert_eq!(dt, Utc.with_ymd_and_hms(1969, 12, 31, 23, 59, 59).unwrap());
+    }
+
+    #[test]
+    fn test_micros_to_chrono_with_subsecond() {
+        let dt = micros_to_chrono(1_500_000); // 1.5 seconds
+        assert_eq!(dt.timestamp(), 1);
+        assert_eq!(dt.timestamp_subsec_micros(), 500_000);
+    }
+
+    #[test]
+    fn test_change_event_serde_round_trip_update() {
+        let old = RowData::from_pairs(vec![("id", ColumnValue::text("1"))]);
+        let new = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("1")),
+            ("v", ColumnValue::text("updated")),
+        ]);
+        let event = ChangeEvent::update(
+            "public",
+            "t",
+            1,
+            Some(old),
+            new,
+            ReplicaIdentity::Full,
+            vec![Arc::from("id")],
+            Lsn::new(100),
+        );
+        let json = serde_json::to_string(&event).unwrap();
+        let back: ChangeEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type, event.event_type);
+    }
+
+    #[test]
+    fn test_change_event_serde_round_trip_delete() {
+        let old = RowData::from_pairs(vec![("id", ColumnValue::text("1"))]);
+        let event = ChangeEvent::delete(
+            "public",
+            "t",
+            1,
+            old,
+            ReplicaIdentity::Index,
+            vec![Arc::from("id")],
+            Lsn::new(200),
+        );
+        let json = serde_json::to_string(&event).unwrap();
+        let back: ChangeEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type, event.event_type);
+    }
+
+    #[test]
+    fn test_change_event_serde_round_trip_begin() {
+        let ts = Utc.with_ymd_and_hms(2024, 3, 15, 8, 0, 0).unwrap();
+        let event = ChangeEvent::begin(1, Lsn::new(300), ts, Lsn::new(300));
+        let json = serde_json::to_string(&event).unwrap();
+        let back: ChangeEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type, event.event_type);
+    }
+
+    #[test]
+    fn test_change_event_serde_round_trip_commit() {
+        let ts = Utc.with_ymd_and_hms(2024, 3, 15, 8, 0, 0).unwrap();
+        let event = ChangeEvent::commit(ts, Lsn::new(400), Lsn::new(400), Lsn::new(410));
+        let json = serde_json::to_string(&event).unwrap();
+        let back: ChangeEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type, event.event_type);
+    }
+
+    #[test]
+    fn test_change_event_serde_round_trip_truncate() {
+        let event = ChangeEvent::truncate(vec![Arc::from("t1"), Arc::from("t2")], Lsn::new(500));
+        let json = serde_json::to_string(&event).unwrap();
+        let back: ChangeEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type, event.event_type);
+    }
+
+    #[test]
+    fn test_change_event_serde_round_trip_streaming_events() {
+        let ts = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+
+        // StreamStart
+        let event = ChangeEvent {
+            event_type: EventType::StreamStart {
+                transaction_id: 10,
+                first_segment: true,
+            },
+            lsn: Lsn::new(600),
+            metadata: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: ChangeEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type, event.event_type);
+
+        // StreamStop
+        let event = ChangeEvent {
+            event_type: EventType::StreamStop,
+            lsn: Lsn::new(700),
+            metadata: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: ChangeEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type, event.event_type);
+
+        // StreamCommit
+        let event = ChangeEvent {
+            event_type: EventType::StreamCommit {
+                transaction_id: 10,
+                commit_lsn: Lsn::new(800),
+                end_lsn: Lsn::new(810),
+                commit_timestamp: ts,
+            },
+            lsn: Lsn::new(800),
+            metadata: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: ChangeEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type, event.event_type);
+
+        // StreamAbort with optional fields
+        let event = ChangeEvent {
+            event_type: EventType::StreamAbort {
+                transaction_id: 10,
+                subtransaction_xid: 11,
+                abort_lsn: Some(Lsn::new(900)),
+                abort_timestamp: Some(ts),
+            },
+            lsn: Lsn::new(900),
+            metadata: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: ChangeEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type, event.event_type);
+
+        // StreamAbort without optional fields
+        let event = ChangeEvent {
+            event_type: EventType::StreamAbort {
+                transaction_id: 10,
+                subtransaction_xid: 0,
+                abort_lsn: None,
+                abort_timestamp: None,
+            },
+            lsn: Lsn::new(950),
+            metadata: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: ChangeEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type, event.event_type);
+    }
+
+    #[test]
+    fn test_change_event_serde_round_trip_with_metadata() {
+        let data = RowData::from_pairs(vec![("id", ColumnValue::text("1"))]);
+        let mut meta = HashMap::new();
+        meta.insert("key1".to_string(), "val1".to_string());
+        meta.insert("key2".to_string(), "val2".to_string());
+        let event = ChangeEvent::insert("s", "t", 1, data, Lsn::new(1000)).with_metadata(meta);
+        let json = serde_json::to_string(&event).unwrap();
+        let back: ChangeEvent = serde_json::from_str(&json).unwrap();
+        assert!(back.metadata.is_some());
+        let m = back.metadata.unwrap();
+        assert_eq!(m.get("key1").unwrap(), "val1");
+        assert_eq!(m.get("key2").unwrap(), "val2");
+    }
+
+    #[test]
+    fn test_change_event_serde_round_trip_simple_events() {
+        for event in [
+            ChangeEvent::relation(Lsn::new(1100)),
+            ChangeEvent::type_event(Lsn::new(1200)),
+            ChangeEvent::origin(Lsn::new(1300)),
+            ChangeEvent::message(Lsn::new(1400)),
+        ] {
+            let json = serde_json::to_string(&event).unwrap();
+            let back: ChangeEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                back.event_type, event.event_type,
+                "Failed for {:?}",
+                event.event_type
+            );
+        }
+    }
+
+    #[test]
+    fn test_lsn_zero() {
+        let lsn = Lsn::new(0);
+        assert_eq!(lsn.value(), 0);
+        assert_eq!(format!("{lsn}"), "0/0");
+
+        let parsed: Lsn = "0/0".parse().unwrap();
+        assert_eq!(parsed, lsn);
+    }
+
+    #[test]
+    fn test_lsn_max() {
+        let lsn = Lsn::new(u64::MAX);
+        let formatted = format!("{lsn}");
+        let parsed: Lsn = formatted.parse().unwrap();
+        assert_eq!(parsed, lsn);
+    }
+
+    #[test]
+    fn test_lsn_serde_zero_and_max() {
+        for val in [0u64, 1, u64::MAX / 2, u64::MAX] {
+            let lsn = Lsn::new(val);
+            let json = serde_json::to_string(&lsn).unwrap();
+            let back: Lsn = serde_json::from_str(&json).unwrap();
+            assert_eq!(lsn, back);
+        }
+    }
+
+    #[test]
+    fn test_lsn_equality_and_hash() {
+        use std::collections::HashSet;
+        let a = Lsn::new(100);
+        let b = Lsn::new(100);
+        let c = Lsn::new(200);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+
+        // Lsn doesn't impl Hash, but does impl Copy + Eq
+        let x = a;
+        assert_eq!(x, a);
+        let _ = HashSet::<u64>::new(); // type check only
+    }
+
+    #[test]
+    fn test_replica_identity_debug_clone() {
+        let ri = ReplicaIdentity::Full;
+        let cloned = ri.clone();
+        assert_eq!(ri, cloned);
+        let debug = format!("{ri:?}");
+        assert!(debug.contains("Full"), "got: {debug}");
+    }
+
+    #[test]
+    fn test_replica_identity_round_trip_byte() {
+        for byte in [b'd', b'n', b'f', b'i'] {
+            let ri = ReplicaIdentity::from_byte(byte).unwrap();
+            assert_eq!(ri.to_byte(), byte);
+        }
+    }
+
+    #[test]
+    fn test_base_backup_options_default() {
+        let opts = BaseBackupOptions::default();
+        assert!(opts.label.is_none());
+        assert!(opts.target.is_none());
+        assert!(!opts.progress);
+        assert!(!opts.wal);
+        assert!(!opts.wait);
+        assert!(opts.compression.is_none());
+        assert!(opts.max_rate.is_none());
+        assert!(!opts.tablespace_map);
+        assert!(!opts.verify_checksums);
+        assert!(opts.manifest.is_none());
+        assert!(!opts.incremental);
+    }
+
+    #[test]
+    fn test_replication_slot_options_default() {
+        let opts = ReplicationSlotOptions::default();
+        assert!(!opts.temporary);
+        assert!(!opts.two_phase);
+        assert!(!opts.reserve_wal);
+        assert!(opts.snapshot.is_none());
+        assert!(!opts.failover);
+    }
+
+    #[test]
+    fn test_change_event_clone() {
+        let data = RowData::from_pairs(vec![("id", ColumnValue::text("1"))]);
+        let event = ChangeEvent::insert("s", "t", 1, data, Lsn::new(100));
+        let cloned = event.clone();
+        assert_eq!(cloned.lsn, event.lsn);
+        assert_eq!(cloned.event_type, event.event_type);
+    }
+
+    #[test]
+    fn test_change_event_debug() {
+        let data = RowData::from_pairs(vec![("id", ColumnValue::text("1"))]);
+        let event = ChangeEvent::insert("s", "t", 1, data, Lsn::new(100));
+        let debug = format!("{event:?}");
+        assert!(debug.contains("Insert"), "got: {debug}");
+        assert!(debug.contains("Lsn"), "got: {debug}");
+    }
+
+    #[test]
+    fn test_event_type_debug_all_variants() {
+        let data = RowData::new();
+        let ts = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+
+        let variants: Vec<EventType> = vec![
+            EventType::Insert {
+                schema: Arc::from("s"),
+                table: Arc::from("t"),
+                relation_oid: 1,
+                data: data.clone(),
+            },
+            EventType::Update {
+                schema: Arc::from("s"),
+                table: Arc::from("t"),
+                relation_oid: 1,
+                old_data: None,
+                new_data: data.clone(),
+                replica_identity: ReplicaIdentity::Default,
+                key_columns: vec![],
+            },
+            EventType::Delete {
+                schema: Arc::from("s"),
+                table: Arc::from("t"),
+                relation_oid: 1,
+                old_data: data.clone(),
+                replica_identity: ReplicaIdentity::Default,
+                key_columns: vec![],
+            },
+            EventType::Truncate(vec![]),
+            EventType::Begin {
+                transaction_id: 1,
+                final_lsn: Lsn::new(1),
+                commit_timestamp: ts,
+            },
+            EventType::Commit {
+                commit_timestamp: ts,
+                commit_lsn: Lsn::new(1),
+                end_lsn: Lsn::new(2),
+            },
+            EventType::StreamStart {
+                transaction_id: 1,
+                first_segment: true,
+            },
+            EventType::StreamStop,
+            EventType::StreamCommit {
+                transaction_id: 1,
+                commit_lsn: Lsn::new(1),
+                end_lsn: Lsn::new(2),
+                commit_timestamp: ts,
+            },
+            EventType::StreamAbort {
+                transaction_id: 1,
+                subtransaction_xid: 0,
+                abort_lsn: None,
+                abort_timestamp: None,
+            },
+            EventType::Relation,
+            EventType::Type,
+            EventType::Origin,
+            EventType::Message,
+        ];
+
+        for v in &variants {
+            let debug = format!("{v:?}");
+            assert!(!debug.is_empty());
+        }
     }
 }
