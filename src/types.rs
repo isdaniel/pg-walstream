@@ -1157,7 +1157,7 @@ impl ChangeEvent {
                 let transaction_id = reader.read_u32()?;
                 let final_lsn = Lsn(reader.read_u64()?);
                 let ts_micros = reader.read_i64()?;
-                let commit_timestamp = micros_to_chrono(ts_micros);
+                let commit_timestamp = micros_to_chrono(ts_micros)?;
                 EventType::Begin {
                     transaction_id,
                     final_lsn,
@@ -1166,7 +1166,7 @@ impl ChangeEvent {
             }
             message_types::COMMIT => {
                 let ts_micros = reader.read_i64()?;
-                let commit_timestamp = micros_to_chrono(ts_micros);
+                let commit_timestamp = micros_to_chrono(ts_micros)?;
                 let commit_lsn = Lsn(reader.read_u64()?);
                 let end_lsn = Lsn(reader.read_u64()?);
                 EventType::Commit {
@@ -1189,7 +1189,7 @@ impl ChangeEvent {
                 let commit_lsn = Lsn(reader.read_u64()?);
                 let end_lsn = Lsn(reader.read_u64()?);
                 let ts_micros = reader.read_i64()?;
-                let commit_timestamp = micros_to_chrono(ts_micros);
+                let commit_timestamp = micros_to_chrono(ts_micros)?;
                 EventType::StreamCommit {
                     transaction_id,
                     commit_lsn,
@@ -1208,7 +1208,7 @@ impl ChangeEvent {
                 };
                 let has_ts = reader.read_u8()?;
                 let abort_timestamp = if has_ts != 0 {
-                    Some(micros_to_chrono(reader.read_i64()?))
+                    Some(micros_to_chrono(reader.read_i64()?)?)
                 } else {
                     None
                 };
@@ -1261,13 +1261,19 @@ fn decode_string(reader: &mut BufferReader) -> Result<String> {
 }
 
 /// Convert Unix timestamp microseconds to chrono DateTime.
-fn micros_to_chrono(micros: i64) -> chrono::DateTime<chrono::Utc> {
+///
+/// Returns an error if the value is outside the representable range
+/// (e.g. from a corrupted binary message) instead of silently falling
+/// back to the Unix epoch.
+fn micros_to_chrono(micros: i64) -> Result<chrono::DateTime<chrono::Utc>> {
     use chrono::{TimeZone, Utc};
     let secs = micros.div_euclid(1_000_000);
     let subsec_nanos = (micros.rem_euclid(1_000_000) as u32) * 1000;
     Utc.timestamp_opt(secs, subsec_nanos)
         .single()
-        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap())
+        .ok_or_else(|| {
+            ReplicationError::protocol(format!("timestamp {micros} µs out of representable range"))
+        })
 }
 
 #[cfg(test)]
@@ -2164,22 +2170,34 @@ mod tests {
     #[test]
     fn test_micros_to_chrono_zero() {
         // Zero micros = Unix epoch
-        let dt = micros_to_chrono(0);
+        let dt = micros_to_chrono(0).unwrap();
         assert_eq!(dt, Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap());
     }
 
     #[test]
     fn test_micros_to_chrono_negative() {
         // Negative micros = before Unix epoch
-        let dt = micros_to_chrono(-1_000_000);
+        let dt = micros_to_chrono(-1_000_000).unwrap();
         assert_eq!(dt, Utc.with_ymd_and_hms(1969, 12, 31, 23, 59, 59).unwrap());
     }
 
     #[test]
     fn test_micros_to_chrono_with_subsecond() {
-        let dt = micros_to_chrono(1_500_000); // 1.5 seconds
+        let dt = micros_to_chrono(1_500_000).unwrap(); // 1.5 seconds
         assert_eq!(dt.timestamp(), 1);
         assert_eq!(dt.timestamp_subsec_micros(), 500_000);
+    }
+
+    #[test]
+    fn test_micros_to_chrono_out_of_range() {
+        // i64::MAX µs is far beyond what chrono can represent — must return Err
+        let result = micros_to_chrono(i64::MAX);
+        assert!(result.is_err(), "expected Err for i64::MAX, got {result:?}");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("out of representable range"),
+            "unexpected error message: {msg}"
+        );
     }
 
     #[test]
