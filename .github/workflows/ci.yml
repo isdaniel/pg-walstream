@@ -251,6 +251,18 @@ jobs:
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Verify tag is on main branch
+      run: |
+        git fetch origin main
+        if git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+          echo "Tag commit is on main branch — proceeding with publish."
+        else
+          echo "Error: Tag is NOT on the main branch. Publishing is only allowed from main."
+          exit 1
+        fi
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
