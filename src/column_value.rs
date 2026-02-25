@@ -8,9 +8,9 @@
 use crate::buffer::BufferReader;
 use crate::error::{ReplicationError, Result};
 use bytes::{Bytes, BytesMut};
+use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use serde::ser::SerializeMap;
 
 /// Encode a byte slice as lowercase hex string.
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
