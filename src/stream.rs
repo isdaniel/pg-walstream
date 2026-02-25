@@ -13,10 +13,11 @@
 //! you can easily wrap it using `futures::stream::unfold`. See the EventStream
 //! documentation for an example.
 
+use crate::column_value::{ColumnValue, RowData};
 use crate::error::{ReplicationError, Result};
 use crate::lsn::SharedLsnFeedback;
 use crate::types::{
-    ChangeEvent, EventType, Lsn, ReplicaIdentity, ReplicationSlotOptions, RowData, SlotType,
+    ChangeEvent, EventType, Lsn, ReplicaIdentity, ReplicationSlotOptions, SlotType,
 };
 use crate::{
     format_lsn, parse_keepalive_message, postgres_timestamp_to_chrono, BufferReader,
@@ -1954,7 +1955,11 @@ async fn timeout_or_error<T>(
     }
 }
 
-/// Convert tuple data to a RowData for ChangeEvent
+/// Convert tuple data to a [`RowData`] for [`ChangeEvent`].
+///
+/// Text columns become [`ColumnValue::Text`] (zero-copy), binary columns
+/// become [`ColumnValue::Binary`], and null/unknown become [`ColumnValue::Null`].
+/// Unchanged TOAST columns are skipped.
 #[inline]
 fn tuple_to_data(tuple: &TupleData, relation: &RelationInfo) -> Result<RowData> {
     let mut data = RowData::with_capacity(tuple.columns.len());
@@ -1965,16 +1970,13 @@ fn tuple_to_data(tuple: &TupleData, relation: &RelationInfo) -> Result<RowData> 
         }
         if let Some(column_info) = relation.get_column_by_index(i) {
             let value = if column_data.is_null() {
-                serde_json::Value::Null
+                ColumnValue::Null
             } else if column_data.is_text() {
-                let text = column_data.as_str().unwrap_or_default();
-                serde_json::Value::String(text.into_owned())
+                ColumnValue::text_bytes(column_data.raw_bytes())
             } else if column_data.is_binary() {
-                // For binary data, convert to hex string
-                let hex_string = hex_encode(column_data.as_bytes());
-                serde_json::Value::String(format!("\\x{hex_string}"))
+                ColumnValue::binary_bytes(column_data.raw_bytes())
             } else {
-                serde_json::Value::Null
+                ColumnValue::Null
             };
 
             data.push(Arc::clone(&column_info.name), value);
@@ -1984,23 +1986,11 @@ fn tuple_to_data(tuple: &TupleData, relation: &RelationInfo) -> Result<RowData> 
     Ok(data)
 }
 
-// Simple hex encoding implementation to avoid adding another dependency
-fn hex_encode(bytes: &[u8]) -> String {
-    const LUT: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-
-    for &byte in bytes {
-        out.push(LUT[(byte >> 4) as usize] as char);
-        out.push(LUT[(byte & 0x0f) as usize] as char);
-    }
-
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{parse_lsn, ReplicaIdentity, RowData};
+    use crate::column_value::{ColumnValue, RowData};
+    use crate::types::{parse_lsn, ReplicaIdentity};
 
     /// Helper function to create a test configuration
     fn create_test_config() -> ReplicationStreamConfig {
@@ -2221,8 +2211,8 @@ mod tests {
     #[test]
     fn test_change_event_insert_creation() {
         let data = RowData::from_pairs(vec![
-            ("id", serde_json::json!(1)),
-            ("name", serde_json::json!("Alice")),
+            ("id", ColumnValue::text("1")),
+            ("name", ColumnValue::text("Alice")),
         ]);
 
         let event = ChangeEvent::insert("public", "users", 16384, data.clone(), Lsn::new(1000));
@@ -2248,13 +2238,13 @@ mod tests {
     #[test]
     fn test_change_event_update_creation() {
         let old_data = RowData::from_pairs(vec![
-            ("id", serde_json::json!(1)),
-            ("name", serde_json::json!("Alice")),
+            ("id", ColumnValue::text("1")),
+            ("name", ColumnValue::text("Alice")),
         ]);
 
         let new_data = RowData::from_pairs(vec![
-            ("id", serde_json::json!(1)),
-            ("name", serde_json::json!("Bob")),
+            ("id", ColumnValue::text("1")),
+            ("name", ColumnValue::text("Bob")),
         ]);
 
         let event = ChangeEvent::update(
@@ -2292,7 +2282,7 @@ mod tests {
 
     #[test]
     fn test_change_event_delete_creation() {
-        let old_data = RowData::from_pairs(vec![("id", serde_json::json!(1))]);
+        let old_data = RowData::from_pairs(vec![("id", ColumnValue::text("1"))]);
 
         let event = ChangeEvent::delete(
             "public",
@@ -2369,14 +2359,6 @@ mod tests {
         let tuple = TupleData::new(vec![crate::protocol::ColumnData::text(Vec::new())]);
         let data = tuple_to_data(&tuple, &relation).unwrap();
         assert_eq!(data.get("col1").unwrap(), "");
-    }
-
-    #[test]
-    fn test_hex_encoding() {
-        assert_eq!(hex_encode(&[0x00, 0x01, 0x02]), "000102");
-        assert_eq!(hex_encode(&[0xff, 0xfe, 0xfd]), "fffefd");
-        assert_eq!(hex_encode(&[]), "");
-        assert_eq!(hex_encode(&[0x12, 0x34, 0x56, 0x78]), "12345678");
     }
 
     #[test]
@@ -2797,8 +2779,8 @@ mod tests {
     #[test]
     fn test_change_event_with_null_values() {
         let data = RowData::from_pairs(vec![
-            ("id", serde_json::json!(1)),
-            ("nullable_field", serde_json::json!(null)),
+            ("id", ColumnValue::text("1")),
+            ("nullable_field", ColumnValue::Null),
         ]);
 
         let event = ChangeEvent::insert(
@@ -2811,11 +2793,8 @@ mod tests {
 
         match event.event_type {
             EventType::Insert { data, .. } => {
-                assert_eq!(data.get("id").unwrap(), &serde_json::json!(1));
-                assert_eq!(
-                    data.get("nullable_field").unwrap(),
-                    &serde_json::json!(null)
-                );
+                assert_eq!(data.get("id").unwrap(), &ColumnValue::text("1"));
+                assert_eq!(data.get("nullable_field").unwrap(), &ColumnValue::Null);
             }
             _ => panic!("Expected Insert event"),
         }
@@ -2997,26 +2976,6 @@ mod tests {
         assert!(d4 <= Duration::from_millis(500));
     }
 
-    #[test]
-    fn test_hex_encode_various_inputs() {
-        // Empty
-        assert_eq!(hex_encode(&[]), "");
-
-        // Single byte
-        assert_eq!(hex_encode(&[0x00]), "00");
-        assert_eq!(hex_encode(&[0xff]), "ff");
-
-        // Multiple bytes
-        assert_eq!(hex_encode(&[0x12, 0x34]), "1234");
-        assert_eq!(hex_encode(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
-
-        // All zeros
-        assert_eq!(hex_encode(&[0x00, 0x00, 0x00]), "000000");
-
-        // All ones
-        assert_eq!(hex_encode(&[0xff, 0xff, 0xff]), "ffffff");
-    }
-
     #[tokio::test]
     async fn test_cancellation_token_async_cancel() {
         let token = CancellationToken::new();
@@ -3108,9 +3067,9 @@ mod tests {
     fn test_full_change_event_lifecycle() {
         // Test complete lifecycle: insert -> update -> delete
         let insert_data = RowData::from_pairs(vec![
-            ("id", serde_json::json!(1)),
-            ("name", serde_json::json!("Alice")),
-            ("email", serde_json::json!("alice@example.com")),
+            ("id", ColumnValue::text("1")),
+            ("name", ColumnValue::text("Alice")),
+            ("email", ColumnValue::text("alice@example.com")),
         ]);
 
         let insert_event = ChangeEvent::insert(
@@ -3125,9 +3084,9 @@ mod tests {
 
         // Update event
         let update_data = RowData::from_pairs(vec![
-            ("id", serde_json::json!(1)),
-            ("name", serde_json::json!("Alice")),
-            ("email", serde_json::json!("alice.new@example.com")),
+            ("id", ColumnValue::text("1")),
+            ("name", ColumnValue::text("Alice")),
+            ("email", ColumnValue::text("alice.new@example.com")),
         ]);
 
         let update_event = ChangeEvent::update(
@@ -3144,7 +3103,7 @@ mod tests {
         assert_eq!(update_event.lsn.value(), 2000);
 
         // Delete event
-        let delete_key = RowData::from_pairs(vec![("id", serde_json::json!(1))]);
+        let delete_key = RowData::from_pairs(vec![("id", ColumnValue::text("1"))]);
 
         let delete_event = ChangeEvent::delete(
             "public",
@@ -3283,8 +3242,8 @@ mod tests {
 
         // Create multiple event types for same relation
         let insert_data = RowData::from_pairs(vec![
-            ("order_id", serde_json::json!(100)),
-            ("amount", serde_json::json!(99.99)),
+            ("order_id", ColumnValue::text("100")),
+            ("amount", ColumnValue::text("99.99")),
         ]);
 
         let insert = ChangeEvent::insert(
@@ -3296,8 +3255,8 @@ mod tests {
         );
 
         let update_data = RowData::from_pairs(vec![
-            ("order_id", serde_json::json!(100)),
-            ("amount", serde_json::json!(89.99)),
+            ("order_id", ColumnValue::text("100")),
+            ("amount", ColumnValue::text("89.99")),
         ]);
 
         let update = ChangeEvent::update(
@@ -3490,8 +3449,8 @@ mod tests {
     #[test]
     fn test_event_with_unicode_data() {
         let data = RowData::from_pairs(vec![
-            ("name", serde_json::json!("Alice 中文 émoji 😀")),
-            ("description", serde_json::json!("Test with ñ, ü, ö")),
+            ("name", ColumnValue::text("Alice 中文 émoji 😀")),
+            ("description", ColumnValue::text("Test with ñ, ü, ö")),
         ]);
 
         let event = ChangeEvent::insert("public", "users", 12345, data.clone(), Lsn::new(1000));
@@ -3502,11 +3461,11 @@ mod tests {
             } => {
                 assert_eq!(
                     event_data.get("name").unwrap(),
-                    &serde_json::json!("Alice 中文 émoji 😀")
+                    &ColumnValue::text("Alice 中文 émoji 😀")
                 );
                 assert_eq!(
                     event_data.get("description").unwrap(),
-                    &serde_json::json!("Test with ñ, ü, ö")
+                    &ColumnValue::text("Test with ñ, ü, ö")
                 );
             }
             _ => panic!("Expected insert"),
@@ -3554,17 +3513,6 @@ mod tests {
         assert!(child1.is_cancelled());
         assert!(child2.is_cancelled());
         assert!(grandchild.is_cancelled());
-    }
-
-    #[test]
-    fn test_hex_encoding_edge_cases() {
-        // Test with repeating patterns
-        assert_eq!(hex_encode(&[0xaa, 0xaa, 0xaa]), "aaaaaa");
-        assert_eq!(hex_encode(&[0x55, 0x55, 0x55]), "555555");
-
-        // Test with single bits
-        assert_eq!(hex_encode(&[0x01, 0x02, 0x04, 0x08]), "01020408");
-        assert_eq!(hex_encode(&[0x10, 0x20, 0x40, 0x80]), "10204080");
     }
 
     #[test]
@@ -3698,8 +3646,9 @@ mod tests {
         let tuple = TupleData::new(vec![ColumnData::binary(vec![0xDE, 0xAD, 0xBE, 0xEF])]);
 
         let data = tuple_to_data(&tuple, &relation).unwrap();
-        let val = data.get("binary_col").unwrap().as_str().unwrap();
-        assert_eq!(val, "\\xdeadbeef");
+        let val = data.get("binary_col").unwrap();
+        assert!(matches!(val, ColumnValue::Binary(_)));
+        assert_eq!(val.as_bytes(), &[0xDE, 0xAD, 0xBE, 0xEF]);
     }
 
     #[test]
@@ -3712,7 +3661,7 @@ mod tests {
         let tuple = TupleData::new(vec![ColumnData::null()]);
 
         let data = tuple_to_data(&tuple, &relation).unwrap();
-        assert_eq!(data.get("nullable").unwrap(), &serde_json::Value::Null);
+        assert_eq!(data.get("nullable").unwrap(), &ColumnValue::Null);
     }
 
     #[test]
@@ -4936,13 +4885,6 @@ mod tests {
         // send_feedback should return Ok(()) when last_received_lsn is 0
         let result = stream.send_feedback().await;
         assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_hex_encode() {
-        assert_eq!(super::hex_encode(&[]), "");
-        assert_eq!(super::hex_encode(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
-        assert_eq!(super::hex_encode(&[0x00, 0xff]), "00ff");
     }
 
     #[test]

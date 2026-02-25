@@ -16,8 +16,7 @@ categories = ["database", "parsing", "network-programming"]
 tokio = { version = "1.49.0", features = ["io-util", "net", "time", "macros"] }
 tokio-util = { version = "0.7.18", features = ["compat"] }
 serde = { version = "1.0.228", features = ["derive", "rc"] }
-serde_json = "1.0.149"
-chrono = { version = "0.4.43", features = ["serde"] }
+chrono = { version = "0.4.44", features = ["serde"] }
 bytes = "1.11.1"
 tracing = "0.1.44"
 libpq-sys = "0.8"
@@ -27,8 +26,9 @@ thiserror = "2.0.18"
 default = []
 
 [dev-dependencies]
-tokio = { version = "1.47.2", features = ["full"] }
+tokio = { version = "1.49.0", features = ["full"] }
 criterion = { version = "0.8.2", features = ["html_reports"] }
+serde_json = "1.0.149"
 
 [[test]]
 name = "snapshot_export"
@@ -42,6 +42,10 @@ path = "integration-tests/rate_limited_streaming.rs"
 name = "safe_transaction_consumer"
 path = "integration-tests/safe_transaction_consumer.rs"
 
+[[test]]
+name = "complex_types"
+path = "integration-tests/complex_types.rs"
+
 [[bench]]
-name = "rowdata_vs_hashmap"
+name = "columnvalue_vs_json"
 harness = false
