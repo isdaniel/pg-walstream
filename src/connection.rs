@@ -348,7 +348,7 @@ impl PgReplicationConnection {
 
     /// Send feedback to the server (standby status update)
     pub async fn send_standby_status_update(
-        &self,
+        &mut self,
         received_lsn: XLogRecPtr,
         flushed_lsn: XLogRecPtr,
         applied_lsn: XLogRecPtr,
@@ -585,7 +585,7 @@ impl PgReplicationConnection {
     ///
     /// Uses `AsyncFd::writable()` to avoid blocking the executor thread while
     /// waiting for the socket to become writable during `PQflush`.
-    async fn put_copy_data_and_flush(&self, data: &[u8]) -> Result<()> {
+    async fn put_copy_data_and_flush(&mut self, data: &[u8]) -> Result<()> {
         let result = unsafe {
             PQputCopyData(
                 self.conn,
@@ -822,7 +822,7 @@ impl PgReplicationConnection {
 
     /// Send hot standby feedback message to the server
     pub async fn send_hot_standby_feedback(
-        &self,
+        &mut self,
         xmin: u32,
         xmin_epoch: u32,
         catalog_xmin: u32,
@@ -979,6 +979,7 @@ impl Drop for PgReplicationConnection {
 }
 
 // Make the connection Send by ensuring exclusive access
+// # Safety: `PgReplicationConnection` wraps `*mut PGconn` which is neither `Send` nor `Sync` by default because of the raw pointer.  We implement `Send` manually because the connection can safely be moved to another thread.  All access goes through `&mut self`, so only one task ever touches the libpq handle at a time.
 unsafe impl Send for PgReplicationConnection {}
 
 #[cfg(test)]
@@ -1060,6 +1061,9 @@ impl Drop for PgResult {
         }
     }
 }
+
+// # Safety: `PgResult` wraps `*mut PGresult`.  It is only created and consumed within synchronous code paths (no `.await` while a `PgResult` is live), but the compiler may conservatively include it in generator state.  `Send` is sufficient because the result is never shared — it is always owned by a single task.
+unsafe impl Send for PgResult {}
 
 #[cfg(test)]
 mod tests {

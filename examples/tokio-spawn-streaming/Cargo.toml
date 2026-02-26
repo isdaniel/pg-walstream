@@ -1,0 +1,12 @@
+[package]
+name = "tokio-spawn-streaming"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Demonstrates running LogicalReplicationStream inside tokio::spawn (Send-safe)"
+
+[dependencies]
+pg_walstream = { path = "../.." }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+tokio = { version = "1.49.0", features = ["full"] }

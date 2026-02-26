@@ -1992,6 +1992,21 @@ mod tests {
     use crate::column_value::{ColumnValue, RowData};
     use crate::types::{parse_lsn, ReplicaIdentity};
 
+    // ========================================
+    // Compile-time Send/Sync assertions
+    // ========================================
+    // These ensure that key types can be used inside tokio::spawn.
+    const _: () = {
+        fn assert_send<T: Send>() {}
+
+        fn assertions() {
+            assert_send::<PgReplicationConnection>();
+            assert_send::<crate::connection::PgResult>();
+            assert_send::<LogicalReplicationStream>();
+            assert_send::<EventStream>();
+        }
+    };
+
     /// Helper function to create a test configuration
     fn create_test_config() -> ReplicationStreamConfig {
         ReplicationStreamConfig::new(
