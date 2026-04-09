@@ -36,6 +36,7 @@ use crate::types::{
     format_lsn, system_time_to_postgres_timestamp, BaseBackupOptions, ReplicationSlotOptions,
     SlotType, XLogRecPtr,
 };
+use bytes::Bytes;
 use libpq_sys::*;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
@@ -87,8 +88,8 @@ pub use crate::types::INVALID_XLOG_REC_PTR;
 /// Result of attempting to read from libpq's internal buffer
 #[derive(Debug)]
 enum ReadResult {
-    /// Successfully read complete data
-    Data(Vec<u8>),
+    /// Successfully read complete data (zero-copy Bytes from libpq buffer)
+    Data(Bytes),
     /// No complete message available (would block)
     WouldBlock,
     /// COPY stream has ended gracefully
@@ -416,13 +417,13 @@ impl PgReplicationConnection {
     /// * `cancellation_token` - Cancellation token to abort the operation
     ///
     /// # Returns
-    /// * `Ok(data)` - Successfully received data
+    /// * `Ok(data)` - Successfully received data as zero-copy Bytes
     /// * `Err(ReplicationError::Cancelled(_))` - Operation was cancelled or COPY stream ended
     /// * `Err(_)` - Other errors occurred (connection issues, protocol errors)
     pub async fn get_copy_data_async(
         &mut self,
         cancellation_token: &CancellationToken,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Bytes> {
         self.ensure_replication_mode()?;
 
         let async_fd = self
@@ -530,8 +531,9 @@ impl PgReplicationConnection {
                     ));
                 }
 
-                let data =
-                    unsafe { slice::from_raw_parts(buffer as *const u8, len as usize).to_vec() };
+                let data = Bytes::copy_from_slice(unsafe {
+                    slice::from_raw_parts(buffer as *const u8, len as usize)
+                });
 
                 // Free the buffer allocated by PostgreSQL
                 unsafe { PQfreemem(buffer as *mut c_void) };

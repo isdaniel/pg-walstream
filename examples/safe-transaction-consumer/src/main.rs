@@ -310,7 +310,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Process events until cancelled
     loop {
-        match event_stream.next().await {
+        match event_stream.next_event().await {
             Ok(event) => {
                 message_count += 1;
                 consumer.process_event(event).await;

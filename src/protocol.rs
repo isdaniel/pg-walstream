@@ -651,6 +651,33 @@ impl LogicalReplicationParser {
         }
 
         let mut reader = BufferReader::new(data);
+        self.parse_wal_message_from_reader(&mut reader)
+    }
+
+    /// Parse a WAL data message from pre-existing Bytes (zero-copy)
+    ///
+    /// This avoids the copy that `parse_wal_message(&[u8])` performs when
+    /// constructing the internal `BufferReader`. Use this when you already
+    /// have a `Bytes` handle (e.g. from `BufferReader::read_bytes_buf`).
+    #[inline]
+    pub fn parse_wal_message_bytes(
+        &mut self,
+        data: bytes::Bytes,
+    ) -> Result<StreamingReplicationMessage> {
+        if data.is_empty() {
+            return Err(ReplicationError::protocol("Empty WAL message".to_string()));
+        }
+
+        let mut reader = BufferReader::from_bytes(data);
+        self.parse_wal_message_from_reader(&mut reader)
+    }
+
+    /// Shared implementation for both `parse_wal_message` and `parse_wal_message_bytes`.
+    #[inline]
+    fn parse_wal_message_from_reader(
+        &mut self,
+        reader: &mut BufferReader,
+    ) -> Result<StreamingReplicationMessage> {
         let message_type = reader.read_u8()?;
 
         debug!(
@@ -659,18 +686,18 @@ impl LogicalReplicationParser {
         );
 
         let message = match message_type {
-            message_types::BEGIN => self.parse_begin_message(&mut reader)?,
-            message_types::COMMIT => self.parse_commit_message(&mut reader)?,
-            message_types::RELATION => self.parse_relation_message(&mut reader)?,
-            message_types::INSERT => self.parse_insert_message(&mut reader)?,
-            message_types::UPDATE => self.parse_update_message(&mut reader)?,
-            message_types::DELETE => self.parse_delete_message(&mut reader)?,
-            message_types::TRUNCATE => self.parse_truncate_message(&mut reader)?,
-            message_types::TYPE => self.parse_type_message(&mut reader)?,
-            message_types::ORIGIN => self.parse_origin_message(&mut reader)?,
-            message_types::MESSAGE => self.parse_message(&mut reader)?,
+            message_types::BEGIN => self.parse_begin_message(reader)?,
+            message_types::COMMIT => self.parse_commit_message(reader)?,
+            message_types::RELATION => self.parse_relation_message(reader)?,
+            message_types::INSERT => self.parse_insert_message(reader)?,
+            message_types::UPDATE => self.parse_update_message(reader)?,
+            message_types::DELETE => self.parse_delete_message(reader)?,
+            message_types::TRUNCATE => self.parse_truncate_message(reader)?,
+            message_types::TYPE => self.parse_type_message(reader)?,
+            message_types::ORIGIN => self.parse_origin_message(reader)?,
+            message_types::MESSAGE => self.parse_message(reader)?,
             message_types::STREAM_START => {
-                let msg = self.parse_stream_start_message(&mut reader)?;
+                let msg = self.parse_stream_start_message(reader)?;
                 self.streaming_context =
                     if let LogicalReplicationMessage::StreamStart { xid, .. } = &msg {
                         Some(*xid)
@@ -680,19 +707,19 @@ impl LogicalReplicationParser {
                 msg
             }
             message_types::STREAM_STOP => {
-                let msg = self.parse_stream_stop_message(&mut reader)?;
+                let msg = self.parse_stream_stop_message(reader)?;
                 self.streaming_context = None;
                 msg
             }
-            message_types::STREAM_COMMIT => self.parse_stream_commit_message(&mut reader)?,
-            message_types::STREAM_ABORT => self.parse_stream_abort_message(&mut reader)?,
-            message_types::BEGIN_PREPARE => self.parse_begin_prepare_message(&mut reader)?,
-            message_types::PREPARE => self.parse_prepare_message(&mut reader)?,
-            message_types::COMMIT_PREPARED => self.parse_commit_prepared_message(&mut reader)?,
+            message_types::STREAM_COMMIT => self.parse_stream_commit_message(reader)?,
+            message_types::STREAM_ABORT => self.parse_stream_abort_message(reader)?,
+            message_types::BEGIN_PREPARE => self.parse_begin_prepare_message(reader)?,
+            message_types::PREPARE => self.parse_prepare_message(reader)?,
+            message_types::COMMIT_PREPARED => self.parse_commit_prepared_message(reader)?,
             message_types::ROLLBACK_PREPARED => {
-                self.parse_rollback_prepared_message(&mut reader)?
+                self.parse_rollback_prepared_message(reader)?
             }
-            message_types::STREAM_PREPARE => self.parse_stream_prepare_message(&mut reader)?,
+            message_types::STREAM_PREPARE => self.parse_stream_prepare_message(reader)?,
             _ => {
                 return Err(ReplicationError::protocol(format!(
                     "Unknown message type: {} ('{}')",
