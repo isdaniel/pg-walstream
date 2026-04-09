@@ -716,9 +716,7 @@ impl LogicalReplicationParser {
             message_types::BEGIN_PREPARE => self.parse_begin_prepare_message(reader)?,
             message_types::PREPARE => self.parse_prepare_message(reader)?,
             message_types::COMMIT_PREPARED => self.parse_commit_prepared_message(reader)?,
-            message_types::ROLLBACK_PREPARED => {
-                self.parse_rollback_prepared_message(reader)?
-            }
+            message_types::ROLLBACK_PREPARED => self.parse_rollback_prepared_message(reader)?,
             message_types::STREAM_PREPARE => self.parse_stream_prepare_message(reader)?,
             _ => {
                 return Err(ReplicationError::protocol(format!(
@@ -2875,5 +2873,208 @@ mod tests {
         // Check if values are tracked
         assert!(!state.lsn_has_changed(500, 300));
         assert!(state.lsn_has_changed(600, 300));
+    }
+
+    // ========================================
+    // parse_wal_message_bytes tests (zero-copy Bytes path)
+    // ========================================
+
+    #[test]
+    fn test_parse_wal_message_bytes_empty() {
+        use bytes::Bytes;
+        let mut parser = LogicalReplicationParser::with_protocol_version(2);
+        let result = parser.parse_wal_message_bytes(Bytes::new());
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Empty WAL message"));
+    }
+
+    #[test]
+    fn test_parse_wal_message_bytes_begin() {
+        use bytes::Bytes;
+        let mut parser = LogicalReplicationParser::with_protocol_version(2);
+
+        // Build a Begin message: 'B' + final_lsn(8) + timestamp(8) + xid(4)
+        let mut payload = Vec::new();
+        payload.push(b'B');
+        payload.extend_from_slice(&0x2000u64.to_be_bytes());
+        payload.extend_from_slice(&0i64.to_be_bytes()); // timestamp
+        payload.extend_from_slice(&42u32.to_be_bytes()); // xid
+
+        let bytes = Bytes::from(payload);
+        let result = parser.parse_wal_message_bytes(bytes).unwrap();
+        match result.message {
+            LogicalReplicationMessage::Begin { xid, .. } => {
+                assert_eq!(xid, 42);
+            }
+            _ => panic!("Expected Begin message"),
+        }
+    }
+
+    #[test]
+    fn test_parse_wal_message_bytes_commit() {
+        use bytes::Bytes;
+        let mut parser = LogicalReplicationParser::with_protocol_version(2);
+
+        // Build a Commit message: 'C' + flags(1) + commit_lsn(8) + end_lsn(8) + timestamp(8)
+        let mut payload = Vec::new();
+        payload.push(b'C');
+        payload.push(0u8); // flags
+        payload.extend_from_slice(&0x3000u64.to_be_bytes()); // commit_lsn
+        payload.extend_from_slice(&0x3100u64.to_be_bytes()); // end_lsn
+        payload.extend_from_slice(&0i64.to_be_bytes()); // timestamp
+
+        let bytes = Bytes::from(payload);
+        let result = parser.parse_wal_message_bytes(bytes).unwrap();
+        match result.message {
+            LogicalReplicationMessage::Commit {
+                commit_lsn,
+                end_lsn,
+                ..
+            } => {
+                assert_eq!(commit_lsn, 0x3000);
+                assert_eq!(end_lsn, 0x3100);
+            }
+            _ => panic!("Expected Commit message"),
+        }
+    }
+
+    #[test]
+    fn test_parse_wal_message_bytes_insert() {
+        use bytes::Bytes;
+        let mut parser = LogicalReplicationParser::with_protocol_version(2);
+
+        // First register a relation
+        let mut rel = Vec::new();
+        rel.push(b'R');
+        rel.extend_from_slice(&100u32.to_be_bytes());
+        rel.extend_from_slice(b"public\0");
+        rel.extend_from_slice(b"users\0");
+        rel.push(b'd'); // replica identity
+        rel.extend_from_slice(&1u16.to_be_bytes()); // 1 column
+        rel.push(1u8); // is_key
+        rel.extend_from_slice(b"id\0");
+        rel.extend_from_slice(&23u32.to_be_bytes()); // int4
+        rel.extend_from_slice(&(-1i32).to_be_bytes());
+
+        parser.parse_wal_message(&rel).unwrap();
+
+        // Now build an Insert: 'I' + relation_id(4) + 'N' + ncols(2) + column data
+        let mut ins = Vec::new();
+        ins.push(b'I');
+        ins.extend_from_slice(&100u32.to_be_bytes());
+        ins.push(b'N'); // new tuple
+        ins.extend_from_slice(&1u16.to_be_bytes()); // 1 column
+        ins.push(b't'); // text format
+        ins.extend_from_slice(&3u32.to_be_bytes()); // length
+        ins.extend_from_slice(b"123"); // value
+
+        let bytes = Bytes::from(ins);
+        let result = parser.parse_wal_message_bytes(bytes).unwrap();
+        match result.message {
+            LogicalReplicationMessage::Insert { relation_id, .. } => {
+                assert_eq!(relation_id, 100);
+            }
+            _ => panic!("Expected Insert message"),
+        }
+    }
+
+    #[test]
+    fn test_parse_wal_message_bytes_unknown_type() {
+        use bytes::Bytes;
+        let mut parser = LogicalReplicationParser::with_protocol_version(2);
+
+        // Use an invalid message type byte
+        let bytes = Bytes::from(vec![0xFF, 0, 0, 0, 0]);
+        let result = parser.parse_wal_message_bytes(bytes);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Unknown message type"));
+    }
+
+    #[test]
+    fn test_parse_wal_message_bytes_matches_slice_path() {
+        use bytes::Bytes;
+        let mut parser_bytes = LogicalReplicationParser::with_protocol_version(2);
+        let mut parser_slice = LogicalReplicationParser::with_protocol_version(2);
+
+        // Build a Begin message
+        let mut payload = Vec::new();
+        payload.push(b'B');
+        payload.extend_from_slice(&0x5000u64.to_be_bytes());
+        payload.extend_from_slice(&0i64.to_be_bytes());
+        payload.extend_from_slice(&99u32.to_be_bytes());
+
+        // Parse with both paths — results should match
+        let result_bytes = parser_bytes
+            .parse_wal_message_bytes(Bytes::from(payload.clone()))
+            .unwrap();
+        let result_slice = parser_slice.parse_wal_message(&payload).unwrap();
+
+        // Compare message types
+        match (&result_bytes.message, &result_slice.message) {
+            (
+                LogicalReplicationMessage::Begin {
+                    xid: xid_b,
+                    final_lsn: lsn_b,
+                    ..
+                },
+                LogicalReplicationMessage::Begin {
+                    xid: xid_s,
+                    final_lsn: lsn_s,
+                    ..
+                },
+            ) => {
+                assert_eq!(xid_b, xid_s);
+                assert_eq!(lsn_b, lsn_s);
+            }
+            _ => panic!("Both paths should return Begin"),
+        }
+    }
+
+    #[test]
+    fn test_parse_wal_message_bytes_relation() {
+        use bytes::Bytes;
+        let mut parser = LogicalReplicationParser::with_protocol_version(2);
+
+        let mut rel = Vec::new();
+        rel.push(b'R');
+        rel.extend_from_slice(&200u32.to_be_bytes());
+        rel.extend_from_slice(b"myschema\0");
+        rel.extend_from_slice(b"mytable\0");
+        rel.push(b'f'); // full replica identity
+        rel.extend_from_slice(&2u16.to_be_bytes()); // 2 columns
+                                                    // col 1
+        rel.push(1u8);
+        rel.extend_from_slice(b"col1\0");
+        rel.extend_from_slice(&23u32.to_be_bytes());
+        rel.extend_from_slice(&(-1i32).to_be_bytes());
+        // col 2
+        rel.push(0u8);
+        rel.extend_from_slice(b"col2\0");
+        rel.extend_from_slice(&25u32.to_be_bytes());
+        rel.extend_from_slice(&(-1i32).to_be_bytes());
+
+        let bytes = Bytes::from(rel);
+        let result = parser.parse_wal_message_bytes(bytes).unwrap();
+        match result.message {
+            LogicalReplicationMessage::Relation {
+                relation_id,
+                namespace,
+                relation_name,
+                columns,
+                ..
+            } => {
+                assert_eq!(relation_id, 200);
+                assert_eq!(namespace, "myschema");
+                assert_eq!(relation_name, "mytable");
+                assert_eq!(columns.len(), 2);
+            }
+            _ => panic!("Expected Relation message"),
+        }
     }
 }

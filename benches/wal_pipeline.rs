@@ -221,9 +221,7 @@ fn bench_parse_insert(c: &mut Criterion) {
     group.bench_function("copy_path", |b| {
         let mut parser = LogicalReplicationParser::with_protocol_version(2);
         // Pre-register the relation
-        parser
-            .parse_wal_message(&relation_payload)
-            .unwrap();
+        parser.parse_wal_message(&relation_payload).unwrap();
         b.iter(|| {
             let result = parser
                 .parse_wal_message(black_box(&insert_payload))
@@ -235,9 +233,7 @@ fn bench_parse_insert(c: &mut Criterion) {
     // New: parse_wal_message_bytes(Bytes)
     group.bench_function("zero_copy_path", |b| {
         let mut parser = LogicalReplicationParser::with_protocol_version(2);
-        parser
-            .parse_wal_message(&relation_payload)
-            .unwrap();
+        parser.parse_wal_message(&relation_payload).unwrap();
         b.iter(|| {
             let result = parser
                 .parse_wal_message_bytes(black_box(insert_bytes.clone()))
@@ -350,8 +346,7 @@ fn bench_parse_multi_column(c: &mut Criterion) {
                 let mut parser = LogicalReplicationParser::with_protocol_version(2);
                 parser.parse_wal_message(&relation_payload).unwrap();
                 b.iter(|| {
-                    let mut reader =
-                        BufferReader::from_bytes(black_box(envelope_bytes.clone()));
+                    let mut reader = BufferReader::from_bytes(black_box(envelope_bytes.clone()));
                     let _ = reader.read_u8().unwrap();
                     let _ = reader.read_u64().unwrap();
                     let _ = reader.read_u64().unwrap();
