@@ -1528,4 +1528,144 @@ mod tests {
             r#"CREATE_REPLICATION_SLOT "safe_slot" LOGICAL "bad""plugin";"#
         );
     }
+
+    // ========================================
+    // ReadResult and Bytes integration tests
+    // ========================================
+
+    #[test]
+    fn test_read_result_data_variant_with_bytes() {
+        use bytes::Bytes;
+
+        let data = Bytes::from(vec![1u8, 2, 3, 4, 5]);
+        let result = ReadResult::Data(data.clone());
+
+        match result {
+            ReadResult::Data(b) => {
+                assert_eq!(b.len(), 5);
+                assert_eq!(b[0], 1);
+                assert_eq!(b[4], 5);
+                assert_eq!(b, data);
+            }
+            _ => panic!("Expected ReadResult::Data"),
+        }
+    }
+
+    #[test]
+    fn test_read_result_data_bytes_zero_copy_slice() {
+        use bytes::Bytes;
+
+        // Verify that slicing Bytes from ReadResult::Data is zero-copy
+        let original = Bytes::from(vec![10u8, 20, 30, 40, 50, 60, 70, 80]);
+        let result = ReadResult::Data(original.clone());
+
+        match result {
+            ReadResult::Data(b) => {
+                // Slicing Bytes should produce a reference to the same allocation
+                let slice = b.slice(2..6);
+                assert_eq!(slice, Bytes::from_static(&[30, 40, 50, 60]));
+                assert_eq!(b.len(), 8);
+            }
+            _ => panic!("Expected ReadResult::Data"),
+        }
+    }
+
+    #[test]
+    fn test_read_result_data_empty_bytes() {
+        use bytes::Bytes;
+
+        let result = ReadResult::Data(Bytes::new());
+        match result {
+            ReadResult::Data(b) => {
+                assert!(b.is_empty());
+                assert_eq!(b.len(), 0);
+            }
+            _ => panic!("Expected ReadResult::Data"),
+        }
+    }
+
+    #[test]
+    fn test_read_result_would_block_variant() {
+        let result = ReadResult::WouldBlock;
+        assert!(matches!(result, ReadResult::WouldBlock));
+    }
+
+    #[test]
+    fn test_read_result_copy_done_variant() {
+        let result = ReadResult::CopyDone;
+        assert!(matches!(result, ReadResult::CopyDone));
+    }
+
+    #[test]
+    fn test_read_result_data_bytes_copy_from_slice() {
+        use bytes::Bytes;
+
+        // This mirrors what try_read_buffered_data does: Bytes::copy_from_slice
+        let raw_data: Vec<u8> = (0..100).collect();
+        let bytes = Bytes::copy_from_slice(&raw_data);
+
+        let result = ReadResult::Data(bytes);
+        match result {
+            ReadResult::Data(b) => {
+                assert_eq!(b.len(), 100);
+                for (i, &byte) in b.iter().enumerate() {
+                    assert_eq!(byte, i as u8);
+                }
+            }
+            _ => panic!("Expected ReadResult::Data"),
+        }
+    }
+
+    #[test]
+    fn test_read_result_data_large_payload() {
+        use bytes::Bytes;
+
+        // Test with a 4KB payload (typical WAL message size)
+        let raw_data: Vec<u8> = (0..4096).map(|i| (i % 256) as u8).collect();
+        let bytes = Bytes::copy_from_slice(&raw_data);
+
+        let result = ReadResult::Data(bytes.clone());
+        match result {
+            ReadResult::Data(b) => {
+                assert_eq!(b.len(), 4096);
+                // Sub-slicing should work (zero-copy from Bytes)
+                let header = b.slice(0..25);
+                assert_eq!(header.len(), 25);
+                let payload = b.slice(25..);
+                assert_eq!(payload.len(), 4096 - 25);
+            }
+            _ => panic!("Expected ReadResult::Data"),
+        }
+    }
+
+    #[test]
+    fn test_read_result_debug_format() {
+        use bytes::Bytes;
+
+        let result = ReadResult::Data(Bytes::from_static(b"test"));
+        let debug_str = format!("{:?}", result);
+        assert!(debug_str.contains("Data"));
+
+        let result = ReadResult::WouldBlock;
+        let debug_str = format!("{:?}", result);
+        assert!(debug_str.contains("WouldBlock"));
+
+        let result = ReadResult::CopyDone;
+        let debug_str = format!("{:?}", result);
+        assert!(debug_str.contains("CopyDone"));
+    }
+
+    #[test]
+    fn test_get_copy_data_async_return_type_is_bytes() {
+        // Compile-time assertion that get_copy_data_async returns Result<Bytes>
+        // We can't call it without a real connection, but we verify the signature.
+        fn _assert_return_type<'a>(
+            conn: &'a mut PgReplicationConnection,
+            token: &'a CancellationToken,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::error::Result<bytes::Bytes>> + 'a>,
+        > {
+            Box::pin(conn.get_copy_data_async(token))
+        }
+    }
 }

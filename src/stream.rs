@@ -1594,8 +1594,11 @@ pub struct EventStream {
     shared_feedback: Arc<SharedLsnFeedback>,
     /// In-flight future for `Stream::poll_next`. Created lazily when polled.
     #[allow(clippy::type_complexity)]
-    inflight:
-        Option<std::pin::Pin<Box<dyn Future<Output = (LogicalReplicationStream, Result<ChangeEvent>)> + Send>>>,
+    inflight: Option<
+        std::pin::Pin<
+            Box<dyn Future<Output = (LogicalReplicationStream, Result<ChangeEvent>)> + Send>,
+        >,
+    >,
     /// Whether the stream has terminated (cancelled or permanent error).
     terminated: bool,
 }
@@ -1684,9 +1687,7 @@ impl EventStream {
             .inner
             .as_mut()
             .expect("inner stream is temporarily taken during poll");
-        inner
-            .next_event_with_retry(&self.cancellation_token)
-            .await
+        inner.next_event_with_retry(&self.cancellation_token).await
     }
 
     /// Gracefully shut down the replication stream.
@@ -1908,6 +1909,7 @@ mod tests {
     // Compile-time Send/Sync assertions
     // ========================================
     // These ensure that key types can be used inside tokio::spawn.
+    #[allow(dead_code)]
     const _: () = {
         fn assert_send<T: Send>() {}
 
@@ -6480,16 +6482,19 @@ mod tests {
     // futures::Stream trait tests
     // ========================================
 
-    /// Compile-time assertion that EventStream implements futures_core::Stream
+    /// Compile-time assertion that EventStream implements key traits
+    #[allow(dead_code)]
     const _: () = {
         fn assert_stream<T: futures_core::Stream>() {}
         fn assert_fused_stream<T: futures_core::FusedStream>() {}
         fn assert_unpin<T: Unpin>() {}
+        fn assert_send<T: Send>() {}
 
         fn assertions() {
             assert_stream::<EventStream>();
             assert_fused_stream::<EventStream>();
             assert_unpin::<EventStream>();
+            assert_send::<EventStream>();
         }
     };
 
@@ -6612,5 +6617,680 @@ mod tests {
         event_stream.shutdown().await.ok();
 
         assert!(FusedStream::is_terminated(&event_stream));
+    }
+
+    // ========================================
+    // process_wal_message with Bytes (zero-copy path coverage)
+    // ========================================
+
+    #[test]
+    fn test_process_wal_message_with_bytes_input() {
+        use bytes::Bytes;
+
+        let mut stream = create_test_stream(create_test_config());
+        let payload = build_begin_payload(0x2000, 42);
+        let data = build_wal_message(0x1000, 0x1500, &payload);
+        let bytes_data = Bytes::from(data);
+
+        let result = stream.process_wal_message(bytes_data).unwrap();
+        assert!(result.is_some());
+        let event = result.unwrap();
+        match event.event_type {
+            EventType::Begin { transaction_id, .. } => {
+                assert_eq!(transaction_id, 42);
+            }
+            _ => panic!("Expected Begin event"),
+        }
+        assert_eq!(stream.state.last_received_lsn, 0x1500);
+    }
+
+    #[test]
+    fn test_process_wal_message_bytes_commit() {
+        use bytes::Bytes;
+
+        let mut stream = create_test_stream(create_test_config());
+        let payload = build_commit_payload(0x2000, 0x2100);
+        let data = Bytes::from(build_wal_message(0x1000, 0x1500, &payload));
+
+        let result = stream.process_wal_message(data).unwrap();
+        assert!(result.is_some());
+        match result.unwrap().event_type {
+            EventType::Commit { .. } => {}
+            _ => panic!("Expected Commit event"),
+        }
+    }
+
+    #[test]
+    fn test_process_wal_message_bytes_too_short() {
+        use bytes::Bytes;
+
+        let mut stream = create_test_stream(create_test_config());
+        let data = Bytes::from(vec![b'w'; 10]);
+        let result = stream.process_wal_message(data);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too short"));
+    }
+
+    #[test]
+    fn test_process_wal_message_bytes_no_payload() {
+        use bytes::Bytes;
+
+        let mut stream = create_test_stream(create_test_config());
+        let data = Bytes::from(build_wal_message(0x1000, 0x1500, &[]));
+        let result = stream.process_wal_message(data).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_process_wal_message_bytes_updates_lsn() {
+        use bytes::Bytes;
+
+        let mut stream = create_test_stream(create_test_config());
+        assert_eq!(stream.state.last_received_lsn, 0);
+
+        let payload = build_begin_payload(0x2000, 1);
+        let data = Bytes::from(build_wal_message(0x1000, 0x5000, &payload));
+        let _ = stream.process_wal_message(data);
+        assert_eq!(stream.state.last_received_lsn, 0x5000);
+    }
+
+    #[test]
+    fn test_process_wal_message_bytes_zero_end_lsn() {
+        use bytes::Bytes;
+
+        let mut stream = create_test_stream(create_test_config());
+        stream.state.update_received_lsn(0x3000);
+
+        let payload = build_begin_payload(0x2000, 1);
+        let data = Bytes::from(build_wal_message(0x1000, 0, &payload));
+        let _ = stream.process_wal_message(data);
+        assert_eq!(stream.state.last_received_lsn, 0x3000); // unchanged
+    }
+
+    #[test]
+    fn test_process_wal_message_bytes_relation_then_insert() {
+        use bytes::Bytes;
+
+        let mut stream = create_test_stream(create_test_config());
+
+        // Build Relation payload
+        let mut rel_payload = Vec::new();
+        rel_payload.push(b'R');
+        rel_payload.extend_from_slice(&100u32.to_be_bytes());
+        rel_payload.extend_from_slice(b"public\0");
+        rel_payload.extend_from_slice(b"items\0");
+        rel_payload.push(b'd');
+        rel_payload.extend_from_slice(&1u16.to_be_bytes());
+        rel_payload.push(1u8);
+        rel_payload.extend_from_slice(b"id\0");
+        rel_payload.extend_from_slice(&23u32.to_be_bytes());
+        rel_payload.extend_from_slice(&(-1i32).to_be_bytes());
+
+        let wal = Bytes::from(build_wal_message(0x1000, 0x1500, &rel_payload));
+        let result = stream.process_wal_message(wal).unwrap();
+        assert!(result.is_none()); // Relation messages don't produce events
+
+        // Build Insert payload
+        let mut ins_payload = Vec::new();
+        ins_payload.push(b'I');
+        ins_payload.extend_from_slice(&100u32.to_be_bytes());
+        ins_payload.push(b'N');
+        ins_payload.extend_from_slice(&1u16.to_be_bytes());
+        ins_payload.push(b't');
+        ins_payload.extend_from_slice(&5u32.to_be_bytes());
+        ins_payload.extend_from_slice(b"hello");
+
+        let wal2 = Bytes::from(build_wal_message(0x2000, 0x2500, &ins_payload));
+        let result2 = stream.process_wal_message(wal2).unwrap();
+        assert!(result2.is_some());
+        match result2.unwrap().event_type {
+            EventType::Insert { schema, table, .. } => {
+                assert_eq!(&*schema, "public");
+                assert_eq!(&*table, "items");
+            }
+            _ => panic!("Expected Insert event"),
+        }
+    }
+
+    // ========================================
+    // into_stream() and EventStream construction coverage
+    // ========================================
+
+    #[test]
+    fn test_into_stream_creates_valid_event_stream() {
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+        let cancel_token = CancellationToken::new();
+        let event_stream = stream.into_stream(cancel_token.clone());
+
+        // Verify all fields are properly initialized
+        assert!(event_stream.inner.is_some());
+        assert!(!event_stream.terminated);
+        assert!(event_stream.inflight.is_none());
+        assert!(!event_stream.is_terminated());
+
+        // Shared feedback should work
+        event_stream.update_flushed_lsn(100);
+        let (flushed, _) = event_stream.get_feedback_lsn();
+        assert_eq!(flushed, 100);
+    }
+
+    #[test]
+    fn test_into_stream_shared_feedback_is_cloned() {
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+        let original_feedback = Arc::clone(&stream.shared_lsn_feedback);
+        let cancel_token = CancellationToken::new();
+        let event_stream = stream.into_stream(cancel_token);
+
+        // Updates via event_stream should be visible via the original Arc
+        event_stream.update_applied_lsn(5000);
+        let (flushed, applied) = original_feedback.get_feedback_lsn();
+        assert_eq!(applied, 5000);
+        assert_eq!(flushed, 5000);
+    }
+
+    #[test]
+    fn test_into_stream_inner_accessible() {
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+        let cancel_token = CancellationToken::new();
+        let event_stream = stream.into_stream(cancel_token);
+
+        // inner() should return the stream
+        let inner = event_stream.inner();
+        assert_eq!(inner.current_lsn(), 0);
+    }
+
+    #[test]
+    fn test_into_stream_inner_mut_accessible() {
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+        let cancel_token = CancellationToken::new();
+        let mut event_stream = stream.into_stream(cancel_token);
+
+        // Mutate via inner_mut
+        event_stream.inner_mut().state.update_received_lsn(9999);
+        assert_eq!(event_stream.current_lsn(), 9999);
+    }
+
+    // ========================================
+    // Stream::poll_next coverage
+    // ========================================
+
+    #[tokio::test]
+    async fn test_event_stream_poll_next_terminated_returns_none() {
+        use futures::StreamExt;
+
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+        let cancel_token = CancellationToken::new();
+        let mut event_stream = stream.into_stream(cancel_token);
+
+        // Manually set terminated
+        event_stream.terminated = true;
+
+        // poll_next should return None immediately
+        let result = event_stream.next().await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_event_stream_poll_next_after_shutdown_returns_none() {
+        use futures::StreamExt;
+
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+        let cancel_token = CancellationToken::new();
+        let mut event_stream = stream.into_stream(cancel_token);
+
+        event_stream.shutdown().await.ok();
+        assert!(event_stream.is_terminated());
+
+        // After shutdown, poll_next should return None
+        let result = event_stream.next().await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_event_stream_poll_next_cancel_terminates() {
+        use futures::StreamExt;
+
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+        let cancel_token = CancellationToken::new();
+        let cancel_clone = cancel_token.clone();
+        let mut event_stream = stream.into_stream(cancel_token);
+
+        // Cancel immediately
+        cancel_clone.cancel();
+
+        // poll_next should detect cancellation and return None
+        let result = event_stream.next().await;
+        assert!(result.is_none());
+        assert!(event_stream.is_terminated());
+    }
+
+    #[tokio::test]
+    async fn test_event_stream_poll_next_fused_after_cancel() {
+        use futures::StreamExt;
+        use futures_core::FusedStream;
+
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+        let cancel_token = CancellationToken::new();
+        cancel_token.cancel(); // Pre-cancel
+        let mut event_stream = stream.into_stream(cancel_token);
+
+        assert!(!event_stream.is_terminated());
+
+        // First poll should cancel
+        let _ = event_stream.next().await;
+        assert!(FusedStream::is_terminated(&event_stream));
+
+        // Subsequent polls should return None
+        let result = event_stream.next().await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_event_stream_poll_next_restores_inner_after_cancel() {
+        use futures::StreamExt;
+
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+        let cancel_token = CancellationToken::new();
+        cancel_token.cancel();
+        let mut event_stream = stream.into_stream(cancel_token);
+
+        // Poll to trigger the take/restore cycle
+        let _ = event_stream.next().await;
+
+        // After poll completes, inner should be restored (even though terminated)
+        // The inner is restored on Ready, so it should be Some
+        assert!(event_stream.inner.is_some());
+        assert!(event_stream.inflight.is_none());
+    }
+
+    // ========================================
+    // shutdown() additional coverage
+    // ========================================
+
+    #[tokio::test]
+    async fn test_event_stream_shutdown_clears_inflight() {
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+        let cancel_token = CancellationToken::new();
+        let mut event_stream = stream.into_stream(cancel_token);
+
+        event_stream.shutdown().await.ok();
+
+        assert!(event_stream.inflight.is_none());
+        assert!(event_stream.terminated);
+        assert!(event_stream.inner.is_some()); // inner remains available
+    }
+
+    #[tokio::test]
+    async fn test_event_stream_shutdown_with_inner_none() {
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+        let cancel_token = CancellationToken::new();
+        let mut event_stream = stream.into_stream(cancel_token);
+
+        // Simulate inner being None (as if taken during polling)
+        let taken = event_stream.inner.take();
+
+        let result = event_stream.shutdown().await;
+        assert!(result.is_ok()); // shutdown handles None gracefully
+        assert!(event_stream.terminated);
+
+        // Restore for cleanup
+        event_stream.inner = taken;
+    }
+
+    // ========================================
+    // EventStream next_event() coverage
+    // ========================================
+
+    #[test]
+    fn test_event_stream_next_event_returns_future() {
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+        let cancel_token = CancellationToken::new();
+        let mut event_stream = stream.into_stream(cancel_token);
+
+        // Verify that next_event returns a future (compile-time check)
+        let _fut = event_stream.next_event();
+        // Don't await — we have a null connection
+    }
+
+    // ========================================
+    // process_wal_message impl Into<Bytes> coverage
+    // ========================================
+
+    #[test]
+    fn test_process_wal_message_accepts_vec() {
+        let mut stream = create_test_stream(create_test_config());
+        let payload = build_begin_payload(0x2000, 10);
+        let data: Vec<u8> = build_wal_message(0x1000, 0x1500, &payload);
+
+        // Vec<u8> implements Into<Bytes>
+        let result = stream.process_wal_message(data).unwrap();
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_process_wal_message_accepts_bytes() {
+        use bytes::Bytes;
+
+        let mut stream = create_test_stream(create_test_config());
+        let payload = build_begin_payload(0x2000, 10);
+        let data = Bytes::from(build_wal_message(0x1000, 0x1500, &payload));
+
+        // Bytes implements Into<Bytes> (identity)
+        let result = stream.process_wal_message(data).unwrap();
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_process_wal_message_uses_zero_copy_reader() {
+        use bytes::Bytes;
+
+        let mut stream = create_test_stream(create_test_config());
+
+        // Build a relation + insert to test zero-copy Bytes slicing through the pipeline
+        let mut rel_payload = Vec::new();
+        rel_payload.push(b'R');
+        rel_payload.extend_from_slice(&50u32.to_be_bytes());
+        rel_payload.extend_from_slice(b"test_schema\0");
+        rel_payload.extend_from_slice(b"test_table\0");
+        rel_payload.push(b'd');
+        rel_payload.extend_from_slice(&2u16.to_be_bytes());
+        // col 1
+        rel_payload.push(1u8);
+        rel_payload.extend_from_slice(b"col_a\0");
+        rel_payload.extend_from_slice(&23u32.to_be_bytes());
+        rel_payload.extend_from_slice(&(-1i32).to_be_bytes());
+        // col 2
+        rel_payload.push(0u8);
+        rel_payload.extend_from_slice(b"col_b\0");
+        rel_payload.extend_from_slice(&25u32.to_be_bytes());
+        rel_payload.extend_from_slice(&(-1i32).to_be_bytes());
+
+        let wal = Bytes::from(build_wal_message(0x100, 0x200, &rel_payload));
+        let _ = stream.process_wal_message(wal);
+
+        // Insert with two columns
+        let mut ins = Vec::new();
+        ins.push(b'I');
+        ins.extend_from_slice(&50u32.to_be_bytes());
+        ins.push(b'N');
+        ins.extend_from_slice(&2u16.to_be_bytes());
+        ins.push(b't');
+        ins.extend_from_slice(&2u32.to_be_bytes());
+        ins.extend_from_slice(b"42");
+        ins.push(b't');
+        ins.extend_from_slice(&5u32.to_be_bytes());
+        ins.extend_from_slice(b"world");
+
+        let wal2 = Bytes::from(build_wal_message(0x300, 0x400, &ins));
+        let result = stream.process_wal_message(wal2).unwrap();
+        assert!(result.is_some());
+
+        let event = result.unwrap();
+        match event.event_type {
+            EventType::Insert {
+                schema,
+                table,
+                data,
+                ..
+            } => {
+                assert_eq!(&*schema, "test_schema");
+                assert_eq!(&*table, "test_table");
+                assert_eq!(data.len(), 2);
+            }
+            _ => panic!("Expected Insert"),
+        }
+    }
+
+    // ========================================
+    // poll_next branch coverage via injected inflight futures
+    // ========================================
+
+    /// Helper: create an EventStream and inject a pre-built inflight future
+    /// so that poll_next exercises the result-handling branches without
+    /// needing a real PostgreSQL connection.
+    fn create_event_stream_with_inflight(result: Result<ChangeEvent>) -> EventStream {
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+        let cancel_token = CancellationToken::new();
+        let mut event_stream = stream.into_stream(cancel_token);
+
+        // Take the inner stream and wrap it in a ready future with the desired result
+        let inner = event_stream.inner.take().unwrap();
+        event_stream.inflight = Some(Box::pin(async move { (inner, result) }));
+
+        event_stream
+    }
+
+    #[tokio::test]
+    async fn test_poll_next_ok_event_branch() {
+        use futures::StreamExt;
+
+        let event = ChangeEvent {
+            event_type: EventType::Begin {
+                final_lsn: crate::types::Lsn::new(0x1000),
+                commit_timestamp: chrono::Utc::now(),
+                transaction_id: 42,
+            },
+            lsn: crate::types::Lsn::new(0x1000),
+            metadata: None,
+        };
+
+        let mut event_stream = create_event_stream_with_inflight(Ok(event));
+
+        // poll_next should return Ready(Some(Ok(event)))
+        let result = event_stream.next().await;
+        assert!(result.is_some());
+        let item = result.unwrap();
+        assert!(item.is_ok());
+        let ev = item.unwrap();
+        match ev.event_type {
+            EventType::Begin { transaction_id, .. } => assert_eq!(transaction_id, 42),
+            _ => panic!("Expected Begin event"),
+        }
+
+        // Stream should NOT be terminated after a successful event
+        assert!(!event_stream.is_terminated());
+        // Inner should be restored
+        assert!(event_stream.inner.is_some());
+        assert!(event_stream.inflight.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_poll_next_permanent_error_branch() {
+        use futures::StreamExt;
+
+        let err = ReplicationError::PermanentConnection("fatal error".to_string());
+        let mut event_stream = create_event_stream_with_inflight(Err(err));
+
+        // poll_next should return Ready(Some(Err(...))) and set terminated
+        let result = event_stream.next().await;
+        assert!(result.is_some());
+        let item = result.unwrap();
+        assert!(item.is_err());
+        let e = item.unwrap_err();
+        assert!(e.is_permanent());
+        assert!(e.to_string().contains("fatal error"));
+
+        // Stream SHOULD be terminated after a permanent error
+        assert!(event_stream.is_terminated());
+        // Inner should be restored
+        assert!(event_stream.inner.is_some());
+
+        // Subsequent poll should return None (terminated)
+        let result2 = event_stream.next().await;
+        assert!(result2.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_poll_next_transient_error_branch() {
+        use futures::StreamExt;
+
+        // Protocol error is neither permanent, nor cancelled, nor transient (by enum match) —
+        // it falls through to the catch-all Err(e) arm
+        let err = ReplicationError::Protocol("not in replication mode".to_string());
+        let mut event_stream = create_event_stream_with_inflight(Err(err));
+
+        // poll_next should return Ready(Some(Err(...))) but NOT terminate
+        let result = event_stream.next().await;
+        assert!(result.is_some());
+        let item = result.unwrap();
+        assert!(item.is_err());
+        let e = item.unwrap_err();
+        assert!(!e.is_permanent());
+        assert!(!e.is_cancelled());
+
+        // Stream should NOT be terminated — it's a transient error
+        assert!(!event_stream.is_terminated());
+        // Inner should be restored
+        assert!(event_stream.inner.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_poll_next_cancelled_error_branch() {
+        use futures::StreamExt;
+
+        let err = ReplicationError::Cancelled("user cancelled".to_string());
+        let mut event_stream = create_event_stream_with_inflight(Err(err));
+
+        // poll_next should return Ready(None) and set terminated
+        let result = event_stream.next().await;
+        assert!(result.is_none());
+
+        assert!(event_stream.is_terminated());
+        assert!(event_stream.inner.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_poll_next_authentication_error_is_permanent() {
+        use futures::StreamExt;
+
+        let err = ReplicationError::Authentication("bad credentials".to_string());
+        let mut event_stream = create_event_stream_with_inflight(Err(err));
+
+        let result = event_stream.next().await;
+        assert!(result.is_some());
+        let item = result.unwrap();
+        assert!(item.is_err());
+        assert!(item.unwrap_err().is_permanent());
+
+        assert!(event_stream.is_terminated());
+    }
+
+    #[tokio::test]
+    async fn test_poll_next_slot_error_is_permanent() {
+        use futures::StreamExt;
+
+        let err = ReplicationError::ReplicationSlot("slot does not exist".to_string());
+        let mut event_stream = create_event_stream_with_inflight(Err(err));
+
+        let result = event_stream.next().await;
+        assert!(result.is_some());
+        assert!(result.unwrap().unwrap_err().is_permanent());
+        assert!(event_stream.is_terminated());
+    }
+
+    #[tokio::test]
+    async fn test_poll_next_buffer_error_is_transient_fallthrough() {
+        use futures::StreamExt;
+
+        let err = ReplicationError::Buffer("buffer overflow".to_string());
+        let mut event_stream = create_event_stream_with_inflight(Err(err));
+
+        let result = event_stream.next().await;
+        assert!(result.is_some());
+        let item = result.unwrap();
+        assert!(item.is_err());
+
+        // Buffer errors are neither permanent nor cancelled — stream stays alive
+        assert!(!event_stream.is_terminated());
+    }
+
+    #[tokio::test]
+    async fn test_poll_next_multiple_transient_errors_keep_stream_alive() {
+        use futures::StreamExt;
+
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+        let cancel_token = CancellationToken::new();
+        let mut event_stream = stream.into_stream(cancel_token);
+
+        // Inject first transient error
+        let inner = event_stream.inner.take().unwrap();
+        let err1 = ReplicationError::Protocol("error 1".to_string());
+        event_stream.inflight = Some(Box::pin(async move { (inner, Err(err1)) }));
+
+        let result1 = event_stream.next().await;
+        assert!(result1.is_some());
+        assert!(result1.unwrap().is_err());
+        assert!(!event_stream.is_terminated());
+
+        // Inject second transient error
+        let inner = event_stream.inner.take().unwrap();
+        let err2 = ReplicationError::Buffer("error 2".to_string());
+        event_stream.inflight = Some(Box::pin(async move { (inner, Err(err2)) }));
+
+        let result2 = event_stream.next().await;
+        assert!(result2.is_some());
+        assert!(result2.unwrap().is_err());
+        assert!(!event_stream.is_terminated()); // Still alive after multiple transient errors
+
+        // Now inject a permanent error
+        let inner = event_stream.inner.take().unwrap();
+        let err3 = ReplicationError::PermanentConnection("done".to_string());
+        event_stream.inflight = Some(Box::pin(async move { (inner, Err(err3)) }));
+
+        let result3 = event_stream.next().await;
+        assert!(result3.is_some());
+        assert!(result3.unwrap().is_err());
+        assert!(event_stream.is_terminated()); // Now terminated
+    }
+
+    #[tokio::test]
+    async fn test_poll_next_success_then_cancel() {
+        use futures::StreamExt;
+
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+        let cancel_token = CancellationToken::new();
+        let mut event_stream = stream.into_stream(cancel_token);
+
+        // Inject a successful event
+        let inner = event_stream.inner.take().unwrap();
+        let event = ChangeEvent {
+            event_type: EventType::Commit {
+                commit_lsn: crate::types::Lsn::new(0x2000),
+                end_lsn: crate::types::Lsn::new(0x2100),
+                commit_timestamp: chrono::Utc::now(),
+            },
+            lsn: crate::types::Lsn::new(0x2000),
+            metadata: None,
+        };
+        event_stream.inflight = Some(Box::pin(async move { (inner, Ok(event)) }));
+
+        let result1 = event_stream.next().await;
+        assert!(result1.is_some());
+        assert!(result1.unwrap().is_ok());
+        assert!(!event_stream.is_terminated());
+
+        // Now inject a cancellation
+        let inner = event_stream.inner.take().unwrap();
+        let cancel_err = ReplicationError::Cancelled("shutting down".to_string());
+        event_stream.inflight = Some(Box::pin(async move { (inner, Err(cancel_err)) }));
+
+        let result2 = event_stream.next().await;
+        assert!(result2.is_none());
+        assert!(event_stream.is_terminated());
     }
 }
