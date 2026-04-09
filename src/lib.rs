@@ -13,8 +13,28 @@
 //! - Zero-copy buffer operations using `bytes` crate
 //! - Thread-safe LSN tracking
 //! - **Truly async, non-blocking I/O** - Tasks properly yield to the executor
+//! - **`futures::Stream` trait implementation** - Works with all stream combinators
 //! - **Graceful cancellation** - All operations support cancellation tokens
 //! - Protocol parsing is portable; the connection module uses libpq
+//!
+//! ## Async Stream API
+//!
+//! The `EventStream` type implements both:
+//! - A native `.next_event().await` API for simple usage without trait imports
+//! - The [`futures_core::Stream`] trait for use with stream combinators
+//!
+//! ```ignore
+//! use futures::StreamExt;
+//!
+//! let mut event_stream = stream.into_stream(cancel_token);
+//!
+//! // Use as a futures::Stream with combinators
+//! while let Some(result) = event_stream.next().await {
+//!     let event = result?;
+//!     println!("Event: {:?}", event);
+//!     event_stream.update_applied_lsn(event.lsn.value());
+//! }
+//! ```
 //!
 //! ## Async I/O Performance
 //!
@@ -24,6 +44,7 @@
 //! - When waiting for data from PostgreSQL, the task is suspended and the thread
 //!   is released back to the executor to run other tasks
 //! - Uses `AsyncFd` with proper edge-triggered readiness handling
+//! - Zero-copy `Bytes` throughout the WAL data path
 //! - Supports concurrent processing of multiple replication streams on a single thread
 //! - Enables efficient resource utilization in high-concurrency scenarios
 //!
@@ -70,13 +91,18 @@
 //!     stream.start(None).await?;
 //!
 //!     let cancel_token = CancellationToken::new();
+//!     let mut event_stream = stream.into_stream(cancel_token.clone());
 //!
-//!     // Traditional polling loop with automatic retry
+//!     // Option 1: Use as futures::Stream
+//!     // use futures::StreamExt;
+//!     // while let Some(result) = event_stream.next().await { ... }
+//!
+//!     // Option 2: Use native API
 //!     loop {
-//!         match stream.next_event_with_retry(&cancel_token).await {
+//!         match event_stream.next_event().await {
 //!             Ok(event) => {
 //!                 println!("Received event: {:?}", event);
-//!                 stream.shared_lsn_feedback.update_applied_lsn(event.lsn.value());
+//!                 event_stream.update_applied_lsn(event.lsn.value());
 //!             }
 //!             Err(e) if matches!(e, pg_walstream::ReplicationError::Cancelled(_)) => {
 //!                 println!("Cancelled, shutting down gracefully");
@@ -88,7 +114,10 @@
 //!             }
 //!         }
 //!     }
-//!     
+//!
+//!     // Graceful shutdown
+//!     event_stream.shutdown().await?;
+//!
 //!     Ok(())
 //! }
 //! ```

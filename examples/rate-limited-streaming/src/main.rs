@@ -124,7 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Wrap with futures::stream::unfold to get a proper futures::Stream
     let pg_stream = stream::unfold(event_stream, |mut event_stream| async move {
-        match event_stream.next().await {
+        match event_stream.next_event().await {
             Ok(event) => {
                 // Update applied LSN after successful event retrieval
                 event_stream.update_applied_lsn(event.lsn.value());

@@ -112,7 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Process events using Stream combinators
     loop {
-        match event_stream.next().await {
+        match event_stream.next_event().await {
             Ok(event) => {
                 println!("Received event: {:?}", event);
                 // Update LSN feedback using the convenient method

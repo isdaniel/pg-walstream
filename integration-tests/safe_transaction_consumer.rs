@@ -178,7 +178,7 @@ async fn test_transaction_boundaries() {
     let mut event_order: Vec<String> = Vec::new();
 
     loop {
-        match event_stream.next().await {
+        match event_stream.next_event().await {
             Ok(event) => {
                 let label = match &event.event_type {
                     EventType::Begin { .. } => "Begin".to_string(),

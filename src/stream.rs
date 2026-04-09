@@ -25,6 +25,7 @@ use crate::{
     ReplicationConnectionRetry, ReplicationState, RetryConfig, StreamingReplicationMessage,
     TupleData, XLogRecPtr, INVALID_XLOG_REC_PTR,
 };
+use bytes::Bytes;
 use std::sync::Arc;
 
 use std::future::Future;
@@ -571,7 +572,7 @@ impl LogicalReplicationStream {
             // Send proactive feedback if enough time has passed
             self.maybe_send_feedback().await;
 
-            // Get data from replication stream
+            // Get data from replication stream (returns Bytes for zero-copy)
             let data = self
                 .connection
                 .get_copy_data_async(cancellation_token)
@@ -583,10 +584,8 @@ impl LogicalReplicationStream {
 
             match data[0] as char {
                 'w' => {
-                    // WAL data message
-                    if let Some(event) = self.process_wal_message(&data)? {
-                        // Send feedback after processing WAL data
-                        self.maybe_send_feedback().await;
+                    // WAL data message (zero-copy: Bytes slicing avoids copies)
+                    if let Some(event) = self.process_wal_message(data)? {
                         return Ok(event);
                     }
                 }
@@ -799,10 +798,11 @@ impl LogicalReplicationStream {
         }
     }
 
-    /// Process a WAL data message
-    fn process_wal_message(&mut self, data: &[u8]) -> Result<Option<ChangeEvent>> {
-        // Use BufferReader for safe parsing of WAL message
-        let mut reader = BufferReader::new(data);
+    /// Process a WAL data message (zero-copy: uses Bytes slicing)
+    fn process_wal_message(&mut self, data: impl Into<Bytes>) -> Result<Option<ChangeEvent>> {
+        let data = data.into();
+        // Use BufferReader with zero-copy Bytes
+        let mut reader = BufferReader::from_bytes(data.clone());
 
         // Check minimum message length (1 + 8 + 8 + 8 = 25 bytes)
         if data.len() < 25 {
@@ -830,9 +830,9 @@ impl LogicalReplicationStream {
             return Ok(None);
         }
 
-        // Get the remaining bytes for message parsing
+        // Get the remaining bytes for message parsing (zero-copy Bytes slice)
         let message_data = reader.read_bytes_buf(reader.remaining())?;
-        let replication_message = self.parser.parse_wal_message(&message_data)?;
+        let replication_message = self.parser.parse_wal_message_bytes(message_data)?;
         self.convert_to_change_event(replication_message, start_lsn)
     }
 
@@ -1398,7 +1398,7 @@ impl LogicalReplicationStream {
     /// let mut event_stream = stream.into_stream(cancel_token);
     ///
     /// loop {
-    ///     match event_stream.next().await {
+    ///     match event_stream.next_event().await {
     ///         Ok(event) => println!("Event: {:?}", event),
     ///         Err(_) => break,
     ///     }
@@ -1407,9 +1407,13 @@ impl LogicalReplicationStream {
     /// # }
     /// ```
     pub fn into_stream(self, cancellation_token: CancellationToken) -> EventStream {
+        let shared_feedback = Arc::clone(&self.shared_lsn_feedback);
         EventStream {
-            inner: self,
+            inner: Some(self),
             cancellation_token,
+            shared_feedback,
+            inflight: None,
+            terminated: false,
         }
     }
 
@@ -1507,112 +1511,37 @@ impl LogicalReplicationStream {
 
 /// Async stream of PostgreSQL replication events (owned version)
 ///
-/// This struct provides an iterator-like interface for consuming replication events.
-/// It has a built-in `next()` method that returns `Future<Result<ChangeEvent>>`,
-/// allowing you to call `.next().await` without importing any traits.
+/// This struct implements both a native `.next().await` API and the
+/// [`futures_core::Stream`] trait, so you can use it with any stream
+/// combinator from `futures` or `tokio-stream`.
 ///
 /// Create an `EventStream` by calling `into_stream()` on `LogicalReplicationStream`.
 ///
-/// # Example
+/// # Using as `futures::Stream`
 ///
-/// ```no_run
-/// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig, StreamingMode};
-/// use tokio_util::sync::CancellationToken;
-/// use std::time::Duration;
+/// The stream yields `Result<ChangeEvent>` items. When cancelled or after a
+/// permanent error, the stream terminates (yields `None`). It also implements
+/// [`futures_core::FusedStream`] so `select!` macros can detect termination.
 ///
-/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let config = ReplicationStreamConfig::new(
-///     "my_slot".to_string(),
-///     "my_publication".to_string(),
-///     2, StreamingMode::On,
-///     Duration::from_secs(10),
-///     Duration::from_secs(30),
-///     Duration::from_secs(60),
-///     RetryConfig::default(),
-/// );
+/// ```ignore
+/// use futures::StreamExt;
 ///
-/// let mut stream = LogicalReplicationStream::new("connection_string", config).await?;
-/// stream.start(None).await?;
-///
-/// let cancel_token = CancellationToken::new();
 /// let mut event_stream = stream.into_stream(cancel_token);
 ///
-/// // No need to import futures::StreamExt!
-/// loop {
-///     match event_stream.next().await {
-///         Ok(event) => {
-///             // Process event
-///             println!("Received: {:?}", event);
-///         }
-///         Err(e) if matches!(e, pg_walstream::ReplicationError::Cancelled(_)) => {
-///             // Graceful shutdown
-///             println!("Stream cancelled");
-///             break;
-///         }
+/// // Works directly with StreamExt combinators!
+/// while let Some(result) = event_stream.next().await {
+///     match result {
+///         Ok(event) => println!("Event: {:?}", event),
 ///         Err(e) => {
-///             // Handle error
 ///             eprintln!("Error: {}", e);
 ///             break;
 ///         }
 ///     }
 /// }
-/// # Ok(())
-/// # }
-/// ```
-/// Async stream of PostgreSQL replication events (owned version)
-///
-/// This struct provides an iterator-like interface for consuming replication events.
-/// It has a built-in `next()` method that returns `Future<Result<ChangeEvent>>`,
-/// allowing you to call `.next().await` without importing any traits.
-///
-/// Create an `EventStream` by calling `into_stream()` on `LogicalReplicationStream`.
-///
-/// # Using with `futures::Stream`
-///
-/// If you need to use stream combinators from the `futures` crate, you can easily
-/// wrap this with `futures::stream::unfold`:
-///
-/// ```ignore
-/// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig, StreamingMode};
-/// use tokio_util::sync::CancellationToken;
-/// use futures::stream::{self, StreamExt};
-/// use std::time::Duration;
-///
-/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let config = ReplicationStreamConfig::new(
-///     "my_slot".to_string(),
-///     "my_publication".to_string(),
-///     2, StreamingMode::On,
-///     Duration::from_secs(10),
-///     Duration::from_secs(30),
-///     Duration::from_secs(60),
-///     RetryConfig::default(),
-/// );
-///
-/// let stream = LogicalReplicationStream::new("connection_string", config).await?;
-/// let cancel_token = CancellationToken::new();
-/// let event_stream = stream.into_stream(cancel_token);
-///
-/// // Wrap with unfold to get a futures::Stream
-/// let pg_stream = stream::unfold(event_stream, |mut event_stream| async move {
-///     match event_stream.next().await {
-///         Ok(event) => Some((event, event_stream)),
-///         Err(_) => None,
-///     }
-/// });
-///
-/// // Pin the stream so we can poll it
-/// let mut stream = Box::pin(pg_stream);
-///
-/// // Now you can use stream combinators!
-/// while let Some(event) = stream.next().await {
-///     println!("Event: {:?}", event);
-/// }
-/// # Ok(())
-/// # }
+/// println!("Stream terminated");
 /// ```
 ///
-/// # Basic Example
+/// # Using the native API
 ///
 /// ```no_run
 /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig, StreamingMode};
@@ -1636,20 +1565,17 @@ impl LogicalReplicationStream {
 /// let cancel_token = CancellationToken::new();
 /// let mut event_stream = stream.into_stream(cancel_token);
 ///
-/// // No need to import futures::StreamExt!
+/// // Native API — no trait imports needed
 /// loop {
-///     match event_stream.next().await {
+///     match event_stream.next_event().await {
 ///         Ok(event) => {
-///             // Process event
 ///             println!("Received: {:?}", event);
 ///         }
 ///         Err(e) if matches!(e, pg_walstream::ReplicationError::Cancelled(_)) => {
-///             // Graceful shutdown
 ///             println!("Stream cancelled");
 ///             break;
 ///         }
 ///         Err(e) => {
-///             // Handle error
 ///             eprintln!("Error: {}", e);
 ///             break;
 ///         }
@@ -1659,202 +1585,188 @@ impl LogicalReplicationStream {
 /// # }
 /// ```
 pub struct EventStream {
-    inner: LogicalReplicationStream,
+    /// The inner replication stream. Temporarily `None` while an async poll
+    /// future is in flight; always `Some` between calls to `poll_next`.
+    inner: Option<LogicalReplicationStream>,
     cancellation_token: CancellationToken,
+    /// Cached reference to the shared LSN feedback so callers can always
+    /// update/read LSN values even if `inner` is temporarily taken.
+    shared_feedback: Arc<SharedLsnFeedback>,
+    /// In-flight future for `Stream::poll_next`. Created lazily when polled.
+    #[allow(clippy::type_complexity)]
+    inflight:
+        Option<std::pin::Pin<Box<dyn Future<Output = (LogicalReplicationStream, Result<ChangeEvent>)> + Send>>>,
+    /// Whether the stream has terminated (cancelled or permanent error).
+    terminated: bool,
 }
 
 impl EventStream {
     /// Get a reference to the underlying LogicalReplicationStream
+    ///
+    /// # Panics
+    ///
+    /// Panics if called while a `Stream::poll_next` future is in flight
+    /// (this never happens in normal usage).
     pub fn inner(&self) -> &LogicalReplicationStream {
-        &self.inner
+        self.inner
+            .as_ref()
+            .expect("inner stream is temporarily taken during poll")
     }
 
     /// Get a mutable reference to the underlying LogicalReplicationStream
+    ///
+    /// # Panics
+    ///
+    /// Panics if called while a `Stream::poll_next` future is in flight.
     pub fn inner_mut(&mut self) -> &mut LogicalReplicationStream {
-        &mut self.inner
+        self.inner
+            .as_mut()
+            .expect("inner stream is temporarily taken during poll")
     }
 
     /// Get the current LSN position
     pub fn current_lsn(&self) -> XLogRecPtr {
-        self.inner.current_lsn()
+        self.inner().current_lsn()
     }
 
     /// Update the flushed LSN feedback
     ///
     /// Call this after data has been written/flushed to the destination database,
     /// but not yet committed (e.g., during batch writes).
-    ///
-    /// # Arguments
-    ///
-    /// * `lsn` - The LSN value to update
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig, StreamingMode};
-    /// # use tokio_util::sync::CancellationToken;
-    /// # use std::time::Duration;
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let config = ReplicationStreamConfig::new(
-    /// #     "my_slot".to_string(), "my_publication".to_string(),
-    /// #     2, StreamingMode::On, Duration::from_secs(10), Duration::from_secs(30),
-    /// #     Duration::from_secs(60), RetryConfig::default(),
-    /// # );
-    /// # let mut stream = LogicalReplicationStream::new("connection_string", config).await?;
-    /// # stream.start(None).await?;
-    /// # let cancel_token = CancellationToken::new();
-    /// let mut event_stream = stream.into_stream(cancel_token);
-    ///
-    /// loop {
-    ///     match event_stream.next().await {
-    ///         Ok(event) => {
-    ///             // Process the event...
-    ///             // Update flushed LSN after writing to destination
-    ///             event_stream.update_flushed_lsn(event.lsn.value());
-    ///         }
-    ///         Err(_) => break,
-    ///     }
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// This method is always safe to call, even during stream polling.
     #[inline]
     pub fn update_flushed_lsn(&self, lsn: XLogRecPtr) {
-        self.inner.shared_lsn_feedback.update_flushed_lsn(lsn);
+        self.shared_feedback.update_flushed_lsn(lsn);
     }
 
     /// Update the applied LSN feedback
     ///
     /// Call this after data has been committed to the destination database.
     /// This is the most common feedback update in typical replication scenarios.
-    ///
-    /// # Arguments
-    ///
-    /// * `lsn` - The LSN value to update
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig, StreamingMode};
-    /// # use tokio_util::sync::CancellationToken;
-    /// # use std::time::Duration;
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let config = ReplicationStreamConfig::new(
-    /// #     "my_slot".to_string(), "my_publication".to_string(),
-    /// #     2, StreamingMode::On, Duration::from_secs(10), Duration::from_secs(30),
-    /// #     Duration::from_secs(60), RetryConfig::default(),
-    /// # );
-    /// # let mut stream = LogicalReplicationStream::new("connection_string", config).await?;
-    /// # stream.start(None).await?;
-    /// # let cancel_token = CancellationToken::new();
-    /// let mut event_stream = stream.into_stream(cancel_token);
-    ///
-    /// loop {
-    ///     match event_stream.next().await {
-    ///         Ok(event) => {
-    ///             // Process and commit the event...
-    ///             // Update applied LSN after successful commit
-    ///             event_stream.update_applied_lsn(event.lsn.value());
-    ///         }
-    ///         Err(_) => break,
-    ///     }
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// This method is always safe to call, even during stream polling.
     #[inline]
     pub fn update_applied_lsn(&self, lsn: XLogRecPtr) {
-        self.inner.shared_lsn_feedback.update_applied_lsn(lsn);
+        self.shared_feedback.update_applied_lsn(lsn);
     }
 
     /// Get the current feedback LSN values
     ///
     /// Returns a tuple of (flushed_lsn, applied_lsn).
-    ///
-    /// # Returns
-    ///
-    /// A tuple containing:
-    /// - `flushed_lsn`: Last LSN that was flushed to destination
-    /// - `applied_lsn`: Last LSN that was committed/applied to destination
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig, StreamingMode};
-    /// # use tokio_util::sync::CancellationToken;
-    /// # use std::time::Duration;
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let config = ReplicationStreamConfig::new(
-    /// #     "my_slot".to_string(), "my_publication".to_string(),
-    /// #     2, StreamingMode::On, Duration::from_secs(10), Duration::from_secs(30),
-    /// #     Duration::from_secs(60), RetryConfig::default(),
-    /// # );
-    /// # let mut stream = LogicalReplicationStream::new("connection_string", config).await?;
-    /// # stream.start(None).await?;
-    /// # let cancel_token = CancellationToken::new();
-    /// let event_stream = stream.into_stream(cancel_token);
-    ///
-    /// let (flushed, applied) = event_stream.get_feedback_lsn();
-    /// println!("Flushed: {}, Applied: {}", flushed, applied);
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// This method is always safe to call, even during stream polling.
     #[inline]
     pub fn get_feedback_lsn(&self) -> (XLogRecPtr, XLogRecPtr) {
-        self.inner.shared_lsn_feedback.get_feedback_lsn()
+        self.shared_feedback.get_feedback_lsn()
     }
 
-    /// Get the next event from the stream
+    /// Returns whether this stream has terminated.
+    ///
+    /// A terminated stream will always return `None` from `poll_next()`.
+    /// The stream terminates when:
+    /// - The cancellation token is triggered
+    /// - A permanent error occurs
+    /// - `shutdown()` is called
+    #[inline]
+    pub fn is_terminated(&self) -> bool {
+        self.terminated
+    }
+
+    /// Get the next event from the stream (native async API)
     ///
     /// This method provides a native async API without requiring any trait imports.
     /// It returns `Ok(event)` when an event is available, and `Err(e)` when an error occurs
     /// (including cancellation via `Err(ReplicationError::Cancelled(_))`).
     ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig, StreamingMode};
-    /// use tokio_util::sync::CancellationToken;
-    /// use std::time::Duration;
-    ///
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let config = ReplicationStreamConfig::new(
-    ///     "my_slot".to_string(),
-    ///     "my_publication".to_string(),
-    ///     2, StreamingMode::On,
-    ///     Duration::from_secs(10),
-    ///     Duration::from_secs(30),
-    ///     Duration::from_secs(60),
-    ///     RetryConfig::default(),
-    /// );
-    ///
-    /// let mut stream = LogicalReplicationStream::new("connection_string", config).await?;
-    /// stream.start(None).await?;
-    ///
-    /// let cancel_token = CancellationToken::new();
-    /// let mut event_stream = stream.into_stream(cancel_token);
-    ///
-    /// // No need to import futures::StreamExt!
-    /// loop {
-    ///     match event_stream.next().await {
-    ///         Ok(event) => println!("Event: {:?}", event),
-    ///         Err(e) if matches!(e, pg_walstream::ReplicationError::Cancelled(_)) => {
-    ///             println!("Stream cancelled, shutting down gracefully");
-    ///             break;
-    ///         }
-    ///         Err(e) => {
-    ///             eprintln!("Error: {}", e);
-    ///             break;
-    ///         }
-    ///     }
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn next(&mut self) -> Result<ChangeEvent> {
-        self.inner
+    /// **Note**: If you also use this type as a `futures::Stream`, prefer calling
+    /// `StreamExt::next()` instead to avoid confusion. This method is named `next_event()`
+    /// to avoid conflict with `StreamExt::next()`.
+    pub async fn next_event(&mut self) -> Result<ChangeEvent> {
+        let inner = self
+            .inner
+            .as_mut()
+            .expect("inner stream is temporarily taken during poll");
+        inner
             .next_event_with_retry(&self.cancellation_token)
             .await
+    }
+
+    /// Gracefully shut down the replication stream.
+    ///
+    /// This method:
+    /// 1. Cancels the cancellation token (signals all async operations to stop)
+    /// 2. Sends a final LSN feedback to PostgreSQL
+    /// 3. Marks the stream as terminated
+    ///
+    /// After calling this, `next_event()` and `Stream::poll_next` will return `None`.
+    pub async fn shutdown(&mut self) -> Result<()> {
+        self.cancellation_token.cancel();
+        let result = if let Some(inner) = self.inner.as_mut() {
+            inner.stop().await
+        } else {
+            Ok(())
+        };
+        self.terminated = true;
+        self.inflight = None;
+        result
+    }
+}
+
+impl futures_core::Stream for EventStream {
+    type Item = Result<ChangeEvent>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if self.terminated {
+            return std::task::Poll::Ready(None);
+        }
+
+        // If no future is in flight, create one by taking the inner stream
+        if self.inflight.is_none() {
+            let mut stream = self
+                .inner
+                .take()
+                .expect("inner stream missing without inflight future");
+            let cancel_token = self.cancellation_token.clone();
+
+            self.inflight = Some(Box::pin(async move {
+                let result = stream.next_event_with_retry(&cancel_token).await;
+                (stream, result)
+            }));
+        }
+
+        // Poll the in-flight future
+        let fut = self.inflight.as_mut().unwrap();
+        match fut.as_mut().poll(cx) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready((stream, result)) => {
+                // Restore the inner stream
+                self.inner = Some(stream);
+                self.inflight = None;
+
+                match result {
+                    Ok(event) => std::task::Poll::Ready(Some(Ok(event))),
+                    Err(ref e) if e.is_cancelled() => {
+                        self.terminated = true;
+                        std::task::Poll::Ready(None)
+                    }
+                    Err(ref e) if e.is_permanent() => {
+                        self.terminated = true;
+                        std::task::Poll::Ready(Some(Err(result.unwrap_err())))
+                    }
+                    Err(e) => {
+                        // Transient error — yield it but keep the stream alive
+                        std::task::Poll::Ready(Some(Err(e)))
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl futures_core::FusedStream for EventStream {
+    fn is_terminated(&self) -> bool {
+        self.terminated
     }
 }
 
@@ -4657,7 +4569,7 @@ mod tests {
     fn test_process_wal_message_too_short() {
         let mut stream = create_test_stream(create_test_config());
         let data = vec![b'w'; 10]; // Too short (< 25 bytes)
-        let result = stream.process_wal_message(&data);
+        let result = stream.process_wal_message(data);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("too short"));
     }
@@ -4668,7 +4580,7 @@ mod tests {
         let payload = build_begin_payload(0x2000, 42);
         let data = build_wal_message(0x1000, 0x1500, &payload);
 
-        let result = stream.process_wal_message(&data).unwrap();
+        let result = stream.process_wal_message(data).unwrap();
         assert!(result.is_some());
         let event = result.unwrap();
         match event.event_type {
@@ -4687,7 +4599,7 @@ mod tests {
         let payload = build_commit_payload(0x2000, 0x2100);
         let data = build_wal_message(0x1000, 0x1500, &payload);
 
-        let result = stream.process_wal_message(&data).unwrap();
+        let result = stream.process_wal_message(data).unwrap();
         assert!(result.is_some());
         match result.unwrap().event_type {
             EventType::Commit { .. } => {}
@@ -4700,7 +4612,7 @@ mod tests {
         let mut stream = create_test_stream(create_test_config());
         // WAL message with header only (no payload after the 25 header bytes)
         let data = build_wal_message(0x1000, 0x1500, &[]);
-        let result = stream.process_wal_message(&data).unwrap();
+        let result = stream.process_wal_message(data).unwrap();
         assert!(result.is_none()); // No message data = None
     }
 
@@ -4711,7 +4623,7 @@ mod tests {
 
         let payload = build_begin_payload(0x2000, 1);
         let data = build_wal_message(0x1000, 0x5000, &payload);
-        let _ = stream.process_wal_message(&data);
+        let _ = stream.process_wal_message(data);
 
         assert_eq!(stream.state.last_received_lsn, 0x5000);
     }
@@ -4723,7 +4635,7 @@ mod tests {
 
         let payload = build_begin_payload(0x2000, 1);
         let data = build_wal_message(0x1000, 0, &payload); // end_lsn = 0
-        let _ = stream.process_wal_message(&data);
+        let _ = stream.process_wal_message(data);
 
         assert_eq!(stream.state.last_received_lsn, 0x3000); // unchanged
     }
@@ -4855,7 +4767,7 @@ mod tests {
         rel_payload.extend_from_slice(&(-1i32).to_be_bytes());
 
         let wal = build_wal_message(0x1000, 0x1100, &rel_payload);
-        let result = stream.process_wal_message(&wal).unwrap();
+        let result = stream.process_wal_message(wal).unwrap();
         assert!(result.is_none()); // Relation => None
         assert!(stream.state.get_relation(100).is_some());
 
@@ -4875,7 +4787,7 @@ mod tests {
         ins_payload.extend_from_slice(b"abc");
 
         let wal2 = build_wal_message(0x1100, 0x1200, &ins_payload);
-        let result2 = stream.process_wal_message(&wal2).unwrap();
+        let result2 = stream.process_wal_message(wal2).unwrap();
         assert!(result2.is_some());
         let event = result2.unwrap();
         match event.event_type {
@@ -6562,5 +6474,143 @@ mod tests {
         let result = stream.stop().await;
         assert!(result.is_ok());
         assert_eq!(stream.current_lsn(), high_lsn);
+    }
+
+    // ========================================
+    // futures::Stream trait tests
+    // ========================================
+
+    /// Compile-time assertion that EventStream implements futures_core::Stream
+    const _: () = {
+        fn assert_stream<T: futures_core::Stream>() {}
+        fn assert_fused_stream<T: futures_core::FusedStream>() {}
+        fn assert_unpin<T: Unpin>() {}
+
+        fn assertions() {
+            assert_stream::<EventStream>();
+            assert_fused_stream::<EventStream>();
+            assert_unpin::<EventStream>();
+        }
+    };
+
+    #[test]
+    fn test_event_stream_is_terminated_initially_false() {
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+        let cancel_token = CancellationToken::new();
+        let event_stream = stream.into_stream(cancel_token);
+
+        assert!(!event_stream.is_terminated());
+    }
+
+    #[tokio::test]
+    async fn test_event_stream_shutdown_sets_terminated() {
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+        let cancel_token = CancellationToken::new();
+        let mut event_stream = stream.into_stream(cancel_token);
+
+        assert!(!event_stream.is_terminated());
+
+        let result = event_stream.shutdown().await;
+        assert!(result.is_ok());
+        assert!(event_stream.is_terminated());
+    }
+
+    #[tokio::test]
+    async fn test_event_stream_shutdown_cancels_token() {
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+        let cancel_token = CancellationToken::new();
+        let cancel_clone = cancel_token.clone();
+        let mut event_stream = stream.into_stream(cancel_token);
+
+        assert!(!cancel_clone.is_cancelled());
+
+        event_stream.shutdown().await.ok();
+
+        assert!(cancel_clone.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_event_stream_shutdown_idempotent() {
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+        let cancel_token = CancellationToken::new();
+        let mut event_stream = stream.into_stream(cancel_token);
+
+        // Calling shutdown multiple times should be safe
+        assert!(event_stream.shutdown().await.is_ok());
+        assert!(event_stream.shutdown().await.is_ok());
+        assert!(event_stream.is_terminated());
+    }
+
+    #[test]
+    fn test_event_stream_shared_feedback_always_available() {
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+        let cancel_token = CancellationToken::new();
+        let event_stream = stream.into_stream(cancel_token);
+
+        // LSN feedback methods should work regardless of stream state
+        event_stream.update_flushed_lsn(1000);
+        event_stream.update_applied_lsn(2000);
+
+        let (flushed, applied) = event_stream.get_feedback_lsn();
+        assert_eq!(flushed, 2000); // applied also updates flushed
+        assert_eq!(applied, 2000);
+    }
+
+    #[test]
+    fn test_event_stream_inner_returns_ref() {
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+        let cancel_token = CancellationToken::new();
+        let event_stream = stream.into_stream(cancel_token);
+
+        // inner() should return a reference when no poll is in flight
+        let inner = event_stream.inner();
+        assert_eq!(inner.current_lsn(), 0);
+    }
+
+    #[test]
+    fn test_event_stream_inner_mut_returns_ref() {
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+        let cancel_token = CancellationToken::new();
+        let mut event_stream = stream.into_stream(cancel_token);
+
+        // inner_mut() should allow mutation when no poll is in flight
+        event_stream.inner_mut().state.update_received_lsn(9000);
+        assert_eq!(event_stream.current_lsn(), 9000);
+    }
+
+    #[test]
+    fn test_event_stream_next_event_name() {
+        // Verify that next_event() is the method name (not conflicting with StreamExt::next)
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+        let cancel_token = CancellationToken::new();
+        let mut event_stream = stream.into_stream(cancel_token);
+
+        // This should compile - next_event is our native method
+        let _future = event_stream.next_event();
+        // Don't await it since we have a null connection
+    }
+
+    #[tokio::test]
+    async fn test_event_stream_fused_stream_after_shutdown() {
+        use futures_core::FusedStream;
+
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+        let cancel_token = CancellationToken::new();
+        let mut event_stream = stream.into_stream(cancel_token);
+
+        assert!(!FusedStream::is_terminated(&event_stream));
+
+        event_stream.shutdown().await.ok();
+
+        assert!(FusedStream::is_terminated(&event_stream));
     }
 }

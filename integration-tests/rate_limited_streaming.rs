@@ -118,7 +118,7 @@ async fn test_event_stream_receives_events() {
     let mut saw_commit = false;
 
     loop {
-        match event_stream.next().await {
+        match event_stream.next_event().await {
             Ok(event) => {
                 event_count += 1;
                 event_stream.update_applied_lsn(event.lsn.value());
@@ -192,7 +192,7 @@ async fn test_event_stream_lsn_feedback() {
     // Read until commit, updating both flushed and applied LSN
     let mut last_lsn: u64;
     loop {
-        match event_stream.next().await {
+        match event_stream.next_event().await {
             Ok(event) => {
                 last_lsn = event.lsn.value();
                 event_stream.update_flushed_lsn(last_lsn);
@@ -265,7 +265,7 @@ async fn test_rate_limited_event_processing() {
     let mut commit_count = 0u32;
 
     loop {
-        match event_stream.next().await {
+        match event_stream.next_event().await {
             Ok(event) => {
                 event_count += 1;
                 event_stream.update_applied_lsn(event.lsn.value());
@@ -355,7 +355,7 @@ async fn test_event_type_categorization() {
     let mut commit_count = 0u32;
 
     loop {
-        match event_stream.next().await {
+        match event_stream.next_event().await {
             Ok(event) => {
                 event_stream.update_applied_lsn(event.lsn.value());
 
