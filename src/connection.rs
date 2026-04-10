@@ -785,6 +785,77 @@ impl PgReplicationConnection {
         Ok(result)
     }
 
+    /// Drop a replication slot
+    ///
+    /// Generates: `DROP_REPLICATION_SLOT "slot_name" [WAIT]`
+    ///
+    /// # Arguments
+    ///
+    /// * `slot_name` - Name of the replication slot to drop
+    /// * `wait` - If true, the command waits until the slot becomes inactive
+    ///            instead of returning an error when the slot is in use
+    pub fn drop_replication_slot(&self, slot_name: &str, wait: bool) -> Result<()> {
+        let quoted_slot = quote_sql_identifier(slot_name);
+        let sql = if wait {
+            format!("DROP_REPLICATION_SLOT {} WAIT;", quoted_slot)
+        } else {
+            format!("DROP_REPLICATION_SLOT {};", quoted_slot)
+        };
+
+        debug!("Dropping replication slot: {}", sql);
+        let result = self.exec(&sql)?;
+        if !result.is_ok() {
+            return Err(ReplicationError::replication_slot(format!(
+                "Failed to drop replication slot '{}': {}",
+                slot_name,
+                result
+                    .error_message()
+                    .unwrap_or_else(|| "unknown error".to_string())
+            )));
+        }
+        debug!("Replication slot {} dropped", slot_name);
+        Ok(())
+    }
+
+    /// Read information about a replication slot
+    ///
+    /// Generates: `READ_REPLICATION_SLOT "slot_name"`
+    ///
+    /// Returns slot type, restart LSN, and restart timeline.
+    /// Requires PostgreSQL 15+.
+    pub fn read_replication_slot(
+        &self,
+        slot_name: &str,
+    ) -> Result<crate::types::ReplicationSlotInfo> {
+        let quoted_slot = quote_sql_identifier(slot_name);
+        let sql = format!("READ_REPLICATION_SLOT {};", quoted_slot);
+
+        debug!("Reading replication slot: {}", sql);
+        let result = self.exec(&sql)?;
+        if !result.is_ok() {
+            return Err(ReplicationError::replication_slot(format!(
+                "Failed to read replication slot '{}': {}",
+                slot_name,
+                result
+                    .error_message()
+                    .unwrap_or_else(|| "unknown error".to_string())
+            )));
+        }
+
+        let slot_type = result.get_value(0, 0);
+        let restart_lsn = result
+            .get_value(0, 1)
+            .and_then(|s| crate::types::parse_lsn(&s).ok())
+            .map(crate::types::Lsn::new);
+        let restart_tli = result.get_value(0, 2).and_then(|s| s.parse::<i32>().ok());
+
+        Ok(crate::types::ReplicationSlotInfo {
+            slot_type,
+            restart_lsn,
+            restart_tli,
+        })
+    }
+
     /// Start physical replication
     pub fn start_physical_replication(
         &mut self,

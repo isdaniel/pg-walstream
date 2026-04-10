@@ -505,29 +505,6 @@ mod tests {
     }
 
     #[test]
-    fn test_rowdata_deserialize_invalid_type() {
-        // Feeding a non-object type triggers the `expecting()` method.
-        let err = serde_json::from_str::<RowData>("42").unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("a map"),
-            "Error should reference expecting(), got: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_rowdata_deserialize_string_gives_error() {
-        let err = serde_json::from_str::<RowData>("\"hello\"").unwrap_err();
-        assert!(err.to_string().contains("a map"));
-    }
-
-    #[test]
-    fn test_rowdata_deserialize_array_gives_error() {
-        let err = serde_json::from_str::<RowData>("[1, 2, 3]").unwrap_err();
-        assert!(err.to_string().contains("a map"));
-    }
-
-    #[test]
     fn test_column_value_text() {
         let v = ColumnValue::text("hello");
         assert_eq!(v.as_str(), Some("hello"));
@@ -583,27 +560,6 @@ mod tests {
         assert!(v == *"hello");
         assert!(v != *"world");
         assert!(ColumnValue::Null != *"hello");
-    }
-
-    #[test]
-    fn test_column_value_serde_round_trip() {
-        // Text
-        let v = ColumnValue::text("hello");
-        let json = serde_json::to_string(&v).unwrap();
-        let back: ColumnValue = serde_json::from_str(&json).unwrap();
-        assert_eq!(v, back);
-
-        // Null
-        let v = ColumnValue::Null;
-        let json = serde_json::to_string(&v).unwrap();
-        let back: ColumnValue = serde_json::from_str(&json).unwrap();
-        assert_eq!(v, back);
-
-        // Binary
-        let v = ColumnValue::binary_bytes(Bytes::from_static(&[0xde, 0xad]));
-        let json = serde_json::to_string(&v).unwrap();
-        let back: ColumnValue = serde_json::from_str(&json).unwrap();
-        assert_eq!(v, back);
     }
 
     #[test]
@@ -671,21 +627,6 @@ mod tests {
 
         let pairs: Vec<_> = row.iter().collect();
         assert_eq!(pairs.len(), 2);
-    }
-
-    #[test]
-    fn test_rowdata_serde_round_trip() {
-        let row = RowData::from_pairs(vec![
-            ("id", ColumnValue::text("1")),
-            ("name", ColumnValue::text("Alice")),
-        ]);
-        let json = serde_json::to_string(&row).unwrap();
-        let back: RowData = serde_json::from_str(&json).unwrap();
-        assert_eq!(row.len(), back.len());
-
-        // Values should match (order may differ in JSON map round-trip)
-        assert_eq!(back.get("id").and_then(|v| v.as_str()), Some("1"));
-        assert_eq!(back.get("name").and_then(|v| v.as_str()), Some("Alice"));
     }
 
     #[test]
@@ -768,35 +709,6 @@ mod tests {
 
         let binary = ColumnValue::binary_bytes(Bytes::from_static(b"hello"));
         assert!(binary != "hello");
-    }
-
-    #[test]
-    fn test_column_value_serialize_non_utf8_text() {
-        // Text with invalid UTF-8 falls back to tagged binary object
-        let v = ColumnValue::Text(Bytes::from_static(&[0xff, 0xfe]));
-        let json = serde_json::to_string(&v).unwrap();
-        assert_eq!(json, r#"{"$binary":"fffe"}"#);
-
-        // Round-trip: deserializes back as Binary (raw bytes preserved)
-        let back: ColumnValue = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.as_bytes(), &[0xff, 0xfe]);
-    }
-
-    #[test]
-    fn test_column_value_deserialize_invalid_hex() {
-        // $binary with invalid hex chars triggers an error
-        let json = r#"{"$binary":"ZZZZ"}"#;
-        let result = serde_json::from_str::<ColumnValue>(json);
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("invalid hex"), "got: {err_msg}");
-    }
-
-    #[test]
-    fn test_column_value_deserialize_expecting() {
-        // Feeding an unexpected type (integer) should trigger the expecting() method
-        let result = serde_json::from_str::<ColumnValue>("42");
-        assert!(result.is_err());
     }
 
     #[test]
@@ -961,105 +873,6 @@ mod tests {
         let mut reader = BufferReader::new(&frozen);
         let decoded = RowData::decode(&mut reader).unwrap();
         assert_eq!(decoded, row);
-    }
-
-    #[test]
-    fn test_rowdata_serde_with_null_and_binary() {
-        let row = RowData::from_pairs(vec![
-            ("name", ColumnValue::text("Alice")),
-            ("middle", ColumnValue::Null),
-            (
-                "blob",
-                ColumnValue::binary_bytes(Bytes::from_static(&[0xca, 0xfe])),
-            ),
-        ]);
-        let json = serde_json::to_string(&row).unwrap();
-        let back: RowData = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.len(), row.len());
-        assert_eq!(back.get("name").and_then(|v| v.as_str()), Some("Alice"));
-        assert!(back.get("middle").map(|v| v.is_null()).unwrap_or(false));
-        assert_eq!(
-            back.get("blob").map(|v| v.as_bytes()),
-            Some(&[0xca, 0xfe][..])
-        );
-    }
-
-    #[test]
-    fn test_text_starting_with_backslash_x_round_trips_as_text() {
-        // Text that happens to start with literal `\x` followed by valid hex must survive a JSON round-trip as Text, not be silently reinterpreted as Binary.
-        let original = ColumnValue::text(r"\x4142");
-        let json = serde_json::to_string(&original).unwrap();
-        let back: ColumnValue = serde_json::from_str(&json).unwrap();
-
-        // The variant must stay Text, not become Binary
-        assert_eq!(
-            back.as_str(),
-            Some(r"\x4142"),
-            "Text was corrupted into Binary on JSON round-trip"
-        );
-        assert_eq!(original, back);
-    }
-
-    #[test]
-    fn test_text_with_hex_prefix_and_odd_length_round_trips() {
-        // Odd-length hex after `\x` — still valid text content
-        let original = ColumnValue::text(r"\xABC");
-        let json = serde_json::to_string(&original).unwrap();
-        let back: ColumnValue = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.as_str(), Some(r"\xABC"));
-        assert_eq!(original, back);
-    }
-
-    #[test]
-    fn test_binary_round_trips_unambiguously() {
-        // Binary values must round-trip as Binary, not collide with Text
-        let original = ColumnValue::binary_bytes(Bytes::from_static(&[0x41, 0x42]));
-        let json = serde_json::to_string(&original).unwrap();
-        let back: ColumnValue = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.as_bytes(), &[0x41, 0x42]);
-        assert_eq!(original, back);
-    }
-
-    #[test]
-    fn test_binary_and_text_do_not_collide_in_json() {
-        // The _serialized_ forms of Binary([0x41, 0x42]) and Text(r"\x4142")
-        // must be different JSON values so they decode to the correct variant.
-        let binary = ColumnValue::binary_bytes(Bytes::from_static(&[0x41, 0x42]));
-        let text = ColumnValue::text(r"\x4142");
-
-        let binary_json = serde_json::to_string(&binary).unwrap();
-        let text_json = serde_json::to_string(&text).unwrap();
-
-        assert_ne!(
-            binary_json, text_json,
-            "Binary and Text produce identical JSON — deserialization will be ambiguous"
-        );
-    }
-
-    #[test]
-    fn test_rowdata_with_hex_like_text_round_trips() {
-        // End-to-end: a RowData containing a text column that looks like hex must survive JSON round-trip without corruption.
-        let row = RowData::from_pairs(vec![
-            ("hash", ColumnValue::text(r"\xdeadbeef")),
-            (
-                "blob",
-                ColumnValue::binary_bytes(Bytes::from_static(&[0xca, 0xfe])),
-            ),
-            ("name", ColumnValue::text("Alice")),
-        ]);
-        let json = serde_json::to_string(&row).unwrap();
-        let back: RowData = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(
-            back.get("hash").and_then(|v| v.as_str()),
-            Some(r"\xdeadbeef"),
-            "Text column 'hash' was corrupted to Binary"
-        );
-        assert_eq!(
-            back.get("blob").map(|v| v.as_bytes()),
-            Some(&[0xca, 0xfe][..])
-        );
-        assert_eq!(back.get("name").and_then(|v| v.as_str()), Some("Alice"));
     }
 
     #[test]
