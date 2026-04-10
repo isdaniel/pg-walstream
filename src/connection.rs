@@ -785,6 +785,16 @@ impl PgReplicationConnection {
         Ok(result)
     }
 
+    /// Build the SQL string for `DROP_REPLICATION_SLOT`.
+    fn build_drop_slot_sql(slot_name: &str, wait: bool) -> String {
+        let quoted_slot = quote_sql_identifier(slot_name);
+        if wait {
+            format!("DROP_REPLICATION_SLOT {} WAIT;", quoted_slot)
+        } else {
+            format!("DROP_REPLICATION_SLOT {};", quoted_slot)
+        }
+    }
+
     /// Drop a replication slot
     ///
     /// Generates: `DROP_REPLICATION_SLOT "slot_name" [WAIT]`
@@ -795,12 +805,7 @@ impl PgReplicationConnection {
     /// * `wait` - If true, the command waits until the slot becomes inactive
     ///            instead of returning an error when the slot is in use
     pub fn drop_replication_slot(&self, slot_name: &str, wait: bool) -> Result<()> {
-        let quoted_slot = quote_sql_identifier(slot_name);
-        let sql = if wait {
-            format!("DROP_REPLICATION_SLOT {} WAIT;", quoted_slot)
-        } else {
-            format!("DROP_REPLICATION_SLOT {};", quoted_slot)
-        };
+        let sql = Self::build_drop_slot_sql(slot_name, wait);
 
         debug!("Dropping replication slot: {}", sql);
         let result = self.exec(&sql)?;
@@ -817,6 +822,12 @@ impl PgReplicationConnection {
         Ok(())
     }
 
+    /// Build the SQL string for `READ_REPLICATION_SLOT`.
+    fn build_read_slot_sql(slot_name: &str) -> String {
+        let quoted_slot = quote_sql_identifier(slot_name);
+        format!("READ_REPLICATION_SLOT {};", quoted_slot)
+    }
+
     /// Read information about a replication slot
     ///
     /// Generates: `READ_REPLICATION_SLOT "slot_name"`
@@ -827,8 +838,7 @@ impl PgReplicationConnection {
         &self,
         slot_name: &str,
     ) -> Result<crate::types::ReplicationSlotInfo> {
-        let quoted_slot = quote_sql_identifier(slot_name);
-        let sql = format!("READ_REPLICATION_SLOT {};", quoted_slot);
+        let sql = Self::build_read_slot_sql(slot_name);
 
         debug!("Reading replication slot: {}", sql);
         let result = self.exec(&sql)?;
@@ -1738,5 +1748,49 @@ mod tests {
         > {
             Box::pin(conn.get_copy_data_async(token))
         }
+    }
+
+    // ========================================
+    // build_drop_slot_sql tests
+    // ========================================
+
+    #[test]
+    fn test_build_drop_slot_sql_without_wait() {
+        let sql = PgReplicationConnection::build_drop_slot_sql("my_slot", false);
+        assert_eq!(sql, r#"DROP_REPLICATION_SLOT "my_slot";"#);
+    }
+
+    #[test]
+    fn test_build_drop_slot_sql_with_wait() {
+        let sql = PgReplicationConnection::build_drop_slot_sql("my_slot", true);
+        assert_eq!(sql, r#"DROP_REPLICATION_SLOT "my_slot" WAIT;"#);
+    }
+
+    #[test]
+    fn test_build_drop_slot_sql_injection() {
+        let sql = PgReplicationConnection::build_drop_slot_sql(r#"evil"slot"#, false);
+        assert_eq!(sql, r#"DROP_REPLICATION_SLOT "evil""slot";"#);
+    }
+
+    #[test]
+    fn test_build_drop_slot_sql_injection_with_wait() {
+        let sql = PgReplicationConnection::build_drop_slot_sql(r#"evil"slot"#, true);
+        assert_eq!(sql, r#"DROP_REPLICATION_SLOT "evil""slot" WAIT;"#);
+    }
+
+    // ========================================
+    // build_read_slot_sql tests
+    // ========================================
+
+    #[test]
+    fn test_build_read_slot_sql_basic() {
+        let sql = PgReplicationConnection::build_read_slot_sql("my_slot");
+        assert_eq!(sql, r#"READ_REPLICATION_SLOT "my_slot";"#);
+    }
+
+    #[test]
+    fn test_build_read_slot_sql_injection() {
+        let sql = PgReplicationConnection::build_read_slot_sql(r#"evil"slot"#);
+        assert_eq!(sql, r#"READ_REPLICATION_SLOT "evil""slot";"#);
     }
 }

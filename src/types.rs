@@ -3423,6 +3423,102 @@ mod tests {
         assert_eq!(msg.event_type_str(), "message");
     }
 
+    // ---- event_type_str coverage for streaming variants ----
+
+    #[test]
+    fn test_event_type_str_streaming_variants() {
+        let stream_start = ChangeEvent {
+            event_type: EventType::StreamStart {
+                transaction_id: 1,
+                first_segment: true,
+            },
+            lsn: Lsn::new(1),
+            metadata: None,
+        };
+        assert_eq!(stream_start.event_type_str(), "stream_start");
+
+        let stream_stop = ChangeEvent {
+            event_type: EventType::StreamStop,
+            lsn: Lsn::new(2),
+            metadata: None,
+        };
+        assert_eq!(stream_stop.event_type_str(), "stream_stop");
+
+        let ts = chrono::Utc::now();
+        let stream_commit = ChangeEvent {
+            event_type: EventType::StreamCommit {
+                transaction_id: 1,
+                commit_lsn: Lsn::new(100),
+                end_lsn: Lsn::new(200),
+                commit_timestamp: ts,
+            },
+            lsn: Lsn::new(3),
+            metadata: None,
+        };
+        assert_eq!(stream_commit.event_type_str(), "stream_commit");
+
+        let stream_abort = ChangeEvent {
+            event_type: EventType::StreamAbort {
+                transaction_id: 1,
+                subtransaction_xid: 2,
+                abort_lsn: Some(Lsn::new(300)),
+                abort_timestamp: Some(ts),
+            },
+            lsn: Lsn::new(4),
+            metadata: None,
+        };
+        assert_eq!(stream_abort.event_type_str(), "stream_abort");
+    }
+
+    // ---- decode error path: unknown replica identity byte ----
+
+    #[test]
+    fn test_decode_unknown_replica_identity_byte_errors() {
+        // Build a valid Relation event, encode it, then corrupt the replica identity byte
+        let event = ChangeEvent::relation(
+            42,
+            "public",
+            "users",
+            ReplicaIdentity::Default,
+            vec![RelationColumn {
+                name: Arc::from("id"),
+                type_id: 23,
+                type_modifier: -1,
+                is_key: true,
+            }],
+            Lsn::new(100),
+        );
+        let mut buf = BytesMut::new();
+        event.encode(&mut buf);
+        let mut encoded = buf.to_vec();
+
+        // Find the replica identity byte in the encoded buffer.
+        // Format: lsn(8) + metadata_flag(1) + tag(1) + relation_id(4) + namespace string + relation_name string + ri_byte(1) + ...
+        let offset = 10; // after lsn(8) + metadata_flag(1) + tag(1)
+                         // namespace "public" = u16(6) + 6 bytes = 8 bytes
+        let ns_len = u16::from_be_bytes([encoded[offset + 4], encoded[offset + 5]]) as usize;
+        let ns_end = offset + 4 + 2 + ns_len;
+        // relation_name "users" = u16(5) + 5 bytes
+        let rn_len = u16::from_be_bytes([encoded[ns_end], encoded[ns_end + 1]]) as usize;
+        let rn_end = ns_end + 2 + rn_len;
+        // ri_byte is at rn_end
+        let ri_offset = rn_end;
+
+        // Corrupt the replica identity byte with an invalid value
+        encoded[ri_offset] = 0xFF;
+
+        let result = ChangeEvent::decode(&encoded);
+        assert!(
+            result.is_err(),
+            "expected error for invalid replica identity byte"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Unknown replica identity byte"),
+            "error should mention unknown replica identity byte, got: {err_msg}"
+        );
+    }
+
     // ---- RelationColumn tests ----
 
     #[test]
