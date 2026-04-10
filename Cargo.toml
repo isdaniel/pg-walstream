@@ -13,11 +13,11 @@ keywords = ["postgresql", "replication", "wal", "logical-decoding", "streaming"]
 categories = ["database", "parsing", "network-programming"]
 
 [dependencies]
-tokio = { version = "1.49.0", features = ["io-util", "net", "time", "macros"] }
+tokio = { version = "1.51.1", features = ["io-util", "net", "time", "macros"] }
 tokio-util = { version = "0.7.18", features = ["compat"] }
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 chrono = { version = "0.4.44", features = ["serde"] }
-bytes = "1.11.1"
+bytes = { version = "1.11.1", features = ["serde"] }
 tracing = "0.1.44"
 libpq-sys = "0.8"
 thiserror = "2.0.18"
@@ -28,9 +28,8 @@ pin-project-lite = "0.2.17"
 default = []
 
 [dev-dependencies]
-tokio = { version = "1.49.0", features = ["full"] }
+tokio = { version = "1.51.1", features = ["full"] }
 criterion = { version = "0.8.2", features = ["html_reports"] }
-serde_json = "1.0.149"
 futures = "0.3.32"
 
 [[test]]
@@ -48,10 +47,6 @@ path = "integration-tests/safe_transaction_consumer.rs"
 [[test]]
 name = "complex_types"
 path = "integration-tests/complex_types.rs"
-
-[[bench]]
-name = "columnvalue_vs_json"
-harness = false
 
 [[bench]]
 name = "wal_pipeline"

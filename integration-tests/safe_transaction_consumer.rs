@@ -186,7 +186,7 @@ async fn test_transaction_boundaries() {
                     EventType::Update { .. } => "Update".to_string(),
                     EventType::Delete { .. } => "Delete".to_string(),
                     EventType::Commit { .. } => "Commit".to_string(),
-                    EventType::Relation => "Relation".to_string(),
+                    EventType::Relation { .. } => "Relation".to_string(),
                     other => format!("{other:?}"),
                 };
                 event_order.push(label.clone());

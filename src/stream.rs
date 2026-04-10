@@ -17,7 +17,7 @@ use crate::column_value::{ColumnValue, RowData};
 use crate::error::{ReplicationError, Result};
 use crate::lsn::SharedLsnFeedback;
 use crate::types::{
-    ChangeEvent, EventType, Lsn, ReplicaIdentity, ReplicationSlotOptions, SlotType,
+    ChangeEvent, EventType, Lsn, RelationColumn, ReplicaIdentity, ReplicationSlotOptions, SlotType,
 };
 use crate::{
     format_lsn, parse_keepalive_message, postgres_timestamp_to_chrono, BufferReader,
@@ -869,18 +869,57 @@ impl LogicalReplicationStream {
                 replica_identity,
                 columns,
             } => {
+                // Detect schema changes: if we already have this relation cached
+                // and the schema differs, emit a Relation event before updating.
+                let schema_changed = if let Some(existing) = self.state.get_relation(relation_id) {
+                    existing.namespace.as_ref() != namespace.as_str()
+                        || existing.relation_name.as_ref() != relation_name.as_str()
+                        || existing.replica_identity != replica_identity
+                        || existing.columns.len() != columns.len()
+                        || existing.columns.iter().zip(columns.iter()).any(|(a, b)| {
+                            a.name.as_ref() != b.name.as_ref()
+                                || a.type_id != b.type_id
+                                || a.type_modifier != b.type_modifier
+                                || a.is_key() != b.is_key()
+                        })
+                } else {
+                    false
+                };
+
                 let relation_info = RelationInfo::new(
                     relation_id,
                     namespace.clone(),
                     relation_name.clone(),
                     replica_identity,
-                    columns,
+                    columns.clone(),
                 );
 
                 self.state.add_relation(relation_info);
 
-                // Don't generate events for relation messages
-                return Ok(None);
+                if schema_changed {
+                    // Convert u8 replica_identity to ReplicaIdentity enum
+                    let ri = ReplicaIdentity::from_byte(replica_identity)
+                        .unwrap_or(ReplicaIdentity::Default);
+                    let relation_columns = columns
+                        .iter()
+                        .map(|c| RelationColumn {
+                            name: Arc::clone(&c.name),
+                            type_id: c.type_id,
+                            type_modifier: c.type_modifier,
+                            is_key: c.is_key(),
+                        })
+                        .collect();
+                    ChangeEvent::relation(
+                        relation_id,
+                        namespace,
+                        relation_name,
+                        ri,
+                        relation_columns,
+                        Lsn::new(lsn),
+                    )
+                } else {
+                    return Ok(None);
+                }
             }
 
             LogicalReplicationMessage::Insert { relation_id, tuple } => {
@@ -1108,9 +1147,174 @@ impl LogicalReplicationStream {
                 }
             }
 
-            _ => {
-                debug!("Ignoring message type: {:?}", message.message);
-                return Ok(None);
+            // Origin, Type, and Message events (previously dropped)
+            LogicalReplicationMessage::Origin {
+                origin_lsn,
+                origin_name,
+            } => {
+                debug!(
+                    "Origin: lsn={}, name={}",
+                    format_lsn(origin_lsn),
+                    origin_name
+                );
+                ChangeEvent::origin(Lsn::new(origin_lsn), origin_name, Lsn::new(lsn))
+            }
+
+            LogicalReplicationMessage::Type {
+                type_id,
+                namespace,
+                type_name,
+            } => {
+                debug!("Type: id={}, {}.{}", type_id, namespace, type_name);
+                ChangeEvent::type_event(type_id, namespace, type_name, Lsn::new(lsn))
+            }
+
+            LogicalReplicationMessage::Message {
+                flags,
+                lsn: msg_lsn,
+                prefix,
+                content,
+            } => {
+                debug!(
+                    "Message: flags={}, lsn={}, prefix={}, content_len={}",
+                    flags,
+                    format_lsn(msg_lsn),
+                    prefix,
+                    content.len()
+                );
+                ChangeEvent::message(
+                    flags,
+                    Lsn::new(msg_lsn),
+                    Arc::<str>::from(prefix.as_str()),
+                    Bytes::from(content),
+                    Lsn::new(lsn),
+                )
+            }
+
+            // Two-phase commit events (protocol v3+)
+            LogicalReplicationMessage::BeginPrepare {
+                prepare_lsn,
+                end_lsn: end,
+                timestamp,
+                xid,
+                gid,
+            } => {
+                debug!(
+                    "Begin prepare: xid={}, gid={}, prepare_lsn={}",
+                    xid,
+                    gid,
+                    format_lsn(prepare_lsn)
+                );
+                ChangeEvent::begin_prepare(
+                    xid,
+                    Lsn::new(prepare_lsn),
+                    Lsn::new(end),
+                    postgres_timestamp_to_chrono(timestamp),
+                    Arc::<str>::from(gid.as_str()),
+                    Lsn::new(lsn),
+                )
+            }
+
+            LogicalReplicationMessage::Prepare {
+                flags,
+                prepare_lsn,
+                end_lsn: end,
+                timestamp,
+                xid,
+                gid,
+            } => {
+                debug!(
+                    "Prepare: xid={}, gid={}, prepare_lsn={}",
+                    xid,
+                    gid,
+                    format_lsn(prepare_lsn)
+                );
+                ChangeEvent::prepare(
+                    flags,
+                    xid,
+                    Lsn::new(prepare_lsn),
+                    Lsn::new(end),
+                    postgres_timestamp_to_chrono(timestamp),
+                    Arc::<str>::from(gid.as_str()),
+                    Lsn::new(lsn),
+                )
+            }
+
+            LogicalReplicationMessage::CommitPrepared {
+                flags,
+                commit_lsn,
+                end_lsn: end,
+                timestamp,
+                xid,
+                gid,
+            } => {
+                debug!(
+                    "Commit prepared: xid={}, gid={}, commit_lsn={}",
+                    xid,
+                    gid,
+                    format_lsn(commit_lsn)
+                );
+                ChangeEvent::commit_prepared(
+                    flags,
+                    xid,
+                    Lsn::new(commit_lsn),
+                    Lsn::new(end),
+                    postgres_timestamp_to_chrono(timestamp),
+                    Arc::<str>::from(gid.as_str()),
+                    Lsn::new(lsn),
+                )
+            }
+
+            LogicalReplicationMessage::RollbackPrepared {
+                flags,
+                prepare_end_lsn,
+                rollback_end_lsn,
+                prepare_timestamp,
+                rollback_timestamp,
+                xid,
+                gid,
+            } => {
+                debug!(
+                    "Rollback prepared: xid={}, gid={}, rollback_lsn={}",
+                    xid,
+                    gid,
+                    format_lsn(rollback_end_lsn)
+                );
+                ChangeEvent::rollback_prepared(
+                    flags,
+                    xid,
+                    Lsn::new(prepare_end_lsn),
+                    Lsn::new(rollback_end_lsn),
+                    postgres_timestamp_to_chrono(prepare_timestamp),
+                    postgres_timestamp_to_chrono(rollback_timestamp),
+                    Arc::<str>::from(gid.as_str()),
+                    Lsn::new(lsn),
+                )
+            }
+
+            LogicalReplicationMessage::StreamPrepare {
+                flags,
+                prepare_lsn,
+                end_lsn: end,
+                timestamp,
+                xid,
+                gid,
+            } => {
+                debug!(
+                    "Stream prepare: xid={}, gid={}, prepare_lsn={}",
+                    xid,
+                    gid,
+                    format_lsn(prepare_lsn)
+                );
+                ChangeEvent::stream_prepare(
+                    flags,
+                    xid,
+                    Lsn::new(prepare_lsn),
+                    Lsn::new(end),
+                    postgres_timestamp_to_chrono(timestamp),
+                    Arc::<str>::from(gid.as_str()),
+                    Lsn::new(lsn),
+                )
             }
         };
 
@@ -4469,8 +4673,10 @@ mod tests {
         });
 
         let result = stream.convert_to_change_event(msg, 0x500).unwrap();
-        // Origin messages are handled by the catch-all `_ =>` arm
-        assert!(result.is_none());
+        // Origin messages are now surfaced as events
+        assert!(result.is_some());
+        let event = result.unwrap();
+        assert_eq!(event.event_type_str(), "origin");
     }
 
     #[test]
@@ -5023,8 +5229,23 @@ mod tests {
         });
 
         let result = stream.convert_to_change_event(msg, 0x500).unwrap();
-        // LogicalMessage hits the catch-all arm => None
-        assert!(result.is_none());
+        // Message events are now surfaced with full content
+        assert!(result.is_some());
+        let event = result.unwrap();
+        assert_eq!(event.event_type_str(), "message");
+        if let EventType::Message {
+            flags,
+            prefix,
+            content,
+            ..
+        } = &event.event_type
+        {
+            assert_eq!(*flags, 1);
+            assert_eq!(prefix.as_ref(), "test_prefix");
+            assert_eq!(content.as_ref(), b"hello world");
+        } else {
+            panic!("Expected Message event");
+        }
     }
 
     #[test]
@@ -5041,7 +5262,10 @@ mod tests {
         });
 
         let result = stream.convert_to_change_event(msg, 0x500).unwrap();
-        assert!(result.is_none());
+        // Type messages are now surfaced as events
+        assert!(result.is_some());
+        let event = result.unwrap();
+        assert_eq!(event.event_type_str(), "type");
     }
 
     #[test]
@@ -7292,5 +7516,588 @@ mod tests {
         let result2 = event_stream.next().await;
         assert!(result2.is_none());
         assert!(event_stream.is_terminated());
+    }
+
+    // ================================================================
+    // Two-phase commit convert_to_change_event tests
+    // ================================================================
+
+    #[test]
+    fn test_convert_to_change_event_begin_prepare() {
+        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::BeginPrepare {
+            prepare_lsn: 0x5000,
+            end_lsn: 0x5100,
+            timestamp: 756_864_000_000_000, // some PG timestamp
+            xid: 42,
+            gid: "gid_test_bp".to_string(),
+        });
+
+        let result = stream.convert_to_change_event(msg, 0x4900).unwrap();
+        assert!(result.is_some());
+        let event = result.unwrap();
+        assert_eq!(event.event_type_str(), "begin_prepare");
+        assert_eq!(event.lsn.value(), 0x4900);
+        if let EventType::BeginPrepare {
+            transaction_id,
+            prepare_lsn,
+            end_lsn,
+            gid,
+            ..
+        } = &event.event_type
+        {
+            assert_eq!(*transaction_id, 42);
+            assert_eq!(prepare_lsn.value(), 0x5000);
+            assert_eq!(end_lsn.value(), 0x5100);
+            assert_eq!(gid.as_ref(), "gid_test_bp");
+        } else {
+            panic!("Expected BeginPrepare event");
+        }
+    }
+
+    #[test]
+    fn test_convert_to_change_event_prepare() {
+        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Prepare {
+            flags: 0,
+            prepare_lsn: 0x6000,
+            end_lsn: 0x6100,
+            timestamp: 756_864_000_000_000,
+            xid: 43,
+            gid: "gid_test_p".to_string(),
+        });
+
+        let result = stream.convert_to_change_event(msg, 0x6000).unwrap();
+        assert!(result.is_some());
+        let event = result.unwrap();
+        assert_eq!(event.event_type_str(), "prepare");
+        assert_eq!(event.lsn.value(), 0x6000);
+        if let EventType::Prepare {
+            flags,
+            transaction_id,
+            prepare_lsn,
+            end_lsn,
+            gid,
+            ..
+        } = &event.event_type
+        {
+            assert_eq!(*flags, 0);
+            assert_eq!(*transaction_id, 43);
+            assert_eq!(prepare_lsn.value(), 0x6000);
+            assert_eq!(end_lsn.value(), 0x6100);
+            assert_eq!(gid.as_ref(), "gid_test_p");
+        } else {
+            panic!("Expected Prepare event");
+        }
+    }
+
+    #[test]
+    fn test_convert_to_change_event_commit_prepared() {
+        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::CommitPrepared {
+            flags: 0,
+            commit_lsn: 0x7000,
+            end_lsn: 0x7100,
+            timestamp: 756_864_000_000_000,
+            xid: 44,
+            gid: "gid_test_cp".to_string(),
+        });
+
+        let result = stream.convert_to_change_event(msg, 0x7000).unwrap();
+        assert!(result.is_some());
+        let event = result.unwrap();
+        assert_eq!(event.event_type_str(), "commit_prepared");
+        assert_eq!(event.lsn.value(), 0x7000);
+        if let EventType::CommitPrepared {
+            flags,
+            transaction_id,
+            commit_lsn,
+            end_lsn,
+            gid,
+            ..
+        } = &event.event_type
+        {
+            assert_eq!(*flags, 0);
+            assert_eq!(*transaction_id, 44);
+            assert_eq!(commit_lsn.value(), 0x7000);
+            assert_eq!(end_lsn.value(), 0x7100);
+            assert_eq!(gid.as_ref(), "gid_test_cp");
+        } else {
+            panic!("Expected CommitPrepared event");
+        }
+    }
+
+    #[test]
+    fn test_convert_to_change_event_rollback_prepared() {
+        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::RollbackPrepared {
+            flags: 0,
+            prepare_end_lsn: 0x8000,
+            rollback_end_lsn: 0x8100,
+            prepare_timestamp: 756_864_000_000_000,
+            rollback_timestamp: 756_864_060_000_000,
+            xid: 45,
+            gid: "gid_test_rp".to_string(),
+        });
+
+        let result = stream.convert_to_change_event(msg, 0x8000).unwrap();
+        assert!(result.is_some());
+        let event = result.unwrap();
+        assert_eq!(event.event_type_str(), "rollback_prepared");
+        assert_eq!(event.lsn.value(), 0x8000);
+        if let EventType::RollbackPrepared {
+            flags,
+            transaction_id,
+            prepare_end_lsn,
+            rollback_end_lsn,
+            gid,
+            ..
+        } = &event.event_type
+        {
+            assert_eq!(*flags, 0);
+            assert_eq!(*transaction_id, 45);
+            assert_eq!(prepare_end_lsn.value(), 0x8000);
+            assert_eq!(rollback_end_lsn.value(), 0x8100);
+            assert_eq!(gid.as_ref(), "gid_test_rp");
+        } else {
+            panic!("Expected RollbackPrepared event");
+        }
+    }
+
+    #[test]
+    fn test_convert_to_change_event_stream_prepare() {
+        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::StreamPrepare {
+            flags: 0,
+            prepare_lsn: 0x9000,
+            end_lsn: 0x9100,
+            timestamp: 756_864_000_000_000,
+            xid: 46,
+            gid: "gid_test_sp".to_string(),
+        });
+
+        let result = stream.convert_to_change_event(msg, 0x9000).unwrap();
+        assert!(result.is_some());
+        let event = result.unwrap();
+        assert_eq!(event.event_type_str(), "stream_prepare");
+        assert_eq!(event.lsn.value(), 0x9000);
+        if let EventType::StreamPrepare {
+            flags,
+            transaction_id,
+            prepare_lsn,
+            end_lsn,
+            gid,
+            ..
+        } = &event.event_type
+        {
+            assert_eq!(*flags, 0);
+            assert_eq!(*transaction_id, 46);
+            assert_eq!(prepare_lsn.value(), 0x9000);
+            assert_eq!(end_lsn.value(), 0x9100);
+            assert_eq!(gid.as_ref(), "gid_test_sp");
+        } else {
+            panic!("Expected StreamPrepare event");
+        }
+    }
+
+    // ================================================================
+    // Origin event with field validation
+    // ================================================================
+
+    #[test]
+    fn test_convert_to_change_event_origin_fields() {
+        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Origin {
+            origin_lsn: 0xA000,
+            origin_name: "upstream_dc".to_string(),
+        });
+
+        let result = stream.convert_to_change_event(msg, 0xA100).unwrap();
+        assert!(result.is_some());
+        let event = result.unwrap();
+        assert_eq!(event.event_type_str(), "origin");
+        assert_eq!(event.lsn.value(), 0xA100);
+        if let EventType::Origin {
+            origin_lsn,
+            origin_name,
+        } = &event.event_type
+        {
+            assert_eq!(origin_lsn.value(), 0xA000);
+            assert_eq!(origin_name.as_ref(), "upstream_dc");
+        } else {
+            panic!("Expected Origin event");
+        }
+    }
+
+    // ================================================================
+    // Relation schema-change detection tests
+    // ================================================================
+
+    #[test]
+    fn test_convert_to_change_event_relation_first_time_returns_none() {
+        use crate::protocol::ColumnInfo;
+        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        // First time seeing this relation — should cache it and return None
+        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Relation {
+            relation_id: 200,
+            namespace: "public".to_string(),
+            relation_name: "orders".to_string(),
+            replica_identity: b'd',
+            columns: vec![
+                ColumnInfo::new(1, "id".to_string(), 23, -1),
+                ColumnInfo::new(0, "total".to_string(), 1700, -1),
+            ],
+        });
+
+        let result = stream.convert_to_change_event(msg, 0xB000).unwrap();
+        assert!(result.is_none(), "First-time relation should return None");
+
+        // Verify it was cached
+        assert!(stream.state.get_relation(200).is_some());
+    }
+
+    #[test]
+    fn test_convert_to_change_event_relation_same_schema_returns_none() {
+        use crate::protocol::{ColumnInfo, RelationInfo};
+        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        // Pre-populate cache
+        let relation = RelationInfo::new(
+            300,
+            "public".to_string(),
+            "items".to_string(),
+            b'd',
+            vec![
+                ColumnInfo::new(1, "id".to_string(), 23, -1),
+                ColumnInfo::new(0, "name".to_string(), 25, -1),
+            ],
+        );
+        stream.state.add_relation(relation);
+
+        // Send identical relation message — no schema change
+        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Relation {
+            relation_id: 300,
+            namespace: "public".to_string(),
+            relation_name: "items".to_string(),
+            replica_identity: b'd',
+            columns: vec![
+                ColumnInfo::new(1, "id".to_string(), 23, -1),
+                ColumnInfo::new(0, "name".to_string(), 25, -1),
+            ],
+        });
+
+        let result = stream.convert_to_change_event(msg, 0xC000).unwrap();
+        assert!(
+            result.is_none(),
+            "Same schema should not emit a Relation event"
+        );
+    }
+
+    #[test]
+    fn test_convert_to_change_event_relation_schema_change_new_column() {
+        use crate::protocol::{ColumnInfo, RelationInfo};
+        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        // Pre-populate cache with 2 columns
+        let relation = RelationInfo::new(
+            400,
+            "public".to_string(),
+            "accounts".to_string(),
+            b'd',
+            vec![
+                ColumnInfo::new(1, "id".to_string(), 23, -1),
+                ColumnInfo::new(0, "email".to_string(), 25, -1),
+            ],
+        );
+        stream.state.add_relation(relation);
+
+        // Send relation message with an extra column — schema change!
+        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Relation {
+            relation_id: 400,
+            namespace: "public".to_string(),
+            relation_name: "accounts".to_string(),
+            replica_identity: b'd',
+            columns: vec![
+                ColumnInfo::new(1, "id".to_string(), 23, -1),
+                ColumnInfo::new(0, "email".to_string(), 25, -1),
+                ColumnInfo::new(0, "phone".to_string(), 25, -1),
+            ],
+        });
+
+        let result = stream.convert_to_change_event(msg, 0xD000).unwrap();
+        assert!(
+            result.is_some(),
+            "Schema change should emit a Relation event"
+        );
+        let event = result.unwrap();
+        assert_eq!(event.event_type_str(), "relation");
+        assert_eq!(event.lsn.value(), 0xD000);
+        if let EventType::Relation {
+            relation_id,
+            namespace,
+            relation_name,
+            columns,
+            ..
+        } = &event.event_type
+        {
+            assert_eq!(*relation_id, 400);
+            assert_eq!(namespace.as_ref(), "public");
+            assert_eq!(relation_name.as_ref(), "accounts");
+            assert_eq!(columns.len(), 3);
+            assert_eq!(columns[2].name.as_ref(), "phone");
+        } else {
+            panic!("Expected Relation event");
+        }
+    }
+
+    #[test]
+    fn test_convert_to_change_event_relation_schema_change_type_change() {
+        use crate::protocol::{ColumnInfo, RelationInfo};
+        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        // Pre-populate with type_id=25 (text)
+        let relation = RelationInfo::new(
+            500,
+            "public".to_string(),
+            "products".to_string(),
+            b'd',
+            vec![
+                ColumnInfo::new(1, "id".to_string(), 23, -1),
+                ColumnInfo::new(0, "price".to_string(), 25, -1),
+            ],
+        );
+        stream.state.add_relation(relation);
+
+        // Send relation with price changed to type_id=1700 (numeric)
+        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Relation {
+            relation_id: 500,
+            namespace: "public".to_string(),
+            relation_name: "products".to_string(),
+            replica_identity: b'd',
+            columns: vec![
+                ColumnInfo::new(1, "id".to_string(), 23, -1),
+                ColumnInfo::new(0, "price".to_string(), 1700, -1),
+            ],
+        });
+
+        let result = stream.convert_to_change_event(msg, 0xE000).unwrap();
+        assert!(
+            result.is_some(),
+            "Column type change should emit a Relation event"
+        );
+        let event = result.unwrap();
+        assert_eq!(event.event_type_str(), "relation");
+    }
+
+    #[test]
+    fn test_convert_to_change_event_relation_schema_change_replica_identity() {
+        use crate::protocol::{ColumnInfo, RelationInfo};
+        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        // Pre-populate with replica_identity = 'd' (Default)
+        let relation = RelationInfo::new(
+            600,
+            "public".to_string(),
+            "logs".to_string(),
+            b'd',
+            vec![ColumnInfo::new(1, "id".to_string(), 23, -1)],
+        );
+        stream.state.add_relation(relation);
+
+        // Send relation with replica_identity changed to 'f' (Full)
+        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Relation {
+            relation_id: 600,
+            namespace: "public".to_string(),
+            relation_name: "logs".to_string(),
+            replica_identity: b'f',
+            columns: vec![ColumnInfo::new(1, "id".to_string(), 23, -1)],
+        });
+
+        let result = stream.convert_to_change_event(msg, 0xF000).unwrap();
+        assert!(
+            result.is_some(),
+            "Replica identity change should emit a Relation event"
+        );
+        let event = result.unwrap();
+        if let EventType::Relation {
+            replica_identity, ..
+        } = &event.event_type
+        {
+            assert_eq!(*replica_identity, ReplicaIdentity::Full);
+        } else {
+            panic!("Expected Relation event");
+        }
+    }
+
+    #[test]
+    fn test_convert_to_change_event_relation_schema_change_column_rename() {
+        use crate::protocol::{ColumnInfo, RelationInfo};
+        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        // Pre-populate
+        let relation = RelationInfo::new(
+            700,
+            "public".to_string(),
+            "events".to_string(),
+            b'd',
+            vec![
+                ColumnInfo::new(1, "id".to_string(), 23, -1),
+                ColumnInfo::new(0, "name".to_string(), 25, -1),
+            ],
+        );
+        stream.state.add_relation(relation);
+
+        // Column renamed: "name" -> "title"
+        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Relation {
+            relation_id: 700,
+            namespace: "public".to_string(),
+            relation_name: "events".to_string(),
+            replica_identity: b'd',
+            columns: vec![
+                ColumnInfo::new(1, "id".to_string(), 23, -1),
+                ColumnInfo::new(0, "title".to_string(), 25, -1),
+            ],
+        });
+
+        let result = stream.convert_to_change_event(msg, 0xF100).unwrap();
+        assert!(
+            result.is_some(),
+            "Column rename should emit a Relation event"
+        );
+        let event = result.unwrap();
+        if let EventType::Relation { columns, .. } = &event.event_type {
+            assert_eq!(columns[1].name.as_ref(), "title");
+        } else {
+            panic!("Expected Relation event");
+        }
+    }
+
+    #[test]
+    fn test_convert_to_change_event_relation_schema_change_namespace() {
+        use crate::protocol::{ColumnInfo, RelationInfo};
+        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        // Pre-populate in "public" schema
+        let relation = RelationInfo::new(
+            800,
+            "public".to_string(),
+            "data".to_string(),
+            b'd',
+            vec![ColumnInfo::new(1, "id".to_string(), 23, -1)],
+        );
+        stream.state.add_relation(relation);
+
+        // Same relation_id but moved to "archive" schema
+        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Relation {
+            relation_id: 800,
+            namespace: "archive".to_string(),
+            relation_name: "data".to_string(),
+            replica_identity: b'd',
+            columns: vec![ColumnInfo::new(1, "id".to_string(), 23, -1)],
+        });
+
+        let result = stream.convert_to_change_event(msg, 0xF200).unwrap();
+        assert!(
+            result.is_some(),
+            "Namespace change should emit a Relation event"
+        );
+        let event = result.unwrap();
+        if let EventType::Relation { namespace, .. } = &event.event_type {
+            assert_eq!(namespace.as_ref(), "archive");
+        } else {
+            panic!("Expected Relation event");
+        }
+    }
+
+    #[test]
+    fn test_convert_to_change_event_relation_schema_change_key_flag() {
+        use crate::protocol::{ColumnInfo, RelationInfo};
+        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+
+        let config = create_test_config();
+        let mut stream = create_test_stream(config);
+
+        // Pre-populate: "email" is NOT a key column (flags=0)
+        let relation = RelationInfo::new(
+            900,
+            "public".to_string(),
+            "users".to_string(),
+            b'd',
+            vec![
+                ColumnInfo::new(1, "id".to_string(), 23, -1),
+                ColumnInfo::new(0, "email".to_string(), 25, -1),
+            ],
+        );
+        stream.state.add_relation(relation);
+
+        // Now "email" becomes a key column (flags=1)
+        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Relation {
+            relation_id: 900,
+            namespace: "public".to_string(),
+            relation_name: "users".to_string(),
+            replica_identity: b'd',
+            columns: vec![
+                ColumnInfo::new(1, "id".to_string(), 23, -1),
+                ColumnInfo::new(1, "email".to_string(), 25, -1),
+            ],
+        });
+
+        let result = stream.convert_to_change_event(msg, 0xF300).unwrap();
+        assert!(
+            result.is_some(),
+            "Key flag change should emit a Relation event"
+        );
+        let event = result.unwrap();
+        if let EventType::Relation { columns, .. } = &event.event_type {
+            assert!(columns[1].is_key, "email should now be a key column");
+        } else {
+            panic!("Expected Relation event");
+        }
     }
 }

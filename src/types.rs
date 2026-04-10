@@ -6,7 +6,7 @@
 use crate::buffer::BufferReader;
 use crate::error::{ReplicationError, Result};
 use crate::protocol::message_types;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -528,10 +528,95 @@ pub enum EventType {
         abort_lsn: Option<Lsn>,
         abort_timestamp: Option<chrono::DateTime<chrono::Utc>>,
     },
-    Relation,
-    Type,
-    Origin,
-    Message,
+    /// Relation (schema) definition — emitted on schema changes
+    Relation {
+        relation_id: Oid,
+        namespace: Arc<str>,
+        relation_name: Arc<str>,
+        replica_identity: ReplicaIdentity,
+        columns: Vec<RelationColumn>,
+    },
+    /// Custom type definition
+    Type {
+        type_id: Oid,
+        namespace: Arc<str>,
+        type_name: Arc<str>,
+    },
+    /// Replication origin information
+    Origin {
+        origin_lsn: Lsn,
+        origin_name: Arc<str>,
+    },
+    /// Logical decoding message (application-defined)
+    Message {
+        /// 1 = transactional, 0 = non-transactional
+        flags: u8,
+        message_lsn: Lsn,
+        prefix: Arc<str>,
+        content: Bytes,
+    },
+    /// Begin of a two-phase transaction prepare (protocol v3+)
+    BeginPrepare {
+        transaction_id: u32,
+        prepare_lsn: Lsn,
+        end_lsn: Lsn,
+        prepare_timestamp: chrono::DateTime<chrono::Utc>,
+        gid: Arc<str>,
+    },
+    /// Two-phase transaction prepared (protocol v3+)
+    Prepare {
+        flags: u8,
+        transaction_id: u32,
+        prepare_lsn: Lsn,
+        end_lsn: Lsn,
+        prepare_timestamp: chrono::DateTime<chrono::Utc>,
+        gid: Arc<str>,
+    },
+    /// Two-phase transaction committed (protocol v3+)
+    CommitPrepared {
+        flags: u8,
+        transaction_id: u32,
+        commit_lsn: Lsn,
+        end_lsn: Lsn,
+        commit_timestamp: chrono::DateTime<chrono::Utc>,
+        gid: Arc<str>,
+    },
+    /// Two-phase transaction rolled back (protocol v3+)
+    RollbackPrepared {
+        flags: u8,
+        transaction_id: u32,
+        prepare_end_lsn: Lsn,
+        rollback_end_lsn: Lsn,
+        prepare_timestamp: chrono::DateTime<chrono::Utc>,
+        rollback_timestamp: chrono::DateTime<chrono::Utc>,
+        gid: Arc<str>,
+    },
+    /// Streaming two-phase transaction prepare (protocol v3+)
+    StreamPrepare {
+        flags: u8,
+        transaction_id: u32,
+        prepare_lsn: Lsn,
+        end_lsn: Lsn,
+        prepare_timestamp: chrono::DateTime<chrono::Utc>,
+        gid: Arc<str>,
+    },
+}
+
+/// Lightweight representation of a column in a relation (table schema).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelationColumn {
+    pub name: Arc<str>,
+    pub type_id: Oid,
+    pub type_modifier: i32,
+    pub is_key: bool,
+}
+
+/// Information about a replication slot returned by `READ_REPLICATION_SLOT`.
+#[derive(Debug, Clone)]
+pub struct ReplicationSlotInfo {
+    pub slot_type: Option<String>,
+    pub restart_lsn: Option<Lsn>,
+    pub restart_tli: Option<i32>,
 }
 
 /// Represents a single change event from PostgreSQL logical replication
@@ -784,53 +869,224 @@ impl ChangeEvent {
         }
     }
 
-    /// Create a RELATION event
+    /// Create a RELATION event (schema definition change)
     ///
     /// # Arguments
     ///
+    /// * `relation_id` - PostgreSQL relation OID
+    /// * `namespace` - Schema name
+    /// * `relation_name` - Table name
+    /// * `replica_identity` - Table's replica identity setting
+    /// * `columns` - Column definitions
     /// * `lsn` - Log Sequence Number for this event
-    pub fn relation(lsn: Lsn) -> Self {
+    pub fn relation(
+        relation_id: Oid,
+        namespace: impl Into<Arc<str>>,
+        relation_name: impl Into<Arc<str>>,
+        replica_identity: ReplicaIdentity,
+        columns: Vec<RelationColumn>,
+        lsn: Lsn,
+    ) -> Self {
         Self {
-            event_type: EventType::Relation,
+            event_type: EventType::Relation {
+                relation_id,
+                namespace: namespace.into(),
+                relation_name: relation_name.into(),
+                replica_identity,
+                columns,
+            },
             lsn,
             metadata: None,
         }
     }
 
-    /// Create a TYPE event
+    /// Create a TYPE event (custom type definition)
     ///
     /// # Arguments
     ///
+    /// * `type_id` - PostgreSQL type OID
+    /// * `namespace` - Schema name
+    /// * `type_name` - Type name
     /// * `lsn` - Log Sequence Number for this event
-    pub fn type_event(lsn: Lsn) -> Self {
+    pub fn type_event(
+        type_id: Oid,
+        namespace: impl Into<Arc<str>>,
+        type_name: impl Into<Arc<str>>,
+        lsn: Lsn,
+    ) -> Self {
         Self {
-            event_type: EventType::Type,
+            event_type: EventType::Type {
+                type_id,
+                namespace: namespace.into(),
+                type_name: type_name.into(),
+            },
             lsn,
             metadata: None,
         }
     }
 
-    /// Create an ORIGIN event
+    /// Create an ORIGIN event (replication origin information)
     ///
     /// # Arguments
     ///
+    /// * `origin_lsn` - Origin commit LSN
+    /// * `origin_name` - Origin name
     /// * `lsn` - Log Sequence Number for this event
-    pub fn origin(lsn: Lsn) -> Self {
+    pub fn origin(origin_lsn: Lsn, origin_name: impl Into<Arc<str>>, lsn: Lsn) -> Self {
         Self {
-            event_type: EventType::Origin,
+            event_type: EventType::Origin {
+                origin_lsn,
+                origin_name: origin_name.into(),
+            },
             lsn,
             metadata: None,
         }
     }
 
-    /// Create a MESSAGE event
+    /// Create a MESSAGE event (logical decoding message)
     ///
     /// # Arguments
     ///
+    /// * `flags` - 1 = transactional, 0 = non-transactional
+    /// * `message_lsn` - LSN of the message
+    /// * `prefix` - Application-defined message prefix
+    /// * `content` - Message payload bytes
     /// * `lsn` - Log Sequence Number for this event
-    pub fn message(lsn: Lsn) -> Self {
+    pub fn message(
+        flags: u8,
+        message_lsn: Lsn,
+        prefix: impl Into<Arc<str>>,
+        content: Bytes,
+        lsn: Lsn,
+    ) -> Self {
         Self {
-            event_type: EventType::Message,
+            event_type: EventType::Message {
+                flags,
+                message_lsn,
+                prefix: prefix.into(),
+                content,
+            },
+            lsn,
+            metadata: None,
+        }
+    }
+
+    /// Create a BEGIN_PREPARE event (two-phase commit, protocol v3+)
+    pub fn begin_prepare(
+        transaction_id: u32,
+        prepare_lsn: Lsn,
+        end_lsn: Lsn,
+        prepare_timestamp: chrono::DateTime<chrono::Utc>,
+        gid: impl Into<Arc<str>>,
+        lsn: Lsn,
+    ) -> Self {
+        Self {
+            event_type: EventType::BeginPrepare {
+                transaction_id,
+                prepare_lsn,
+                end_lsn,
+                prepare_timestamp,
+                gid: gid.into(),
+            },
+            lsn,
+            metadata: None,
+        }
+    }
+
+    /// Create a PREPARE event (two-phase commit, protocol v3+)
+    pub fn prepare(
+        flags: u8,
+        transaction_id: u32,
+        prepare_lsn: Lsn,
+        end_lsn: Lsn,
+        prepare_timestamp: chrono::DateTime<chrono::Utc>,
+        gid: impl Into<Arc<str>>,
+        lsn: Lsn,
+    ) -> Self {
+        Self {
+            event_type: EventType::Prepare {
+                flags,
+                transaction_id,
+                prepare_lsn,
+                end_lsn,
+                prepare_timestamp,
+                gid: gid.into(),
+            },
+            lsn,
+            metadata: None,
+        }
+    }
+
+    /// Create a COMMIT_PREPARED event (two-phase commit, protocol v3+)
+    pub fn commit_prepared(
+        flags: u8,
+        transaction_id: u32,
+        commit_lsn: Lsn,
+        end_lsn: Lsn,
+        commit_timestamp: chrono::DateTime<chrono::Utc>,
+        gid: impl Into<Arc<str>>,
+        lsn: Lsn,
+    ) -> Self {
+        Self {
+            event_type: EventType::CommitPrepared {
+                flags,
+                transaction_id,
+                commit_lsn,
+                end_lsn,
+                commit_timestamp,
+                gid: gid.into(),
+            },
+            lsn,
+            metadata: None,
+        }
+    }
+
+    /// Create a ROLLBACK_PREPARED event (two-phase commit, protocol v3+)
+    #[allow(clippy::too_many_arguments)]
+    pub fn rollback_prepared(
+        flags: u8,
+        transaction_id: u32,
+        prepare_end_lsn: Lsn,
+        rollback_end_lsn: Lsn,
+        prepare_timestamp: chrono::DateTime<chrono::Utc>,
+        rollback_timestamp: chrono::DateTime<chrono::Utc>,
+        gid: impl Into<Arc<str>>,
+        lsn: Lsn,
+    ) -> Self {
+        Self {
+            event_type: EventType::RollbackPrepared {
+                flags,
+                transaction_id,
+                prepare_end_lsn,
+                rollback_end_lsn,
+                prepare_timestamp,
+                rollback_timestamp,
+                gid: gid.into(),
+            },
+            lsn,
+            metadata: None,
+        }
+    }
+
+    /// Create a STREAM_PREPARE event (two-phase + streaming, protocol v3+)
+    pub fn stream_prepare(
+        flags: u8,
+        transaction_id: u32,
+        prepare_lsn: Lsn,
+        end_lsn: Lsn,
+        prepare_timestamp: chrono::DateTime<chrono::Utc>,
+        gid: impl Into<Arc<str>>,
+        lsn: Lsn,
+    ) -> Self {
+        Self {
+            event_type: EventType::StreamPrepare {
+                flags,
+                transaction_id,
+                prepare_lsn,
+                end_lsn,
+                prepare_timestamp,
+                gid: gid.into(),
+            },
             lsn,
             metadata: None,
         }
@@ -870,7 +1126,21 @@ impl ChangeEvent {
             EventType::Update { .. } => "update",
             EventType::Delete { .. } => "delete",
             EventType::Truncate(_) => "truncate",
-            _ => "other",
+            EventType::Begin { .. } => "begin",
+            EventType::Commit { .. } => "commit",
+            EventType::StreamStart { .. } => "stream_start",
+            EventType::StreamStop => "stream_stop",
+            EventType::StreamCommit { .. } => "stream_commit",
+            EventType::StreamAbort { .. } => "stream_abort",
+            EventType::Relation { .. } => "relation",
+            EventType::Type { .. } => "type",
+            EventType::Origin { .. } => "origin",
+            EventType::Message { .. } => "message",
+            EventType::BeginPrepare { .. } => "begin_prepare",
+            EventType::Prepare { .. } => "prepare",
+            EventType::CommitPrepared { .. } => "commit_prepared",
+            EventType::RollbackPrepared { .. } => "rollback_prepared",
+            EventType::StreamPrepare { .. } => "stream_prepare",
         }
     }
 
@@ -1044,10 +1314,137 @@ impl ChangeEvent {
                     }
                 }
             }
-            EventType::Relation => buf.extend_from_slice(&[message_types::RELATION]),
-            EventType::Type => buf.extend_from_slice(&[message_types::TYPE]),
-            EventType::Origin => buf.extend_from_slice(&[message_types::ORIGIN]),
-            EventType::Message => buf.extend_from_slice(&[message_types::MESSAGE]),
+            EventType::Relation {
+                relation_id,
+                namespace,
+                relation_name,
+                replica_identity,
+                ref columns,
+            } => {
+                buf.extend_from_slice(&[message_types::RELATION]);
+                buf.extend_from_slice(&relation_id.to_be_bytes());
+                encode_arc_str(buf, namespace);
+                encode_arc_str(buf, relation_name);
+                buf.extend_from_slice(&[replica_identity.to_byte()]);
+                buf.extend_from_slice(&(columns.len() as u16).to_be_bytes());
+                for col in columns {
+                    encode_arc_str(buf, &col.name);
+                    buf.extend_from_slice(&col.type_id.to_be_bytes());
+                    buf.extend_from_slice(&col.type_modifier.to_be_bytes());
+                    buf.extend_from_slice(&[u8::from(col.is_key)]);
+                }
+            }
+            EventType::Type {
+                type_id,
+                namespace,
+                type_name,
+            } => {
+                buf.extend_from_slice(&[message_types::TYPE]);
+                buf.extend_from_slice(&type_id.to_be_bytes());
+                encode_arc_str(buf, namespace);
+                encode_arc_str(buf, type_name);
+            }
+            EventType::Origin {
+                origin_lsn,
+                origin_name,
+            } => {
+                buf.extend_from_slice(&[message_types::ORIGIN]);
+                buf.extend_from_slice(&origin_lsn.0.to_be_bytes());
+                encode_arc_str(buf, origin_name);
+            }
+            EventType::Message {
+                flags,
+                message_lsn,
+                prefix,
+                ref content,
+            } => {
+                buf.extend_from_slice(&[message_types::MESSAGE]);
+                buf.extend_from_slice(&[*flags]);
+                buf.extend_from_slice(&message_lsn.0.to_be_bytes());
+                encode_arc_str(buf, prefix);
+                buf.extend_from_slice(&(content.len() as u32).to_be_bytes());
+                buf.extend_from_slice(content);
+            }
+            EventType::BeginPrepare {
+                transaction_id,
+                prepare_lsn,
+                end_lsn,
+                prepare_timestamp,
+                gid,
+            } => {
+                buf.extend_from_slice(&[message_types::BEGIN_PREPARE]);
+                buf.extend_from_slice(&transaction_id.to_be_bytes());
+                buf.extend_from_slice(&prepare_lsn.0.to_be_bytes());
+                buf.extend_from_slice(&end_lsn.0.to_be_bytes());
+                buf.extend_from_slice(&prepare_timestamp.timestamp_micros().to_be_bytes());
+                encode_arc_str(buf, gid);
+            }
+            EventType::Prepare {
+                flags,
+                transaction_id,
+                prepare_lsn,
+                end_lsn,
+                prepare_timestamp,
+                gid,
+            } => {
+                buf.extend_from_slice(&[message_types::PREPARE]);
+                buf.extend_from_slice(&[*flags]);
+                buf.extend_from_slice(&transaction_id.to_be_bytes());
+                buf.extend_from_slice(&prepare_lsn.0.to_be_bytes());
+                buf.extend_from_slice(&end_lsn.0.to_be_bytes());
+                buf.extend_from_slice(&prepare_timestamp.timestamp_micros().to_be_bytes());
+                encode_arc_str(buf, gid);
+            }
+            EventType::CommitPrepared {
+                flags,
+                transaction_id,
+                commit_lsn,
+                end_lsn,
+                commit_timestamp,
+                gid,
+            } => {
+                buf.extend_from_slice(&[message_types::COMMIT_PREPARED]);
+                buf.extend_from_slice(&[*flags]);
+                buf.extend_from_slice(&transaction_id.to_be_bytes());
+                buf.extend_from_slice(&commit_lsn.0.to_be_bytes());
+                buf.extend_from_slice(&end_lsn.0.to_be_bytes());
+                buf.extend_from_slice(&commit_timestamp.timestamp_micros().to_be_bytes());
+                encode_arc_str(buf, gid);
+            }
+            EventType::RollbackPrepared {
+                flags,
+                transaction_id,
+                prepare_end_lsn,
+                rollback_end_lsn,
+                prepare_timestamp,
+                rollback_timestamp,
+                gid,
+            } => {
+                buf.extend_from_slice(&[message_types::ROLLBACK_PREPARED]);
+                buf.extend_from_slice(&[*flags]);
+                buf.extend_from_slice(&transaction_id.to_be_bytes());
+                buf.extend_from_slice(&prepare_end_lsn.0.to_be_bytes());
+                buf.extend_from_slice(&rollback_end_lsn.0.to_be_bytes());
+                buf.extend_from_slice(&prepare_timestamp.timestamp_micros().to_be_bytes());
+                buf.extend_from_slice(&rollback_timestamp.timestamp_micros().to_be_bytes());
+                encode_arc_str(buf, gid);
+            }
+            EventType::StreamPrepare {
+                flags,
+                transaction_id,
+                prepare_lsn,
+                end_lsn,
+                prepare_timestamp,
+                gid,
+            } => {
+                buf.extend_from_slice(&[message_types::STREAM_PREPARE]);
+                buf.extend_from_slice(&[*flags]);
+                buf.extend_from_slice(&transaction_id.to_be_bytes());
+                buf.extend_from_slice(&prepare_lsn.0.to_be_bytes());
+                buf.extend_from_slice(&end_lsn.0.to_be_bytes());
+                buf.extend_from_slice(&prepare_timestamp.timestamp_micros().to_be_bytes());
+                encode_arc_str(buf, gid);
+            }
         }
     }
 
@@ -1219,10 +1616,149 @@ impl ChangeEvent {
                     abort_timestamp,
                 }
             }
-            message_types::RELATION => EventType::Relation,
-            message_types::TYPE => EventType::Type,
-            message_types::ORIGIN => EventType::Origin,
-            message_types::MESSAGE => EventType::Message,
+            message_types::RELATION => {
+                let relation_id = reader.read_u32()?;
+                let namespace = decode_arc_str(&mut reader)?;
+                let relation_name = decode_arc_str(&mut reader)?;
+                let ri_byte = reader.read_u8()?;
+                let replica_identity = ReplicaIdentity::from_byte(ri_byte).ok_or_else(|| {
+                    ReplicationError::protocol(format!(
+                        "Unknown replica identity byte: 0x{ri_byte:02x}"
+                    ))
+                })?;
+                let col_count = reader.read_u16()? as usize;
+                let mut columns = Vec::with_capacity(col_count);
+                for _ in 0..col_count {
+                    let name = decode_arc_str(&mut reader)?;
+                    let type_id = reader.read_u32()?;
+                    let type_modifier = reader.read_i32()?;
+                    let is_key = reader.read_u8()? != 0;
+                    columns.push(RelationColumn {
+                        name,
+                        type_id,
+                        type_modifier,
+                        is_key,
+                    });
+                }
+                EventType::Relation {
+                    relation_id,
+                    namespace,
+                    relation_name,
+                    replica_identity,
+                    columns,
+                }
+            }
+            message_types::TYPE => {
+                let type_id = reader.read_u32()?;
+                let namespace = decode_arc_str(&mut reader)?;
+                let type_name = decode_arc_str(&mut reader)?;
+                EventType::Type {
+                    type_id,
+                    namespace,
+                    type_name,
+                }
+            }
+            message_types::ORIGIN => {
+                let origin_lsn = Lsn(reader.read_u64()?);
+                let origin_name = decode_arc_str(&mut reader)?;
+                EventType::Origin {
+                    origin_lsn,
+                    origin_name,
+                }
+            }
+            message_types::MESSAGE => {
+                let flags = reader.read_u8()?;
+                let message_lsn = Lsn(reader.read_u64()?);
+                let prefix = decode_arc_str(&mut reader)?;
+                let content_len = reader.read_u32()? as usize;
+                let content_bytes = reader.read_bytes(content_len)?;
+                EventType::Message {
+                    flags,
+                    message_lsn,
+                    prefix,
+                    content: Bytes::from(content_bytes),
+                }
+            }
+            message_types::BEGIN_PREPARE => {
+                let transaction_id = reader.read_u32()?;
+                let prepare_lsn = Lsn(reader.read_u64()?);
+                let end_lsn = Lsn(reader.read_u64()?);
+                let prepare_timestamp = micros_to_chrono(reader.read_i64()?)?;
+                let gid = decode_arc_str(&mut reader)?;
+                EventType::BeginPrepare {
+                    transaction_id,
+                    prepare_lsn,
+                    end_lsn,
+                    prepare_timestamp,
+                    gid,
+                }
+            }
+            message_types::PREPARE => {
+                let flags = reader.read_u8()?;
+                let transaction_id = reader.read_u32()?;
+                let prepare_lsn = Lsn(reader.read_u64()?);
+                let end_lsn = Lsn(reader.read_u64()?);
+                let prepare_timestamp = micros_to_chrono(reader.read_i64()?)?;
+                let gid = decode_arc_str(&mut reader)?;
+                EventType::Prepare {
+                    flags,
+                    transaction_id,
+                    prepare_lsn,
+                    end_lsn,
+                    prepare_timestamp,
+                    gid,
+                }
+            }
+            message_types::COMMIT_PREPARED => {
+                let flags = reader.read_u8()?;
+                let transaction_id = reader.read_u32()?;
+                let commit_lsn = Lsn(reader.read_u64()?);
+                let end_lsn = Lsn(reader.read_u64()?);
+                let commit_timestamp = micros_to_chrono(reader.read_i64()?)?;
+                let gid = decode_arc_str(&mut reader)?;
+                EventType::CommitPrepared {
+                    flags,
+                    transaction_id,
+                    commit_lsn,
+                    end_lsn,
+                    commit_timestamp,
+                    gid,
+                }
+            }
+            message_types::ROLLBACK_PREPARED => {
+                let flags = reader.read_u8()?;
+                let transaction_id = reader.read_u32()?;
+                let prepare_end_lsn = Lsn(reader.read_u64()?);
+                let rollback_end_lsn = Lsn(reader.read_u64()?);
+                let prepare_timestamp = micros_to_chrono(reader.read_i64()?)?;
+                let rollback_timestamp = micros_to_chrono(reader.read_i64()?)?;
+                let gid = decode_arc_str(&mut reader)?;
+                EventType::RollbackPrepared {
+                    flags,
+                    transaction_id,
+                    prepare_end_lsn,
+                    rollback_end_lsn,
+                    prepare_timestamp,
+                    rollback_timestamp,
+                    gid,
+                }
+            }
+            message_types::STREAM_PREPARE => {
+                let flags = reader.read_u8()?;
+                let transaction_id = reader.read_u32()?;
+                let prepare_lsn = Lsn(reader.read_u64()?);
+                let end_lsn = Lsn(reader.read_u64()?);
+                let prepare_timestamp = micros_to_chrono(reader.read_i64()?)?;
+                let gid = decode_arc_str(&mut reader)?;
+                EventType::StreamPrepare {
+                    flags,
+                    transaction_id,
+                    prepare_lsn,
+                    end_lsn,
+                    prepare_timestamp,
+                    gid,
+                }
+            }
             _ => {
                 return Err(ReplicationError::protocol(format!(
                     "Unknown ChangeEvent tag: 0x{tag:02x}"
@@ -1627,30 +2163,49 @@ mod tests {
 
     #[test]
     fn test_change_event_relation() {
-        let event = ChangeEvent::relation(Lsn::new(8000));
+        let cols = vec![RelationColumn {
+            name: Arc::from("id"),
+            type_id: 23,
+            type_modifier: -1,
+            is_key: true,
+        }];
+        let event = ChangeEvent::relation(
+            16384,
+            "public",
+            "users",
+            ReplicaIdentity::Default,
+            cols,
+            Lsn::new(8000),
+        );
         assert_eq!(event.lsn.value(), 8000);
-        assert!(matches!(event.event_type, EventType::Relation));
+        assert!(matches!(event.event_type, EventType::Relation { .. }));
     }
 
     #[test]
     fn test_change_event_type_event() {
-        let event = ChangeEvent::type_event(Lsn::new(9000));
+        let event = ChangeEvent::type_event(100, "public", "my_type", Lsn::new(9000));
         assert_eq!(event.lsn.value(), 9000);
-        assert!(matches!(event.event_type, EventType::Type));
+        assert!(matches!(event.event_type, EventType::Type { .. }));
     }
 
     #[test]
     fn test_change_event_origin() {
-        let event = ChangeEvent::origin(Lsn::new(10000));
+        let event = ChangeEvent::origin(Lsn::new(500), "my_origin", Lsn::new(10000));
         assert_eq!(event.lsn.value(), 10000);
-        assert!(matches!(event.event_type, EventType::Origin));
+        assert!(matches!(event.event_type, EventType::Origin { .. }));
     }
 
     #[test]
     fn test_change_event_message() {
-        let event = ChangeEvent::message(Lsn::new(11000));
+        let event = ChangeEvent::message(
+            1,
+            Lsn::new(500),
+            "test_prefix",
+            Bytes::from_static(b"hello"),
+            Lsn::new(11000),
+        );
         assert_eq!(event.lsn.value(), 11000);
-        assert!(matches!(event.event_type, EventType::Message));
+        assert!(matches!(event.event_type, EventType::Message { .. }));
     }
 
     #[test]
@@ -1788,58 +2343,31 @@ mod tests {
         assert_eq!(truncate.event_type_str(), "truncate");
 
         // "other" for Begin, Commit, Relation, Type, Origin, Message
-        let relation = ChangeEvent::relation(Lsn::new(500));
-        assert_eq!(relation.event_type_str(), "other");
+        let relation = ChangeEvent::relation(
+            1,
+            "public",
+            "t",
+            ReplicaIdentity::Default,
+            vec![],
+            Lsn::new(500),
+        );
+        assert_eq!(relation.event_type_str(), "relation");
 
         let ts = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
         let begin = ChangeEvent::begin(1, Lsn::new(600), ts, Lsn::new(600));
-        assert_eq!(begin.event_type_str(), "other");
+        assert_eq!(begin.event_type_str(), "begin");
 
         let commit = ChangeEvent::commit(ts, Lsn::new(700), Lsn::new(700), Lsn::new(710));
-        assert_eq!(commit.event_type_str(), "other");
+        assert_eq!(commit.event_type_str(), "commit");
 
-        let origin = ChangeEvent::origin(Lsn::new(800));
-        assert_eq!(origin.event_type_str(), "other");
+        let origin = ChangeEvent::origin(Lsn::new(500), "origin_name", Lsn::new(800));
+        assert_eq!(origin.event_type_str(), "origin");
 
-        let message = ChangeEvent::message(Lsn::new(900));
-        assert_eq!(message.event_type_str(), "other");
+        let message = ChangeEvent::message(1, Lsn::new(500), "prefix", Bytes::new(), Lsn::new(900));
+        assert_eq!(message.event_type_str(), "message");
 
-        let type_event = ChangeEvent::type_event(Lsn::new(1000));
-        assert_eq!(type_event.event_type_str(), "other");
-    }
-
-    #[test]
-    fn test_lsn_serialize_deserialize() {
-        let lsn = Lsn::new(0x16B374D848);
-        let serialized = serde_json::to_string(&lsn).unwrap();
-        let deserialized: Lsn = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(lsn, deserialized);
-    }
-
-    #[test]
-    fn test_replica_identity_serialize_deserialize() {
-        for identity in [
-            ReplicaIdentity::Default,
-            ReplicaIdentity::Nothing,
-            ReplicaIdentity::Full,
-            ReplicaIdentity::Index,
-        ] {
-            let serialized = serde_json::to_string(&identity).unwrap();
-            let deserialized: ReplicaIdentity = serde_json::from_str(&serialized).unwrap();
-            assert_eq!(identity, deserialized);
-        }
-    }
-
-    #[test]
-    fn test_change_event_serialize_deserialize() {
-        let data = RowData::from_pairs(vec![("id", ColumnValue::text("42"))]);
-
-        let event = ChangeEvent::insert("public", "test", 12345, data, Lsn::new(1000));
-
-        let serialized = serde_json::to_string(&event).unwrap();
-        let deserialized: ChangeEvent = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(deserialized.lsn, event.lsn);
-        assert_eq!(deserialized.event_type, event.event_type);
+        let type_event = ChangeEvent::type_event(100, "public", "my_type", Lsn::new(1000));
+        assert_eq!(type_event.event_type_str(), "type");
     }
 
     #[test]
@@ -2070,25 +2598,149 @@ mod tests {
 
     #[test]
     fn test_encode_decode_relation() {
-        let event = ChangeEvent::relation(Lsn::new(10000));
+        let cols = vec![
+            RelationColumn {
+                name: Arc::from("id"),
+                type_id: 23,
+                type_modifier: -1,
+                is_key: true,
+            },
+            RelationColumn {
+                name: Arc::from("name"),
+                type_id: 25,
+                type_modifier: -1,
+                is_key: false,
+            },
+        ];
+        let event = ChangeEvent::relation(
+            16384,
+            "public",
+            "users",
+            ReplicaIdentity::Default,
+            cols,
+            Lsn::new(10000),
+        );
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_relation_empty_columns() {
+        let event = ChangeEvent::relation(
+            1,
+            "myschema",
+            "empty_table",
+            ReplicaIdentity::Full,
+            vec![],
+            Lsn::new(10050),
+        );
         assert_encode_decode_round_trip(&event);
     }
 
     #[test]
     fn test_encode_decode_type() {
-        let event = ChangeEvent::type_event(Lsn::new(10100));
+        let event = ChangeEvent::type_event(12345, "pg_catalog", "my_enum", Lsn::new(10100));
         assert_encode_decode_round_trip(&event);
     }
 
     #[test]
     fn test_encode_decode_origin() {
-        let event = ChangeEvent::origin(Lsn::new(10200));
+        let event = ChangeEvent::origin(Lsn::new(500), "my_origin_cluster", Lsn::new(10200));
         assert_encode_decode_round_trip(&event);
     }
 
     #[test]
     fn test_encode_decode_message() {
-        let event = ChangeEvent::message(Lsn::new(10300));
+        let event = ChangeEvent::message(
+            1,
+            Lsn::new(500),
+            "test.prefix",
+            Bytes::from_static(b"hello world"),
+            Lsn::new(10300),
+        );
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_message_empty_content() {
+        let event = ChangeEvent::message(0, Lsn::new(500), "empty", Bytes::new(), Lsn::new(10350));
+        assert_encode_decode_round_trip(&event);
+    }
+
+    // --- Two-phase commit encode/decode tests ---
+
+    #[test]
+    fn test_encode_decode_begin_prepare() {
+        let ts = Utc.with_ymd_and_hms(2024, 7, 1, 12, 0, 0).unwrap();
+        let event = ChangeEvent::begin_prepare(
+            42,
+            Lsn::new(5000),
+            Lsn::new(5100),
+            ts,
+            "gid_test_1",
+            Lsn::new(4900),
+        );
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_prepare() {
+        let ts = Utc.with_ymd_and_hms(2024, 7, 1, 12, 0, 0).unwrap();
+        let event = ChangeEvent::prepare(
+            0,
+            42,
+            Lsn::new(5000),
+            Lsn::new(5100),
+            ts,
+            "gid_test_2",
+            Lsn::new(5000),
+        );
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_commit_prepared() {
+        let ts = Utc.with_ymd_and_hms(2024, 7, 1, 12, 1, 0).unwrap();
+        let event = ChangeEvent::commit_prepared(
+            0,
+            42,
+            Lsn::new(6000),
+            Lsn::new(6100),
+            ts,
+            "gid_test_3",
+            Lsn::new(6000),
+        );
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_rollback_prepared() {
+        let ts1 = Utc.with_ymd_and_hms(2024, 7, 1, 12, 0, 0).unwrap();
+        let ts2 = Utc.with_ymd_and_hms(2024, 7, 1, 12, 2, 0).unwrap();
+        let event = ChangeEvent::rollback_prepared(
+            0,
+            42,
+            Lsn::new(7000),
+            Lsn::new(7100),
+            ts1,
+            ts2,
+            "gid_test_4",
+            Lsn::new(7000),
+        );
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_stream_prepare() {
+        let ts = Utc.with_ymd_and_hms(2024, 7, 1, 12, 0, 0).unwrap();
+        let event = ChangeEvent::stream_prepare(
+            0,
+            42,
+            Lsn::new(8000),
+            Lsn::new(8100),
+            ts,
+            "gid_test_5",
+            Lsn::new(8000),
+        );
         assert_encode_decode_round_trip(&event);
     }
 
@@ -2201,177 +2853,6 @@ mod tests {
     }
 
     #[test]
-    fn test_change_event_serde_round_trip_update() {
-        let old = RowData::from_pairs(vec![("id", ColumnValue::text("1"))]);
-        let new = RowData::from_pairs(vec![
-            ("id", ColumnValue::text("1")),
-            ("v", ColumnValue::text("updated")),
-        ]);
-        let event = ChangeEvent::update(
-            "public",
-            "t",
-            1,
-            Some(old),
-            new,
-            ReplicaIdentity::Full,
-            vec![Arc::from("id")],
-            Lsn::new(100),
-        );
-        let json = serde_json::to_string(&event).unwrap();
-        let back: ChangeEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.event_type, event.event_type);
-    }
-
-    #[test]
-    fn test_change_event_serde_round_trip_delete() {
-        let old = RowData::from_pairs(vec![("id", ColumnValue::text("1"))]);
-        let event = ChangeEvent::delete(
-            "public",
-            "t",
-            1,
-            old,
-            ReplicaIdentity::Index,
-            vec![Arc::from("id")],
-            Lsn::new(200),
-        );
-        let json = serde_json::to_string(&event).unwrap();
-        let back: ChangeEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.event_type, event.event_type);
-    }
-
-    #[test]
-    fn test_change_event_serde_round_trip_begin() {
-        let ts = Utc.with_ymd_and_hms(2024, 3, 15, 8, 0, 0).unwrap();
-        let event = ChangeEvent::begin(1, Lsn::new(300), ts, Lsn::new(300));
-        let json = serde_json::to_string(&event).unwrap();
-        let back: ChangeEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.event_type, event.event_type);
-    }
-
-    #[test]
-    fn test_change_event_serde_round_trip_commit() {
-        let ts = Utc.with_ymd_and_hms(2024, 3, 15, 8, 0, 0).unwrap();
-        let event = ChangeEvent::commit(ts, Lsn::new(400), Lsn::new(400), Lsn::new(410));
-        let json = serde_json::to_string(&event).unwrap();
-        let back: ChangeEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.event_type, event.event_type);
-    }
-
-    #[test]
-    fn test_change_event_serde_round_trip_truncate() {
-        let event = ChangeEvent::truncate(vec![Arc::from("t1"), Arc::from("t2")], Lsn::new(500));
-        let json = serde_json::to_string(&event).unwrap();
-        let back: ChangeEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.event_type, event.event_type);
-    }
-
-    #[test]
-    fn test_change_event_serde_round_trip_streaming_events() {
-        let ts = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
-
-        // StreamStart
-        let event = ChangeEvent {
-            event_type: EventType::StreamStart {
-                transaction_id: 10,
-                first_segment: true,
-            },
-            lsn: Lsn::new(600),
-            metadata: None,
-        };
-        let json = serde_json::to_string(&event).unwrap();
-        let back: ChangeEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.event_type, event.event_type);
-
-        // StreamStop
-        let event = ChangeEvent {
-            event_type: EventType::StreamStop,
-            lsn: Lsn::new(700),
-            metadata: None,
-        };
-        let json = serde_json::to_string(&event).unwrap();
-        let back: ChangeEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.event_type, event.event_type);
-
-        // StreamCommit
-        let event = ChangeEvent {
-            event_type: EventType::StreamCommit {
-                transaction_id: 10,
-                commit_lsn: Lsn::new(800),
-                end_lsn: Lsn::new(810),
-                commit_timestamp: ts,
-            },
-            lsn: Lsn::new(800),
-            metadata: None,
-        };
-        let json = serde_json::to_string(&event).unwrap();
-        let back: ChangeEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.event_type, event.event_type);
-
-        // StreamAbort with optional fields
-        let event = ChangeEvent {
-            event_type: EventType::StreamAbort {
-                transaction_id: 10,
-                subtransaction_xid: 11,
-                abort_lsn: Some(Lsn::new(900)),
-                abort_timestamp: Some(ts),
-            },
-            lsn: Lsn::new(900),
-            metadata: None,
-        };
-        let json = serde_json::to_string(&event).unwrap();
-        let back: ChangeEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.event_type, event.event_type);
-
-        // StreamAbort without optional fields
-        let event = ChangeEvent {
-            event_type: EventType::StreamAbort {
-                transaction_id: 10,
-                subtransaction_xid: 0,
-                abort_lsn: None,
-                abort_timestamp: None,
-            },
-            lsn: Lsn::new(950),
-            metadata: None,
-        };
-        let json = serde_json::to_string(&event).unwrap();
-        let back: ChangeEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.event_type, event.event_type);
-    }
-
-    #[test]
-    fn test_change_event_serde_round_trip_with_metadata() {
-        let data = RowData::from_pairs(vec![("id", ColumnValue::text("1"))]);
-        let mut meta = HashMap::new();
-        meta.insert("key1".to_string(), "val1".to_string());
-        meta.insert("key2".to_string(), "val2".to_string());
-        let event = ChangeEvent::insert("s", "t", 1, data, Lsn::new(1000)).with_metadata(meta);
-        let json = serde_json::to_string(&event).unwrap();
-        let back: ChangeEvent = serde_json::from_str(&json).unwrap();
-        assert!(back.metadata.is_some());
-        let m = back.metadata.unwrap();
-        assert_eq!(m.get("key1").unwrap(), "val1");
-        assert_eq!(m.get("key2").unwrap(), "val2");
-    }
-
-    #[test]
-    fn test_change_event_serde_round_trip_simple_events() {
-        for event in [
-            ChangeEvent::relation(Lsn::new(1100)),
-            ChangeEvent::type_event(Lsn::new(1200)),
-            ChangeEvent::origin(Lsn::new(1300)),
-            ChangeEvent::message(Lsn::new(1400)),
-        ] {
-            let json = serde_json::to_string(&event).unwrap();
-            let back: ChangeEvent = serde_json::from_str(&json).unwrap();
-            assert_eq!(
-                back.event_type, event.event_type,
-                "Failed for {:?}",
-                event.event_type
-            );
-        }
-    }
-
-    #[test]
     fn test_lsn_zero() {
         let lsn = Lsn::new(0);
         assert_eq!(lsn.value(), 0);
@@ -2387,16 +2868,6 @@ mod tests {
         let formatted = format!("{lsn}");
         let parsed: Lsn = formatted.parse().unwrap();
         assert_eq!(parsed, lsn);
-    }
-
-    #[test]
-    fn test_lsn_serde_zero_and_max() {
-        for val in [0u64, 1, u64::MAX / 2, u64::MAX] {
-            let lsn = Lsn::new(val);
-            let json = serde_json::to_string(&lsn).unwrap();
-            let back: Lsn = serde_json::from_str(&json).unwrap();
-            assert_eq!(lsn, back);
-        }
     }
 
     #[test]
@@ -2532,15 +3003,833 @@ mod tests {
                 abort_lsn: None,
                 abort_timestamp: None,
             },
-            EventType::Relation,
-            EventType::Type,
-            EventType::Origin,
-            EventType::Message,
+            EventType::Relation {
+                relation_id: 1,
+                namespace: Arc::from("public"),
+                relation_name: Arc::from("t"),
+                replica_identity: ReplicaIdentity::Default,
+                columns: vec![],
+            },
+            EventType::Type {
+                type_id: 1,
+                namespace: Arc::from("pg_catalog"),
+                type_name: Arc::from("my_type"),
+            },
+            EventType::Origin {
+                origin_lsn: Lsn::new(1),
+                origin_name: Arc::from("origin"),
+            },
+            EventType::Message {
+                flags: 0,
+                message_lsn: Lsn::new(1),
+                prefix: Arc::from("prefix"),
+                content: Bytes::new(),
+            },
+            EventType::BeginPrepare {
+                transaction_id: 1,
+                prepare_lsn: Lsn::new(1),
+                end_lsn: Lsn::new(2),
+                prepare_timestamp: ts,
+                gid: Arc::from("gid1"),
+            },
+            EventType::Prepare {
+                flags: 0,
+                transaction_id: 1,
+                prepare_lsn: Lsn::new(1),
+                end_lsn: Lsn::new(2),
+                prepare_timestamp: ts,
+                gid: Arc::from("gid2"),
+            },
+            EventType::CommitPrepared {
+                flags: 0,
+                transaction_id: 1,
+                commit_lsn: Lsn::new(1),
+                end_lsn: Lsn::new(2),
+                commit_timestamp: ts,
+                gid: Arc::from("gid3"),
+            },
+            EventType::RollbackPrepared {
+                flags: 0,
+                transaction_id: 1,
+                prepare_end_lsn: Lsn::new(1),
+                rollback_end_lsn: Lsn::new(2),
+                prepare_timestamp: ts,
+                rollback_timestamp: ts,
+                gid: Arc::from("gid4"),
+            },
+            EventType::StreamPrepare {
+                flags: 0,
+                transaction_id: 1,
+                prepare_lsn: Lsn::new(1),
+                end_lsn: Lsn::new(2),
+                prepare_timestamp: ts,
+                gid: Arc::from("gid5"),
+            },
         ];
 
         for v in &variants {
             let debug = format!("{v:?}");
             assert!(!debug.is_empty());
+        }
+    }
+
+    // ---- Two-phase factory method tests (field validation) ----
+
+    #[test]
+    fn test_change_event_begin_prepare_fields() {
+        let ts = Utc.with_ymd_and_hms(2024, 7, 1, 12, 0, 0).unwrap();
+        let event = ChangeEvent::begin_prepare(
+            42,
+            Lsn::new(5000),
+            Lsn::new(5100),
+            ts,
+            "gid_bp_1",
+            Lsn::new(4900),
+        );
+
+        assert_eq!(event.lsn.value(), 4900);
+        assert_eq!(event.event_type_str(), "begin_prepare");
+        match &event.event_type {
+            EventType::BeginPrepare {
+                transaction_id,
+                prepare_lsn,
+                end_lsn,
+                prepare_timestamp,
+                gid,
+            } => {
+                assert_eq!(*transaction_id, 42);
+                assert_eq!(prepare_lsn.value(), 5000);
+                assert_eq!(end_lsn.value(), 5100);
+                assert_eq!(*prepare_timestamp, ts);
+                assert_eq!(gid.as_ref(), "gid_bp_1");
+            }
+            _ => panic!("Expected BeginPrepare event"),
+        }
+    }
+
+    #[test]
+    fn test_change_event_prepare_fields() {
+        let ts = Utc.with_ymd_and_hms(2024, 7, 1, 12, 0, 0).unwrap();
+        let event = ChangeEvent::prepare(
+            3,
+            99,
+            Lsn::new(6000),
+            Lsn::new(6100),
+            ts,
+            "gid_p_1",
+            Lsn::new(6000),
+        );
+
+        assert_eq!(event.lsn.value(), 6000);
+        assert_eq!(event.event_type_str(), "prepare");
+        match &event.event_type {
+            EventType::Prepare {
+                flags,
+                transaction_id,
+                prepare_lsn,
+                end_lsn,
+                prepare_timestamp,
+                gid,
+            } => {
+                assert_eq!(*flags, 3);
+                assert_eq!(*transaction_id, 99);
+                assert_eq!(prepare_lsn.value(), 6000);
+                assert_eq!(end_lsn.value(), 6100);
+                assert_eq!(*prepare_timestamp, ts);
+                assert_eq!(gid.as_ref(), "gid_p_1");
+            }
+            _ => panic!("Expected Prepare event"),
+        }
+    }
+
+    #[test]
+    fn test_change_event_commit_prepared_fields() {
+        let ts = Utc.with_ymd_and_hms(2024, 7, 1, 12, 1, 0).unwrap();
+        let event = ChangeEvent::commit_prepared(
+            1,
+            50,
+            Lsn::new(7000),
+            Lsn::new(7100),
+            ts,
+            "gid_cp_1",
+            Lsn::new(7000),
+        );
+
+        assert_eq!(event.lsn.value(), 7000);
+        assert_eq!(event.event_type_str(), "commit_prepared");
+        match &event.event_type {
+            EventType::CommitPrepared {
+                flags,
+                transaction_id,
+                commit_lsn,
+                end_lsn,
+                commit_timestamp,
+                gid,
+            } => {
+                assert_eq!(*flags, 1);
+                assert_eq!(*transaction_id, 50);
+                assert_eq!(commit_lsn.value(), 7000);
+                assert_eq!(end_lsn.value(), 7100);
+                assert_eq!(*commit_timestamp, ts);
+                assert_eq!(gid.as_ref(), "gid_cp_1");
+            }
+            _ => panic!("Expected CommitPrepared event"),
+        }
+    }
+
+    #[test]
+    fn test_change_event_rollback_prepared_fields() {
+        let ts1 = Utc.with_ymd_and_hms(2024, 7, 1, 12, 0, 0).unwrap();
+        let ts2 = Utc.with_ymd_and_hms(2024, 7, 1, 12, 5, 0).unwrap();
+        let event = ChangeEvent::rollback_prepared(
+            2,
+            60,
+            Lsn::new(8000),
+            Lsn::new(8100),
+            ts1,
+            ts2,
+            "gid_rp_1",
+            Lsn::new(8000),
+        );
+
+        assert_eq!(event.lsn.value(), 8000);
+        assert_eq!(event.event_type_str(), "rollback_prepared");
+        match &event.event_type {
+            EventType::RollbackPrepared {
+                flags,
+                transaction_id,
+                prepare_end_lsn,
+                rollback_end_lsn,
+                prepare_timestamp,
+                rollback_timestamp,
+                gid,
+            } => {
+                assert_eq!(*flags, 2);
+                assert_eq!(*transaction_id, 60);
+                assert_eq!(prepare_end_lsn.value(), 8000);
+                assert_eq!(rollback_end_lsn.value(), 8100);
+                assert_eq!(*prepare_timestamp, ts1);
+                assert_eq!(*rollback_timestamp, ts2);
+                assert_eq!(gid.as_ref(), "gid_rp_1");
+            }
+            _ => panic!("Expected RollbackPrepared event"),
+        }
+    }
+
+    #[test]
+    fn test_change_event_stream_prepare_fields() {
+        let ts = Utc.with_ymd_and_hms(2024, 7, 1, 12, 0, 0).unwrap();
+        let event = ChangeEvent::stream_prepare(
+            4,
+            70,
+            Lsn::new(9000),
+            Lsn::new(9100),
+            ts,
+            "gid_sp_1",
+            Lsn::new(9000),
+        );
+
+        assert_eq!(event.lsn.value(), 9000);
+        assert_eq!(event.event_type_str(), "stream_prepare");
+        match &event.event_type {
+            EventType::StreamPrepare {
+                flags,
+                transaction_id,
+                prepare_lsn,
+                end_lsn,
+                prepare_timestamp,
+                gid,
+            } => {
+                assert_eq!(*flags, 4);
+                assert_eq!(*transaction_id, 70);
+                assert_eq!(prepare_lsn.value(), 9000);
+                assert_eq!(end_lsn.value(), 9100);
+                assert_eq!(*prepare_timestamp, ts);
+                assert_eq!(gid.as_ref(), "gid_sp_1");
+            }
+            _ => panic!("Expected StreamPrepare event"),
+        }
+    }
+
+    // ---- Enriched factory method tests (field validation) ----
+
+    #[test]
+    fn test_change_event_relation_fields() {
+        let cols = vec![
+            RelationColumn {
+                name: Arc::from("id"),
+                type_id: 23,
+                type_modifier: -1,
+                is_key: true,
+            },
+            RelationColumn {
+                name: Arc::from("name"),
+                type_id: 25,
+                type_modifier: 64,
+                is_key: false,
+            },
+        ];
+        let event = ChangeEvent::relation(
+            16384,
+            "myschema",
+            "users",
+            ReplicaIdentity::Full,
+            cols,
+            Lsn::new(8000),
+        );
+
+        assert_eq!(event.lsn.value(), 8000);
+        assert_eq!(event.event_type_str(), "relation");
+        match &event.event_type {
+            EventType::Relation {
+                relation_id,
+                namespace,
+                relation_name,
+                replica_identity,
+                columns,
+            } => {
+                assert_eq!(*relation_id, 16384);
+                assert_eq!(namespace.as_ref(), "myschema");
+                assert_eq!(relation_name.as_ref(), "users");
+                assert_eq!(*replica_identity, ReplicaIdentity::Full);
+                assert_eq!(columns.len(), 2);
+                assert_eq!(columns[0].name.as_ref(), "id");
+                assert_eq!(columns[0].type_id, 23);
+                assert_eq!(columns[0].type_modifier, -1);
+                assert!(columns[0].is_key);
+                assert_eq!(columns[1].name.as_ref(), "name");
+                assert_eq!(columns[1].type_id, 25);
+                assert_eq!(columns[1].type_modifier, 64);
+                assert!(!columns[1].is_key);
+            }
+            _ => panic!("Expected Relation event"),
+        }
+    }
+
+    #[test]
+    fn test_change_event_type_event_fields() {
+        let event = ChangeEvent::type_event(12345, "pg_catalog", "my_enum", Lsn::new(9000));
+
+        assert_eq!(event.lsn.value(), 9000);
+        assert_eq!(event.event_type_str(), "type");
+        match &event.event_type {
+            EventType::Type {
+                type_id,
+                namespace,
+                type_name,
+            } => {
+                assert_eq!(*type_id, 12345);
+                assert_eq!(namespace.as_ref(), "pg_catalog");
+                assert_eq!(type_name.as_ref(), "my_enum");
+            }
+            _ => panic!("Expected Type event"),
+        }
+    }
+
+    #[test]
+    fn test_change_event_origin_fields() {
+        let event = ChangeEvent::origin(Lsn::new(500), "upstream_cluster", Lsn::new(10000));
+
+        assert_eq!(event.lsn.value(), 10000);
+        assert_eq!(event.event_type_str(), "origin");
+        match &event.event_type {
+            EventType::Origin {
+                origin_lsn,
+                origin_name,
+            } => {
+                assert_eq!(origin_lsn.value(), 500);
+                assert_eq!(origin_name.as_ref(), "upstream_cluster");
+            }
+            _ => panic!("Expected Origin event"),
+        }
+    }
+
+    #[test]
+    fn test_change_event_message_fields() {
+        let content = Bytes::from_static(b"payload data");
+        let event = ChangeEvent::message(
+            1,
+            Lsn::new(700),
+            "app.notify",
+            content.clone(),
+            Lsn::new(11000),
+        );
+
+        assert_eq!(event.lsn.value(), 11000);
+        assert_eq!(event.event_type_str(), "message");
+        match &event.event_type {
+            EventType::Message {
+                flags,
+                message_lsn,
+                prefix,
+                content: c,
+            } => {
+                assert_eq!(*flags, 1);
+                assert_eq!(message_lsn.value(), 700);
+                assert_eq!(prefix.as_ref(), "app.notify");
+                assert_eq!(c.as_ref(), b"payload data");
+            }
+            _ => panic!("Expected Message event"),
+        }
+    }
+
+    // ---- event_type_str coverage for two-phase variants ----
+
+    #[test]
+    fn test_event_type_str_two_phase_variants() {
+        let ts = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+
+        let bp = ChangeEvent::begin_prepare(1, Lsn::new(1), Lsn::new(2), ts, "g1", Lsn::new(1));
+        assert_eq!(bp.event_type_str(), "begin_prepare");
+
+        let p = ChangeEvent::prepare(0, 1, Lsn::new(1), Lsn::new(2), ts, "g2", Lsn::new(1));
+        assert_eq!(p.event_type_str(), "prepare");
+
+        let cp =
+            ChangeEvent::commit_prepared(0, 1, Lsn::new(1), Lsn::new(2), ts, "g3", Lsn::new(1));
+        assert_eq!(cp.event_type_str(), "commit_prepared");
+
+        let rp = ChangeEvent::rollback_prepared(
+            0,
+            1,
+            Lsn::new(1),
+            Lsn::new(2),
+            ts,
+            ts,
+            "g4",
+            Lsn::new(1),
+        );
+        assert_eq!(rp.event_type_str(), "rollback_prepared");
+
+        let sp = ChangeEvent::stream_prepare(0, 1, Lsn::new(1), Lsn::new(2), ts, "g5", Lsn::new(1));
+        assert_eq!(sp.event_type_str(), "stream_prepare");
+    }
+
+    // ---- event_type_str coverage for enriched variants ----
+
+    #[test]
+    fn test_event_type_str_enriched_variants() {
+        let relation =
+            ChangeEvent::relation(1, "s", "t", ReplicaIdentity::Default, vec![], Lsn::new(1));
+        assert_eq!(relation.event_type_str(), "relation");
+
+        let type_ev = ChangeEvent::type_event(1, "s", "t", Lsn::new(1));
+        assert_eq!(type_ev.event_type_str(), "type");
+
+        let origin = ChangeEvent::origin(Lsn::new(1), "o", Lsn::new(1));
+        assert_eq!(origin.event_type_str(), "origin");
+
+        let msg = ChangeEvent::message(0, Lsn::new(1), "p", Bytes::new(), Lsn::new(1));
+        assert_eq!(msg.event_type_str(), "message");
+    }
+
+    // ---- event_type_str coverage for streaming variants ----
+
+    #[test]
+    fn test_event_type_str_streaming_variants() {
+        let stream_start = ChangeEvent {
+            event_type: EventType::StreamStart {
+                transaction_id: 1,
+                first_segment: true,
+            },
+            lsn: Lsn::new(1),
+            metadata: None,
+        };
+        assert_eq!(stream_start.event_type_str(), "stream_start");
+
+        let stream_stop = ChangeEvent {
+            event_type: EventType::StreamStop,
+            lsn: Lsn::new(2),
+            metadata: None,
+        };
+        assert_eq!(stream_stop.event_type_str(), "stream_stop");
+
+        let ts = chrono::Utc::now();
+        let stream_commit = ChangeEvent {
+            event_type: EventType::StreamCommit {
+                transaction_id: 1,
+                commit_lsn: Lsn::new(100),
+                end_lsn: Lsn::new(200),
+                commit_timestamp: ts,
+            },
+            lsn: Lsn::new(3),
+            metadata: None,
+        };
+        assert_eq!(stream_commit.event_type_str(), "stream_commit");
+
+        let stream_abort = ChangeEvent {
+            event_type: EventType::StreamAbort {
+                transaction_id: 1,
+                subtransaction_xid: 2,
+                abort_lsn: Some(Lsn::new(300)),
+                abort_timestamp: Some(ts),
+            },
+            lsn: Lsn::new(4),
+            metadata: None,
+        };
+        assert_eq!(stream_abort.event_type_str(), "stream_abort");
+    }
+
+    // ---- decode error path: unknown replica identity byte ----
+
+    #[test]
+    fn test_decode_unknown_replica_identity_byte_errors() {
+        // Build a valid Relation event, encode it, then corrupt the replica identity byte
+        let event = ChangeEvent::relation(
+            42,
+            "public",
+            "users",
+            ReplicaIdentity::Default,
+            vec![RelationColumn {
+                name: Arc::from("id"),
+                type_id: 23,
+                type_modifier: -1,
+                is_key: true,
+            }],
+            Lsn::new(100),
+        );
+        let mut buf = BytesMut::new();
+        event.encode(&mut buf);
+        let mut encoded = buf.to_vec();
+
+        // Find the replica identity byte in the encoded buffer.
+        // Format: lsn(8) + metadata_flag(1) + tag(1) + relation_id(4) + namespace string + relation_name string + ri_byte(1) + ...
+        let offset = 10; // after lsn(8) + metadata_flag(1) + tag(1)
+                         // namespace "public" = u16(6) + 6 bytes = 8 bytes
+        let ns_len = u16::from_be_bytes([encoded[offset + 4], encoded[offset + 5]]) as usize;
+        let ns_end = offset + 4 + 2 + ns_len;
+        // relation_name "users" = u16(5) + 5 bytes
+        let rn_len = u16::from_be_bytes([encoded[ns_end], encoded[ns_end + 1]]) as usize;
+        let rn_end = ns_end + 2 + rn_len;
+        // ri_byte is at rn_end
+        let ri_offset = rn_end;
+
+        // Corrupt the replica identity byte with an invalid value
+        encoded[ri_offset] = 0xFF;
+
+        let result = ChangeEvent::decode(&encoded);
+        assert!(
+            result.is_err(),
+            "expected error for invalid replica identity byte"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Unknown replica identity byte"),
+            "error should mention unknown replica identity byte, got: {err_msg}"
+        );
+    }
+
+    // ---- RelationColumn tests ----
+
+    #[test]
+    fn test_relation_column_equality() {
+        let col1 = RelationColumn {
+            name: Arc::from("id"),
+            type_id: 23,
+            type_modifier: -1,
+            is_key: true,
+        };
+        let col2 = RelationColumn {
+            name: Arc::from("id"),
+            type_id: 23,
+            type_modifier: -1,
+            is_key: true,
+        };
+        let col3 = RelationColumn {
+            name: Arc::from("name"),
+            type_id: 25,
+            type_modifier: -1,
+            is_key: false,
+        };
+
+        assert_eq!(col1, col2);
+        assert_ne!(col1, col3);
+    }
+
+    #[test]
+    fn test_relation_column_clone() {
+        let col = RelationColumn {
+            name: Arc::from("data"),
+            type_id: 17,
+            type_modifier: 100,
+            is_key: false,
+        };
+        let cloned = col.clone();
+        assert_eq!(col, cloned);
+        assert_eq!(cloned.name.as_ref(), "data");
+        assert_eq!(cloned.type_id, 17);
+        assert_eq!(cloned.type_modifier, 100);
+        assert!(!cloned.is_key);
+    }
+
+    #[test]
+    fn test_relation_column_debug() {
+        let col = RelationColumn {
+            name: Arc::from("id"),
+            type_id: 23,
+            type_modifier: -1,
+            is_key: true,
+        };
+        let debug = format!("{col:?}");
+        assert!(debug.contains("id"), "got: {debug}");
+        assert!(debug.contains("23"), "got: {debug}");
+        assert!(debug.contains("true"), "got: {debug}");
+    }
+
+    #[test]
+    fn test_relation_column_serde_round_trip() {
+        let col = RelationColumn {
+            name: Arc::from("amount"),
+            type_id: 1700,
+            type_modifier: 655364,
+            is_key: false,
+        };
+        // Serialize with bincode-like approach via encode/decode in a Relation event
+        let event = ChangeEvent::relation(
+            1,
+            "s",
+            "t",
+            ReplicaIdentity::Default,
+            vec![col.clone()],
+            Lsn::new(1),
+        );
+        let mut buf = BytesMut::new();
+        event.encode(&mut buf);
+        let decoded = ChangeEvent::decode(&buf).unwrap();
+        if let EventType::Relation { columns, .. } = &decoded.event_type {
+            assert_eq!(columns.len(), 1);
+            assert_eq!(columns[0], col);
+        } else {
+            panic!("Expected Relation event");
+        }
+    }
+
+    // ---- ReplicationSlotInfo tests ----
+
+    #[test]
+    fn test_replication_slot_info_creation() {
+        let info = ReplicationSlotInfo {
+            slot_type: Some("logical".to_string()),
+            restart_lsn: Some(Lsn::new(0x1000)),
+            restart_tli: Some(1),
+        };
+        assert_eq!(info.slot_type.as_deref(), Some("logical"));
+        assert_eq!(info.restart_lsn.unwrap().value(), 0x1000);
+        assert_eq!(info.restart_tli, Some(1));
+    }
+
+    #[test]
+    fn test_replication_slot_info_all_none() {
+        let info = ReplicationSlotInfo {
+            slot_type: None,
+            restart_lsn: None,
+            restart_tli: None,
+        };
+        assert!(info.slot_type.is_none());
+        assert!(info.restart_lsn.is_none());
+        assert!(info.restart_tli.is_none());
+    }
+
+    #[test]
+    fn test_replication_slot_info_debug() {
+        let info = ReplicationSlotInfo {
+            slot_type: Some("physical".to_string()),
+            restart_lsn: Some(Lsn::new(0x2000)),
+            restart_tli: Some(2),
+        };
+        let debug = format!("{info:?}");
+        assert!(debug.contains("physical"), "got: {debug}");
+        assert!(debug.contains("Lsn"), "got: {debug}");
+    }
+
+    #[test]
+    fn test_replication_slot_info_clone() {
+        let info = ReplicationSlotInfo {
+            slot_type: Some("logical".to_string()),
+            restart_lsn: Some(Lsn::new(0x3000)),
+            restart_tli: Some(3),
+        };
+        let cloned = info.clone();
+        assert_eq!(cloned.slot_type, info.slot_type);
+        assert_eq!(cloned.restart_lsn, info.restart_lsn);
+        assert_eq!(cloned.restart_tli, info.restart_tli);
+    }
+
+    // ---- get_key_columns / get_replica_identity for new event types ----
+
+    #[test]
+    fn test_get_key_columns_returns_none_for_new_variants() {
+        let ts = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+
+        let events: Vec<ChangeEvent> = vec![
+            ChangeEvent::relation(1, "s", "t", ReplicaIdentity::Default, vec![], Lsn::new(1)),
+            ChangeEvent::type_event(1, "s", "t", Lsn::new(1)),
+            ChangeEvent::origin(Lsn::new(1), "o", Lsn::new(1)),
+            ChangeEvent::message(0, Lsn::new(1), "p", Bytes::new(), Lsn::new(1)),
+            ChangeEvent::begin_prepare(1, Lsn::new(1), Lsn::new(2), ts, "g1", Lsn::new(1)),
+            ChangeEvent::prepare(0, 1, Lsn::new(1), Lsn::new(2), ts, "g2", Lsn::new(1)),
+            ChangeEvent::commit_prepared(0, 1, Lsn::new(1), Lsn::new(2), ts, "g3", Lsn::new(1)),
+            ChangeEvent::rollback_prepared(
+                0,
+                1,
+                Lsn::new(1),
+                Lsn::new(2),
+                ts,
+                ts,
+                "g4",
+                Lsn::new(1),
+            ),
+            ChangeEvent::stream_prepare(0, 1, Lsn::new(1), Lsn::new(2), ts, "g5", Lsn::new(1)),
+        ];
+
+        for event in &events {
+            assert!(
+                event.get_key_columns().is_none(),
+                "get_key_columns() should be None for {:?}",
+                event.event_type_str()
+            );
+        }
+    }
+
+    #[test]
+    fn test_get_replica_identity_returns_none_for_new_variants() {
+        let ts = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+
+        let events: Vec<ChangeEvent> = vec![
+            ChangeEvent::relation(1, "s", "t", ReplicaIdentity::Default, vec![], Lsn::new(1)),
+            ChangeEvent::type_event(1, "s", "t", Lsn::new(1)),
+            ChangeEvent::origin(Lsn::new(1), "o", Lsn::new(1)),
+            ChangeEvent::message(0, Lsn::new(1), "p", Bytes::new(), Lsn::new(1)),
+            ChangeEvent::begin_prepare(1, Lsn::new(1), Lsn::new(2), ts, "g1", Lsn::new(1)),
+            ChangeEvent::prepare(0, 1, Lsn::new(1), Lsn::new(2), ts, "g2", Lsn::new(1)),
+            ChangeEvent::commit_prepared(0, 1, Lsn::new(1), Lsn::new(2), ts, "g3", Lsn::new(1)),
+            ChangeEvent::rollback_prepared(
+                0,
+                1,
+                Lsn::new(1),
+                Lsn::new(2),
+                ts,
+                ts,
+                "g4",
+                Lsn::new(1),
+            ),
+            ChangeEvent::stream_prepare(0, 1, Lsn::new(1), Lsn::new(2), ts, "g5", Lsn::new(1)),
+        ];
+
+        for event in &events {
+            assert!(
+                event.get_replica_identity().is_none(),
+                "get_replica_identity() should be None for {:?}",
+                event.event_type_str()
+            );
+        }
+    }
+
+    // ---- Encode/decode with metadata for two-phase events ----
+
+    #[test]
+    fn test_encode_decode_begin_prepare_with_metadata() {
+        let ts = Utc.with_ymd_and_hms(2024, 7, 1, 12, 0, 0).unwrap();
+        let mut meta = HashMap::new();
+        meta.insert("source".to_string(), "test".to_string());
+        let event = ChangeEvent::begin_prepare(
+            42,
+            Lsn::new(5000),
+            Lsn::new(5100),
+            ts,
+            "gid_meta",
+            Lsn::new(4900),
+        )
+        .with_metadata(meta);
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_rollback_prepared_with_metadata() {
+        let ts1 = Utc.with_ymd_and_hms(2024, 7, 1, 12, 0, 0).unwrap();
+        let ts2 = Utc.with_ymd_and_hms(2024, 7, 1, 12, 5, 0).unwrap();
+        let mut meta = HashMap::new();
+        meta.insert("reason".to_string(), "timeout".to_string());
+        let event = ChangeEvent::rollback_prepared(
+            0,
+            42,
+            Lsn::new(7000),
+            Lsn::new(7100),
+            ts1,
+            ts2,
+            "gid_rb",
+            Lsn::new(7000),
+        )
+        .with_metadata(meta);
+        assert_encode_decode_round_trip(&event);
+    }
+
+    // ---- Encode/decode with metadata for enriched events ----
+
+    #[test]
+    fn test_encode_decode_origin_with_metadata() {
+        let mut meta = HashMap::new();
+        meta.insert("cluster".to_string(), "us-east".to_string());
+        let event = ChangeEvent::origin(Lsn::new(500), "us_east_origin", Lsn::new(10200))
+            .with_metadata(meta);
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_type_with_metadata() {
+        let mut meta = HashMap::new();
+        meta.insert("schema_version".to_string(), "1".to_string());
+        let event = ChangeEvent::type_event(12345, "pg_catalog", "my_enum", Lsn::new(10100))
+            .with_metadata(meta);
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_relation_with_many_columns() {
+        let cols: Vec<RelationColumn> = (0..20)
+            .map(|i| RelationColumn {
+                name: Arc::from(format!("col_{i}").as_str()),
+                type_id: 23 + i,
+                type_modifier: if i % 2 == 0 { -1 } else { i as i32 * 100 },
+                is_key: i == 0,
+            })
+            .collect();
+        let event = ChangeEvent::relation(
+            16384,
+            "public",
+            "wide_table",
+            ReplicaIdentity::Index,
+            cols,
+            Lsn::new(20000),
+        );
+        assert_encode_decode_round_trip(&event);
+    }
+
+    #[test]
+    fn test_encode_decode_message_large_content() {
+        let content = Bytes::from(vec![0xABu8; 8192]);
+        let event = ChangeEvent::message(1, Lsn::new(500), "bulk.data", content, Lsn::new(30000));
+        assert_encode_decode_round_trip(&event);
+    }
+
+    // ---- Encode/decode round-trips for all replica identity values with Relation ----
+
+    #[test]
+    fn test_encode_decode_relation_all_replica_identities() {
+        for ri in [
+            ReplicaIdentity::Default,
+            ReplicaIdentity::Nothing,
+            ReplicaIdentity::Full,
+            ReplicaIdentity::Index,
+        ] {
+            let cols = vec![RelationColumn {
+                name: Arc::from("pk"),
+                type_id: 23,
+                type_modifier: -1,
+                is_key: true,
+            }];
+            let event = ChangeEvent::relation(1, "s", "t", ri, cols, Lsn::new(50000));
+            assert_encode_decode_round_trip(&event);
         }
     }
 }
