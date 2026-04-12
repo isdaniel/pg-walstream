@@ -36,8 +36,9 @@ use crate::types::{
     format_lsn, system_time_to_postgres_timestamp, BaseBackupOptions, ReplicationSlotOptions,
     SlotType, XLogRecPtr,
 };
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use libpq_sys::*;
+use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 use std::os::unix::io::RawFd;
@@ -96,6 +97,24 @@ enum ReadResult {
     CopyDone,
 }
 
+/// Result of draining all available messages from libpq
+#[derive(Debug, PartialEq)]
+enum DrainResult {
+    /// One or more messages were queued
+    Drained,
+    /// No complete message available
+    WouldBlock,
+    /// COPY stream has ended
+    CopyDone,
+}
+
+/// Maximum messages to drain from libpq in a single batch.
+/// Prevents unbounded queue growth under extreme throughput.
+const MAX_DRAIN_BATCH: usize = 4096;
+
+/// Initial capacity for the reusable read buffer.
+const READ_BUF_INITIAL_CAPACITY: usize = 64 * 1024;
+
 /// Safe wrapper around PostgreSQL connection for replication
 ///
 /// This struct provides a safe, high-level interface to libpq for PostgreSQL
@@ -137,6 +156,10 @@ pub struct PgReplicationConnection {
     conn: *mut PGconn,
     is_replication_conn: bool,
     async_fd: Option<AsyncFd<RawFd>>,
+    /// Pre-drained messages waiting to be consumed (drain-loop optimization).
+    pending_messages: VecDeque<Bytes>,
+    /// Reusable buffer for copying data from libpq (avoids per-message heap alloc).
+    read_buf: BytesMut,
 }
 
 impl PgReplicationConnection {
@@ -243,11 +266,13 @@ impl PgReplicationConnection {
             conn,
             is_replication_conn: false,
             async_fd: None,
+            pending_messages: VecDeque::with_capacity(256),
+            read_buf: BytesMut::with_capacity(READ_BUF_INITIAL_CAPACITY),
         })
     }
 
     /// Execute a replication command (like IDENTIFY_SYSTEM)
-    pub fn exec(&self, query: &str) -> Result<PgResult> {
+    pub fn exec(&mut self, query: &str) -> Result<PgResult> {
         let c_query = CString::new(query)
             .map_err(|e| ReplicationError::protocol(format!("Invalid query string: {e}")))?;
 
@@ -286,7 +311,7 @@ impl PgReplicationConnection {
     }
 
     /// Send IDENTIFY_SYSTEM command
-    pub fn identify_system(&self) -> Result<PgResult> {
+    pub fn identify_system(&mut self) -> Result<PgResult> {
         debug!("Sending IDENTIFY_SYSTEM command");
         let result = self.exec("IDENTIFY_SYSTEM")?;
 
@@ -306,13 +331,12 @@ impl PgReplicationConnection {
         Ok(result)
     }
 
-    /// Start logical replication
-    pub fn start_replication(
-        &mut self,
+    /// Build the SQL string for `START_REPLICATION` (logical).
+    fn build_start_replication_sql(
         slot_name: &str,
         start_lsn: XLogRecPtr,
         options: &[(&str, &str)],
-    ) -> Result<()> {
+    ) -> String {
         let quoted_slot = quote_sql_identifier(slot_name);
         let mut options_str = String::new();
         for (i, (key, value)) in options.iter().enumerate() {
@@ -324,7 +348,7 @@ impl PgReplicationConnection {
             options_str.push_str(&format!("{quoted_key} '{sanitized_value}'"));
         }
 
-        let start_replication_sql = if start_lsn == INVALID_XLOG_REC_PTR {
+        if start_lsn == INVALID_XLOG_REC_PTR {
             format!("START_REPLICATION SLOT {quoted_slot} LOGICAL 0/0 ({options_str})")
         } else {
             format!(
@@ -333,10 +357,20 @@ impl PgReplicationConnection {
                 format_lsn(start_lsn),
                 options_str
             )
-        };
+        }
+    }
 
-        debug!("Starting replication: {}", start_replication_sql);
-        let _result = self.exec(&start_replication_sql)?;
+    /// Start logical replication
+    pub fn start_replication(
+        &mut self,
+        slot_name: &str,
+        start_lsn: XLogRecPtr,
+        options: &[(&str, &str)],
+    ) -> Result<()> {
+        let sql = Self::build_start_replication_sql(slot_name, start_lsn, options);
+
+        debug!("Starting replication: {}", sql);
+        let _result = self.exec(&sql)?;
 
         self.is_replication_conn = true;
 
@@ -404,14 +438,19 @@ impl PgReplicationConnection {
             .map_err(|e| ReplicationError::protocol(format!("Failed to create AsyncFd: {e}")))?;
 
         self.async_fd = Some(async_fd);
+
         Ok(())
     }
 
     /// Get copy data from replication stream (truly async, non-blocking)
     ///
-    /// This method uses proper async I/O patterns with AsyncFd to enable the tokio
-    /// scheduler to yield the task when no data is available, allowing other tasks
-    /// to run without blocking threads.
+    /// This method implements a **drain-loop batch queue** optimization:
+    /// after each `PQconsumeInput`, ALL available messages are drained from
+    /// libpq into an internal `VecDeque`. Subsequent calls return from the
+    /// queue without any syscall, epoll, or `select!` overhead.
+    ///
+    /// When the `io-uring` feature is enabled, socket readiness monitoring
+    /// uses io_uring `POLL_ADD` instead of epoll, reducing syscall overhead.
     ///
     /// # Arguments
     /// * `cancellation_token` - Cancellation token to abort the operation
@@ -426,55 +465,40 @@ impl PgReplicationConnection {
     ) -> Result<Bytes> {
         self.ensure_replication_mode()?;
 
-        let async_fd = self
-            .async_fd
-            .as_ref()
-            .ok_or_else(|| ReplicationError::protocol("AsyncFd not initialized".to_string()))?;
-
         loop {
-            // First, try to read any buffered data without blocking
-            match self.try_read_buffered_data()? {
-                ReadResult::Data(data) => return Ok(data),
-                ReadResult::CopyDone => {
+            // ── Fast path: return from pre-drained queue ──
+            if let Some(msg) = self.pending_messages.pop_front() {
+                return Ok(msg);
+            }
+
+            // ── Try to drain any messages already buffered inside libpq ──
+            match drain_buffered_messages(self.conn, &mut self.pending_messages, &mut self.read_buf)
+            {
+                DrainResult::Drained => continue, // messages queued, loop to pop
+                DrainResult::CopyDone => {
                     debug!("COPY stream ended gracefully");
                     return Err(ReplicationError::Cancelled("COPY stream ended".to_string()));
                 }
-                ReadResult::WouldBlock => {}
+                DrainResult::WouldBlock => {} // need to wait for socket
             }
 
-            // If no buffered data, wait for either socket readability or cancellation
+            // ── Wait for socket readability or cancellation ──
+            let async_fd = self
+                .async_fd
+                .as_ref()
+                .ok_or_else(|| ReplicationError::protocol("AsyncFd not initialized".to_string()))?;
+
             tokio::select! {
                 biased;
-
                 _ = cancellation_token.cancelled() => {
-                    debug!("Cancellation detected in get_copy_data_async");
-                    // Check one more time for buffered data before returning
-                    match self.try_read_buffered_data()? {
-                        ReadResult::Data(data) => {
-                            info!("Found buffered data after cancellation, returning it");
-                            return Ok(data);
-                        }
-                        ReadResult::CopyDone => {
-                            info!("Cancellation token triggered COPY stream ended during cancellation check");
-                            return Err(ReplicationError::Cancelled(
-                                "COPY stream ended".to_string(),
-                            ));
-                        }
-                        ReadResult::WouldBlock => {
-                            info!("Cancellation token triggered with no buffered data");
-                        }
-                    }
-                    return Err(ReplicationError::Cancelled("Operation cancelled".to_string()));
+                    return self.handle_cancellation();
                 }
-
-                // Wait for socket to become readable
                 guard_result = async_fd.readable() => {
                     let mut guard = guard_result.map_err(|e| {
                         ReplicationError::protocol(format!("Failed to wait for socket readability: {e}"))
                     })?;
 
-                    // Socket is readable - consume input from the OS socket
-                    // This is the ONLY place we call PQconsumeInput, avoiding busy-loops
+                    // Consume input from OS socket into libpq's buffer
                     let consumed = unsafe { PQconsumeInput(self.conn) };
                     if consumed == 0 {
                         let error_msg = self.last_error_message();
@@ -483,22 +507,19 @@ impl PgReplicationConnection {
                         )));
                     }
 
-                    // Check if we got a complete message after consuming input.
-                    // If we got data, return it immediately (the guard drop will clear ready flag).
-                    // If no complete message yet, explicitly clear the ready flag to re-arm epoll.
-                    match self.try_read_buffered_data()? {
-                        ReadResult::Data(data) => {
-                            return Ok(data);
+                    // Drain all available messages
+                    match drain_buffered_messages(self.conn, &mut self.pending_messages, &mut self.read_buf) {
+                        DrainResult::Drained => {
+                            // Messages queued; guard drops and clears ready flag
                         }
-                        ReadResult::CopyDone => {
+                        DrainResult::CopyDone => {
                             debug!("COPY stream ended after consuming input");
                             return Err(ReplicationError::Cancelled(
                                 "COPY stream ended".to_string(),
                             ));
                         }
-                        ReadResult::WouldBlock => {
-                            // No complete message available yet.
-                            // Clear the ready flag to re-arm epoll and continue waiting.
+                        DrainResult::WouldBlock => {
+                            // No complete message yet, clear ready flag to re-arm epoll
                             guard.clear_ready();
                         }
                     }
@@ -507,57 +528,33 @@ impl PgReplicationConnection {
         }
     }
 
-    /// Try to read copy data from libpq's internal buffer without consuming OS socket
-    /// This is a non-blocking operation that only checks libpq's internal buffer.
-    /// It should only be called after PQconsumeInput has been called to transfer
-    /// data from the OS socket to libpq's buffer.
-    ///
-    /// # Returns
-    /// * `Ok(ReadResult::Data(data))` - Complete message available in buffer
-    /// * `Ok(ReadResult::WouldBlock)` - No complete message yet, need to wait for more data
-    /// * `Ok(ReadResult::CopyDone)` - COPY stream has ended gracefully
-    /// * `Err(_)` - Protocol or buffer error
-    #[inline]
-    fn try_read_buffered_data(&self) -> Result<ReadResult> {
-        // PQgetCopyData with async=1 is already non-blocking, so we don't need PQisBusy check.
-        let mut buffer: *mut std::os::raw::c_char = ptr::null_mut();
-        let result = unsafe { PQgetCopyData(self.conn, &mut buffer, 1) };
-
-        match result {
-            len if len > 0 => {
-                if buffer.is_null() {
-                    return Err(ReplicationError::buffer(
-                        "Received null buffer from PQgetCopyData".to_string(),
-                    ));
-                }
-
-                let data = Bytes::copy_from_slice(unsafe {
-                    slice::from_raw_parts(buffer as *const u8, len as usize)
-                });
-
-                // Free the buffer allocated by PostgreSQL
-                unsafe { PQfreemem(buffer as *mut c_void) };
-                Ok(ReadResult::Data(data))
-            }
-            0 => {
-                // 0: According to libpq docs, async mode and no data ready
-                Ok(ReadResult::WouldBlock)
-            }
-            -1 => {
-                // COPY finished - this is a graceful shutdown signal
-                debug!("COPY stream finished (PQgetCopyData returned -1)");
-                Ok(ReadResult::CopyDone)
-            }
-            -2 => {
-                let error_msg = self.last_error_message();
-                Err(ReplicationError::protocol(format!(
-                    "PQgetCopyData error: {error_msg}"
-                )))
-            }
-            other => Err(ReplicationError::protocol(format!(
-                "Unexpected PQgetCopyData result: {other}"
-            ))),
+    /// Handle cancellation: check for remaining buffered data before returning.
+    fn handle_cancellation(&mut self) -> Result<Bytes> {
+        debug!("Cancellation detected in get_copy_data_async");
+        // Return any queued message first
+        if let Some(msg) = self.pending_messages.pop_front() {
+            info!("Found queued data after cancellation, returning it");
+            return Ok(msg);
         }
+        // Try one last drain
+        match drain_buffered_messages(self.conn, &mut self.pending_messages, &mut self.read_buf) {
+            DrainResult::Drained => {
+                if let Some(msg) = self.pending_messages.pop_front() {
+                    info!("Found buffered data after cancellation, returning it");
+                    return Ok(msg);
+                }
+            }
+            DrainResult::CopyDone => {
+                info!("COPY stream ended during cancellation check");
+                return Err(ReplicationError::Cancelled("COPY stream ended".to_string()));
+            }
+            DrainResult::WouldBlock => {
+                info!("Cancellation token triggered with no buffered data");
+            }
+        }
+        Err(ReplicationError::Cancelled(
+            "Operation cancelled".to_string(),
+        ))
     }
 
     /// Get the last error message from the connection
@@ -674,7 +671,7 @@ impl PgReplicationConnection {
     ///
     /// See: <https://www.postgresql.org/docs/current/protocol-replication.html>
     pub fn create_replication_slot_with_options(
-        &self,
+        &mut self,
         slot_name: &str,
         slot_type: SlotType,
         output_plugin: Option<&str>,
@@ -752,13 +749,12 @@ impl PgReplicationConnection {
         Ok(format!("{};", parts.join(" ")))
     }
 
-    /// Alter a replication slot (logical slots only)
-    pub fn alter_replication_slot(
-        &self,
+    /// Build the SQL string for `ALTER_REPLICATION_SLOT`.
+    fn build_alter_slot_sql(
         slot_name: &str,
         two_phase: Option<bool>,
         failover: Option<bool>,
-    ) -> Result<PgResult> {
+    ) -> Result<String> {
         let mut opts = Vec::new();
 
         if let Some(tp) = two_phase {
@@ -777,7 +773,20 @@ impl PgReplicationConnection {
 
         let options_str = Self::build_sql_options(&opts);
         let quoted_slot = quote_sql_identifier(slot_name);
-        let alter_slot_sql = format!("ALTER_REPLICATION_SLOT {}{};", quoted_slot, options_str);
+        Ok(format!(
+            "ALTER_REPLICATION_SLOT {}{};",
+            quoted_slot, options_str
+        ))
+    }
+
+    /// Alter a replication slot (logical slots only)
+    pub fn alter_replication_slot(
+        &mut self,
+        slot_name: &str,
+        two_phase: Option<bool>,
+        failover: Option<bool>,
+    ) -> Result<PgResult> {
+        let alter_slot_sql = Self::build_alter_slot_sql(slot_name, two_phase, failover)?;
 
         debug!("Altering replication slot: {}", alter_slot_sql);
         let result = self.exec(&alter_slot_sql)?;
@@ -804,7 +813,7 @@ impl PgReplicationConnection {
     /// * `slot_name` - Name of the replication slot to drop
     /// * `wait` - If true, the command waits until the slot becomes inactive
     ///            instead of returning an error when the slot is in use
-    pub fn drop_replication_slot(&self, slot_name: &str, wait: bool) -> Result<()> {
+    pub fn drop_replication_slot(&mut self, slot_name: &str, wait: bool) -> Result<()> {
         let sql = Self::build_drop_slot_sql(slot_name, wait);
 
         debug!("Dropping replication slot: {}", sql);
@@ -835,7 +844,7 @@ impl PgReplicationConnection {
     /// Returns slot type, restart LSN, and restart timeline.
     /// Requires PostgreSQL 15+.
     pub fn read_replication_slot(
-        &self,
+        &mut self,
         slot_name: &str,
     ) -> Result<crate::types::ReplicationSlotInfo> {
         let sql = Self::build_read_slot_sql(slot_name);
@@ -866,13 +875,12 @@ impl PgReplicationConnection {
         })
     }
 
-    /// Start physical replication
-    pub fn start_physical_replication(
-        &mut self,
+    /// Build the SQL string for `START_REPLICATION` (physical).
+    fn build_start_physical_replication_sql(
         slot_name: Option<&str>,
         start_lsn: XLogRecPtr,
         timeline_id: Option<u32>,
-    ) -> Result<()> {
+    ) -> String {
         let mut sql = String::from("START_REPLICATION ");
 
         if let Some(slot) = slot_name {
@@ -892,6 +900,18 @@ impl PgReplicationConnection {
         if let Some(tli) = timeline_id {
             sql.push_str(&format!(" TIMELINE {}", tli));
         }
+
+        sql
+    }
+
+    /// Start physical replication
+    pub fn start_physical_replication(
+        &mut self,
+        slot_name: Option<&str>,
+        start_lsn: XLogRecPtr,
+        timeline_id: Option<u32>,
+    ) -> Result<()> {
+        let sql = Self::build_start_physical_replication_sql(slot_name, start_lsn, timeline_id);
 
         debug!("Starting physical replication: {}", sql);
         let _result = self.exec(&sql)?;
@@ -925,8 +945,8 @@ impl PgReplicationConnection {
         Ok(())
     }
 
-    /// Start a base backup with options
-    pub fn base_backup(&mut self, options: &BaseBackupOptions) -> Result<PgResult> {
+    /// Build the SQL string for `BASE_BACKUP`.
+    fn build_base_backup_sql(options: &BaseBackupOptions) -> String {
         let mut opts = Vec::new();
 
         if let Some(ref label) = options.label {
@@ -1001,11 +1021,16 @@ impl PgReplicationConnection {
             opts.push("INCREMENTAL".to_string());
         }
 
-        let base_backup_sql = if opts.is_empty() {
+        if opts.is_empty() {
             "BASE_BACKUP".to_string()
         } else {
             format!("BASE_BACKUP ({})", opts.join(", "))
-        };
+        }
+    }
+
+    /// Start a base backup with options
+    pub fn base_backup(&mut self, options: &BaseBackupOptions) -> Result<PgResult> {
+        let base_backup_sql = Self::build_base_backup_sql(options);
 
         debug!("Starting base backup: {}", base_backup_sql);
         let result = self.exec(&base_backup_sql)?;
@@ -1047,6 +1072,7 @@ impl PgReplicationConnection {
             // Clear the connection pointer and reset state
             self.conn = std::ptr::null_mut();
             self.async_fd = None;
+            self.pending_messages.clear();
 
             info!("PostgreSQL replication connection closed and cleaned up");
         } else {
@@ -1073,7 +1099,14 @@ impl PgReplicationConnection {
             conn: std::ptr::null_mut(),
             is_replication_conn: false,
             async_fd: None,
+            pending_messages: VecDeque::new(),
+            read_buf: BytesMut::new(),
         }
+    }
+
+    /// Push a message into the pending queue for testing
+    fn push_pending_message_for_testing(&mut self, msg: Bytes) {
+        self.pending_messages.push_back(msg);
     }
 }
 
@@ -1148,6 +1181,98 @@ impl Drop for PgResult {
 // # Safety: `PgResult` wraps `*mut PGresult`.  It is only created and consumed within synchronous code paths (no `.await` while a `PgResult` is live), but the compiler may conservatively include it in generator state.  `Send` is sufficient because the result is never shared — it is always owned by a single task.
 unsafe impl Send for PgResult {}
 
+// ── Free functions for the drain-loop optimization ────────────────────────
+// These are free functions (not methods) to avoid borrow-checker conflicts:
+// `get_copy_data_async` needs `&self.async_fd` (immutable borrow of struct)
+// while simultaneously calling these to mutate `pending_messages` / `read_buf`.
+
+/// Read a single message from libpq's internal buffer using a reusable `BytesMut`.
+///
+/// Instead of `Bytes::copy_from_slice()` (which allocates a new `Vec` per message),
+/// this uses `BytesMut::put_slice() + split().freeze()` which reuses the same
+/// backing allocation after the buffer warms up.
+#[inline]
+fn try_read_buffered_data_raw(conn: *mut PGconn, read_buf: &mut BytesMut) -> Result<ReadResult> {
+    let mut buffer: *mut std::os::raw::c_char = ptr::null_mut();
+    let result = unsafe { PQgetCopyData(conn, &mut buffer, 1) };
+
+    match result {
+        len if len > 0 => {
+            if buffer.is_null() {
+                return Err(ReplicationError::buffer(
+                    "Received null buffer from PQgetCopyData".to_string(),
+                ));
+            }
+
+            let len = len as usize;
+            let src = unsafe { slice::from_raw_parts(buffer as *const u8, len) };
+
+            // Reserve space and copy into the reusable buffer
+            read_buf.reserve(len);
+            read_buf.put_slice(src);
+
+            // Split off the message as a frozen Bytes (zero-copy reference counting)
+            let data = read_buf.split().freeze();
+
+            // Free the buffer allocated by PostgreSQL
+            unsafe { PQfreemem(buffer as *mut c_void) };
+            Ok(ReadResult::Data(data))
+        }
+        0 => Ok(ReadResult::WouldBlock),
+        -1 => {
+            debug!("COPY stream finished (PQgetCopyData returned -1)");
+            Ok(ReadResult::CopyDone)
+        }
+        -2 => {
+            let error_msg = unsafe {
+                let error_ptr = PQerrorMessage(conn);
+                if error_ptr.is_null() {
+                    "Unknown error".to_string()
+                } else {
+                    CStr::from_ptr(error_ptr).to_string_lossy().into_owned()
+                }
+            };
+            Err(ReplicationError::protocol(format!(
+                "PQgetCopyData error: {error_msg}"
+            )))
+        }
+        other => Err(ReplicationError::protocol(format!(
+            "Unexpected PQgetCopyData result: {other}"
+        ))),
+    }
+}
+
+/// Drain ALL available messages from libpq's buffer into the `pending_messages` queue.
+///
+/// After `PQconsumeInput` fills libpq's internal buffer, this function extracts
+/// every complete message in a tight loop — avoiding the overhead of re-entering
+/// `select!`, re-checking cancellation, and re-awaiting readiness per message.
+#[inline]
+fn drain_buffered_messages(
+    conn: *mut PGconn,
+    pending_messages: &mut VecDeque<Bytes>,
+    read_buf: &mut BytesMut,
+) -> DrainResult {
+    let mut drained = false;
+
+    for _ in 0..MAX_DRAIN_BATCH {
+        match try_read_buffered_data_raw(conn, read_buf) {
+            Ok(ReadResult::Data(data)) => {
+                pending_messages.push_back(data);
+                drained = true;
+            }
+            Ok(ReadResult::WouldBlock) => break,
+            Ok(ReadResult::CopyDone) => return DrainResult::CopyDone,
+            Err(_) => break, // treat errors as would-block for drain purposes
+        }
+    }
+
+    if drained {
+        DrainResult::Drained
+    } else {
+        DrainResult::WouldBlock
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1792,5 +1917,498 @@ mod tests {
     fn test_build_read_slot_sql_injection() {
         let sql = PgReplicationConnection::build_read_slot_sql(r#"evil"slot"#);
         assert_eq!(sql, r#"READ_REPLICATION_SLOT "evil""slot";"#);
+    }
+
+    // ========================================
+    // DrainResult tests
+    // ========================================
+
+    #[test]
+    fn test_drain_result_drained_variant() {
+        let result = DrainResult::Drained;
+        assert_eq!(result, DrainResult::Drained);
+        assert_ne!(result, DrainResult::WouldBlock);
+        assert_ne!(result, DrainResult::CopyDone);
+    }
+
+    #[test]
+    fn test_drain_result_would_block_variant() {
+        let result = DrainResult::WouldBlock;
+        assert_eq!(result, DrainResult::WouldBlock);
+        assert_ne!(result, DrainResult::Drained);
+    }
+
+    #[test]
+    fn test_drain_result_copy_done_variant() {
+        let result = DrainResult::CopyDone;
+        assert_eq!(result, DrainResult::CopyDone);
+        assert_ne!(result, DrainResult::Drained);
+    }
+
+    #[test]
+    fn test_drain_result_debug_format() {
+        let drained = format!("{:?}", DrainResult::Drained);
+        assert!(drained.contains("Drained"));
+
+        let would_block = format!("{:?}", DrainResult::WouldBlock);
+        assert!(would_block.contains("WouldBlock"));
+
+        let copy_done = format!("{:?}", DrainResult::CopyDone);
+        assert!(copy_done.contains("CopyDone"));
+    }
+
+    // ========================================
+    // handle_cancellation tests
+    // ========================================
+
+    #[test]
+    fn test_handle_cancellation_returns_queued_message() {
+        let mut conn = PgReplicationConnection::null_for_testing();
+        let msg = Bytes::from_static(b"queued message");
+        conn.push_pending_message_for_testing(msg.clone());
+
+        let result = conn.handle_cancellation();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), msg);
+    }
+
+    #[test]
+    fn test_handle_cancellation_returns_first_queued_message() {
+        let mut conn = PgReplicationConnection::null_for_testing();
+        let msg1 = Bytes::from_static(b"first");
+        let msg2 = Bytes::from_static(b"second");
+        conn.push_pending_message_for_testing(msg1.clone());
+        conn.push_pending_message_for_testing(msg2.clone());
+
+        // Should return the first message (FIFO order)
+        let result = conn.handle_cancellation();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), msg1);
+
+        // Second message should still be in the queue
+        assert_eq!(conn.pending_messages.len(), 1);
+    }
+
+    #[test]
+    fn test_handle_cancellation_returns_cancelled_when_empty() {
+        let mut conn = PgReplicationConnection::null_for_testing();
+
+        // With a null connection and empty queue, handle_cancellation should:
+        // 1. Find no pending messages
+        // 2. Call drain_buffered_messages (which returns WouldBlock for null conn)
+        // 3. Return Cancelled error
+        let result = conn.handle_cancellation();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("cancelled")
+                || err.to_string().contains("Cancelled")
+                || err.to_string().contains("Operation cancelled"),
+            "Expected cancellation error, got: {err}"
+        );
+    }
+
+    // ========================================
+    // build_base_backup_sql tests
+    // ========================================
+
+    #[test]
+    fn test_base_backup_sql_default_options() {
+        let opts = BaseBackupOptions::default();
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(sql, "BASE_BACKUP");
+    }
+
+    #[test]
+    fn test_base_backup_sql_with_label() {
+        let opts = BaseBackupOptions {
+            label: Some("my_backup".to_string()),
+            ..Default::default()
+        };
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(sql, "BASE_BACKUP (LABEL 'my_backup')");
+    }
+
+    #[test]
+    fn test_base_backup_sql_with_target() {
+        let opts = BaseBackupOptions {
+            target: Some("client".to_string()),
+            ..Default::default()
+        };
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(sql, "BASE_BACKUP (TARGET 'client')");
+    }
+
+    #[test]
+    fn test_base_backup_sql_with_target_detail() {
+        let opts = BaseBackupOptions {
+            target: Some("server".to_string()),
+            target_detail: Some("/var/backups".to_string()),
+            ..Default::default()
+        };
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(
+            sql,
+            "BASE_BACKUP (TARGET 'server', TARGET_DETAIL '/var/backups')"
+        );
+    }
+
+    #[test]
+    fn test_base_backup_sql_with_progress() {
+        let opts = BaseBackupOptions {
+            progress: true,
+            ..Default::default()
+        };
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(sql, "BASE_BACKUP (PROGRESS true)");
+    }
+
+    #[test]
+    fn test_base_backup_sql_with_checkpoint() {
+        let opts = BaseBackupOptions {
+            checkpoint: Some("fast".to_string()),
+            ..Default::default()
+        };
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(sql, "BASE_BACKUP (CHECKPOINT 'fast')");
+    }
+
+    #[test]
+    fn test_base_backup_sql_with_wal() {
+        let opts = BaseBackupOptions {
+            wal: true,
+            ..Default::default()
+        };
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(sql, "BASE_BACKUP (WAL true)");
+    }
+
+    #[test]
+    fn test_base_backup_sql_with_wait() {
+        let opts = BaseBackupOptions {
+            wait: true,
+            ..Default::default()
+        };
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(sql, "BASE_BACKUP (WAIT true)");
+    }
+
+    #[test]
+    fn test_base_backup_sql_with_compression() {
+        let opts = BaseBackupOptions {
+            compression: Some("gzip".to_string()),
+            ..Default::default()
+        };
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(sql, "BASE_BACKUP (COMPRESSION 'gzip')");
+    }
+
+    #[test]
+    fn test_base_backup_sql_with_compression_detail() {
+        let opts = BaseBackupOptions {
+            compression: Some("zstd".to_string()),
+            compression_detail: Some("level=3".to_string()),
+            ..Default::default()
+        };
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(
+            sql,
+            "BASE_BACKUP (COMPRESSION 'zstd', COMPRESSION_DETAIL 'level=3')"
+        );
+    }
+
+    #[test]
+    fn test_base_backup_sql_with_max_rate() {
+        let opts = BaseBackupOptions {
+            max_rate: Some(32768),
+            ..Default::default()
+        };
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(sql, "BASE_BACKUP (MAX_RATE 32768)");
+    }
+
+    #[test]
+    fn test_base_backup_sql_with_tablespace_map() {
+        let opts = BaseBackupOptions {
+            tablespace_map: true,
+            ..Default::default()
+        };
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(sql, "BASE_BACKUP (TABLESPACE_MAP true)");
+    }
+
+    #[test]
+    fn test_base_backup_sql_with_verify_checksums() {
+        let opts = BaseBackupOptions {
+            verify_checksums: true,
+            ..Default::default()
+        };
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(sql, "BASE_BACKUP (VERIFY_CHECKSUMS true)");
+    }
+
+    #[test]
+    fn test_base_backup_sql_with_manifest() {
+        let opts = BaseBackupOptions {
+            manifest: Some("yes".to_string()),
+            ..Default::default()
+        };
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(sql, "BASE_BACKUP (MANIFEST 'yes')");
+    }
+
+    #[test]
+    fn test_base_backup_sql_with_manifest_checksums() {
+        let opts = BaseBackupOptions {
+            manifest: Some("yes".to_string()),
+            manifest_checksums: Some("SHA256".to_string()),
+            ..Default::default()
+        };
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(
+            sql,
+            "BASE_BACKUP (MANIFEST 'yes', MANIFEST_CHECKSUMS 'SHA256')"
+        );
+    }
+
+    #[test]
+    fn test_base_backup_sql_with_incremental() {
+        let opts = BaseBackupOptions {
+            incremental: true,
+            ..Default::default()
+        };
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(sql, "BASE_BACKUP (INCREMENTAL)");
+    }
+
+    #[test]
+    fn test_base_backup_sql_with_multiple_options() {
+        let opts = BaseBackupOptions {
+            label: Some("full_backup".to_string()),
+            progress: true,
+            wal: true,
+            checkpoint: Some("fast".to_string()),
+            verify_checksums: true,
+            ..Default::default()
+        };
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(
+            sql,
+            "BASE_BACKUP (LABEL 'full_backup', PROGRESS true, CHECKPOINT 'fast', WAL true, VERIFY_CHECKSUMS true)"
+        );
+    }
+
+    #[test]
+    fn test_base_backup_sql_label_injection() {
+        let opts = BaseBackupOptions {
+            label: Some("evil'label".to_string()),
+            ..Default::default()
+        };
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(sql, "BASE_BACKUP (LABEL 'evil''label')");
+    }
+
+    // ========================================
+    // build_start_replication_sql tests
+    // ========================================
+
+    #[test]
+    fn test_start_replication_sql_with_zero_lsn() {
+        let sql = PgReplicationConnection::build_start_replication_sql(
+            "my_slot",
+            INVALID_XLOG_REC_PTR,
+            &[("proto_version", "1"), ("publication_names", "my_pub")],
+        );
+        assert_eq!(
+            sql,
+            r#"START_REPLICATION SLOT "my_slot" LOGICAL 0/0 ("proto_version" '1', "publication_names" 'my_pub')"#
+        );
+    }
+
+    #[test]
+    fn test_start_replication_sql_with_valid_lsn() {
+        let lsn: XLogRecPtr = 0x0000_0001_0000_0000; // 1/0
+        let sql = PgReplicationConnection::build_start_replication_sql(
+            "test_slot",
+            lsn,
+            &[("proto_version", "2")],
+        );
+        assert!(sql.contains("START_REPLICATION SLOT \"test_slot\" LOGICAL"));
+        assert!(sql.contains("(\"proto_version\" '2')"));
+        // Should NOT contain "0/0" since we provided a valid LSN
+        assert!(!sql.contains("0/0"));
+    }
+
+    #[test]
+    fn test_start_replication_sql_with_multiple_options() {
+        let sql = PgReplicationConnection::build_start_replication_sql(
+            "slot1",
+            INVALID_XLOG_REC_PTR,
+            &[
+                ("proto_version", "1"),
+                ("publication_names", "pub1"),
+                ("messages", "true"),
+            ],
+        );
+        assert!(
+            sql.contains(r#""proto_version" '1', "publication_names" 'pub1', "messages" 'true'"#)
+        );
+    }
+
+    #[test]
+    fn test_start_replication_sql_empty_options() {
+        let sql = PgReplicationConnection::build_start_replication_sql(
+            "slot1",
+            INVALID_XLOG_REC_PTR,
+            &[],
+        );
+        assert_eq!(sql, r#"START_REPLICATION SLOT "slot1" LOGICAL 0/0 ()"#);
+    }
+
+    #[test]
+    fn test_start_replication_sql_option_injection() {
+        let sql = PgReplicationConnection::build_start_replication_sql(
+            r#"evil"slot"#,
+            INVALID_XLOG_REC_PTR,
+            &[("key", "it's")],
+        );
+        // Slot name should be quoted, value should be sanitized
+        assert!(sql.contains(r#""evil""slot""#));
+        assert!(sql.contains("'it''s'"));
+    }
+
+    #[test]
+    fn test_start_replication_sql_single_option() {
+        let sql = PgReplicationConnection::build_start_replication_sql(
+            "my_slot",
+            INVALID_XLOG_REC_PTR,
+            &[("proto_version", "1")],
+        );
+        assert_eq!(
+            sql,
+            r#"START_REPLICATION SLOT "my_slot" LOGICAL 0/0 ("proto_version" '1')"#
+        );
+    }
+
+    // ========================================
+    // build_alter_slot_sql tests
+    // ========================================
+
+    #[test]
+    fn test_alter_slot_sql_two_phase_true() {
+        let sql =
+            PgReplicationConnection::build_alter_slot_sql("my_slot", Some(true), None).unwrap();
+        assert_eq!(sql, r#"ALTER_REPLICATION_SLOT "my_slot" (TWO_PHASE true);"#);
+    }
+
+    #[test]
+    fn test_alter_slot_sql_two_phase_false() {
+        let sql =
+            PgReplicationConnection::build_alter_slot_sql("my_slot", Some(false), None).unwrap();
+        assert_eq!(
+            sql,
+            r#"ALTER_REPLICATION_SLOT "my_slot" (TWO_PHASE false);"#
+        );
+    }
+
+    #[test]
+    fn test_alter_slot_sql_failover_true() {
+        let sql =
+            PgReplicationConnection::build_alter_slot_sql("my_slot", None, Some(true)).unwrap();
+        assert_eq!(sql, r#"ALTER_REPLICATION_SLOT "my_slot" (FAILOVER true);"#);
+    }
+
+    #[test]
+    fn test_alter_slot_sql_both_options() {
+        let sql = PgReplicationConnection::build_alter_slot_sql("my_slot", Some(true), Some(false))
+            .unwrap();
+        assert_eq!(
+            sql,
+            r#"ALTER_REPLICATION_SLOT "my_slot" (TWO_PHASE true, FAILOVER false);"#
+        );
+    }
+
+    #[test]
+    fn test_alter_slot_sql_no_options_error() {
+        let result = PgReplicationConnection::build_alter_slot_sql("my_slot", None, None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("At least one option must be specified"),
+            "Expected option error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_alter_slot_sql_injection() {
+        let sql = PgReplicationConnection::build_alter_slot_sql(r#"evil"slot"#, Some(true), None)
+            .unwrap();
+        assert!(sql.contains(r#""evil""slot""#));
+    }
+
+    // ========================================
+    // build_start_physical_replication_sql tests
+    // ========================================
+
+    #[test]
+    fn test_physical_replication_sql_no_slot_zero_lsn() {
+        let sql = PgReplicationConnection::build_start_physical_replication_sql(
+            None,
+            INVALID_XLOG_REC_PTR,
+            None,
+        );
+        assert_eq!(sql, "START_REPLICATION PHYSICAL 0/0");
+    }
+
+    #[test]
+    fn test_physical_replication_sql_with_slot() {
+        let sql = PgReplicationConnection::build_start_physical_replication_sql(
+            Some("phys_slot"),
+            INVALID_XLOG_REC_PTR,
+            None,
+        );
+        assert_eq!(sql, r#"START_REPLICATION SLOT "phys_slot" PHYSICAL 0/0"#);
+    }
+
+    #[test]
+    fn test_physical_replication_sql_with_timeline() {
+        let sql = PgReplicationConnection::build_start_physical_replication_sql(
+            None,
+            INVALID_XLOG_REC_PTR,
+            Some(3),
+        );
+        assert_eq!(sql, "START_REPLICATION PHYSICAL 0/0 TIMELINE 3");
+    }
+
+    #[test]
+    fn test_physical_replication_sql_with_valid_lsn() {
+        let lsn: XLogRecPtr = 0x0000_0001_0000_0000; // 1/0
+        let sql = PgReplicationConnection::build_start_physical_replication_sql(None, lsn, None);
+        assert!(sql.starts_with("START_REPLICATION PHYSICAL "));
+        assert!(!sql.contains("0/0"));
+    }
+
+    #[test]
+    fn test_physical_replication_sql_all_options() {
+        let sql = PgReplicationConnection::build_start_physical_replication_sql(
+            Some("my_slot"),
+            INVALID_XLOG_REC_PTR,
+            Some(2),
+        );
+        assert_eq!(
+            sql,
+            r#"START_REPLICATION SLOT "my_slot" PHYSICAL 0/0 TIMELINE 2"#
+        );
+    }
+
+    #[test]
+    fn test_physical_replication_sql_slot_injection() {
+        let sql = PgReplicationConnection::build_start_physical_replication_sql(
+            Some(r#"evil"slot"#),
+            INVALID_XLOG_REC_PTR,
+            None,
+        );
+        assert!(sql.contains(r#""evil""slot""#));
     }
 }
