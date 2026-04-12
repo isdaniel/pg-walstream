@@ -14,9 +14,7 @@ pub struct GeneratorConfig {
     pub batch_size: usize,
     pub payload_size: usize,
     pub use_wide_table: bool,
-    /// Fraction of INSERTs (vs UPDATE/DELETE). 1.0 = all inserts.
     pub insert_ratio: f64,
-    /// Fraction of UPDATEs among non-insert DML.
     pub update_ratio: f64,
 }
 

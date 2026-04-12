@@ -113,8 +113,7 @@ impl ResourceSummary {
             .iter()
             .map(|s| s.system_cpu_pct)
             .fold(0.0f32, f32::max);
-        let nd = samples.len() as f64;
-        let avg_rss = samples.iter().map(|s| s.process_rss_mb).sum::<f64>() / nd;
+        let avg_rss = samples.iter().map(|s| s.process_rss_mb).sum::<f64>() / samples.len() as f64;
         let peak_rss = samples
             .iter()
             .map(|s| s.process_rss_mb)

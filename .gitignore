@@ -21,5 +21,4 @@ target
 #.idea/
 
 pg2any_last_lsn
-reports/loadtest-libpq-20260412-100352.md
-reports/loadtest-rustls-tls-20260412-095108.md
+reports/*

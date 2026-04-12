@@ -98,6 +98,7 @@ enum ReadResult {
 }
 
 /// Result of draining all available messages from libpq
+#[derive(Debug, PartialEq)]
 enum DrainResult {
     /// One or more messages were queued
     Drained,
@@ -330,13 +331,12 @@ impl PgReplicationConnection {
         Ok(result)
     }
 
-    /// Start logical replication
-    pub fn start_replication(
-        &mut self,
+    /// Build the SQL string for `START_REPLICATION` (logical).
+    fn build_start_replication_sql(
         slot_name: &str,
         start_lsn: XLogRecPtr,
         options: &[(&str, &str)],
-    ) -> Result<()> {
+    ) -> String {
         let quoted_slot = quote_sql_identifier(slot_name);
         let mut options_str = String::new();
         for (i, (key, value)) in options.iter().enumerate() {
@@ -348,7 +348,7 @@ impl PgReplicationConnection {
             options_str.push_str(&format!("{quoted_key} '{sanitized_value}'"));
         }
 
-        let start_replication_sql = if start_lsn == INVALID_XLOG_REC_PTR {
+        if start_lsn == INVALID_XLOG_REC_PTR {
             format!("START_REPLICATION SLOT {quoted_slot} LOGICAL 0/0 ({options_str})")
         } else {
             format!(
@@ -357,10 +357,20 @@ impl PgReplicationConnection {
                 format_lsn(start_lsn),
                 options_str
             )
-        };
+        }
+    }
 
-        debug!("Starting replication: {}", start_replication_sql);
-        let _result = self.exec(&start_replication_sql)?;
+    /// Start logical replication
+    pub fn start_replication(
+        &mut self,
+        slot_name: &str,
+        start_lsn: XLogRecPtr,
+        options: &[(&str, &str)],
+    ) -> Result<()> {
+        let sql = Self::build_start_replication_sql(slot_name, start_lsn, options);
+
+        debug!("Starting replication: {}", sql);
+        let _result = self.exec(&sql)?;
 
         self.is_replication_conn = true;
 
@@ -739,13 +749,12 @@ impl PgReplicationConnection {
         Ok(format!("{};", parts.join(" ")))
     }
 
-    /// Alter a replication slot (logical slots only)
-    pub fn alter_replication_slot(
-        &mut self,
+    /// Build the SQL string for `ALTER_REPLICATION_SLOT`.
+    fn build_alter_slot_sql(
         slot_name: &str,
         two_phase: Option<bool>,
         failover: Option<bool>,
-    ) -> Result<PgResult> {
+    ) -> Result<String> {
         let mut opts = Vec::new();
 
         if let Some(tp) = two_phase {
@@ -764,7 +773,20 @@ impl PgReplicationConnection {
 
         let options_str = Self::build_sql_options(&opts);
         let quoted_slot = quote_sql_identifier(slot_name);
-        let alter_slot_sql = format!("ALTER_REPLICATION_SLOT {}{};", quoted_slot, options_str);
+        Ok(format!(
+            "ALTER_REPLICATION_SLOT {}{};",
+            quoted_slot, options_str
+        ))
+    }
+
+    /// Alter a replication slot (logical slots only)
+    pub fn alter_replication_slot(
+        &mut self,
+        slot_name: &str,
+        two_phase: Option<bool>,
+        failover: Option<bool>,
+    ) -> Result<PgResult> {
+        let alter_slot_sql = Self::build_alter_slot_sql(slot_name, two_phase, failover)?;
 
         debug!("Altering replication slot: {}", alter_slot_sql);
         let result = self.exec(&alter_slot_sql)?;
@@ -853,13 +875,12 @@ impl PgReplicationConnection {
         })
     }
 
-    /// Start physical replication
-    pub fn start_physical_replication(
-        &mut self,
+    /// Build the SQL string for `START_REPLICATION` (physical).
+    fn build_start_physical_replication_sql(
         slot_name: Option<&str>,
         start_lsn: XLogRecPtr,
         timeline_id: Option<u32>,
-    ) -> Result<()> {
+    ) -> String {
         let mut sql = String::from("START_REPLICATION ");
 
         if let Some(slot) = slot_name {
@@ -879,6 +900,18 @@ impl PgReplicationConnection {
         if let Some(tli) = timeline_id {
             sql.push_str(&format!(" TIMELINE {}", tli));
         }
+
+        sql
+    }
+
+    /// Start physical replication
+    pub fn start_physical_replication(
+        &mut self,
+        slot_name: Option<&str>,
+        start_lsn: XLogRecPtr,
+        timeline_id: Option<u32>,
+    ) -> Result<()> {
+        let sql = Self::build_start_physical_replication_sql(slot_name, start_lsn, timeline_id);
 
         debug!("Starting physical replication: {}", sql);
         let _result = self.exec(&sql)?;
@@ -912,8 +945,8 @@ impl PgReplicationConnection {
         Ok(())
     }
 
-    /// Start a base backup with options
-    pub fn base_backup(&mut self, options: &BaseBackupOptions) -> Result<PgResult> {
+    /// Build the SQL string for `BASE_BACKUP`.
+    fn build_base_backup_sql(options: &BaseBackupOptions) -> String {
         let mut opts = Vec::new();
 
         if let Some(ref label) = options.label {
@@ -988,11 +1021,16 @@ impl PgReplicationConnection {
             opts.push("INCREMENTAL".to_string());
         }
 
-        let base_backup_sql = if opts.is_empty() {
+        if opts.is_empty() {
             "BASE_BACKUP".to_string()
         } else {
             format!("BASE_BACKUP ({})", opts.join(", "))
-        };
+        }
+    }
+
+    /// Start a base backup with options
+    pub fn base_backup(&mut self, options: &BaseBackupOptions) -> Result<PgResult> {
+        let base_backup_sql = Self::build_base_backup_sql(options);
 
         debug!("Starting base backup: {}", base_backup_sql);
         let result = self.exec(&base_backup_sql)?;
@@ -1064,6 +1102,11 @@ impl PgReplicationConnection {
             pending_messages: VecDeque::new(),
             read_buf: BytesMut::new(),
         }
+    }
+
+    /// Push a message into the pending queue for testing
+    fn push_pending_message_for_testing(&mut self, msg: Bytes) {
+        self.pending_messages.push_back(msg);
     }
 }
 
@@ -1874,5 +1917,511 @@ mod tests {
     fn test_build_read_slot_sql_injection() {
         let sql = PgReplicationConnection::build_read_slot_sql(r#"evil"slot"#);
         assert_eq!(sql, r#"READ_REPLICATION_SLOT "evil""slot";"#);
+    }
+
+    // ========================================
+    // DrainResult tests
+    // ========================================
+
+    #[test]
+    fn test_drain_result_drained_variant() {
+        let result = DrainResult::Drained;
+        assert_eq!(result, DrainResult::Drained);
+        assert_ne!(result, DrainResult::WouldBlock);
+        assert_ne!(result, DrainResult::CopyDone);
+    }
+
+    #[test]
+    fn test_drain_result_would_block_variant() {
+        let result = DrainResult::WouldBlock;
+        assert_eq!(result, DrainResult::WouldBlock);
+        assert_ne!(result, DrainResult::Drained);
+    }
+
+    #[test]
+    fn test_drain_result_copy_done_variant() {
+        let result = DrainResult::CopyDone;
+        assert_eq!(result, DrainResult::CopyDone);
+        assert_ne!(result, DrainResult::Drained);
+    }
+
+    #[test]
+    fn test_drain_result_debug_format() {
+        let drained = format!("{:?}", DrainResult::Drained);
+        assert!(drained.contains("Drained"));
+
+        let would_block = format!("{:?}", DrainResult::WouldBlock);
+        assert!(would_block.contains("WouldBlock"));
+
+        let copy_done = format!("{:?}", DrainResult::CopyDone);
+        assert!(copy_done.contains("CopyDone"));
+    }
+
+    // ========================================
+    // handle_cancellation tests
+    // ========================================
+
+    #[test]
+    fn test_handle_cancellation_returns_queued_message() {
+        let mut conn = PgReplicationConnection::null_for_testing();
+        let msg = Bytes::from_static(b"queued message");
+        conn.push_pending_message_for_testing(msg.clone());
+
+        let result = conn.handle_cancellation();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), msg);
+    }
+
+    #[test]
+    fn test_handle_cancellation_returns_first_queued_message() {
+        let mut conn = PgReplicationConnection::null_for_testing();
+        let msg1 = Bytes::from_static(b"first");
+        let msg2 = Bytes::from_static(b"second");
+        conn.push_pending_message_for_testing(msg1.clone());
+        conn.push_pending_message_for_testing(msg2.clone());
+
+        // Should return the first message (FIFO order)
+        let result = conn.handle_cancellation();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), msg1);
+
+        // Second message should still be in the queue
+        assert_eq!(conn.pending_messages.len(), 1);
+    }
+
+    #[test]
+    fn test_handle_cancellation_returns_cancelled_when_empty() {
+        let mut conn = PgReplicationConnection::null_for_testing();
+
+        // With a null connection and empty queue, handle_cancellation should:
+        // 1. Find no pending messages
+        // 2. Call drain_buffered_messages (which returns WouldBlock for null conn)
+        // 3. Return Cancelled error
+        let result = conn.handle_cancellation();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("cancelled")
+                || err.to_string().contains("Cancelled")
+                || err.to_string().contains("Operation cancelled"),
+            "Expected cancellation error, got: {err}"
+        );
+    }
+
+    // ========================================
+    // build_base_backup_sql tests
+    // ========================================
+
+    #[test]
+    fn test_base_backup_sql_default_options() {
+        let opts = BaseBackupOptions::default();
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(sql, "BASE_BACKUP");
+    }
+
+    #[test]
+    fn test_base_backup_sql_with_label() {
+        let opts = BaseBackupOptions {
+            label: Some("my_backup".to_string()),
+            ..Default::default()
+        };
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(sql, "BASE_BACKUP (LABEL 'my_backup')");
+    }
+
+    #[test]
+    fn test_base_backup_sql_with_target() {
+        let opts = BaseBackupOptions {
+            target: Some("client".to_string()),
+            ..Default::default()
+        };
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(sql, "BASE_BACKUP (TARGET 'client')");
+    }
+
+    #[test]
+    fn test_base_backup_sql_with_target_detail() {
+        let opts = BaseBackupOptions {
+            target: Some("server".to_string()),
+            target_detail: Some("/var/backups".to_string()),
+            ..Default::default()
+        };
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(
+            sql,
+            "BASE_BACKUP (TARGET 'server', TARGET_DETAIL '/var/backups')"
+        );
+    }
+
+    #[test]
+    fn test_base_backup_sql_with_progress() {
+        let opts = BaseBackupOptions {
+            progress: true,
+            ..Default::default()
+        };
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(sql, "BASE_BACKUP (PROGRESS true)");
+    }
+
+    #[test]
+    fn test_base_backup_sql_with_checkpoint() {
+        let opts = BaseBackupOptions {
+            checkpoint: Some("fast".to_string()),
+            ..Default::default()
+        };
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(sql, "BASE_BACKUP (CHECKPOINT 'fast')");
+    }
+
+    #[test]
+    fn test_base_backup_sql_with_wal() {
+        let opts = BaseBackupOptions {
+            wal: true,
+            ..Default::default()
+        };
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(sql, "BASE_BACKUP (WAL true)");
+    }
+
+    #[test]
+    fn test_base_backup_sql_with_wait() {
+        let opts = BaseBackupOptions {
+            wait: true,
+            ..Default::default()
+        };
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(sql, "BASE_BACKUP (WAIT true)");
+    }
+
+    #[test]
+    fn test_base_backup_sql_with_compression() {
+        let opts = BaseBackupOptions {
+            compression: Some("gzip".to_string()),
+            ..Default::default()
+        };
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(sql, "BASE_BACKUP (COMPRESSION 'gzip')");
+    }
+
+    #[test]
+    fn test_base_backup_sql_with_compression_detail() {
+        let opts = BaseBackupOptions {
+            compression: Some("zstd".to_string()),
+            compression_detail: Some("level=3".to_string()),
+            ..Default::default()
+        };
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(
+            sql,
+            "BASE_BACKUP (COMPRESSION 'zstd', COMPRESSION_DETAIL 'level=3')"
+        );
+    }
+
+    #[test]
+    fn test_base_backup_sql_with_max_rate() {
+        let opts = BaseBackupOptions {
+            max_rate: Some(32768),
+            ..Default::default()
+        };
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(sql, "BASE_BACKUP (MAX_RATE 32768)");
+    }
+
+    #[test]
+    fn test_base_backup_sql_with_tablespace_map() {
+        let opts = BaseBackupOptions {
+            tablespace_map: true,
+            ..Default::default()
+        };
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(sql, "BASE_BACKUP (TABLESPACE_MAP true)");
+    }
+
+    #[test]
+    fn test_base_backup_sql_with_verify_checksums() {
+        let opts = BaseBackupOptions {
+            verify_checksums: true,
+            ..Default::default()
+        };
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(sql, "BASE_BACKUP (VERIFY_CHECKSUMS true)");
+    }
+
+    #[test]
+    fn test_base_backup_sql_with_manifest() {
+        let opts = BaseBackupOptions {
+            manifest: Some("yes".to_string()),
+            ..Default::default()
+        };
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(sql, "BASE_BACKUP (MANIFEST 'yes')");
+    }
+
+    #[test]
+    fn test_base_backup_sql_with_manifest_checksums() {
+        let opts = BaseBackupOptions {
+            manifest: Some("yes".to_string()),
+            manifest_checksums: Some("SHA256".to_string()),
+            ..Default::default()
+        };
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(
+            sql,
+            "BASE_BACKUP (MANIFEST 'yes', MANIFEST_CHECKSUMS 'SHA256')"
+        );
+    }
+
+    #[test]
+    fn test_base_backup_sql_with_incremental() {
+        let opts = BaseBackupOptions {
+            incremental: true,
+            ..Default::default()
+        };
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(sql, "BASE_BACKUP (INCREMENTAL)");
+    }
+
+    #[test]
+    fn test_base_backup_sql_with_multiple_options() {
+        let opts = BaseBackupOptions {
+            label: Some("full_backup".to_string()),
+            progress: true,
+            wal: true,
+            checkpoint: Some("fast".to_string()),
+            verify_checksums: true,
+            ..Default::default()
+        };
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(
+            sql,
+            "BASE_BACKUP (LABEL 'full_backup', PROGRESS true, CHECKPOINT 'fast', WAL true, VERIFY_CHECKSUMS true)"
+        );
+    }
+
+    #[test]
+    fn test_base_backup_sql_label_injection() {
+        let opts = BaseBackupOptions {
+            label: Some("evil'label".to_string()),
+            ..Default::default()
+        };
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        assert_eq!(sql, "BASE_BACKUP (LABEL 'evil''label')");
+    }
+
+    // ========================================
+    // build_start_replication_sql tests
+    // ========================================
+
+    #[test]
+    fn test_start_replication_sql_with_zero_lsn() {
+        let sql = PgReplicationConnection::build_start_replication_sql(
+            "my_slot",
+            INVALID_XLOG_REC_PTR,
+            &[("proto_version", "1"), ("publication_names", "my_pub")],
+        );
+        assert_eq!(
+            sql,
+            r#"START_REPLICATION SLOT "my_slot" LOGICAL 0/0 ("proto_version" '1', "publication_names" 'my_pub')"#
+        );
+    }
+
+    #[test]
+    fn test_start_replication_sql_with_valid_lsn() {
+        let lsn: XLogRecPtr = 0x0000_0001_0000_0000; // 1/0
+        let sql = PgReplicationConnection::build_start_replication_sql(
+            "test_slot",
+            lsn,
+            &[("proto_version", "2")],
+        );
+        assert!(sql.contains("START_REPLICATION SLOT \"test_slot\" LOGICAL"));
+        assert!(sql.contains("(\"proto_version\" '2')"));
+        // Should NOT contain "0/0" since we provided a valid LSN
+        assert!(!sql.contains("0/0"));
+    }
+
+    #[test]
+    fn test_start_replication_sql_with_multiple_options() {
+        let sql = PgReplicationConnection::build_start_replication_sql(
+            "slot1",
+            INVALID_XLOG_REC_PTR,
+            &[
+                ("proto_version", "1"),
+                ("publication_names", "pub1"),
+                ("messages", "true"),
+            ],
+        );
+        assert!(sql.contains(r#""proto_version" '1', "publication_names" 'pub1', "messages" 'true'"#));
+    }
+
+    #[test]
+    fn test_start_replication_sql_empty_options() {
+        let sql = PgReplicationConnection::build_start_replication_sql(
+            "slot1",
+            INVALID_XLOG_REC_PTR,
+            &[],
+        );
+        assert_eq!(
+            sql,
+            r#"START_REPLICATION SLOT "slot1" LOGICAL 0/0 ()"#
+        );
+    }
+
+    #[test]
+    fn test_start_replication_sql_option_injection() {
+        let sql = PgReplicationConnection::build_start_replication_sql(
+            r#"evil"slot"#,
+            INVALID_XLOG_REC_PTR,
+            &[("key", "val'ue")],
+        );
+        // Slot name should be quoted, value should be sanitized
+        assert!(sql.contains(r#""evil""slot""#));
+        assert!(sql.contains("'val''ue'"));
+    }
+
+    #[test]
+    fn test_start_replication_sql_single_option() {
+        let sql = PgReplicationConnection::build_start_replication_sql(
+            "my_slot",
+            INVALID_XLOG_REC_PTR,
+            &[("proto_version", "1")],
+        );
+        assert_eq!(
+            sql,
+            r#"START_REPLICATION SLOT "my_slot" LOGICAL 0/0 ("proto_version" '1')"#
+        );
+    }
+
+    // ========================================
+    // build_alter_slot_sql tests
+    // ========================================
+
+    #[test]
+    fn test_alter_slot_sql_two_phase_true() {
+        let sql =
+            PgReplicationConnection::build_alter_slot_sql("my_slot", Some(true), None).unwrap();
+        assert_eq!(
+            sql,
+            r#"ALTER_REPLICATION_SLOT "my_slot" (TWO_PHASE true);"#
+        );
+    }
+
+    #[test]
+    fn test_alter_slot_sql_two_phase_false() {
+        let sql =
+            PgReplicationConnection::build_alter_slot_sql("my_slot", Some(false), None).unwrap();
+        assert_eq!(
+            sql,
+            r#"ALTER_REPLICATION_SLOT "my_slot" (TWO_PHASE false);"#
+        );
+    }
+
+    #[test]
+    fn test_alter_slot_sql_failover_true() {
+        let sql =
+            PgReplicationConnection::build_alter_slot_sql("my_slot", None, Some(true)).unwrap();
+        assert_eq!(
+            sql,
+            r#"ALTER_REPLICATION_SLOT "my_slot" (FAILOVER true);"#
+        );
+    }
+
+    #[test]
+    fn test_alter_slot_sql_both_options() {
+        let sql = PgReplicationConnection::build_alter_slot_sql("my_slot", Some(true), Some(false))
+            .unwrap();
+        assert_eq!(
+            sql,
+            r#"ALTER_REPLICATION_SLOT "my_slot" (TWO_PHASE true, FAILOVER false);"#
+        );
+    }
+
+    #[test]
+    fn test_alter_slot_sql_no_options_error() {
+        let result = PgReplicationConnection::build_alter_slot_sql("my_slot", None, None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("At least one option must be specified"),
+            "Expected option error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_alter_slot_sql_injection() {
+        let sql =
+            PgReplicationConnection::build_alter_slot_sql(r#"evil"slot"#, Some(true), None)
+                .unwrap();
+        assert!(sql.contains(r#""evil""slot""#));
+    }
+
+    // ========================================
+    // build_start_physical_replication_sql tests
+    // ========================================
+
+    #[test]
+    fn test_physical_replication_sql_no_slot_zero_lsn() {
+        let sql = PgReplicationConnection::build_start_physical_replication_sql(
+            None,
+            INVALID_XLOG_REC_PTR,
+            None,
+        );
+        assert_eq!(sql, "START_REPLICATION PHYSICAL 0/0");
+    }
+
+    #[test]
+    fn test_physical_replication_sql_with_slot() {
+        let sql = PgReplicationConnection::build_start_physical_replication_sql(
+            Some("phys_slot"),
+            INVALID_XLOG_REC_PTR,
+            None,
+        );
+        assert_eq!(
+            sql,
+            r#"START_REPLICATION SLOT "phys_slot" PHYSICAL 0/0"#
+        );
+    }
+
+    #[test]
+    fn test_physical_replication_sql_with_timeline() {
+        let sql = PgReplicationConnection::build_start_physical_replication_sql(
+            None,
+            INVALID_XLOG_REC_PTR,
+            Some(3),
+        );
+        assert_eq!(sql, "START_REPLICATION PHYSICAL 0/0 TIMELINE 3");
+    }
+
+    #[test]
+    fn test_physical_replication_sql_with_valid_lsn() {
+        let lsn: XLogRecPtr = 0x0000_0001_0000_0000; // 1/0
+        let sql = PgReplicationConnection::build_start_physical_replication_sql(
+            None, lsn, None,
+        );
+        assert!(sql.starts_with("START_REPLICATION PHYSICAL "));
+        assert!(!sql.contains("0/0"));
+    }
+
+    #[test]
+    fn test_physical_replication_sql_all_options() {
+        let sql = PgReplicationConnection::build_start_physical_replication_sql(
+            Some("my_slot"),
+            INVALID_XLOG_REC_PTR,
+            Some(2),
+        );
+        assert_eq!(
+            sql,
+            r#"START_REPLICATION SLOT "my_slot" PHYSICAL 0/0 TIMELINE 2"#
+        );
+    }
+
+    #[test]
+    fn test_physical_replication_sql_slot_injection() {
+        let sql = PgReplicationConnection::build_start_physical_replication_sql(
+            Some(r#"evil"slot"#),
+            INVALID_XLOG_REC_PTR,
+            None,
+        );
+        assert!(sql.contains(r#""evil""slot""#));
     }
 }

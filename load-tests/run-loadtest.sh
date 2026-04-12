@@ -114,8 +114,7 @@ run_loadtest() {
     cd "$SCRIPT_DIR"
     cargo run --release --bin pg-walstream-loadtest 2>&1
 
-    # The binary writes LOAD_TEST_REPORT.md to the project root
-    local generated="$PROJECT_DIR/LOAD_TEST_REPORT.md"
+    local generated="$REPORTS_DIR/LOAD_TEST_REPORT.md"
     if [[ -f "$generated" ]]; then
         cp "$generated" "$report_file"
         ok "Report saved: $report_file"
@@ -147,51 +146,6 @@ run_single() {
     ok "Done! Report: $report_file"
 }
 
-run_compare() {
-    check_database_url
-    ensure_reports_dir
-    save_originals
-    trap restore_originals EXIT
-
-    local rustls_report="$REPORTS_DIR/loadtest-rustls-tls-${TIMESTAMP}.md"
-    local libpq_report="$REPORTS_DIR/loadtest-libpq-${TIMESTAMP}.md"
-    local compare_report="$PROJECT_DIR/LOAD_TEST_REPORT_V2.md"
-
-    # ── Run rustls-tls ──
-    info "═══════════════════════════════════════════"
-    info "  Phase 1/2: rustls-tls backend"
-    info "═══════════════════════════════════════════"
-    switch_to_rustls
-    build_loadtest "rustls-tls"
-    run_loadtest "rustls-tls" "$rustls_report"
-    echo ""
-
-    # ── Run libpq ──
-    info "═══════════════════════════════════════════"
-    info "  Phase 2/2: libpq+OpenSSL backend"
-    info "═══════════════════════════════════════════"
-    switch_to_libpq
-    build_loadtest "libpq"
-    run_loadtest "libpq" "$libpq_report"
-    echo ""
-
-    # ── Generate comparison ──
-    info "Generating comparison report..."
-    generate_comparison "$rustls_report" "$libpq_report" "$compare_report"
-
-    echo ""
-    ok "═══════════════════════════════════════════"
-    ok "  All done!"
-    ok "═══════════════════════════════════════════"
-    echo ""
-    echo "  Individual reports:"
-    echo "    rustls-tls : $rustls_report"
-    echo "    libpq      : $libpq_report"
-    echo ""
-    echo "  Comparison report:"
-    echo "    $compare_report"
-    echo ""
-}
 
 # ── Comparison report generator ─────────────────────────────────────────────
 
@@ -303,9 +257,6 @@ case "${1:-rustls-tls}" in
         ;;
     libpq)
         run_single "libpq"
-        ;;
-    compare|cmp|both)
-        run_compare
         ;;
     -h|--help|help)
         usage
