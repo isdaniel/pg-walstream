@@ -594,7 +594,7 @@ async fn main() {
         .unwrap()
         .parent()
         .unwrap_or(&std::env::current_dir().unwrap())
-        .join("LOAD_TEST_REPORT.md");
+        .join("report/LOAD_TEST_REPORT.md");
     std::fs::write(&report_path, &report).expect("Failed to write report");
 
     println!();

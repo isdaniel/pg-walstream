@@ -26,6 +26,14 @@ pub async fn read_message<R: AsyncRead + Unpin>(
         // Try to parse a complete message from buffered data
         if buf.len() >= HEADER_LEN {
             let body_len = i32::from_be_bytes(buf[1..5].try_into().unwrap()) as usize;
+
+            // The length field includes its own 4 bytes, so body_len must be >= 4, value < 4 indicates a corrupt or malicious message.
+            if body_len < 4 {
+                return Err(ReplicationError::protocol(format!(
+                    "invalid message length {body_len} (must be >= 4)"
+                )));
+            }
+
             let total_len = 1 + body_len; // tag + body_len (body_len includes its own 4 bytes)
 
             if buf.len() >= total_len {
@@ -158,11 +166,20 @@ pub fn build_terminate() -> BytesMut {
 }
 
 /// Parse a null-terminated C string from a byte slice.
-/// Returns the string and the number of bytes consumed (including the null).
+/// Returns the string and the number of bytes consumed (including the null terminator).
+/// If no null terminator exists, consumes the entire slice.
 pub fn read_cstring(data: &[u8]) -> (&str, usize) {
-    let null_pos = data.iter().position(|&b| b == 0).unwrap_or(data.len());
-    let s = std::str::from_utf8(&data[..null_pos]).unwrap_or("");
-    (s, null_pos + 1)
+    match data.iter().position(|&b| b == 0) {
+        Some(null_pos) => {
+            let s = std::str::from_utf8(&data[..null_pos]).unwrap_or("");
+            (s, null_pos + 1) // consume string + null byte
+        }
+        None => {
+            // No null terminator — consume everything
+            let s = std::str::from_utf8(data).unwrap_or("");
+            (s, data.len())
+        }
+    }
 }
 
 #[cfg(test)]

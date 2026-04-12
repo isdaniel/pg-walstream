@@ -6,20 +6,26 @@
 
 # pg-walstream
 
-A high-performance Rust library for PostgreSQL logical and physical replication protocol parsing and streaming. This library provides a robust, type-safe interface for consuming PostgreSQL Write-Ahead Log (WAL) streams.
+A high-performance Rust library for PostgreSQL logical and physical replication protocol parsing and streaming. Provides a robust, type-safe interface for consuming PostgreSQL Write-Ahead Log (WAL) streams.
 
 ## Features
 
 - **Full Logical Replication Support**: Implements PostgreSQL logical replication protocol versions 1-4
 - **Physical Replication Support**: Stream raw WAL data for standby servers and PITR
+- **Base Backup Support**: Full `BASE_BACKUP` command with progress, compression, and manifest options
+- **Pure-Rust Backend**: Optional `rustls-tls` feature eliminates all C dependencies (no libpq, no libclang)
+- **TLS/SSL Support**: All PostgreSQL SSL modes (`disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`)
+- **Authentication**: Cleartext, MD5, and SCRAM-SHA-256 authentication methods
 - **Streaming Transactions**: Support for streaming large transactions (protocol v2+)
 - **Two-Phase Commit**: Prepared transaction support (protocol v3+)
 - **Parallel Streaming**: Multi-stream parallel replication (protocol v4+)
-- **Zero-Copy Operations**: Efficient buffer management using the `bytes` crate
+- **Zero-Copy Operations**: Efficient buffer management using the `bytes` crate with drain-loop batch queue optimization
 - **Thread-Safe LSN Tracking**: Atomic LSN feedback for producer-consumer patterns
 - **Connection Management**: Built-in connection handling with exponential backoff retry logic
 - **Type-Safe API**: Strongly typed message parsing with comprehensive error handling
-- **Configurable Slot Options**: Temporary slots, snapshot export, two-phase, and failover support
+- **Replication Slot Management**: Create, alter, read, and drop slots with full option support
+- **Hot Standby Feedback**: Send hot standby feedback messages for physical replication
+- **`Send`-Safe Streams**: `LogicalReplicationStream` is `Send`, compatible with `tokio::spawn`
 
 ## Installation
 
@@ -27,18 +33,36 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-pg_walstream = "0.1.0"
+pg_walstream = "0.5.1"
 ```
+
+By default, this uses the `libpq` backend (C FFI). For a **pure-Rust** build with no system dependencies:
+
+```toml
+[dependencies]
+pg_walstream = { version = "0.5.1", default-features = false, features = ["rustls-tls"] }
+```
+
+## Feature Flags
+
+pg-walstream provides two mutually exclusive connection backends, selected at compile time:
+
+| Feature | Default | C Dependencies | Description |
+|---------|---------|----------------|-------------|
+| `libpq` | Yes | `libpq-dev`, `libclang-dev` | Uses PostgreSQL's C client library via FFI. Battle-tested, supports all auth methods natively. |
+| `rustls-tls` | No | **None** | Pure-Rust implementation using `rustls` for TLS and `postgres-protocol` for wire framing. Zero system dependencies. |
+
+> **Note:** Enabling both features simultaneously will cause a compile error.
 
 ## System Dependencies
 
-Make sure you have libpq development libraries installed:
+System dependencies are **only required** when using the default `libpq` feature. The `rustls-tls` feature has zero system dependencies.
+
+### For `libpq` feature (default)
 
 **Ubuntu/Debian:**
 ```bash
-sudo apt-get install libpq-dev \
-    clang \
-    libclang-dev 
+sudo apt-get install libpq-dev clang libclang-dev
 ```
 
 **CentOS/RHEL/Fedora:**
@@ -46,6 +70,13 @@ sudo apt-get install libpq-dev \
 sudo yum install postgresql-devel
 # or
 sudo dnf install postgresql-devel
+```
+
+### For `rustls-tls` feature
+
+No system dependencies required. Just add to `Cargo.toml`:
+```toml
+pg_walstream = { version = "0.5.1", default-features = false, features = ["rustls-tls"] }
 ```
 
 ## Quick Start
@@ -92,7 +123,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     stream.ensure_replication_slot().await?;
 
     // Step 2: Use the exported snapshot on a SEPARATE regular connection
-    // If the slot was created with EXPORT_SNAPSHOT, use the snapshot name on a SEPARATE regular connection to read the initial table state:
+    // If the slot was created with EXPORT_SNAPSHOT, use the snapshot name
+    // on a SEPARATE regular connection to read the initial table state:
     //   BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
     //   SET TRANSACTION SNAPSHOT '<snapshot_name>';
     //   COPY my_table TO STDOUT;   -- or SELECT * FROM my_table
@@ -128,16 +160,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    
+
     Ok(())
 }
 ```
 
-> **Note:** The exported snapshot is only valid between `ensure_replication_slot()` and `start()`. Once `START_REPLICATION` is issued, PostgreSQL destroys the snapshot, you must read the snapshot on a separate connection **before** calling `start()`.
+> **Note:** The exported snapshot is only valid between `ensure_replication_slot()` and `start()`. Once `START_REPLICATION` is issued, PostgreSQL destroys the snapshot. You must read the snapshot on a separate connection **before** calling `start()`.
 
 ### Working with Event Data
 
-Events carry row data as [`RowData`] — an ordered list of `(Arc<str>, ColumnValue)` pairs.
+Events carry row data as [`RowData`] an ordered list of `(Arc<str>, ColumnValue)` pairs.
 [`ColumnValue`] is a lightweight enum (`Null | Text(Bytes) | Binary(Bytes)`) that preserves
 the raw PostgreSQL wire representation with zero-copy semantics.
 Schema, table, and column names are `Arc<str>` (reference-counted, zero-cost cloning):
@@ -148,7 +180,6 @@ use pg_walstream::{EventType, RowData, ColumnValue};
 // Pattern match on event types
 match &event.event_type {
     EventType::Insert { schema, table, data, .. } => {
-        // schema and table are Arc<str> — Display works directly
         println!("INSERT into {}.{}", schema, table);
 
         // Access columns by name
@@ -175,7 +206,7 @@ match &event.event_type {
 }
 ```
 
-### Using the Polling API 
+### Using the Polling API
 
 For more control, you can use the traditional polling approach:
 
@@ -203,7 +234,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "postgresql://postgres:password@localhost:5432/mydb?replication=database",
         config,
     ).await?;
-    
+
     stream.start(None).await?;
 
     let cancel_token = CancellationToken::new();
@@ -225,11 +256,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    
+
     Ok(())
 }
 ```
-
 
 ## LSN Tracking
 
@@ -285,25 +315,35 @@ GRANT SELECT ON ALL TABLES IN SCHEMA public TO replication_user;
 GRANT USAGE ON SCHEMA public TO replication_user;
 ```
 
-### 4. Create Replication Slot with Advanced Options
+### 4. Replication Slot Options
 
-The library provides two methods for creating replication slots:
-
-#### Replication Slot Options
-
-The library automatically selects the correct `CREATE_REPLICATION_SLOT` SQL syntax based on the connected PostgreSQL server version:
+The library provides full control over replication slot creation. The correct SQL syntax is automatically selected based on the connected PostgreSQL version:
 - **PG14**: Legacy positional keyword syntax (`EXPORT_SNAPSHOT`, `NOEXPORT_SNAPSHOT`, `USE_SNAPSHOT`, `TWO_PHASE`, `RESERVE_WAL`)
 - **PG15+**: Modern parenthesized options syntax (`(SNAPSHOT 'export', TWO_PHASE true, ...)`)
 
 | Option | Description | PG Version |
 |--------|-------------|------------|
 | `temporary` | Temporary slot (not persisted to disk, dropped on disconnect) | 14+ |
-| `two_phase` | Enable two-phase commit for logical slots | 14+  |
-| `reserve_wal` | Reserve WAL immediately for physical slots | 14+  |
+| `two_phase` | Enable two-phase commit for logical slots | 14+ |
+| `reserve_wal` | Reserve WAL immediately for physical slots | 14+ |
 | `snapshot` | Snapshot behavior: `"export"`, `"use"`, or `"nothing"` | 14+ |
 | `failover` | Enable slot synchronization to standbys for HA | 16+ |
 
-> **Note:** : If both `two_phase` and `snapshot` are set, `two_phase` takes priority. The `failover` option is not available on PG14 and will return an error.
+> **Note:** If both `two_phase` and `snapshot` are set, `two_phase` takes priority. The `failover` option is not available on PG14 and will return an error.
+
+## Examples
+
+The [`examples/`](examples/) directory contains runnable examples demonstrating various usage patterns:
+
+| Example | Description |
+|---------|-------------|
+| [`basic-streaming`](examples/basic-streaming) | High-level `futures::Stream` API with stream combinators (`filter`, `take_while`) |
+| [`polling`](examples/polling) | Manual polling loop using `next_event()` for custom integration scenarios |
+| [`safe-transaction-consumer`](examples/safe-transaction-consumer) | Production-grade transaction-aware CDC consumer with ordered commits and safe LSN feedback |
+| [`rate-limited-streaming`](examples/rate-limited-streaming) | Rate-limited consumption using `tokio_stream::StreamExt::throttle` |
+| [`tokio-spawn-streaming`](examples/tokio-spawn-streaming) | Producer/consumer pattern via `tokio::spawn` with `mpsc` channel (demonstrates `Send` safety) |
+| [`pg-basebackup`](examples/pg-basebackup) | Full physical backup tool using `BASE_BACKUP` with tar extraction and progress reporting |
+| [`arbitrary-fuzzing`](examples/arbitrary-fuzzing) | Property-based fuzzing of all protocol types using the `arbitrary` crate |
 
 ## Message Types
 
@@ -340,34 +380,49 @@ The library supports all PostgreSQL logical replication message types:
 ## Architecture
 
 ```
-┌─────────────────────────────────────────┐
-│         Application Layer               │
-│  (Your CDC / Replication Logic)        │
-└──────────────┬──────────────────────────┘
+┌──────────────────────────────────────────┐
+│          Application Layer               │
+│  (Your CDC / Replication Logic)          │
+└──────────────┬───────────────────────────┘
                │
-┌──────────────▼──────────────────────────┐
-│    LogicalReplicationStream             │
-│  - Connection management                │
-│  - Event processing                     │
-│  - LSN feedback                         │
-└──────────────┬──────────────────────────┘
+┌──────────────▼───────────────────────────┐
+│    LogicalReplicationStream              │
+│  - Connection management & retry         │
+│  - Event processing & LSN feedback       │
+│  - Snapshot export support               │
+└──────────────┬───────────────────────────┘
                │
-┌──────────────▼──────────────────────────┐
-│  LogicalReplicationParser               │
-│  - Protocol parsing                     │
-│  - Message deserialization              │
-└──────────────┬──────────────────────────┘
+┌──────────────▼───────────────────────────┐
+│  LogicalReplicationParser                │
+│  - Protocol v1-v4 parsing                │
+│  - Zero-copy message deserialization     │
+│  - Streaming transaction support         │
+└──────────────┬───────────────────────────┘
                │
-┌──────────────▼──────────────────────────┐
-│     BufferReader / BufferWriter         │
-│  - Zero-copy operations                 │
-│  - Binary protocol handling             │
-└─────────────────────────────────────────┘
+┌──────────────▼───────────────────────────┐
+│     PgReplicationConnection              │
+│  ┌─────────────────┬──────────────────┐  │
+│  │  libpq backend  │ rustls-tls       │  │
+│  │  (C FFI)        │ (pure Rust)      │  │
+│  │                 │                  │  │
+│  │  libpq-sys      │ rustls + rustls- │  │
+│  │  + libclang     │ native-certs +   │  │
+│  │                 │ postgres-protocol│  │
+│  └─────────────────┴──────────────────┘  │
+│  Compile-time feature flag selection     │
+└──────────────┬───────────────────────────┘
+               │
+┌──────────────▼───────────────────────────┐
+│     BufferReader / BufferWriter          │
+│  - Zero-copy operations (bytes crate)    │
+│  - Binary protocol handling              │
+│  - Drain-loop batch queue optimization   │
+└──────────────────────────────────────────┘
 ```
 
-## 7. Stress Test & System Threshold Analysis
+## Stress Test & System Threshold Analysis
 
-Progressive writer concurrency ramp (8 → 128 writers) to find the library's CPU saturation point and throughput ceiling.
+Progressive writer concurrency ramp (16 - 192 writers) to find the library's CPU saturation point and throughput ceiling.
 
 ### Test Environment
 
@@ -436,9 +491,9 @@ Memory (RSS) scaling with writer concurrency:
 
 - **Peak throughput**: 135,681 DML events/sec at **64w** concurrency
 - **Throughput saturation** detected at **64 writers** (throughput gain < 5% or regression)
-- **Library CPU moderate**: Process CPU peaked at 88.8% — approaching but not yet at saturation
+- **Library CPU moderate**: Process CPU peaked at 88.8% -- approaching but not yet at saturation
 - **Memory**: Peak process RSS 18.7 MB / 32044 MB total system (0.06% utilization)
-- **CPU efficiency**: ~1528 DML events/sec per 1% CPU at peak
+- **CPU efficiency**: ~1,528 DML events/sec per 1% CPU at peak
 
 ## Limitations
 
@@ -456,6 +511,10 @@ Memory (RSS) scaling with writer concurrency:
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
+
+## License
+
+This project is licensed under the [BSD 3-Clause License](LICENSE).
 
 ## Author
 

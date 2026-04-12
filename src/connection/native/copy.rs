@@ -49,7 +49,9 @@ pub async fn get_copy_data<R: AsyncRead + Unpin>(
             biased;
             _ = cancellation_token.cancelled() => {
                 // Check for remaining buffered data before returning
-                drain_read_buffer(read_buf, pending);
+                if let Some(err) = drain_read_buffer(read_buf, pending) {
+                    return Err(err);
+                }
                 if let Some(payload) = pending.pop_front() {
                     tracing::info!("Found buffered data after cancellation");
                     return Ok(payload);
@@ -69,7 +71,9 @@ pub async fn get_copy_data<R: AsyncRead + Unpin>(
                 }
 
                 // Drain all complete messages from the buffer
-                drain_read_buffer(read_buf, pending);
+                if let Some(err) = drain_read_buffer(read_buf, pending) {
+                    return Err(err);
+                }
 
                 // If we got messages, the next loop iteration will pop one
                 if pending.is_empty() {
@@ -84,8 +88,14 @@ pub async fn get_copy_data<R: AsyncRead + Unpin>(
 /// Parse and drain all complete PostgreSQL messages from `read_buf` into `pending`.
 ///
 /// CopyData ('d') payloads are extracted zero-copy via `split_to().freeze().slice(5..)`.
-/// Other message types (ErrorResponse, CopyDone, keepalive) are handled inline.
-fn drain_read_buffer(read_buf: &mut BytesMut, pending: &mut VecDeque<Bytes>) {
+/// Other message types (NoticeResponse, CopyDone, keepalive) are handled inline.
+///
+/// Returns `Some(error)` if an ErrorResponse is received during COPY mode,
+/// indicating the server reported a protocol-level error.
+fn drain_read_buffer(
+    read_buf: &mut BytesMut,
+    pending: &mut VecDeque<Bytes>,
+) -> Option<ReplicationError> {
     let mut drained = 0;
 
     while read_buf.len() >= HEADER_LEN && drained < MAX_DRAIN_BATCH {
@@ -109,14 +119,12 @@ fn drain_read_buffer(read_buf: &mut BytesMut, pending: &mut VecDeque<Bytes>) {
                 drained += 1;
             }
             b'E' => {
-                // ErrorResponse inside COPY mode
+                // ErrorResponse inside COPY mode — return as a protocol error
                 let frame = read_buf.split_to(total_len);
                 let fields = super::error::parse_error_fields(&frame[5..]);
-                tracing::error!("Error during replication: {}", fields);
-                // Push an error marker — the caller will handle it
-                // We push the raw frame so the consumer can detect it
-                pending.push_back(frame.freeze());
-                drained += 1;
+                return Some(ReplicationError::protocol(format!(
+                    "server error during replication: {fields}"
+                )));
             }
             b'c' => {
                 // CopyDone — replication stream ended
@@ -141,6 +149,8 @@ fn drain_read_buffer(read_buf: &mut BytesMut, pending: &mut VecDeque<Bytes>) {
             }
         }
     }
+
+    None
 }
 
 /// Send a CopyData message containing the given payload.
@@ -288,12 +298,16 @@ mod tests {
         buf.put_slice(payload);
 
         let mut pending = VecDeque::new();
-        drain_read_buffer(&mut buf, &mut pending);
+        let result = drain_read_buffer(&mut buf, &mut pending);
 
-        // ErrorResponse should be pushed as raw frame
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0][0], b'E');
-        assert!(buf.is_empty());
+        // ErrorResponse should return an error, not be queued as data
+        assert!(result.is_some());
+        let err = result.unwrap();
+        assert!(
+            err.to_string().contains("server error during replication"),
+            "Expected protocol error, got: {err}"
+        );
+        assert!(pending.is_empty());
     }
 
     #[test]

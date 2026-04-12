@@ -629,6 +629,12 @@ impl NativeConnection {
     }
 
     /// Gracefully close the replication connection.
+    ///
+    /// This performs a best-effort synchronous shutdown by sending CopyDone
+    /// (if in COPY mode) and Terminate messages. It uses `run_sync` to bridge
+    /// async I/O, which internally uses `block_in_place` when called from a
+    /// multi-threaded runtime. The entire call is wrapped in `catch_unwind` to
+    /// prevent panics from propagating during Drop.
     fn close_connection(&mut self) {
         // Best-effort graceful shutdown.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
