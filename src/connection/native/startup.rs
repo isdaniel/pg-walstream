@@ -305,9 +305,7 @@ impl rustls::client::danger::ServerCertVerifier for NoVerification {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0
-            .signature_verification_algorithms
-            .supported_schemes()
+        self.0.signature_verification_algorithms.supported_schemes()
     }
 }
 
@@ -320,12 +318,10 @@ struct NoHostnameVerifier {
 
 impl NoHostnameVerifier {
     fn new(roots: rustls::RootCertStore, provider: Arc<rustls::crypto::CryptoProvider>) -> Self {
-        let inner = rustls::client::WebPkiServerVerifier::builder_with_provider(
-            Arc::new(roots),
-            provider,
-        )
-        .build()
-        .expect("failed to build WebPkiServerVerifier");
+        let inner =
+            rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
+                .build()
+                .expect("failed to build WebPkiServerVerifier");
         Self { inner }
     }
 }
