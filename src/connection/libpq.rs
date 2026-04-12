@@ -2250,7 +2250,9 @@ mod tests {
                 ("messages", "true"),
             ],
         );
-        assert!(sql.contains(r#""proto_version" '1', "publication_names" 'pub1', "messages" 'true'"#));
+        assert!(
+            sql.contains(r#""proto_version" '1', "publication_names" 'pub1', "messages" 'true'"#)
+        );
     }
 
     #[test]
@@ -2260,10 +2262,7 @@ mod tests {
             INVALID_XLOG_REC_PTR,
             &[],
         );
-        assert_eq!(
-            sql,
-            r#"START_REPLICATION SLOT "slot1" LOGICAL 0/0 ()"#
-        );
+        assert_eq!(sql, r#"START_REPLICATION SLOT "slot1" LOGICAL 0/0 ()"#);
     }
 
     #[test]
@@ -2271,11 +2270,11 @@ mod tests {
         let sql = PgReplicationConnection::build_start_replication_sql(
             r#"evil"slot"#,
             INVALID_XLOG_REC_PTR,
-            &[("key", "val'ue")],
+            &[("key", "it's")],
         );
         // Slot name should be quoted, value should be sanitized
         assert!(sql.contains(r#""evil""slot""#));
-        assert!(sql.contains("'val''ue'"));
+        assert!(sql.contains("'it''s'"));
     }
 
     #[test]
@@ -2299,10 +2298,7 @@ mod tests {
     fn test_alter_slot_sql_two_phase_true() {
         let sql =
             PgReplicationConnection::build_alter_slot_sql("my_slot", Some(true), None).unwrap();
-        assert_eq!(
-            sql,
-            r#"ALTER_REPLICATION_SLOT "my_slot" (TWO_PHASE true);"#
-        );
+        assert_eq!(sql, r#"ALTER_REPLICATION_SLOT "my_slot" (TWO_PHASE true);"#);
     }
 
     #[test]
@@ -2319,10 +2315,7 @@ mod tests {
     fn test_alter_slot_sql_failover_true() {
         let sql =
             PgReplicationConnection::build_alter_slot_sql("my_slot", None, Some(true)).unwrap();
-        assert_eq!(
-            sql,
-            r#"ALTER_REPLICATION_SLOT "my_slot" (FAILOVER true);"#
-        );
+        assert_eq!(sql, r#"ALTER_REPLICATION_SLOT "my_slot" (FAILOVER true);"#);
     }
 
     #[test]
@@ -2349,9 +2342,8 @@ mod tests {
 
     #[test]
     fn test_alter_slot_sql_injection() {
-        let sql =
-            PgReplicationConnection::build_alter_slot_sql(r#"evil"slot"#, Some(true), None)
-                .unwrap();
+        let sql = PgReplicationConnection::build_alter_slot_sql(r#"evil"slot"#, Some(true), None)
+            .unwrap();
         assert!(sql.contains(r#""evil""slot""#));
     }
 
@@ -2376,10 +2368,7 @@ mod tests {
             INVALID_XLOG_REC_PTR,
             None,
         );
-        assert_eq!(
-            sql,
-            r#"START_REPLICATION SLOT "phys_slot" PHYSICAL 0/0"#
-        );
+        assert_eq!(sql, r#"START_REPLICATION SLOT "phys_slot" PHYSICAL 0/0"#);
     }
 
     #[test]
@@ -2395,9 +2384,7 @@ mod tests {
     #[test]
     fn test_physical_replication_sql_with_valid_lsn() {
         let lsn: XLogRecPtr = 0x0000_0001_0000_0000; // 1/0
-        let sql = PgReplicationConnection::build_start_physical_replication_sql(
-            None, lsn, None,
-        );
+        let sql = PgReplicationConnection::build_start_physical_replication_sql(None, lsn, None);
         assert!(sql.starts_with("START_REPLICATION PHYSICAL "));
         assert!(!sql.contains("0/0"));
     }
