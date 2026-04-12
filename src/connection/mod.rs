@@ -6,8 +6,9 @@
 //! - **`libpq`** (default): Uses the C libpq library via FFI. Requires
 //!   `libpq-dev` and `libssl-dev` at build time.
 //!
-//! - **`rustls-tls`**: Pure-Rust implementation using `rustls` for TLS and
-//!   `postgres-protocol` for wire framing. No C dependencies.
+//! - **`rustls-tls`**: Pure-Rust implementation using `rustls` with the
+//!   `aws-lc-rs` crypto backend for hardware-accelerated TLS (AES-NI, AVX2).
+//!   Requires `cmake` + C compiler at build time.
 //!
 //! Both backends expose the same public types: `PgReplicationConnection` and
 //! `PgResult`.

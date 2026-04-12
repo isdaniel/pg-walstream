@@ -13,7 +13,7 @@ A high-performance Rust library for PostgreSQL logical and physical replication 
 - **Full Logical Replication Support**: Implements PostgreSQL logical replication protocol versions 1-4
 - **Physical Replication Support**: Stream raw WAL data for standby servers and PITR
 - **Base Backup Support**: Full `BASE_BACKUP` command with progress, compression, and manifest options
-- **Pure-Rust Backend**: Optional `rustls-tls` feature eliminates all C dependencies (no libpq, no libclang)
+- **Pure-Rust Backend**: Optional `rustls-tls` feature eliminates all C dependencies (no libpq, no libclang), using `aws-lc-rs` for hardware-accelerated TLS (AES-NI, AVX2, SHA-NI)
 - **TLS/SSL Support**: All PostgreSQL SSL modes (`disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`)
 - **Authentication**: Cleartext, MD5, and SCRAM-SHA-256 authentication methods
 - **Streaming Transactions**: Support for streaming large transactions (protocol v2+)
@@ -50,13 +50,13 @@ pg-walstream provides two mutually exclusive connection backends, selected at co
 | Feature | Default | C Dependencies | Description |
 |---------|---------|----------------|-------------|
 | `libpq` | Yes | `libpq-dev`, `libclang-dev` | Uses PostgreSQL's C client library via FFI. Battle-tested, supports all auth methods natively. |
-| `rustls-tls` | No | **None** | Pure-Rust implementation using `rustls` for TLS and `postgres-protocol` for wire framing. Zero system dependencies. |
+| `rustls-tls` | No | `cmake`, `gcc` (build-time only) | Pure-Rust implementation using `rustls` with `aws-lc-rs` crypto backend for hardware-accelerated TLS. No runtime C dependencies. |
 
 > **Note:** Enabling both features simultaneously will cause a compile error.
 
 ## System Dependencies
 
-System dependencies are **only required** when using the default `libpq` feature. The `rustls-tls` feature has zero system dependencies.
+System dependencies are **only required** when using the default `libpq` feature. The `rustls-tls` feature requires only `cmake` and a C compiler at build time (for the `aws-lc-rs` crypto library), with no runtime dependencies.
 
 ### For `libpq` feature (default)
 
@@ -74,7 +74,16 @@ sudo dnf install postgresql-devel
 
 ### For `rustls-tls` feature
 
-No system dependencies required. Just add to `Cargo.toml`:
+Requires `cmake` and a C compiler at build time for `aws-lc-rs` (hardware-accelerated cryptography):
+
+**Ubuntu/Debian:**
+
+```bash
+sudo apt-get install cmake gcc
+```
+
+Then add to `Cargo.toml`:
+
 ```toml
 pg_walstream = { version = "0.5.1", default-features = false, features = ["rustls-tls"] }
 ```
@@ -405,8 +414,8 @@ The library supports all PostgreSQL logical replication message types:
 │  │  libpq backend  │ rustls-tls       │  │
 │  │  (C FFI)        │ (pure Rust)      │  │
 │  │                 │                  │  │
-│  │  libpq-sys      │ rustls + rustls- │  │
-│  │  + libclang     │ native-certs +   │  │
+│  │  libpq-sys      │ rustls +         │  │
+│  │  + libclang     │ aws-lc-rs +      │  │
 │  │                 │ postgres-protocol│  │
 │  └─────────────────┴──────────────────┘  │
 │  Compile-time feature flag selection     │

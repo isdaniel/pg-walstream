@@ -533,10 +533,10 @@ async fn scenario_stress_ramp(cfg: &DbConfig) -> Vec<ScenarioResult> {
 
 #[tokio::main]
 async fn main() {
-    // Install the ring crypto provider for rustls before any TLS connections.
-    // This is needed because the load test links both rustls (via pg_walstream)
-    // and openssl (via postgres-openssl), and rustls needs an explicit provider.
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    // Install the aws-lc-rs crypto provider for rustls before any TLS connections.
+    // aws-lc-rs provides hardware-accelerated AES-GCM via AES-NI/AVX2, which is
+    // faster than ring for bulk TLS decryption on x86_64 CPUs.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     println!("============================================================");
     println!("         pg-walstream Load Test Suite                        ");
@@ -594,7 +594,7 @@ async fn main() {
         .unwrap()
         .parent()
         .unwrap_or(&std::env::current_dir().unwrap())
-        .join("report/LOAD_TEST_REPORT.md");
+        .join("LOAD_TEST_REPORT.md");
     std::fs::write(&report_path, &report).expect("Failed to write report");
 
     println!();

@@ -17,6 +17,14 @@ use super::conninfo::{ConnInfo, SslMode};
 use super::wire;
 use crate::error::ReplicationError;
 
+/// Return the aws-lc-rs crypto provider for hardware-accelerated TLS.
+///
+/// aws-lc-rs leverages AES-NI, AVX2, and SHA-NI instructions for
+/// high-throughput AES-GCM decryption during WAL streaming.
+fn crypto_provider() -> rustls::crypto::CryptoProvider {
+    rustls::crypto::aws_lc_rs::default_provider()
+}
+
 /// The transport layer — either plain TCP or TLS-wrapped TCP.
 pub enum Transport {
     Plain(TcpStream),
@@ -146,11 +154,19 @@ async fn negotiate_tls(mut tcp: TcpStream, info: &ConnInfo) -> Result<Transport,
 
 /// Build a rustls `ClientConfig` based on the sslmode.
 fn build_tls_config(info: &ConnInfo) -> Result<rustls::ClientConfig, ReplicationError> {
+    let provider = Arc::new(crypto_provider());
+
     match info.sslmode {
         SslMode::VerifyFull => {
             // Full verification: check cert chain + hostname
             let root_store = build_root_store(info.sslrootcert.as_deref())?;
-            let config = rustls::ClientConfig::builder()
+            let config = rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .map_err(|e| {
+                    ReplicationError::permanent_connection(format!(
+                        "Failed to configure TLS protocol versions: {e}"
+                    ))
+                })?
                 .with_root_certificates(root_store)
                 .with_no_client_auth();
             Ok(config)
@@ -158,9 +174,15 @@ fn build_tls_config(info: &ConnInfo) -> Result<rustls::ClientConfig, Replication
         SslMode::VerifyCa => {
             // Verify cert chain but NOT hostname.
             let root_store = build_root_store(info.sslrootcert.as_deref())?;
-            let verifier = NoHostnameVerifier::new(root_store);
+            let verifier = NoHostnameVerifier::new(root_store, provider.clone());
 
-            let config = rustls::ClientConfig::builder()
+            let config = rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .map_err(|e| {
+                    ReplicationError::permanent_connection(format!(
+                        "Failed to configure TLS protocol versions: {e}"
+                    ))
+                })?
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(verifier))
                 .with_no_client_auth();
@@ -169,9 +191,15 @@ fn build_tls_config(info: &ConnInfo) -> Result<rustls::ClientConfig, Replication
         SslMode::Require | SslMode::Prefer | SslMode::Allow => {
             // Encrypt but skip certificate verification entirely.
             // This matches libpq's `sslmode=require` behavior.
-            let config = rustls::ClientConfig::builder()
+            let config = rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .map_err(|e| {
+                    ReplicationError::permanent_connection(format!(
+                        "Failed to configure TLS protocol versions: {e}"
+                    ))
+                })?
                 .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoVerification))
+                .with_custom_certificate_verifier(Arc::new(NoVerification(crypto_provider())))
                 .with_no_client_auth();
             Ok(config)
         }
@@ -244,7 +272,7 @@ fn build_root_store(sslrootcert: Option<&str>) -> Result<rustls::RootCertStore, 
 /// A certificate verifier that accepts any certificate (no verification).
 /// Used for `sslmode=require` which only requires encryption, not authentication.
 #[derive(Debug)]
-struct NoVerification;
+struct NoVerification(rustls::crypto::CryptoProvider);
 
 impl rustls::client::danger::ServerCertVerifier for NoVerification {
     fn verify_server_cert(
@@ -277,7 +305,7 @@ impl rustls::client::danger::ServerCertVerifier for NoVerification {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
+        self.0
             .signature_verification_algorithms
             .supported_schemes()
     }
@@ -291,10 +319,13 @@ struct NoHostnameVerifier {
 }
 
 impl NoHostnameVerifier {
-    fn new(roots: rustls::RootCertStore) -> Self {
-        let inner = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
-            .build()
-            .expect("failed to build WebPkiServerVerifier");
+    fn new(roots: rustls::RootCertStore, provider: Arc<rustls::crypto::CryptoProvider>) -> Self {
+        let inner = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::new(roots),
+            provider,
+        )
+        .build()
+        .expect("failed to build WebPkiServerVerifier");
         Self { inner }
     }
 }
@@ -518,7 +549,7 @@ mod tests {
     #[test]
     fn test_build_tls_config_require() {
         // Install crypto provider for test
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = crypto_provider().install_default();
 
         let info = ConnInfo {
             host: "localhost".to_string(),
@@ -536,7 +567,7 @@ mod tests {
 
     #[test]
     fn test_build_tls_config_verify_full() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = crypto_provider().install_default();
 
         let info = ConnInfo {
             host: "localhost".to_string(),
@@ -554,7 +585,7 @@ mod tests {
 
     #[test]
     fn test_build_tls_config_verify_ca() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = crypto_provider().install_default();
 
         let info = ConnInfo {
             host: "localhost".to_string(),
@@ -572,7 +603,7 @@ mod tests {
 
     #[test]
     fn test_build_root_store_default() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = crypto_provider().install_default();
 
         // No sslrootcert → should load system + Mozilla CAs
         let store = build_root_store(None).unwrap();
@@ -582,7 +613,7 @@ mod tests {
 
     #[test]
     fn test_build_root_store_custom_file() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = crypto_provider().install_default();
 
         // Create a temp PEM file with a self-signed cert for testing
         let pem_content = include_str!("../../../load-tests/fixtures/test_ca.pem");
@@ -606,7 +637,7 @@ mod tests {
 
     #[test]
     fn test_build_root_store_missing_file() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = crypto_provider().install_default();
 
         let result = build_root_store(Some("/nonexistent/path/ca.pem"));
         assert!(result.is_err());
@@ -619,7 +650,7 @@ mod tests {
 
     #[test]
     fn test_build_tls_config_verify_full_with_custom_ca() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = crypto_provider().install_default();
 
         let info = ConnInfo {
             host: "localhost".to_string(),
@@ -638,7 +669,7 @@ mod tests {
 
     #[test]
     fn test_build_tls_config_require_ignores_sslrootcert() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = crypto_provider().install_default();
 
         let info = ConnInfo {
             host: "localhost".to_string(),

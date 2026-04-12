@@ -75,7 +75,7 @@ switch_to_libpq() {
         "$CARGO_TOML"
     # Comment out the rustls crypto provider init
     sed -i \
-        's|^\(\s*\)let _ = rustls::crypto::ring::default_provider()\.install_default();|\1// let _ = rustls::crypto::ring::default_provider().install_default();|' \
+        's|^\(\s*\)let _ = rustls::crypto::aws_lc_rs::default_provider()\.install_default();|\1// let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();|' \
         "$MAIN_RS"
 }
 
@@ -89,7 +89,7 @@ switch_to_rustls() {
         's|^#rustls = |rustls = |' \
         "$CARGO_TOML"
     sed -i \
-        's|^\(\s*\)// let _ = rustls::crypto::ring::default_provider()\.install_default();|\1let _ = rustls::crypto::ring::default_provider().install_default();|' \
+        's|^\(\s*\)// let _ = rustls::crypto::aws_lc_rs::default_provider()\.install_default();|\1let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();|' \
         "$MAIN_RS"
 }
 
@@ -258,11 +258,40 @@ case "${1:-rustls-tls}" in
     libpq)
         run_single "libpq"
         ;;
+    compare)
+        check_database_url
+        ensure_reports_dir
+        save_originals
+        trap restore_originals EXIT
+
+        RUSTLS_REPORT="$REPORTS_DIR/loadtest-rustls-tls-${TIMESTAMP}.md"
+        LIBPQ_REPORT="$REPORTS_DIR/loadtest-libpq-${TIMESTAMP}.md"
+        COMPARE_REPORT="$REPORTS_DIR/loadtest-comparison-${TIMESTAMP}.md"
+
+        # Run rustls-tls first (default config)
+        switch_to_rustls
+        build_loadtest "rustls-tls"
+        run_loadtest "rustls-tls" "$RUSTLS_REPORT"
+
+        # Then libpq
+        switch_to_libpq
+        build_loadtest "libpq"
+        run_loadtest "libpq" "$LIBPQ_REPORT"
+
+        # Generate side-by-side comparison
+        generate_comparison "$RUSTLS_REPORT" "$LIBPQ_REPORT" "$COMPARE_REPORT"
+
+        echo ""
+        ok "Done! Reports:"
+        echo "  rustls-tls:  $RUSTLS_REPORT"
+        echo "  libpq:       $LIBPQ_REPORT"
+        echo "  comparison:  $COMPARE_REPORT"
+        ;;
     -h|--help|help)
         usage
         ;;
     *)
-        err "Unknown backend: $1"
+        err "Unknown argument: $1"
         usage
         exit 1
         ;;
