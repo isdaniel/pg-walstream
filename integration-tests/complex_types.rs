@@ -49,7 +49,7 @@ fn regular_conn_string() -> String {
 }
 
 fn drop_slot(slot_name: &str) {
-    if let Ok(conn) = PgReplicationConnection::connect(&replication_conn_string()) {
+    if let Ok(mut conn) = PgReplicationConnection::connect(&replication_conn_string()) {
         let _ = conn.exec(&format!(
             "SELECT pg_drop_replication_slot('{slot_name}') \
              WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '{slot_name}')"
@@ -137,7 +137,7 @@ async fn test_array_types_basic() {
     let pub_name = "complex_arr_pub";
     drop_slot(slot);
 
-    let regular =
+    let mut regular =
         PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
 
     let _ = regular.exec(
@@ -225,7 +225,7 @@ async fn test_array_types_nested_and_nulls() {
     let pub_name = "complex_arr_nested_pub";
     drop_slot(slot);
 
-    let regular =
+    let mut regular =
         PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
 
     let _ = regular.exec(
@@ -289,7 +289,7 @@ async fn test_array_types_empty() {
     let pub_name = "complex_arr_empty_pub";
     drop_slot(slot);
 
-    let regular =
+    let mut regular =
         PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
 
     let _ = regular.exec(
@@ -346,7 +346,7 @@ async fn test_json_jsonb_basic() {
     let pub_name = "complex_json_pub";
     drop_slot(slot);
 
-    let regular =
+    let mut regular =
         PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
 
     let _ = regular.exec(
@@ -424,7 +424,7 @@ async fn test_json_nested_and_arrays() {
     let pub_name = "complex_json_nested_pub";
     drop_slot(slot);
 
-    let regular =
+    let mut regular =
         PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
 
     let _ = regular.exec(
@@ -497,7 +497,7 @@ async fn test_json_null_handling() {
     let pub_name = "complex_json_null_pub";
     drop_slot(slot);
 
-    let regular =
+    let mut regular =
         PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
 
     let _ = regular.exec(
@@ -569,7 +569,7 @@ async fn test_geometric_types_basic() {
     let pub_name = "complex_geo_pub";
     drop_slot(slot);
 
-    let regular =
+    let mut regular =
         PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
 
     let _ = regular.exec(
@@ -663,7 +663,7 @@ async fn test_geometric_path_polygon() {
     let pub_name = "complex_geo_path_pub";
     drop_slot(slot);
 
-    let regular =
+    let mut regular =
         PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
 
     let _ = regular.exec(
@@ -742,7 +742,7 @@ async fn test_mixed_complex_types_insert() {
     let pub_name = "complex_mixed_pub";
     drop_slot(slot);
 
-    let regular =
+    let mut regular =
         PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
 
     let _ = regular.exec(
@@ -839,7 +839,7 @@ async fn test_mixed_complex_types_update() {
     let pub_name = "complex_update_pub";
     drop_slot(slot);
 
-    let regular =
+    let mut regular =
         PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
 
     let _ = regular.exec(
@@ -962,7 +962,7 @@ async fn test_mixed_complex_types_delete() {
     let pub_name = "complex_delete_pub";
     drop_slot(slot);
 
-    let regular =
+    let mut regular =
         PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
 
     let _ = regular.exec(
@@ -1059,7 +1059,7 @@ async fn test_batch_insert_complex_types() {
     let pub_name = "complex_batch_pub";
     drop_slot(slot);
 
-    let regular =
+    let mut regular =
         PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
 
     let _ = regular.exec(
@@ -1154,7 +1154,7 @@ async fn test_json_special_values() {
     let pub_name = "complex_json_special_pub";
     drop_slot(slot);
 
-    let regular =
+    let mut regular =
         PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
 
     let _ = regular.exec(

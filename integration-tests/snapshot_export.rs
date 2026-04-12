@@ -65,7 +65,7 @@ fn test_config(slot_name: &str) -> ReplicationStreamConfig {
 }
 
 /// Helper: set up the test schema (idempotent).
-fn setup_schema(regular_conn: &PgReplicationConnection) {
+fn setup_schema(regular_conn: &mut PgReplicationConnection) {
     // Create table if not exists
     let _ = regular_conn.exec(
         "CREATE TABLE IF NOT EXISTS snapshot_test (id SERIAL PRIMARY KEY, name TEXT NOT NULL)",
@@ -83,7 +83,7 @@ fn setup_schema(regular_conn: &PgReplicationConnection) {
 
 /// Helper: clean up a replication slot (best-effort).
 fn drop_slot(slot_name: &str) {
-    if let Ok(conn) = PgReplicationConnection::connect(&replication_conn_string()) {
+    if let Ok(mut conn) = PgReplicationConnection::connect(&replication_conn_string()) {
         let _ = conn.exec(&format!(
             "SELECT pg_drop_replication_slot('{}') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '{}')",
             slot_name, slot_name
@@ -97,9 +97,9 @@ async fn test_ensure_slot_returns_snapshot_name() {
     let slot = "it_snap_name";
     drop_slot(slot);
 
-    let regular =
+    let mut regular =
         PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
-    setup_schema(&regular);
+    setup_schema(&mut regular);
 
     let config = test_config(slot);
     let mut stream = LogicalReplicationStream::new(&replication_conn_string(), config)
@@ -131,9 +131,9 @@ async fn test_snapshot_readable_before_start() {
     let slot = "it_snap_read";
     drop_slot(slot);
 
-    let regular =
+    let mut regular =
         PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
-    setup_schema(&regular);
+    setup_schema(&mut regular);
 
     let config = test_config(slot);
     let mut stream = LogicalReplicationStream::new(&replication_conn_string(), config)
@@ -152,7 +152,7 @@ async fn test_snapshot_readable_before_start() {
     println!("Snapshot: {snap_name}");
 
     // Step 2: open a separate regular connection, import the snapshot, read data
-    let reader = PgReplicationConnection::connect(&regular_conn_string())
+    let mut reader = PgReplicationConnection::connect(&regular_conn_string())
         .expect("snapshot reader connection");
 
     reader
@@ -191,9 +191,9 @@ async fn test_snapshot_invalid_after_start() {
     let slot = "it_snap_invalid";
     drop_slot(slot);
 
-    let regular =
+    let mut regular =
         PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
-    setup_schema(&regular);
+    setup_schema(&mut regular);
 
     let config = test_config(slot);
     let mut stream = LogicalReplicationStream::new(&replication_conn_string(), config)
@@ -214,7 +214,7 @@ async fn test_snapshot_invalid_after_start() {
     stream.start(None).await.expect("start");
 
     // Now try to use the snapshot on a separate connection — it MUST fail
-    let reader = PgReplicationConnection::connect(&regular_conn_string())
+    let mut reader = PgReplicationConnection::connect(&regular_conn_string())
         .expect("snapshot reader connection");
 
     reader
@@ -240,9 +240,9 @@ async fn test_ensure_slot_idempotent() {
     let slot = "it_snap_idempotent";
     drop_slot(slot);
 
-    let regular =
+    let mut regular =
         PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
-    setup_schema(&regular);
+    setup_schema(&mut regular);
 
     let config = test_config(slot);
     let mut stream = LogicalReplicationStream::new(&replication_conn_string(), config)
@@ -283,9 +283,9 @@ async fn test_noexport_snapshot_returns_none() {
     let slot = "it_snap_noexport";
     drop_slot(slot);
 
-    let regular =
+    let mut regular =
         PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
-    setup_schema(&regular);
+    setup_schema(&mut regular);
 
     let config = ReplicationStreamConfig::new(
         slot.to_string(),
@@ -328,9 +328,9 @@ async fn test_snapshot_and_stream_consistency() {
     let slot = "it_snap_consistency";
     drop_slot(slot);
 
-    let regular =
+    let mut regular =
         PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
-    setup_schema(&regular);
+    setup_schema(&mut regular);
 
     let config = test_config(slot);
     let mut stream = LogicalReplicationStream::new(&replication_conn_string(), config)
@@ -348,7 +348,7 @@ async fn test_snapshot_and_stream_consistency() {
         .expect("snapshot must exist");
 
     // Step 2: read initial state through the snapshot
-    let reader = PgReplicationConnection::connect(&regular_conn_string())
+    let mut reader = PgReplicationConnection::connect(&regular_conn_string())
         .expect("snapshot reader connection");
 
     reader

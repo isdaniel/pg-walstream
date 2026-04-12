@@ -194,8 +194,8 @@ impl BufferReader {
     pub fn read_cstring(&mut self) -> Result<String> {
         let data_slice = self.data.chunk();
 
-        // Find the null terminator
-        let bytes_to_read = data_slice.iter().position(|&b| b == 0).ok_or_else(|| {
+        // Find the null terminator using SIMD-accelerated scanning
+        let bytes_to_read = memchr::memchr(0, data_slice).ok_or_else(|| {
             ReplicationError::protocol("Unterminated string in buffer".to_string())
         })?;
 
@@ -343,7 +343,15 @@ impl BufferWriter {
     }
 
     /// Write a null-terminated string
+    ///
+    /// Rejects strings containing embedded null bytes, which would produce
+    /// malformed PostgreSQL protocol messages (the null byte is the terminator).
     pub fn write_cstring(&mut self, s: &str) -> Result<()> {
+        if s.as_bytes().contains(&0) {
+            return Err(ReplicationError::protocol(
+                "string contains embedded null byte".to_string(),
+            ));
+        }
         self.data.put_slice(s.as_bytes());
         self.data.put_u8(0);
         Ok(())
@@ -543,6 +551,47 @@ mod tests {
     }
 
     #[test]
+    fn test_buffer_reader_cstring_empty_string() {
+        // Null byte at start → empty string
+        let data = [0x00, 0x01, 0x02];
+        let mut reader = BufferReader::new(&data);
+        let s = reader.read_cstring().unwrap();
+        assert_eq!(s, "");
+        assert_eq!(reader.remaining(), 2); // consumed 1 byte (the null)
+    }
+
+    #[test]
+    fn test_buffer_reader_cstring_consecutive() {
+        // Two back-to-back C strings
+        let data = b"hello\x00world\x00";
+        let mut reader = BufferReader::new(data);
+        assert_eq!(reader.read_cstring().unwrap(), "hello");
+        assert_eq!(reader.read_cstring().unwrap(), "world");
+        assert_eq!(reader.remaining(), 0);
+    }
+
+    #[test]
+    fn test_buffer_reader_cstring_long_string() {
+        // 256-byte string — tests memchr SIMD vectorization beyond a single 16/32-byte lane
+        let mut data = vec![b'A'; 256];
+        data.push(0x00);
+        let mut reader = BufferReader::new(&data);
+        let s = reader.read_cstring().unwrap();
+        assert_eq!(s.len(), 256);
+        assert!(s.chars().all(|c| c == 'A'));
+        assert_eq!(reader.remaining(), 0);
+    }
+
+    #[test]
+    fn test_buffer_reader_cstring_from_bytes_zero_copy() {
+        // Verify read_cstring works correctly via from_bytes (zero-copy path)
+        let data = Bytes::from_static(b"test\x00rest");
+        let mut reader = BufferReader::from_bytes(data);
+        assert_eq!(reader.read_cstring().unwrap(), "test");
+        assert_eq!(reader.remaining(), 4); // "rest"
+    }
+
+    #[test]
     fn test_buffer_reader_from_vec() {
         let data = vec![0x01, 0x02, 0x03];
         let mut reader = BufferReader::from_vec(data);
@@ -660,6 +709,18 @@ mod tests {
         writer.write_cstring("test").unwrap();
         let data = writer.freeze();
         assert_eq!(&data[..], b"test\x00");
+    }
+
+    #[test]
+    fn test_buffer_writer_write_cstring_rejects_embedded_null() {
+        let mut writer = BufferWriter::new();
+        let result = writer.write_cstring("hello\x00world");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("embedded null"),
+            "Expected embedded null error, got: {err}"
+        );
     }
 
     #[test]

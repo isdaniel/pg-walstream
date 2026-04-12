@@ -225,7 +225,7 @@ pub fn format_lsn(lsn: XLogRecPtr) -> String {
 }
 
 /// PostgreSQL replica identity settings
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReplicaIdentity {
     /// Default replica identity (primary key)
     Default,

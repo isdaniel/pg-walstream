@@ -5584,7 +5584,7 @@ mod tests {
 
     /// Test that `new()` with an invalid/unreachable connection string and a short
     /// timeout produces a `Timeout` error (the retry loop takes too long).
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_new_with_unreachable_host_timeout() {
         let config = ReplicationStreamConfig::new(
             "test_slot".to_string(),
@@ -5616,7 +5616,7 @@ mod tests {
 
     /// Test that `new()` with parameters that always fail on connect_with_retry
     /// returns an error (non-timeout path).
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_new_with_invalid_connection_string_no_timeout() {
         let config = ReplicationStreamConfig::new(
             "test_slot".to_string(),
@@ -6244,7 +6244,7 @@ mod tests {
     /// `create_test_stream` with a null connection, calling identify_system()
     /// will fail, so we verify the error is from that call and not from
     /// ensure_replication_slot().
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_initialize_fails_on_identify_system_with_null_conn() {
         let config = create_test_config();
         let mut stream = create_test_stream(config);
@@ -6296,7 +6296,7 @@ mod tests {
     /// Health check detects dead connection when interval has elapsed.
     /// With a null connection, is_alive() returns false, triggering recovery
     /// which will fail since there's no real DB.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_check_connection_health_detects_dead_connection() {
         let config = ReplicationStreamConfig::new(
             "slot".to_string(),
@@ -6563,7 +6563,7 @@ mod tests {
     }
 
     /// RetryConfig with very short max_duration should trigger duration exceeded.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_new_with_short_max_duration() {
         let config = ReplicationStreamConfig::new(
             "slot".to_string(),
