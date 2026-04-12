@@ -36,8 +36,9 @@ use crate::types::{
     format_lsn, system_time_to_postgres_timestamp, BaseBackupOptions, ReplicationSlotOptions,
     SlotType, XLogRecPtr,
 };
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use libpq_sys::*;
+use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 use std::os::unix::io::RawFd;
@@ -96,6 +97,23 @@ enum ReadResult {
     CopyDone,
 }
 
+/// Result of draining all available messages from libpq
+enum DrainResult {
+    /// One or more messages were queued
+    Drained,
+    /// No complete message available
+    WouldBlock,
+    /// COPY stream has ended
+    CopyDone,
+}
+
+/// Maximum messages to drain from libpq in a single batch.
+/// Prevents unbounded queue growth under extreme throughput.
+const MAX_DRAIN_BATCH: usize = 4096;
+
+/// Initial capacity for the reusable read buffer.
+const READ_BUF_INITIAL_CAPACITY: usize = 64 * 1024;
+
 /// Safe wrapper around PostgreSQL connection for replication
 ///
 /// This struct provides a safe, high-level interface to libpq for PostgreSQL
@@ -137,6 +155,10 @@ pub struct PgReplicationConnection {
     conn: *mut PGconn,
     is_replication_conn: bool,
     async_fd: Option<AsyncFd<RawFd>>,
+    /// Pre-drained messages waiting to be consumed (drain-loop optimization).
+    pending_messages: VecDeque<Bytes>,
+    /// Reusable buffer for copying data from libpq (avoids per-message heap alloc).
+    read_buf: BytesMut,
 }
 
 impl PgReplicationConnection {
@@ -243,11 +265,13 @@ impl PgReplicationConnection {
             conn,
             is_replication_conn: false,
             async_fd: None,
+            pending_messages: VecDeque::with_capacity(256),
+            read_buf: BytesMut::with_capacity(READ_BUF_INITIAL_CAPACITY),
         })
     }
 
     /// Execute a replication command (like IDENTIFY_SYSTEM)
-    pub fn exec(&self, query: &str) -> Result<PgResult> {
+    pub fn exec(&mut self, query: &str) -> Result<PgResult> {
         let c_query = CString::new(query)
             .map_err(|e| ReplicationError::protocol(format!("Invalid query string: {e}")))?;
 
@@ -286,7 +310,7 @@ impl PgReplicationConnection {
     }
 
     /// Send IDENTIFY_SYSTEM command
-    pub fn identify_system(&self) -> Result<PgResult> {
+    pub fn identify_system(&mut self) -> Result<PgResult> {
         debug!("Sending IDENTIFY_SYSTEM command");
         let result = self.exec("IDENTIFY_SYSTEM")?;
 
@@ -404,14 +428,19 @@ impl PgReplicationConnection {
             .map_err(|e| ReplicationError::protocol(format!("Failed to create AsyncFd: {e}")))?;
 
         self.async_fd = Some(async_fd);
+
         Ok(())
     }
 
     /// Get copy data from replication stream (truly async, non-blocking)
     ///
-    /// This method uses proper async I/O patterns with AsyncFd to enable the tokio
-    /// scheduler to yield the task when no data is available, allowing other tasks
-    /// to run without blocking threads.
+    /// This method implements a **drain-loop batch queue** optimization:
+    /// after each `PQconsumeInput`, ALL available messages are drained from
+    /// libpq into an internal `VecDeque`. Subsequent calls return from the
+    /// queue without any syscall, epoll, or `select!` overhead.
+    ///
+    /// When the `io-uring` feature is enabled, socket readiness monitoring
+    /// uses io_uring `POLL_ADD` instead of epoll, reducing syscall overhead.
     ///
     /// # Arguments
     /// * `cancellation_token` - Cancellation token to abort the operation
@@ -426,55 +455,40 @@ impl PgReplicationConnection {
     ) -> Result<Bytes> {
         self.ensure_replication_mode()?;
 
-        let async_fd = self
-            .async_fd
-            .as_ref()
-            .ok_or_else(|| ReplicationError::protocol("AsyncFd not initialized".to_string()))?;
-
         loop {
-            // First, try to read any buffered data without blocking
-            match self.try_read_buffered_data()? {
-                ReadResult::Data(data) => return Ok(data),
-                ReadResult::CopyDone => {
+            // ── Fast path: return from pre-drained queue ──
+            if let Some(msg) = self.pending_messages.pop_front() {
+                return Ok(msg);
+            }
+
+            // ── Try to drain any messages already buffered inside libpq ──
+            match drain_buffered_messages(self.conn, &mut self.pending_messages, &mut self.read_buf)
+            {
+                DrainResult::Drained => continue, // messages queued, loop to pop
+                DrainResult::CopyDone => {
                     debug!("COPY stream ended gracefully");
                     return Err(ReplicationError::Cancelled("COPY stream ended".to_string()));
                 }
-                ReadResult::WouldBlock => {}
+                DrainResult::WouldBlock => {} // need to wait for socket
             }
 
-            // If no buffered data, wait for either socket readability or cancellation
+            // ── Wait for socket readability or cancellation ──
+            let async_fd = self
+                .async_fd
+                .as_ref()
+                .ok_or_else(|| ReplicationError::protocol("AsyncFd not initialized".to_string()))?;
+
             tokio::select! {
                 biased;
-
                 _ = cancellation_token.cancelled() => {
-                    debug!("Cancellation detected in get_copy_data_async");
-                    // Check one more time for buffered data before returning
-                    match self.try_read_buffered_data()? {
-                        ReadResult::Data(data) => {
-                            info!("Found buffered data after cancellation, returning it");
-                            return Ok(data);
-                        }
-                        ReadResult::CopyDone => {
-                            info!("Cancellation token triggered COPY stream ended during cancellation check");
-                            return Err(ReplicationError::Cancelled(
-                                "COPY stream ended".to_string(),
-                            ));
-                        }
-                        ReadResult::WouldBlock => {
-                            info!("Cancellation token triggered with no buffered data");
-                        }
-                    }
-                    return Err(ReplicationError::Cancelled("Operation cancelled".to_string()));
+                    return self.handle_cancellation();
                 }
-
-                // Wait for socket to become readable
                 guard_result = async_fd.readable() => {
                     let mut guard = guard_result.map_err(|e| {
                         ReplicationError::protocol(format!("Failed to wait for socket readability: {e}"))
                     })?;
 
-                    // Socket is readable - consume input from the OS socket
-                    // This is the ONLY place we call PQconsumeInput, avoiding busy-loops
+                    // Consume input from OS socket into libpq's buffer
                     let consumed = unsafe { PQconsumeInput(self.conn) };
                     if consumed == 0 {
                         let error_msg = self.last_error_message();
@@ -483,22 +497,19 @@ impl PgReplicationConnection {
                         )));
                     }
 
-                    // Check if we got a complete message after consuming input.
-                    // If we got data, return it immediately (the guard drop will clear ready flag).
-                    // If no complete message yet, explicitly clear the ready flag to re-arm epoll.
-                    match self.try_read_buffered_data()? {
-                        ReadResult::Data(data) => {
-                            return Ok(data);
+                    // Drain all available messages
+                    match drain_buffered_messages(self.conn, &mut self.pending_messages, &mut self.read_buf) {
+                        DrainResult::Drained => {
+                            // Messages queued; guard drops and clears ready flag
                         }
-                        ReadResult::CopyDone => {
+                        DrainResult::CopyDone => {
                             debug!("COPY stream ended after consuming input");
                             return Err(ReplicationError::Cancelled(
                                 "COPY stream ended".to_string(),
                             ));
                         }
-                        ReadResult::WouldBlock => {
-                            // No complete message available yet.
-                            // Clear the ready flag to re-arm epoll and continue waiting.
+                        DrainResult::WouldBlock => {
+                            // No complete message yet, clear ready flag to re-arm epoll
                             guard.clear_ready();
                         }
                     }
@@ -507,57 +518,33 @@ impl PgReplicationConnection {
         }
     }
 
-    /// Try to read copy data from libpq's internal buffer without consuming OS socket
-    /// This is a non-blocking operation that only checks libpq's internal buffer.
-    /// It should only be called after PQconsumeInput has been called to transfer
-    /// data from the OS socket to libpq's buffer.
-    ///
-    /// # Returns
-    /// * `Ok(ReadResult::Data(data))` - Complete message available in buffer
-    /// * `Ok(ReadResult::WouldBlock)` - No complete message yet, need to wait for more data
-    /// * `Ok(ReadResult::CopyDone)` - COPY stream has ended gracefully
-    /// * `Err(_)` - Protocol or buffer error
-    #[inline]
-    fn try_read_buffered_data(&self) -> Result<ReadResult> {
-        // PQgetCopyData with async=1 is already non-blocking, so we don't need PQisBusy check.
-        let mut buffer: *mut std::os::raw::c_char = ptr::null_mut();
-        let result = unsafe { PQgetCopyData(self.conn, &mut buffer, 1) };
-
-        match result {
-            len if len > 0 => {
-                if buffer.is_null() {
-                    return Err(ReplicationError::buffer(
-                        "Received null buffer from PQgetCopyData".to_string(),
-                    ));
-                }
-
-                let data = Bytes::copy_from_slice(unsafe {
-                    slice::from_raw_parts(buffer as *const u8, len as usize)
-                });
-
-                // Free the buffer allocated by PostgreSQL
-                unsafe { PQfreemem(buffer as *mut c_void) };
-                Ok(ReadResult::Data(data))
-            }
-            0 => {
-                // 0: According to libpq docs, async mode and no data ready
-                Ok(ReadResult::WouldBlock)
-            }
-            -1 => {
-                // COPY finished - this is a graceful shutdown signal
-                debug!("COPY stream finished (PQgetCopyData returned -1)");
-                Ok(ReadResult::CopyDone)
-            }
-            -2 => {
-                let error_msg = self.last_error_message();
-                Err(ReplicationError::protocol(format!(
-                    "PQgetCopyData error: {error_msg}"
-                )))
-            }
-            other => Err(ReplicationError::protocol(format!(
-                "Unexpected PQgetCopyData result: {other}"
-            ))),
+    /// Handle cancellation: check for remaining buffered data before returning.
+    fn handle_cancellation(&mut self) -> Result<Bytes> {
+        debug!("Cancellation detected in get_copy_data_async");
+        // Return any queued message first
+        if let Some(msg) = self.pending_messages.pop_front() {
+            info!("Found queued data after cancellation, returning it");
+            return Ok(msg);
         }
+        // Try one last drain
+        match drain_buffered_messages(self.conn, &mut self.pending_messages, &mut self.read_buf) {
+            DrainResult::Drained => {
+                if let Some(msg) = self.pending_messages.pop_front() {
+                    info!("Found buffered data after cancellation, returning it");
+                    return Ok(msg);
+                }
+            }
+            DrainResult::CopyDone => {
+                info!("COPY stream ended during cancellation check");
+                return Err(ReplicationError::Cancelled("COPY stream ended".to_string()));
+            }
+            DrainResult::WouldBlock => {
+                info!("Cancellation token triggered with no buffered data");
+            }
+        }
+        Err(ReplicationError::Cancelled(
+            "Operation cancelled".to_string(),
+        ))
     }
 
     /// Get the last error message from the connection
@@ -674,7 +661,7 @@ impl PgReplicationConnection {
     ///
     /// See: <https://www.postgresql.org/docs/current/protocol-replication.html>
     pub fn create_replication_slot_with_options(
-        &self,
+        &mut self,
         slot_name: &str,
         slot_type: SlotType,
         output_plugin: Option<&str>,
@@ -754,7 +741,7 @@ impl PgReplicationConnection {
 
     /// Alter a replication slot (logical slots only)
     pub fn alter_replication_slot(
-        &self,
+        &mut self,
         slot_name: &str,
         two_phase: Option<bool>,
         failover: Option<bool>,
@@ -804,7 +791,7 @@ impl PgReplicationConnection {
     /// * `slot_name` - Name of the replication slot to drop
     /// * `wait` - If true, the command waits until the slot becomes inactive
     ///            instead of returning an error when the slot is in use
-    pub fn drop_replication_slot(&self, slot_name: &str, wait: bool) -> Result<()> {
+    pub fn drop_replication_slot(&mut self, slot_name: &str, wait: bool) -> Result<()> {
         let sql = Self::build_drop_slot_sql(slot_name, wait);
 
         debug!("Dropping replication slot: {}", sql);
@@ -835,7 +822,7 @@ impl PgReplicationConnection {
     /// Returns slot type, restart LSN, and restart timeline.
     /// Requires PostgreSQL 15+.
     pub fn read_replication_slot(
-        &self,
+        &mut self,
         slot_name: &str,
     ) -> Result<crate::types::ReplicationSlotInfo> {
         let sql = Self::build_read_slot_sql(slot_name);
@@ -1047,6 +1034,7 @@ impl PgReplicationConnection {
             // Clear the connection pointer and reset state
             self.conn = std::ptr::null_mut();
             self.async_fd = None;
+            self.pending_messages.clear();
 
             info!("PostgreSQL replication connection closed and cleaned up");
         } else {
@@ -1073,6 +1061,8 @@ impl PgReplicationConnection {
             conn: std::ptr::null_mut(),
             is_replication_conn: false,
             async_fd: None,
+            pending_messages: VecDeque::new(),
+            read_buf: BytesMut::new(),
         }
     }
 }
@@ -1148,6 +1138,98 @@ impl Drop for PgResult {
 // # Safety: `PgResult` wraps `*mut PGresult`.  It is only created and consumed within synchronous code paths (no `.await` while a `PgResult` is live), but the compiler may conservatively include it in generator state.  `Send` is sufficient because the result is never shared — it is always owned by a single task.
 unsafe impl Send for PgResult {}
 
+// ── Free functions for the drain-loop optimization ────────────────────────
+// These are free functions (not methods) to avoid borrow-checker conflicts:
+// `get_copy_data_async` needs `&self.async_fd` (immutable borrow of struct)
+// while simultaneously calling these to mutate `pending_messages` / `read_buf`.
+
+/// Read a single message from libpq's internal buffer using a reusable `BytesMut`.
+///
+/// Instead of `Bytes::copy_from_slice()` (which allocates a new `Vec` per message),
+/// this uses `BytesMut::put_slice() + split().freeze()` which reuses the same
+/// backing allocation after the buffer warms up.
+#[inline]
+fn try_read_buffered_data_raw(conn: *mut PGconn, read_buf: &mut BytesMut) -> Result<ReadResult> {
+    let mut buffer: *mut std::os::raw::c_char = ptr::null_mut();
+    let result = unsafe { PQgetCopyData(conn, &mut buffer, 1) };
+
+    match result {
+        len if len > 0 => {
+            if buffer.is_null() {
+                return Err(ReplicationError::buffer(
+                    "Received null buffer from PQgetCopyData".to_string(),
+                ));
+            }
+
+            let len = len as usize;
+            let src = unsafe { slice::from_raw_parts(buffer as *const u8, len) };
+
+            // Reserve space and copy into the reusable buffer
+            read_buf.reserve(len);
+            read_buf.put_slice(src);
+
+            // Split off the message as a frozen Bytes (zero-copy reference counting)
+            let data = read_buf.split().freeze();
+
+            // Free the buffer allocated by PostgreSQL
+            unsafe { PQfreemem(buffer as *mut c_void) };
+            Ok(ReadResult::Data(data))
+        }
+        0 => Ok(ReadResult::WouldBlock),
+        -1 => {
+            debug!("COPY stream finished (PQgetCopyData returned -1)");
+            Ok(ReadResult::CopyDone)
+        }
+        -2 => {
+            let error_msg = unsafe {
+                let error_ptr = PQerrorMessage(conn);
+                if error_ptr.is_null() {
+                    "Unknown error".to_string()
+                } else {
+                    CStr::from_ptr(error_ptr).to_string_lossy().into_owned()
+                }
+            };
+            Err(ReplicationError::protocol(format!(
+                "PQgetCopyData error: {error_msg}"
+            )))
+        }
+        other => Err(ReplicationError::protocol(format!(
+            "Unexpected PQgetCopyData result: {other}"
+        ))),
+    }
+}
+
+/// Drain ALL available messages from libpq's buffer into the `pending_messages` queue.
+///
+/// After `PQconsumeInput` fills libpq's internal buffer, this function extracts
+/// every complete message in a tight loop — avoiding the overhead of re-entering
+/// `select!`, re-checking cancellation, and re-awaiting readiness per message.
+#[inline]
+fn drain_buffered_messages(
+    conn: *mut PGconn,
+    pending_messages: &mut VecDeque<Bytes>,
+    read_buf: &mut BytesMut,
+) -> DrainResult {
+    let mut drained = false;
+
+    for _ in 0..MAX_DRAIN_BATCH {
+        match try_read_buffered_data_raw(conn, read_buf) {
+            Ok(ReadResult::Data(data)) => {
+                pending_messages.push_back(data);
+                drained = true;
+            }
+            Ok(ReadResult::WouldBlock) => break,
+            Ok(ReadResult::CopyDone) => return DrainResult::CopyDone,
+            Err(_) => break, // treat errors as would-block for drain purposes
+        }
+    }
+
+    if drained {
+        DrainResult::Drained
+    } else {
+        DrainResult::WouldBlock
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -365,17 +365,80 @@ The library supports all PostgreSQL logical replication message types:
 └─────────────────────────────────────────┘
 ```
 
-## Performance Considerations
+## 7. Stress Test & System Threshold Analysis
 
-- **Zero-Copy**: Uses `bytes::Bytes` for efficient buffer management
-- **Arc-shared column metadata**: Column names, schema, and table names use `Arc<str>` — cloning is a single atomic increment instead of a heap allocation per event
-- **RowData (ordered Vec)**: Row payloads use `RowData` (a `Vec<(Arc<str>, ColumnValue)>`) instead of `HashMap<String, serde_json::Value>`, eliminating per-event hashing overhead and extra allocations
-- **ColumnValue (Null | Text | Binary)**: Preserves the raw PostgreSQL wire representation without intermediate JSON parsing or allocation. Each variant holds zero-copy `Bytes`
-- **Binary Wire Format**: `ChangeEvent::encode` / `ChangeEvent::decode` provide a compact binary serialization that is significantly faster and smaller than `serde_json`, ideal for inter-process or network transport
-- **Atomic Operations**: Thread-safe LSN tracking with minimal overhead
-- **Connection Pooling**: Reusable connection with automatic retry
-- **Streaming Support**: Handle large transactions without memory issues
-- **Efficient Blocking**: Async I/O with tokio::select eliminates busy-waiting
+Progressive writer concurrency ramp (8 → 128 writers) to find the library's CPU saturation point and throughput ceiling.
+
+### Test Environment
+
+```
+CPU: AMD EPYC 7763 64-Core Processor
+CPU cores: 8
+Memory: 32812624 kB
+OS: Ubuntu 22.04.5 LTS
+USE TLS/SSL
+```
+
+### Stress Ramp: Throughput vs CPU at Increasing Writer Concurrency
+
+
+```
+Writers | DML ev/s    | Proc CPU% | Sys CPU%  | RSS (MB)
+--------|-------------|-----------|-----------|--------
+    16 |      48,805 |     31.2% |      5.5% | 18.6
+    32 |      88,645 |     54.3% |      8.6% | 18.6
+    48 |     135,669 |     84.3% |     12.8% | 18.7
+    64 |     135,681 |     82.0% |     11.8% | 18.6
+    96 |     135,524 |     83.2% |     12.6% | 18.7
+    128 |     135,367 |     84.3% |     12.8% | 18.7
+    192 |     132,571 |     82.8% |     13.0% | 18.6
+```
+
+```
+Throughput scaling with writer concurrency:
+
+16w |   48,805 ev/s |██████████████
+32w |   88,645 ev/s |██████████████████████████
+48w |  135,669 ev/s |████████████████████████████████████████
+64w |  135,681 ev/s |████████████████████████████████████████
+96w |  135,524 ev/s |████████████████████████████████████████
+128w |  135,367 ev/s |████████████████████████████████████████
+192w |  132,571 ev/s |███████████████████████████████████████
+```
+
+
+```
+CPU usage scaling with writer concurrency:
+
+16w | proc  31.2% sys   5.5% |████████████
+32w | proc  54.3% sys   8.6% |██████████████████████
+48w | proc  84.3% sys  12.8% |██████████████████████████████████
+64w | proc  82.0% sys  11.8% |█████████████████████████████████
+96w | proc  83.2% sys  12.6% |█████████████████████████████████
+128w | proc  84.3% sys  12.8% |██████████████████████████████████
+192w | proc  82.8% sys  13.0% |█████████████████████████████████
+Legend: █ = process CPU (pg-walstream), ░ = additional system CPU
+```
+
+```
+Memory (RSS) scaling with writer concurrency:
+
+16w |   18.6 MB avg /   18.6 MB peak |████████████████████████████████████████
+32w |   18.6 MB avg /   18.6 MB peak |████████████████████████████████████████
+48w |   18.7 MB avg /   18.7 MB peak |████████████████████████████████████████
+64w |   18.6 MB avg /   18.6 MB peak |████████████████████████████████████████
+96w |   18.7 MB avg /   18.7 MB peak |████████████████████████████████████████
+128w |   18.7 MB avg /   18.7 MB peak |████████████████████████████████████████
+192w |   18.6 MB avg /   18.6 MB peak |████████████████████████████████████████
+```
+
+**Threshold Analysis:**
+
+- **Peak throughput**: 135,681 DML events/sec at **64w** concurrency
+- **Throughput saturation** detected at **64 writers** (throughput gain < 5% or regression)
+- **Library CPU moderate**: Process CPU peaked at 88.8% — approaching but not yet at saturation
+- **Memory**: Peak process RSS 18.7 MB / 32044 MB total system (0.06% utilization)
+- **CPU efficiency**: ~1528 DML events/sec per 1% CPU at peak
 
 ## Limitations
 

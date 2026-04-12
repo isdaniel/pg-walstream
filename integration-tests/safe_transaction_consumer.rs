@@ -38,7 +38,7 @@ fn regular_conn_string() -> String {
     })
 }
 
-fn setup_safe_schema(conn: &PgReplicationConnection) {
+fn setup_safe_schema(conn: &mut PgReplicationConnection) {
     let _ = conn.exec(
         "CREATE TABLE IF NOT EXISTS safe_test (\
          id SERIAL PRIMARY KEY, \
@@ -53,7 +53,7 @@ fn setup_safe_schema(conn: &PgReplicationConnection) {
 }
 
 fn drop_slot(slot_name: &str) {
-    if let Ok(conn) = PgReplicationConnection::connect(&replication_conn_string()) {
+    if let Ok(mut conn) = PgReplicationConnection::connect(&replication_conn_string()) {
         let _ = conn.exec(&format!(
             "SELECT pg_drop_replication_slot('{slot_name}') \
              WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '{slot_name}')"
@@ -149,9 +149,9 @@ async fn test_transaction_boundaries() {
     let slot = "it_safe_txn_boundaries";
     drop_slot(slot);
 
-    let regular =
+    let mut regular =
         PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
-    setup_safe_schema(&regular);
+    setup_safe_schema(&mut regular);
 
     let config = safe_config(slot);
     let mut stream = LogicalReplicationStream::new(&replication_conn_string(), config)
@@ -228,9 +228,9 @@ async fn test_consumer_buffers_until_commit() {
     let slot = "it_safe_buffer";
     drop_slot(slot);
 
-    let regular =
+    let mut regular =
         PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
-    setup_safe_schema(&regular);
+    setup_safe_schema(&mut regular);
 
     let config = safe_config(slot);
     let mut stream = LogicalReplicationStream::new(&replication_conn_string(), config)
@@ -306,9 +306,9 @@ async fn test_ordered_multi_transaction_processing() {
     let slot = "it_safe_multi_tx";
     drop_slot(slot);
 
-    let regular =
+    let mut regular =
         PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
-    setup_safe_schema(&regular);
+    setup_safe_schema(&mut regular);
 
     let config = safe_config(slot);
     let mut stream = LogicalReplicationStream::new(&replication_conn_string(), config)
@@ -395,9 +395,9 @@ async fn test_mixed_dml_transaction() {
     let slot = "it_safe_mixed_dml";
     drop_slot(slot);
 
-    let regular =
+    let mut regular =
         PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
-    setup_safe_schema(&regular);
+    setup_safe_schema(&mut regular);
 
     // Pre-insert a row to update/delete later
     regular
@@ -487,9 +487,9 @@ async fn test_graceful_shutdown_via_cancellation() {
     let slot = "it_safe_shutdown";
     drop_slot(slot);
 
-    let regular =
+    let mut regular =
         PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
-    setup_safe_schema(&regular);
+    setup_safe_schema(&mut regular);
 
     let config = safe_config(slot);
     let mut stream = LogicalReplicationStream::new(&replication_conn_string(), config)

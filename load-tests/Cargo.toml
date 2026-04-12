@@ -1,0 +1,29 @@
+[package]
+name = "pg-walstream-loadtest"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "pg_walstream_loadtest"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pg-walstream-loadtest"
+path = "src/main.rs"
+
+[[bin]]
+name = "pg-walstream-generator"
+path = "src/bin/generator.rs"
+
+[dependencies]
+pg_walstream = { path = "..", default-features = false, features = ["rustls-tls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+tokio = { version = "1.51.1", features = ["full"] }
+tokio-postgres = "0.7.17"
+postgres-openssl = "0.5.3"
+openssl = "0.10.76"
+hdrhistogram = "7.5.4"
+chrono = "0.4.44"
+rand = "0.8.5"
+sysinfo = "0.38.4"
