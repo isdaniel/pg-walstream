@@ -21,3 +21,4 @@ target
 #.idea/
 
 pg2any_last_lsn
+reports/*

@@ -38,7 +38,7 @@ fn regular_conn_string() -> String {
     })
 }
 
-fn setup_rate_schema(conn: &PgReplicationConnection) {
+fn setup_rate_schema(conn: &mut PgReplicationConnection) {
     let _ = conn.exec(
         "CREATE TABLE IF NOT EXISTS rate_test (id SERIAL PRIMARY KEY, payload TEXT NOT NULL)",
     );
@@ -48,7 +48,7 @@ fn setup_rate_schema(conn: &PgReplicationConnection) {
 }
 
 fn drop_slot(slot_name: &str) {
-    if let Ok(conn) = PgReplicationConnection::connect(&replication_conn_string()) {
+    if let Ok(mut conn) = PgReplicationConnection::connect(&replication_conn_string()) {
         let _ = conn.exec(&format!(
             "SELECT pg_drop_replication_slot('{slot_name}') \
              WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '{slot_name}')"
@@ -83,9 +83,9 @@ async fn test_event_stream_receives_events() {
     let slot = "it_rate_basic";
     drop_slot(slot);
 
-    let regular =
+    let mut regular =
         PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
-    setup_rate_schema(&regular);
+    setup_rate_schema(&mut regular);
 
     let config = rate_config(slot);
     let mut stream = LogicalReplicationStream::new(&replication_conn_string(), config)
@@ -160,9 +160,9 @@ async fn test_event_stream_lsn_feedback() {
     let slot = "it_rate_feedback";
     drop_slot(slot);
 
-    let regular =
+    let mut regular =
         PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
-    setup_rate_schema(&regular);
+    setup_rate_schema(&mut regular);
 
     let config = rate_config(slot);
     let mut stream = LogicalReplicationStream::new(&replication_conn_string(), config)
@@ -229,9 +229,9 @@ async fn test_rate_limited_event_processing() {
     let slot = "it_rate_throttle";
     drop_slot(slot);
 
-    let regular =
+    let mut regular =
         PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
-    setup_rate_schema(&regular);
+    setup_rate_schema(&mut regular);
 
     let config = rate_config(slot);
     let mut stream = LogicalReplicationStream::new(&replication_conn_string(), config)
@@ -316,9 +316,9 @@ async fn test_event_type_categorization() {
     let slot = "it_rate_categories";
     drop_slot(slot);
 
-    let regular =
+    let mut regular =
         PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
-    setup_rate_schema(&regular);
+    setup_rate_schema(&mut regular);
 
     let config = rate_config(slot);
     let mut stream = LogicalReplicationStream::new(&replication_conn_string(), config)
