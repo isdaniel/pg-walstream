@@ -6,7 +6,7 @@
 use crate::error::ReplicationError;
 
 /// Parsed connection configuration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ConnInfo {
     pub host: String,
     pub port: u16,
@@ -15,6 +15,8 @@ pub struct ConnInfo {
     pub dbname: String,
     pub sslmode: SslMode,
     pub sslrootcert: Option<String>,
+    /// TLS negotiation mode. `Postgres` (default) uses the standard SSLRequest, round-trip; `Direct` skips it for PostgreSQL 17+ (saves one round-trip).
+    pub sslnegotiation: SslNegotiation,
     pub replication: ReplicationMode,
     /// Connection timeout in seconds (0 = disabled). Maps to libpq's `connect_timeout`.
     pub connect_timeout: u64,
@@ -43,6 +45,52 @@ pub enum ReplicationMode {
     Database,
     Physical,
     None,
+}
+
+/// How TLS negotiation is initiated with the server.
+///
+/// PostgreSQL 17+ supports a "direct" mode that skips the SSLRequest
+/// round-trip and begins the TLS handshake immediately using ALPN
+/// protocol `"postgresql"`. This saves one network round-trip on
+/// every connection establishment.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SslNegotiation {
+    /// Standard PostgreSQL TLS negotiation: send SSLRequest, wait for
+    /// `'S'`/`'N'` response, then perform TLS handshake. Works with all
+    /// PostgreSQL versions.
+    Postgres,
+    /// Direct TLS negotiation (PostgreSQL 17+): skip SSLRequest and send
+    /// TLS ClientHello immediately with ALPN `"postgresql"`. Falls back
+    /// to standard negotiation if the server doesn't support it.
+    Direct,
+}
+
+impl std::fmt::Debug for ConnInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnInfo")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field(
+                "password",
+                if self.password.is_some() {
+                    &"<REDACTED>"
+                } else {
+                    &"None"
+                },
+            )
+            .field("dbname", &self.dbname)
+            .field("sslmode", &self.sslmode)
+            .field("sslrootcert", &self.sslrootcert)
+            .field("sslnegotiation", &self.sslnegotiation)
+            .field("replication", &self.replication)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("keepalives", &self.keepalives)
+            .field("keepalives_idle", &self.keepalives_idle)
+            .field("keepalives_interval", &self.keepalives_interval)
+            .field("keepalives_count", &self.keepalives_count)
+            .finish()
+    }
 }
 
 impl ConnInfo {
@@ -97,6 +145,7 @@ impl ConnInfo {
         let mut sslmode = SslMode::Prefer;
         let mut replication = ReplicationMode::None;
         let mut sslrootcert: Option<String> = None;
+        let mut sslnegotiation = SslNegotiation::Postgres;
         let mut connect_timeout: u64 = 0;
         let mut keepalives = true;
         let mut keepalives_idle: u64 = 120;
@@ -111,6 +160,7 @@ impl ConnInfo {
                 match key {
                     "sslmode" => sslmode = parse_sslmode(val),
                     "sslrootcert" => sslrootcert = Some(url_decode(val)),
+                    "sslnegotiation" => sslnegotiation = parse_ssl_negotiation(val),
                     "replication" => replication = parse_replication_mode(val),
                     "connect_timeout" => {
                         connect_timeout = val.parse().unwrap_or(0);
@@ -141,6 +191,7 @@ impl ConnInfo {
             dbname,
             sslmode,
             sslrootcert,
+            sslnegotiation,
             replication,
             connect_timeout,
             keepalives,
@@ -159,6 +210,7 @@ impl ConnInfo {
         let mut sslmode = SslMode::Prefer;
         let mut replication = ReplicationMode::None;
         let mut sslrootcert: Option<String> = None;
+        let mut sslnegotiation = SslNegotiation::Postgres;
         let mut connect_timeout: u64 = 0;
         let mut keepalives = true;
         let mut keepalives_idle: u64 = 120;
@@ -215,6 +267,7 @@ impl ConnInfo {
                 "dbname" | "database" => dbname = Some(value),
                 "sslmode" => sslmode = parse_sslmode(&value),
                 "sslrootcert" => sslrootcert = Some(value),
+                "sslnegotiation" => sslnegotiation = parse_ssl_negotiation(&value),
                 "replication" => replication = parse_replication_mode(&value),
                 "connect_timeout" => connect_timeout = value.parse().unwrap_or(0),
                 "keepalives" => keepalives = value != "0",
@@ -233,10 +286,11 @@ impl ConnInfo {
             host,
             port,
             user,
-            password: password.clone(),
+            password,
             dbname,
             sslmode,
             sslrootcert,
+            sslnegotiation,
             replication,
             connect_timeout,
             keepalives,
@@ -264,6 +318,13 @@ fn parse_replication_mode(s: &str) -> ReplicationMode {
         "database" => ReplicationMode::Database,
         "true" | "yes" | "1" => ReplicationMode::Physical,
         _ => ReplicationMode::None,
+    }
+}
+
+fn parse_ssl_negotiation(s: &str) -> SslNegotiation {
+    match s {
+        "direct" => SslNegotiation::Direct,
+        _ => SslNegotiation::Postgres,
     }
 }
 
@@ -397,6 +458,26 @@ mod tests {
         assert!(matches!(parse_replication_mode(""), ReplicationMode::None));
     }
 
+    #[test]
+    fn test_parse_ssl_negotiation_variants() {
+        assert!(matches!(
+            parse_ssl_negotiation("direct"),
+            SslNegotiation::Direct
+        ));
+        assert!(matches!(
+            parse_ssl_negotiation("postgres"),
+            SslNegotiation::Postgres
+        ));
+        assert!(matches!(
+            parse_ssl_negotiation(""),
+            SslNegotiation::Postgres
+        ));
+        assert!(matches!(
+            parse_ssl_negotiation("unknown"),
+            SslNegotiation::Postgres
+        ));
+    }
+
     // === URI edge cases ===
 
     #[test]
@@ -504,6 +585,45 @@ mod tests {
         assert_eq!(ci.sslrootcert, Some("/path with spaces/ca.pem".to_string()));
     }
 
+    // === sslnegotiation parsing ===
+
+    #[test]
+    fn test_parse_uri_sslnegotiation_direct() {
+        let ci = ConnInfo::parse(
+            "postgresql://user:pass@host:5432/db?sslmode=require&sslnegotiation=direct",
+        )
+        .unwrap();
+        assert_eq!(ci.sslnegotiation, SslNegotiation::Direct);
+    }
+
+    #[test]
+    fn test_parse_uri_sslnegotiation_postgres() {
+        let ci = ConnInfo::parse(
+            "postgresql://user:pass@host:5432/db?sslmode=require&sslnegotiation=postgres",
+        )
+        .unwrap();
+        assert_eq!(ci.sslnegotiation, SslNegotiation::Postgres);
+    }
+
+    #[test]
+    fn test_parse_uri_sslnegotiation_default() {
+        let ci = ConnInfo::parse("postgresql://user:pass@host:5432/db?sslmode=require").unwrap();
+        assert_eq!(ci.sslnegotiation, SslNegotiation::Postgres);
+    }
+
+    #[test]
+    fn test_parse_key_value_sslnegotiation_direct() {
+        let ci = ConnInfo::parse("host=localhost sslmode=require sslnegotiation=direct user=test")
+            .unwrap();
+        assert_eq!(ci.sslnegotiation, SslNegotiation::Direct);
+    }
+
+    #[test]
+    fn test_parse_key_value_sslnegotiation_default() {
+        let ci = ConnInfo::parse("host=localhost sslmode=require user=test").unwrap();
+        assert_eq!(ci.sslnegotiation, SslNegotiation::Postgres);
+    }
+
     // === keepalive and timeout params ===
 
     #[test]
@@ -551,5 +671,31 @@ mod tests {
         assert_eq!(ci.keepalives_interval, 10);
         assert_eq!(ci.keepalives_count, 3);
         assert_eq!(ci.connect_timeout, 0);
+    }
+
+    // === Debug redaction ===
+
+    #[test]
+    fn test_debug_redacts_password() {
+        let ci = ConnInfo::parse("postgresql://user:supersecret@host/db").unwrap();
+        let debug_output = format!("{:?}", ci);
+        assert!(
+            !debug_output.contains("supersecret"),
+            "Debug output should not contain the password: {debug_output}"
+        );
+        assert!(
+            debug_output.contains("REDACTED"),
+            "Debug output should contain REDACTED: {debug_output}"
+        );
+    }
+
+    #[test]
+    fn test_debug_shows_none_when_no_password() {
+        let ci = ConnInfo::parse("postgresql://user@host/db").unwrap();
+        let debug_output = format!("{:?}", ci);
+        assert!(
+            debug_output.contains("None"),
+            "Debug should show None for missing password: {debug_output}"
+        );
     }
 }
