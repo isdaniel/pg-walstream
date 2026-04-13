@@ -2,11 +2,11 @@
 //!
 //! Supports cleartext, MD5, and SCRAM-SHA-256 authentication.
 
-use bytes::{BufMut, BytesMut};
-use tokio::io::{AsyncRead, AsyncWrite};
-
 use super::wire;
 use crate::error::ReplicationError;
+use bytes::BytesMut;
+use std::fmt::Write;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Handle the authentication exchange after the startup message.
 ///
@@ -49,6 +49,11 @@ pub async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
                     }
                     3 => {
                         // AuthenticationCleartextPassword
+                        if tls_server_end_point.is_none() {
+                            tracing::warn!(
+                                "Server requested cleartext password over unencrypted connection"
+                            );
+                        }
                         let pw = password.ok_or_else(|| {
                             ReplicationError::authentication(
                                 "Server requires password but none provided".to_string(),
@@ -135,7 +140,7 @@ fn md5_password(user: &str, password: &str, salt: &[u8]) -> String {
 fn hex_encode(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        s.push_str(&format!("{b:02x}"));
+        let _ = write!(s, "{b:02x}");
     }
     s
 }
@@ -207,25 +212,24 @@ async fn handle_scram_sha256<S: AsyncRead + AsyncWrite + Unpin>(
     };
 
     let mechanism_name = if use_plus {
-        b"SCRAM-SHA-256-PLUS" as &[u8]
+        sasl::SCRAM_SHA_256_PLUS
     } else {
-        b"SCRAM-SHA-256" as &[u8]
+        sasl::SCRAM_SHA_256
     };
 
     // Create the SCRAM client
     let mut scram = sasl::ScramSha256::new(pw.as_bytes(), channel_binding);
 
-    // Step 1: Send SASLInitialResponse
-    let client_first = scram.message();
-    // Message format: 'p' tag + length + mechanism\0 + client-first-length(i32) + client-first
-    let body_len = 4 + mechanism_name.len() + 1 + 4 + client_first.len();
-    let mut sasl_init = BytesMut::with_capacity(1 + body_len);
-    sasl_init.put_u8(b'p');
-    sasl_init.put_i32(body_len as i32);
-    sasl_init.put_slice(mechanism_name);
-    sasl_init.put_u8(0);
-    sasl_init.put_i32(client_first.len() as i32);
-    sasl_init.put_slice(client_first);
+    // Step 1: Send SASLInitialResponse using postgres-protocol's canonical framing
+    let mut sasl_init = BytesMut::new();
+    postgres_protocol::message::frontend::sasl_initial_response(
+        mechanism_name,
+        scram.message(),
+        &mut sasl_init,
+    )
+    .map_err(|e| {
+        ReplicationError::authentication(format!("Failed to build SASL initial response: {e}"))
+    })?;
 
     wire::write_all(stream, &sasl_init).await?;
     wire::flush(stream).await?;
@@ -257,13 +261,11 @@ async fn handle_scram_sha256<S: AsyncRead + AsyncWrite + Unpin>(
         ReplicationError::authentication(format!("SCRAM server-first processing failed: {e}"))
     })?;
 
-    // Step 3: Send SASLResponse (client-final)
-    let client_final = scram.message();
-    let resp_body_len = 4 + client_final.len();
-    let mut sasl_resp = BytesMut::with_capacity(1 + resp_body_len);
-    sasl_resp.put_u8(b'p');
-    sasl_resp.put_i32(resp_body_len as i32);
-    sasl_resp.put_slice(client_final);
+    // Step 3: Send SASLResponse (client-final) using postgres-protocol's canonical framing
+    let mut sasl_resp = BytesMut::new();
+    postgres_protocol::message::frontend::sasl_response(scram.message(), &mut sasl_resp).map_err(
+        |e| ReplicationError::authentication(format!("Failed to build SASL response: {e}")),
+    )?;
 
     wire::write_all(stream, &sasl_resp).await?;
     wire::flush(stream).await?;

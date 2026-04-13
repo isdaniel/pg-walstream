@@ -81,9 +81,6 @@ pub struct NativeConnection {
     alive: bool,
 }
 
-// NativeConnection is just data + owned transport — no raw pointers.
-unsafe impl Send for NativeConnection {}
-
 impl NativeConnection {
     // ── Connection establishment ─────────────────────────────────────────
 

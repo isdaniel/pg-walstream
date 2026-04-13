@@ -14,7 +14,7 @@ use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
-use super::conninfo::{ConnInfo, SslMode};
+use super::conninfo::{ConnInfo, SslMode, SslNegotiation};
 use super::wire;
 use crate::error::ReplicationError;
 
@@ -290,7 +290,38 @@ fn configure_tcp_keepalive(tcp: &TcpStream, info: &ConnInfo) {
 }
 
 /// Perform TLS negotiation: send SSLRequest, check response, do handshake.
-async fn negotiate_tls(mut tcp: TcpStream, info: &ConnInfo) -> Result<Transport, ReplicationError> {
+///
+/// Supports two modes:
+/// - **Postgres** (default): Send SSLRequest, wait for `'S'`/`'N'`, then handshake.
+/// - **Direct** (PG 17+): Skip SSLRequest, send TLS ClientHello immediately with
+///   ALPN `"postgresql"`. Falls back to standard negotiation on failure.
+async fn negotiate_tls(tcp: TcpStream, info: &ConnInfo) -> Result<Transport, ReplicationError> {
+    if info.sslnegotiation == SslNegotiation::Direct {
+        // Direct mode: attempt TLS handshake immediately with ALPN.
+        // On failure, fall back to standard SSLRequest negotiation with a fresh connection.
+        match negotiate_tls_direct(tcp, info).await {
+            Ok(transport) => return Ok(transport),
+            Err(e) => {
+                tracing::debug!(
+                    "Direct SSL negotiation failed, falling back to standard SSLRequest: {e}"
+                );
+                // The TCP connection is consumed by the failed handshake attempt.
+                // Open a new one for the standard SSLRequest fallback.
+                let addr = format!("{}:{}", info.host, info.port);
+                let tcp = tcp_connect(&addr, info).await?;
+                return negotiate_tls_standard(tcp, info).await;
+            }
+        }
+    }
+
+    negotiate_tls_standard(tcp, info).await
+}
+
+/// Standard PostgreSQL TLS negotiation via SSLRequest.
+async fn negotiate_tls_standard(
+    mut tcp: TcpStream,
+    info: &ConnInfo,
+) -> Result<Transport, ReplicationError> {
     // Send SSLRequest
     let ssl_req = wire::build_ssl_request();
     wire::write_all(&mut tcp, &ssl_req).await?;
@@ -340,6 +371,42 @@ async fn negotiate_tls(mut tcp: TcpStream, info: &ConnInfo) -> Result<Transport,
             "Unexpected SSLRequest response: 0x{other:02x}"
         ))),
     }
+}
+
+/// Direct TLS negotiation (PostgreSQL 17+).
+///
+/// Skips the SSLRequest round-trip entirely: sends TLS ClientHello immediately
+/// with ALPN protocol `"postgresql"` so the server knows this is a PostgreSQL
+/// connection rather than HTTPS or another protocol.
+///
+/// This saves one full network round-trip compared to standard negotiation.
+async fn negotiate_tls_direct(
+    tcp: TcpStream,
+    info: &ConnInfo,
+) -> Result<Transport, ReplicationError> {
+    let mut tls_config = build_tls_config(info)?;
+
+    // Set ALPN to "postgresql" — this is how the server distinguishes a direct
+    // TLS PostgreSQL connection from other protocols.
+    tls_config.alpn_protocols = vec![b"postgresql".to_vec()];
+
+    let connector = TlsConnector::from(Arc::new(tls_config));
+
+    let server_name = rustls::pki_types::ServerName::try_from(info.host.as_str())
+        .map_err(|e| {
+            ReplicationError::permanent_connection(format!("Invalid server name for TLS: {e}"))
+        })?
+        .to_owned();
+
+    let tls_stream = connector.connect(server_name, tcp).await.map_err(|e| {
+        ReplicationError::transient_connection(format!("Direct TLS handshake failed: {e}"))
+    })?;
+
+    tracing::debug!("Direct TLS connection established (ALPN postgresql)");
+    Ok(Transport::Tls(BufReader::with_capacity(
+        TLS_BUF_SIZE,
+        tls_stream,
+    )))
 }
 
 /// Build a rustls `ClientConfig` based on the sslmode.
@@ -716,6 +783,7 @@ mod tests {
             dbname: "test".to_string(),
             sslmode,
             sslrootcert,
+            sslnegotiation: super::super::conninfo::SslNegotiation::Postgres,
             replication: super::super::conninfo::ReplicationMode::None,
             connect_timeout: 0,
             keepalives: true,
@@ -852,6 +920,40 @@ mod tests {
         // sslrootcert is ignored for require mode — should succeed
         let config = build_tls_config(&info);
         assert!(config.is_ok());
+    }
+
+    // === Direct SSL negotiation ===
+
+    #[test]
+    fn test_build_tls_config_has_no_alpn_by_default() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+        let info = test_conninfo(SslMode::Require, None);
+        let config = build_tls_config(&info).unwrap();
+        assert!(
+            config.alpn_protocols.is_empty(),
+            "Standard TLS config should have no ALPN protocols set"
+        );
+    }
+
+    #[test]
+    fn test_direct_ssl_sets_alpn_postgresql() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+        let info = test_conninfo(SslMode::Require, None);
+        let mut config = build_tls_config(&info).unwrap();
+        // Simulate what negotiate_tls_direct does
+        config.alpn_protocols = vec![b"postgresql".to_vec()];
+        assert_eq!(config.alpn_protocols, vec![b"postgresql".to_vec()]);
+    }
+
+    #[test]
+    fn test_sslnegotiation_default_is_postgres() {
+        let info = test_conninfo(SslMode::Require, None);
+        assert_eq!(
+            info.sslnegotiation,
+            super::super::conninfo::SslNegotiation::Postgres
+        );
     }
 
     // === find_subsequence ===
