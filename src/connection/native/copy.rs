@@ -19,6 +19,9 @@ const MAX_DRAIN_BATCH: usize = 4096;
 /// Minimum header size: 1 (tag) + 4 (length) = 5 bytes.
 const HEADER_LEN: usize = 5;
 
+/// Maximum allowed message body length (128 MiB), matching wire.rs.
+const MAX_MESSAGE_LEN: usize = 128 * 1024 * 1024;
+
 /// Read the next CopyData payload from the replication stream.
 ///
 /// This implements a **drain-loop batch queue** optimization:
@@ -106,7 +109,14 @@ fn drain_read_buffer(
                 "invalid message length {body_len} (must be >= 4)"
             )));
         }
-        let total_len = 1 + body_len as usize; // tag + body (body_len includes its own 4 bytes)
+        let body_len_usize = body_len as usize;
+        if body_len_usize > MAX_MESSAGE_LEN {
+            return Some(ReplicationError::protocol(format!(
+                "message length {} exceeds maximum allowed {} bytes",
+                body_len_usize, MAX_MESSAGE_LEN
+            )));
+        }
+        let total_len = 1 + body_len_usize; // tag + body (body_len includes its own 4 bytes)
 
         if read_buf.len() < total_len {
             // Incomplete message — wait for more data
@@ -329,6 +339,26 @@ mod tests {
             err.to_string().contains("invalid message length"),
             "Expected invalid length error, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_drain_exceeds_max_message_len() {
+        let mut buf = BytesMut::new();
+        // body_len exceeding MAX_MESSAGE_LEN (64 MiB)
+        let huge_len: i32 = (MAX_MESSAGE_LEN as i32) + 1;
+        buf.put_u8(b'd');
+        buf.put_i32(huge_len);
+
+        let mut pending = VecDeque::new();
+        let result = drain_read_buffer(&mut buf, &mut pending);
+
+        assert!(result.is_some());
+        let err = result.unwrap();
+        assert!(
+            err.to_string().contains("exceeds maximum"),
+            "Expected max length error, got: {err}"
+        );
+        assert!(pending.is_empty());
     }
 
     #[test]

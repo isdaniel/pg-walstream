@@ -11,6 +11,14 @@ use crate::error::ReplicationError;
 /// Minimum message size: 1 (tag) + 4 (length) = 5 bytes header.
 const HEADER_LEN: usize = 5;
 
+/// Maximum allowed message body length (128 MiB).
+///
+/// Prevents OOM from a malicious or corrupt server sending a message with
+/// `body_len` close to `i32::MAX` (2 GiB). PostgreSQL's own max message size
+/// is 1 GiB, but 128 MiB is more than sufficient for any replication message
+/// and provides a safety margin for large TOAST values.
+const MAX_MESSAGE_LEN: usize = 128 * 1024 * 1024;
+
 /// Read a single complete PostgreSQL backend message from the transport.
 ///
 /// Returns the raw message bytes INCLUDING the tag byte and length.
@@ -35,6 +43,13 @@ pub async fn read_message<R: AsyncRead + Unpin>(
             }
 
             let body_len = body_len as usize;
+
+            if body_len > MAX_MESSAGE_LEN {
+                return Err(ReplicationError::protocol(format!(
+                    "message length {} exceeds maximum allowed {} bytes",
+                    body_len, MAX_MESSAGE_LEN
+                )));
+            }
             let total_len = 1 + body_len; // tag + body_len (body_len includes its own 4 bytes)
 
             if buf.len() >= total_len {
@@ -169,8 +184,10 @@ pub fn build_terminate() -> BytesMut {
 /// Parse a null-terminated C string from a byte slice.
 /// Returns the string and the number of bytes consumed (including the null terminator).
 /// If no null terminator exists, consumes the entire slice.
+///
+/// Uses `memchr` for SIMD-accelerated null-byte scanning.
 pub fn read_cstring(data: &[u8]) -> (&str, usize) {
-    match data.iter().position(|&b| b == 0) {
+    match memchr::memchr(0, data) {
         Some(null_pos) => {
             let s = std::str::from_utf8(&data[..null_pos]).unwrap_or("");
             (s, null_pos + 1) // consume string + null byte
@@ -367,6 +384,25 @@ mod tests {
         assert!(
             err.to_string().contains("invalid message length"),
             "Expected invalid length error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_message_exceeds_max_len() {
+        let (mut client, _server) = tokio::io::duplex(8192);
+
+        // Pre-load a message with body_len exceeding MAX_MESSAGE_LEN (128 MiB)
+        let huge_len: i32 = (MAX_MESSAGE_LEN as i32) + 1;
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&[b'Z']);
+        buf.extend_from_slice(&huge_len.to_be_bytes());
+
+        let result = read_message(&mut client, &mut buf).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds maximum"),
+            "Expected max length error, got: {err}"
         );
     }
 

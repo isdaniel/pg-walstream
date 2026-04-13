@@ -16,6 +16,16 @@ pub struct ConnInfo {
     pub sslmode: SslMode,
     pub sslrootcert: Option<String>,
     pub replication: ReplicationMode,
+    /// Connection timeout in seconds (0 = disabled). Maps to libpq's `connect_timeout`.
+    pub connect_timeout: u64,
+    /// Whether TCP keepalives are enabled (default: true). Maps to `keepalives`.
+    pub keepalives: bool,
+    /// Seconds of idle time before sending a keepalive probe. Maps to `keepalives_idle`.
+    pub keepalives_idle: u64,
+    /// Seconds between keepalive probes. Maps to `keepalives_interval`.
+    pub keepalives_interval: u64,
+    /// Maximum number of keepalive probes before declaring dead. Maps to `keepalives_count`.
+    pub keepalives_count: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -87,6 +97,11 @@ impl ConnInfo {
         let mut sslmode = SslMode::Prefer;
         let mut replication = ReplicationMode::None;
         let mut sslrootcert: Option<String> = None;
+        let mut connect_timeout: u64 = 0;
+        let mut keepalives = true;
+        let mut keepalives_idle: u64 = 120;
+        let mut keepalives_interval: u64 = 10;
+        let mut keepalives_count: u32 = 3;
 
         for param in params_str.split('&') {
             if param.is_empty() {
@@ -97,6 +112,19 @@ impl ConnInfo {
                     "sslmode" => sslmode = parse_sslmode(val),
                     "sslrootcert" => sslrootcert = Some(url_decode(val)),
                     "replication" => replication = parse_replication_mode(val),
+                    "connect_timeout" => {
+                        connect_timeout = val.parse().unwrap_or(0);
+                    }
+                    "keepalives" => keepalives = val != "0",
+                    "keepalives_idle" => {
+                        keepalives_idle = val.parse().unwrap_or(120);
+                    }
+                    "keepalives_interval" => {
+                        keepalives_interval = val.parse().unwrap_or(10);
+                    }
+                    "keepalives_count" => {
+                        keepalives_count = val.parse().unwrap_or(3);
+                    }
                     _ => {} // ignore unknown params
                 }
             }
@@ -114,6 +142,11 @@ impl ConnInfo {
             sslmode,
             sslrootcert,
             replication,
+            connect_timeout,
+            keepalives,
+            keepalives_idle,
+            keepalives_interval,
+            keepalives_count,
         })
     }
 
@@ -126,6 +159,11 @@ impl ConnInfo {
         let mut sslmode = SslMode::Prefer;
         let mut replication = ReplicationMode::None;
         let mut sslrootcert: Option<String> = None;
+        let mut connect_timeout: u64 = 0;
+        let mut keepalives = true;
+        let mut keepalives_idle: u64 = 120;
+        let mut keepalives_interval: u64 = 10;
+        let mut keepalives_count: u32 = 3;
 
         // Simple key=value parser (handles single-quoted values)
         let mut chars = input.chars().peekable();
@@ -161,6 +199,11 @@ impl ConnInfo {
                 "sslmode" => sslmode = parse_sslmode(&value),
                 "sslrootcert" => sslrootcert = Some(value),
                 "replication" => replication = parse_replication_mode(&value),
+                "connect_timeout" => connect_timeout = value.parse().unwrap_or(0),
+                "keepalives" => keepalives = value != "0",
+                "keepalives_idle" => keepalives_idle = value.parse().unwrap_or(120),
+                "keepalives_interval" => keepalives_interval = value.parse().unwrap_or(10),
+                "keepalives_count" => keepalives_count = value.parse().unwrap_or(3),
                 _ => {} // ignore unknown
             }
         }
@@ -178,6 +221,11 @@ impl ConnInfo {
             sslmode,
             sslrootcert,
             replication,
+            connect_timeout,
+            keepalives,
+            keepalives_idle,
+            keepalives_interval,
+            keepalives_count,
         })
     }
 }
@@ -424,5 +472,54 @@ mod tests {
     fn test_parse_key_value_sslrootcert_quoted() {
         let ci = ConnInfo::parse("host=localhost sslrootcert='/path with spaces/ca.pem'").unwrap();
         assert_eq!(ci.sslrootcert, Some("/path with spaces/ca.pem".to_string()));
+    }
+
+    // === keepalive and timeout params ===
+
+    #[test]
+    fn test_parse_uri_keepalive_params() {
+        let ci = ConnInfo::parse(
+            "postgresql://user:pass@host:5432/db?keepalives=1&keepalives_idle=60&keepalives_interval=5&keepalives_count=6",
+        )
+        .unwrap();
+        assert!(ci.keepalives);
+        assert_eq!(ci.keepalives_idle, 60);
+        assert_eq!(ci.keepalives_interval, 5);
+        assert_eq!(ci.keepalives_count, 6);
+    }
+
+    #[test]
+    fn test_parse_uri_keepalives_disabled() {
+        let ci = ConnInfo::parse("postgresql://user:pass@host/db?keepalives=0").unwrap();
+        assert!(!ci.keepalives);
+    }
+
+    #[test]
+    fn test_parse_uri_connect_timeout() {
+        let ci = ConnInfo::parse("postgresql://user:pass@host/db?connect_timeout=30").unwrap();
+        assert_eq!(ci.connect_timeout, 30);
+    }
+
+    #[test]
+    fn test_parse_key_value_keepalive_params() {
+        let ci = ConnInfo::parse(
+            "host=localhost keepalives=1 keepalives_idle=90 keepalives_interval=15 keepalives_count=5 connect_timeout=10",
+        )
+        .unwrap();
+        assert!(ci.keepalives);
+        assert_eq!(ci.keepalives_idle, 90);
+        assert_eq!(ci.keepalives_interval, 15);
+        assert_eq!(ci.keepalives_count, 5);
+        assert_eq!(ci.connect_timeout, 10);
+    }
+
+    #[test]
+    fn test_keepalive_defaults() {
+        let ci = ConnInfo::parse("postgresql://user:pass@host/db").unwrap();
+        assert!(ci.keepalives);
+        assert_eq!(ci.keepalives_idle, 120);
+        assert_eq!(ci.keepalives_interval, 10);
+        assert_eq!(ci.keepalives_count, 3);
+        assert_eq!(ci.connect_timeout, 0);
     }
 }

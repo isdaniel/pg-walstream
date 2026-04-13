@@ -8,7 +8,8 @@
 //! 5. Backend parameter processing until ReadyForQuery
 
 use bytes::BytesMut;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
@@ -17,12 +18,20 @@ use super::conninfo::{ConnInfo, SslMode};
 use super::wire;
 use crate::error::ReplicationError;
 
-/// Return the aws-lc-rs crypto provider for hardware-accelerated TLS.
+/// Lazily-initialized, cached crypto provider.
+///
+/// `aws_lc_rs::default_provider()` constructs a new `CryptoProvider` on each call.
+/// Caching it via `LazyLock` ensures one-time initialization and reuse across
+/// all TLS connections.
+static CRYPTO_PROVIDER: LazyLock<Arc<rustls::crypto::CryptoProvider>> =
+    LazyLock::new(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
+
+/// Return a reference to the cached aws-lc-rs crypto provider.
 ///
 /// aws-lc-rs leverages AES-NI, AVX2, and SHA-NI instructions for
 /// high-throughput AES-GCM decryption during WAL streaming.
-fn crypto_provider() -> rustls::crypto::CryptoProvider {
-    rustls::crypto::aws_lc_rs::default_provider()
+fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    CRYPTO_PROVIDER.clone()
 }
 
 /// The transport layer — either plain TCP or TLS-wrapped TCP.
@@ -83,12 +92,34 @@ impl AsyncWrite for Transport {
 /// Returns the established transport and server version.
 pub async fn connect(info: &ConnInfo) -> Result<(Transport, i32, BytesMut), ReplicationError> {
     let addr = format!("{}:{}", info.host, info.port);
-    let tcp = TcpStream::connect(&addr).await.map_err(|e| {
-        ReplicationError::transient_connection(format!("Failed to connect to {addr}: {e}"))
-    })?;
+
+    // Connect with optional timeout
+    let tcp = if info.connect_timeout > 0 {
+        let timeout = Duration::from_secs(info.connect_timeout);
+        tokio::time::timeout(timeout, TcpStream::connect(&addr))
+            .await
+            .map_err(|_| {
+                ReplicationError::transient_connection(format!(
+                    "Connection to {addr} timed out after {}s",
+                    info.connect_timeout
+                ))
+            })?
+            .map_err(|e| {
+                ReplicationError::transient_connection(format!("Failed to connect to {addr}: {e}"))
+            })?
+    } else {
+        TcpStream::connect(&addr).await.map_err(|e| {
+            ReplicationError::transient_connection(format!("Failed to connect to {addr}: {e}"))
+        })?
+    };
 
     // Disable Nagle's algorithm for low-latency
     tcp.set_nodelay(true).ok();
+
+    // Configure TCP keepalive for long-running replication connections.
+    if info.keepalives {
+        configure_tcp_keepalive(&tcp, info);
+    }
 
     let mut transport = match info.sslmode {
         SslMode::Disable => Transport::Plain(tcp),
@@ -100,6 +131,39 @@ pub async fn connect(info: &ConnInfo) -> Result<(Transport, i32, BytesMut), Repl
     let server_version = startup_and_auth(&mut transport, &mut buf, info).await?;
 
     Ok((transport, server_version, buf))
+}
+
+/// Configure TCP keepalive on the socket using socket2.
+///
+/// This is critical for long-running replication connections over cloud networks
+/// where load balancers silently drop idle TCP connections.
+fn configure_tcp_keepalive(tcp: &TcpStream, info: &ConnInfo) {
+    use socket2::SockRef;
+
+    let sock = SockRef::from(tcp);
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(info.keepalives_idle))
+        .with_interval(Duration::from_secs(info.keepalives_interval));
+
+    // retries/count is platform-specific
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+    ))]
+    let keepalive = keepalive.with_retries(info.keepalives_count);
+
+    if let Err(e) = sock.set_tcp_keepalive(&keepalive) {
+        tracing::warn!("Failed to set TCP keepalive: {e}");
+    } else {
+        tracing::debug!(
+            "TCP keepalive configured: idle={}s, interval={}s",
+            info.keepalives_idle,
+            info.keepalives_interval
+        );
+    }
 }
 
 /// Perform TLS negotiation: send SSLRequest, check response, do handshake.
@@ -154,7 +218,7 @@ async fn negotiate_tls(mut tcp: TcpStream, info: &ConnInfo) -> Result<Transport,
 
 /// Build a rustls `ClientConfig` based on the sslmode.
 fn build_tls_config(info: &ConnInfo) -> Result<rustls::ClientConfig, ReplicationError> {
-    let provider = Arc::new(crypto_provider());
+    let provider = crypto_provider();
 
     match info.sslmode {
         SslMode::VerifyFull => {
@@ -191,7 +255,7 @@ fn build_tls_config(info: &ConnInfo) -> Result<rustls::ClientConfig, Replication
         SslMode::Require | SslMode::Prefer | SslMode::Allow => {
             // Encrypt but skip certificate verification entirely.
             // This matches libpq's `sslmode=require` behavior.
-            let config = rustls::ClientConfig::builder_with_provider(provider)
+            let config = rustls::ClientConfig::builder_with_provider(provider.clone())
                 .with_safe_default_protocol_versions()
                 .map_err(|e| {
                     ReplicationError::permanent_connection(format!(
@@ -199,7 +263,7 @@ fn build_tls_config(info: &ConnInfo) -> Result<rustls::ClientConfig, Replication
                     ))
                 })?
                 .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoVerification(crypto_provider())))
+                .with_custom_certificate_verifier(Arc::new(NoVerification(provider)))
                 .with_no_client_auth();
             Ok(config)
         }
@@ -272,7 +336,7 @@ fn build_root_store(sslrootcert: Option<&str>) -> Result<rustls::RootCertStore, 
 /// A certificate verifier that accepts any certificate (no verification).
 /// Used for `sslmode=require` which only requires encryption, not authentication.
 #[derive(Debug)]
-struct NoVerification(rustls::crypto::CryptoProvider);
+struct NoVerification(Arc<rustls::crypto::CryptoProvider>);
 
 impl rustls::client::danger::ServerCertVerifier for NoVerification {
     fn verify_server_cert(
@@ -508,6 +572,25 @@ fn parse_server_version(version_str: &str) -> i32 {
 mod tests {
     use super::*;
 
+    /// Create a ConnInfo with test defaults, allowing override of specific fields.
+    fn test_conninfo(sslmode: SslMode, sslrootcert: Option<String>) -> ConnInfo {
+        ConnInfo {
+            host: "localhost".to_string(),
+            port: 5432,
+            user: "test".to_string(),
+            password: None,
+            dbname: "test".to_string(),
+            sslmode,
+            sslrootcert,
+            replication: super::super::conninfo::ReplicationMode::None,
+            connect_timeout: 0,
+            keepalives: true,
+            keepalives_idle: 120,
+            keepalives_interval: 10,
+            keepalives_count: 3,
+        }
+    }
+
     #[test]
     fn test_parse_server_version() {
         assert_eq!(parse_server_version("16.1"), 160001);
@@ -545,61 +628,34 @@ mod tests {
     #[test]
     fn test_build_tls_config_require() {
         // Install crypto provider for test
-        let _ = crypto_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-        let info = ConnInfo {
-            host: "localhost".to_string(),
-            port: 5432,
-            user: "test".to_string(),
-            password: None,
-            dbname: "test".to_string(),
-            sslmode: SslMode::Require,
-            sslrootcert: None,
-            replication: super::super::conninfo::ReplicationMode::None,
-        };
+        let info = test_conninfo(SslMode::Require, None);
         let config = build_tls_config(&info);
         assert!(config.is_ok());
     }
 
     #[test]
     fn test_build_tls_config_verify_full() {
-        let _ = crypto_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-        let info = ConnInfo {
-            host: "localhost".to_string(),
-            port: 5432,
-            user: "test".to_string(),
-            password: None,
-            dbname: "test".to_string(),
-            sslmode: SslMode::VerifyFull,
-            sslrootcert: None,
-            replication: super::super::conninfo::ReplicationMode::None,
-        };
+        let info = test_conninfo(SslMode::VerifyFull, None);
         let config = build_tls_config(&info);
         assert!(config.is_ok());
     }
 
     #[test]
     fn test_build_tls_config_verify_ca() {
-        let _ = crypto_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-        let info = ConnInfo {
-            host: "localhost".to_string(),
-            port: 5432,
-            user: "test".to_string(),
-            password: None,
-            dbname: "test".to_string(),
-            sslmode: SslMode::VerifyCa,
-            sslrootcert: None,
-            replication: super::super::conninfo::ReplicationMode::None,
-        };
+        let info = test_conninfo(SslMode::VerifyCa, None);
         let config = build_tls_config(&info);
         assert!(config.is_ok());
     }
 
     #[test]
     fn test_build_root_store_default() {
-        let _ = crypto_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         // No sslrootcert → should load system + Mozilla CAs
         let store = build_root_store(None).unwrap();
@@ -609,7 +665,7 @@ mod tests {
 
     #[test]
     fn test_build_root_store_custom_file() {
-        let _ = crypto_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         // Create a temp PEM file with a self-signed cert for testing
         let pem_content = include_str!("../../../load-tests/fixtures/test_ca.pem");
@@ -633,7 +689,7 @@ mod tests {
 
     #[test]
     fn test_build_root_store_missing_file() {
-        let _ = crypto_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         let result = build_root_store(Some("/nonexistent/path/ca.pem"));
         assert!(result.is_err());
@@ -646,18 +702,9 @@ mod tests {
 
     #[test]
     fn test_build_tls_config_verify_full_with_custom_ca() {
-        let _ = crypto_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-        let info = ConnInfo {
-            host: "localhost".to_string(),
-            port: 5432,
-            user: "test".to_string(),
-            password: None,
-            dbname: "test".to_string(),
-            sslmode: SslMode::VerifyFull,
-            sslrootcert: Some("/nonexistent/ca.pem".to_string()),
-            replication: super::super::conninfo::ReplicationMode::None,
-        };
+        let info = test_conninfo(SslMode::VerifyFull, Some("/nonexistent/ca.pem".to_string()));
         // Should fail because the file doesn't exist
         let config = build_tls_config(&info);
         assert!(config.is_err());
@@ -665,18 +712,9 @@ mod tests {
 
     #[test]
     fn test_build_tls_config_require_ignores_sslrootcert() {
-        let _ = crypto_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-        let info = ConnInfo {
-            host: "localhost".to_string(),
-            port: 5432,
-            user: "test".to_string(),
-            password: None,
-            dbname: "test".to_string(),
-            sslmode: SslMode::Require,
-            sslrootcert: Some("/nonexistent/ca.pem".to_string()),
-            replication: super::super::conninfo::ReplicationMode::None,
-        };
+        let info = test_conninfo(SslMode::Require, Some("/nonexistent/ca.pem".to_string()));
         // sslrootcert is ignored for require mode — should succeed
         let config = build_tls_config(&info);
         assert!(config.is_ok());
