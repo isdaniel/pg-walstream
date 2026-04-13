@@ -33,14 +33,14 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-pg_walstream = "0.5.1"
+pg_walstream = "0.6.0"
 ```
 
 By default, this uses the `libpq` backend (C FFI). For a **pure-Rust** build with no system dependencies:
 
 ```toml
 [dependencies]
-pg_walstream = { version = "0.5.1", default-features = false, features = ["rustls-tls"] }
+pg_walstream = { version = "0.6.0", default-features = false, features = ["rustls-tls"] }
 ```
 
 ## Feature Flags
