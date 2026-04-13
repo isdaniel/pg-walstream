@@ -504,6 +504,51 @@ Memory (RSS) scaling with writer concurrency:
 - **Memory**: Peak process RSS 18.7 MB / 32044 MB total system (0.06% utilization)
 - **CPU efficiency**: ~1,528 DML events/sec per 1% CPU at peak
 
+## Linux VM TCP Tuning for Production
+
+When streaming WAL over high-latency links (e.g., cross-region Azure PostgreSQL), the default Linux TCP buffer sizes can become the throughput bottleneck. The kernel's default `rmem_max` of 208 KB limits the TCP receive window, which — combined with round-trip latency — caps throughput via the **Bandwidth-Delay Product (BDP)**:
+
+### Recommended sysctl Settings
+
+```conf
+# --- TCP buffer sizes ---
+# Allow up to 64 MB per-socket receive/send buffers (kernel will auto-tune within this ceiling)
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+
+# TCP auto-tuning ranges: min / default / max (bytes)
+# The kernel dynamically adjusts each socket's buffer within these bounds
+net.ipv4.tcp_rmem = 4096 262144 67108864
+net.ipv4.tcp_wmem = 4096 262144 67108864
+
+# --- Congestion control ---
+# BBR provides significantly better throughput than cubic on high-latency links
+net.ipv4.tcp_congestion_control = bbr
+
+# --- Packet backlog ---
+# Increase the NIC receive queue (helps at high packet rates)
+net.core.netdev_max_backlog = 5000
+```
+
+Apply immediately:
+
+```bash
+sudo sysctl --system
+```
+
+### Why Each Parameter Matters
+
+| Parameter | Default | Recommended | Why |
+|-----------|---------|-------------|-----|
+| `rmem_max` | 208 KB | 64 MB | Caps TCP receive window; directly limits throughput on high-RTT links |
+| `wmem_max` | 208 KB | 64 MB | Caps TCP send window; limits outbound throughput for feedback messages |
+| `tcp_rmem` (max) | 6 MB | 64 MB | Per-socket auto-tuned receive buffer ceiling |
+| `tcp_wmem` (max) | 4 MB | 64 MB | Per-socket auto-tuned send buffer ceiling |
+| `tcp_congestion_control` | cubic | bbr | BBR reacts to actual bandwidth, not packet loss; better on cloud networks |
+| `netdev_max_backlog` | 1000 | 5000 | Prevents packet drops under burst traffic at NIC level |
+
+> **Note:** These settings affect all TCP connections on the VM, not just pg-walstream. The kernel auto-tunes actual buffer usage within the configured ceiling, so idle connections do not consume 64 MB each.
+
 ## Limitations
 
 - Requires PostgreSQL 14 or later for full protocol support

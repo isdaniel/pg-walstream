@@ -180,10 +180,27 @@ impl ConnInfo {
             let key: String = chars.by_ref().take_while(|c| *c != '=').collect();
             let key = key.trim();
 
-            // Read value (may be quoted)
+            // Read value (may be quoted with single quotes).
+            // Doubled single quotes inside a quoted value represent a literal quote,
+            // e.g. password='it''s' → it's (matches libpq behavior).
             let value = if chars.peek() == Some(&'\'') {
                 chars.next(); // skip opening quote
-                let v: String = chars.by_ref().take_while(|c| *c != '\'').collect();
+                let mut v = String::new();
+                loop {
+                    match chars.next() {
+                        Some('\'') => {
+                            // Check for doubled quote (escaped literal)
+                            if chars.peek() == Some(&'\'') {
+                                chars.next(); // consume second quote
+                                v.push('\'');
+                            } else {
+                                break; // end of quoted value
+                            }
+                        }
+                        Some(c) => v.push(c),
+                        None => break, // unterminated quote — use what we have
+                    }
+                }
                 v
             } else {
                 let v: String = chars.by_ref().take_while(|c| !c.is_whitespace()).collect();
@@ -322,6 +339,19 @@ mod tests {
     fn parse_key_value_quoted() {
         let ci = ConnInfo::parse("host=localhost password='has spaces'").unwrap();
         assert_eq!(ci.password, Some("has spaces".to_string()));
+    }
+
+    #[test]
+    fn parse_key_value_escaped_quotes() {
+        // Doubled single quotes represent a literal quote (libpq behavior)
+        let ci = ConnInfo::parse("host=localhost password='it''s a test'").unwrap();
+        assert_eq!(ci.password, Some("it's a test".to_string()));
+    }
+
+    #[test]
+    fn parse_key_value_multiple_escaped_quotes() {
+        let ci = ConnInfo::parse("host=localhost password='a''b''c'").unwrap();
+        assert_eq!(ci.password, Some("a'b'c".to_string()));
     }
 
     // === parse_sslmode variants ===

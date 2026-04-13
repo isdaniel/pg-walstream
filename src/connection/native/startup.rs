@@ -93,10 +93,36 @@ impl AsyncWrite for Transport {
 pub async fn connect(info: &ConnInfo) -> Result<(Transport, i32, BytesMut), ReplicationError> {
     let addr = format!("{}:{}", info.host, info.port);
 
-    // Connect with optional timeout
+    let tcp = tcp_connect(&addr, info).await?;
+
+    let mut transport = match info.sslmode {
+        SslMode::Disable => Transport::Plain(tcp),
+        SslMode::Prefer | SslMode::Allow => {
+            // For prefer/allow: attempt TLS, but fall back to a new plaintext.
+            match negotiate_tls(tcp, info).await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::debug!("TLS negotiation failed, falling back to plain: {e}");
+                    let tcp = tcp_connect(&addr, info).await?;
+                    Transport::Plain(tcp)
+                }
+            }
+        }
+        _ => negotiate_tls(tcp, info).await?,
+    };
+
+    // Perform startup + auth
+    let mut buf = BytesMut::with_capacity(8192);
+    let server_version = startup_and_auth(&mut transport, &mut buf, info).await?;
+
+    Ok((transport, server_version, buf))
+}
+
+/// Open a TCP connection with optional timeout, TCP_NODELAY, and keepalive.
+async fn tcp_connect(addr: &str, info: &ConnInfo) -> Result<TcpStream, ReplicationError> {
     let tcp = if info.connect_timeout > 0 {
         let timeout = Duration::from_secs(info.connect_timeout);
-        tokio::time::timeout(timeout, TcpStream::connect(&addr))
+        tokio::time::timeout(timeout, TcpStream::connect(addr))
             .await
             .map_err(|_| {
                 ReplicationError::transient_connection(format!(
@@ -108,29 +134,18 @@ pub async fn connect(info: &ConnInfo) -> Result<(Transport, i32, BytesMut), Repl
                 ReplicationError::transient_connection(format!("Failed to connect to {addr}: {e}"))
             })?
     } else {
-        TcpStream::connect(&addr).await.map_err(|e| {
+        TcpStream::connect(addr).await.map_err(|e| {
             ReplicationError::transient_connection(format!("Failed to connect to {addr}: {e}"))
         })?
     };
 
-    // Disable Nagle's algorithm for low-latency
     tcp.set_nodelay(true).ok();
 
-    // Configure TCP keepalive for long-running replication connections.
     if info.keepalives {
         configure_tcp_keepalive(&tcp, info);
     }
 
-    let mut transport = match info.sslmode {
-        SslMode::Disable => Transport::Plain(tcp),
-        _ => negotiate_tls(tcp, info).await?,
-    };
-
-    // Perform startup + auth
-    let mut buf = BytesMut::with_capacity(8192);
-    let server_version = startup_and_auth(&mut transport, &mut buf, info).await?;
-
-    Ok((transport, server_version, buf))
+    Ok(tcp)
 }
 
 /// Configure TCP keepalive on the socket using socket2.
