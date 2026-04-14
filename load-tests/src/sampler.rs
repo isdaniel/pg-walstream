@@ -1,4 +1,4 @@
-use crate::metrics::{Metrics, ResourceSample, ResourceSummary};
+use pg_walstream_loadtest::metrics::{Metrics, ResourceSample, ResourceSummary};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};

@@ -433,75 +433,84 @@ The library supports all PostgreSQL logical replication message types:
 
 Progressive writer concurrency ramp (16 - 192 writers) to find the library's CPU saturation point and throughput ceiling.
 
-### Test Environment
+- **Backend A**: rustls-tls
+- **Backend B**: libpq 
 
-```
-CPU: AMD EPYC 7763 64-Core Processor
-CPU cores: 8
-Memory: 32812624 kB
-OS: Ubuntu 22.04.5 LTS
-USE TLS/SSL (feature: libpq)
-```
+## 2. CPU Efficiency (DML events/sec per 1% CPU)
 
-### Stress Ramp: Throughput vs CPU at Increasing Writer Concurrency
+This is the primary efficiency metric: how many DML events can each backend process for every 1% of CPU it consumes. Higher is better.
 
-```
-Writers | DML ev/s    | Proc CPU% | Sys CPU%  | RSS (MB)
---------|-------------|-----------|-----------|--------
-    16 |      48,805 |     31.2% |      5.5% | 18.6
-    32 |      88,645 |     54.3% |      8.6% | 18.6
-    48 |     135,669 |     84.3% |     12.8% | 18.7
-    64 |     135,681 |     82.0% |     11.8% | 18.6
-    96 |     135,524 |     83.2% |     12.6% | 18.7
-    128 |     135,367 |     84.3% |     12.8% | 18.7
-    192 |     132,571 |     82.8% |     13.0% | 18.6
-```
+| Scenario | rustls-tls | libpq | Delta | Winner |
+|----------|----------:|----------:|--------:|--------|
+| Baseline | 4,252 | 1,628 | +161.2% | **rustls-tls** |
+| Batch-100 | 1,053 | 672 | +56.7% | **rustls-tls** |
+| Batch-5000 | 4,764 | 1,621 | +193.9% | **rustls-tls** |
+| 4-Writers | 4,891 | 1,615 | +202.8% | **rustls-tls** |
+| Wide-20col | 1,090 | 777 | +40.3% | **rustls-tls** |
+| Payload-2KB | 973 | 776 | +25.3% | **rustls-tls** |
+| Mixed-DML | 1,832 | 1,066 | +71.9% | **rustls-tls** |
 
-```
-Throughput scaling with writer concurrency:
+## 3. Throughput Comparison
 
-16w |   48,805 ev/s |██████████████
-32w |   88,645 ev/s |██████████████████████████
-48w |  135,669 ev/s |████████████████████████████████████████
-64w |  135,681 ev/s |████████████████████████████████████████
-96w |  135,524 ev/s |████████████████████████████████████████
-128w |  135,367 ev/s |████████████████████████████████████████
-192w |  132,571 ev/s |███████████████████████████████████████
-```
+| Scenario | rustls-tls ev/s | libpq ev/s | Delta | rustls-tls DML/s | libpq DML/s | Delta | Winner |
+|----------|----------:|----------:|--------:|----------:|----------:|--------:|--------|
+| Baseline | 22,939 | 22,672 | +1.2% | 22,933 | 22,667 | +1.2% | ~tie |
+| Batch-100 | 327 | 324 | +1.1% | 321 | 317 | +1.1% | ~tie |
+| Batch-5000 | 15,173 | 14,359 | +5.7% | 15,167 | 14,353 | +5.7% | **rustls-tls** |
+| 4-Writers | 80,287 | 78,755 | +1.9% | 80,267 | 78,736 | +1.9% | ~tie |
+| Wide-20col | 1,523 | 1,556 | -2.2% | 1,517 | 1,550 | -2.2% | **libpq** |
+| Payload-2KB | 1,422 | 1,473 | -3.4% | 1,417 | 1,467 | -3.4% | **libpq** |
+| Mixed-DML | 811 | 799 | +1.5% | 804 | 793 | +1.5% | ~tie |
 
+## 4. Resource Utilization Comparison
 
-```
-CPU usage scaling with writer concurrency:
+Process CPU and RSS reflect **only the pg-walstream consumer** (generator runs as a separate OS process).
 
-16w | proc  31.2% sys   5.5% |████████████
-32w | proc  54.3% sys   8.6% |██████████████████████
-48w | proc  84.3% sys  12.8% |██████████████████████████████████
-64w | proc  82.0% sys  11.8% |█████████████████████████████████
-96w | proc  83.2% sys  12.6% |█████████████████████████████████
-128w | proc  84.3% sys  12.8% |██████████████████████████████████
-192w | proc  82.8% sys  13.0% |█████████████████████████████████
-Legend: █ = process CPU (pg-walstream), ░ = additional system CPU
-```
+| Scenario | rustls-tls CPU% | libpq CPU% | Delta | rustls-tls RSS MB | libpq RSS MB | Delta | Winner |
+|----------|----------:|----------:|--------:|----------:|----------:|--------:|--------|
+| Baseline | 5.4 | 13.9 | -61.3% | 15.9 | 17.3 | -8.1% | **rustls-tls** |
+| Batch-100 | 0.3 | 0.5 | -35.5% | 17.0 | 18.4 | -7.5% | **rustls-tls** |
+| Batch-5000 | 3.2 | 8.9 | -64.0% | 17.2 | 18.5 | -7.4% | **rustls-tls** |
+| 4-Writers | 16.4 | 48.7 | -66.3% | 17.4 | 18.7 | -6.8% | **rustls-tls** |
+| Wide-20col | 1.4 | 2.0 | -30.3% | 17.5 | 18.7 | -6.5% | **rustls-tls** |
+| Payload-2KB | 1.5 | 1.9 | -22.9% | 17.5 | 18.7 | -6.5% | **rustls-tls** |
+| Mixed-DML | 0.4 | 0.7 | -41.0% | 17.5 | 18.8 | -6.8% | **rustls-tls** |
 
-```
-Memory (RSS) scaling with writer concurrency:
+## 5. Latency Comparison (inter-event, microseconds)
 
-16w |   18.6 MB avg /   18.6 MB peak |████████████████████████████████████████
-32w |   18.6 MB avg /   18.6 MB peak |████████████████████████████████████████
-48w |   18.7 MB avg /   18.7 MB peak |████████████████████████████████████████
-64w |   18.6 MB avg /   18.6 MB peak |████████████████████████████████████████
-96w |   18.7 MB avg /   18.7 MB peak |████████████████████████████████████████
-128w |   18.7 MB avg /   18.7 MB peak |████████████████████████████████████████
-192w |   18.6 MB avg /   18.6 MB peak |████████████████████████████████████████
-```
+| Scenario | rustls-tls P50 | libpq P50 | rustls-tls P99 | libpq P99 | Winner |
+|----------|----------:|----------:|----------:|----------:|--------|
+| Baseline | 1 | 5 | 33 | 17 | **rustls-tls** |
+| Batch-100 | 1 | 6 | 7635 | 7411 | **rustls-tls** |
+| Batch-5000 | 1 | 5 | 111 | 17 | **rustls-tls** |
+| 4-Writers | 1 | 5 | 56 | 22 | **rustls-tls** |
+| Wide-20col | 2 | 7 | 873 | 820 | **rustls-tls** |
+| Payload-2KB | 5 | 6 | 882 | 812 | **rustls-tls** |
+| Mixed-DML | 1 | 5 | 1819 | 1804 | **rustls-tls** |
 
-**Threshold Analysis:**
+## 6. Stress Ramp Comparison
 
-- **Peak throughput**: 135,681 DML events/sec at **64w** concurrency
-- **Throughput saturation** detected at **64 writers** (throughput gain < 5% or regression)
-- **Library CPU moderate**: Process CPU peaked at 88.8% -- approaching but not yet at saturation
-- **Memory**: Peak process RSS 18.7 MB / 32044 MB total system (0.06% utilization)
-- **CPU efficiency**: ~1,528 DML events/sec per 1% CPU at peak
+Progressive writer concurrency ramp — comparing throughput and CPU scaling.
+
+| Writers | rustls-tls DML/s | libpq DML/s | Delta | rustls-tls CPU% | libpq CPU% | rustls-tls eff | libpq eff |
+|--------:|----------:|----------:|--------:|----------:|----------:|----------:|----------:|
+| 16 | 134,280 | 128,718 | +4.3% | 28.3 | 83.4 | 4,749 | 1,544 |
+| 32 | 100,387 | 122,192 | -17.8% | 21.8 | 76.0 | 4,613 | 1,608 |
+| 48 | 98,240 | 112,826 | -12.9% | 21.6 | 71.5 | 4,553 | 1,578 |
+| 64 | 107,748 | 104,107 | +3.5% | 22.9 | 67.6 | 4,712 | 1,541 |
+| 96 | 100,869 | 106,684 | -5.5% | 22.4 | 70.1 | 4,501 | 1,522 |
+| 128 | 105,333 | 100,601 | +4.7% | 23.7 | 66.4 | 4,449 | 1,514 |
+| 192 | 94,963 | 99,571 | -4.6% | 24.0 | 64.8 | 3,961 | 1,536 |
+
+### Peak Numbers
+
+| Metric | rustls-tls | libpq |
+|--------|------:|------:|
+| Peak DML events/sec | 134,280 | 128,718 |
+| Peak total events/sec | 134,307 | 128,744 |
+| Peak CPU efficiency (DML/s per 1% CPU) | 4,749 | 1,544 |
+| Peak process CPU% | 30.9 | 96.4 |
+| Peak RSS (MB) | 17.8 | 18.8 |
 
 ## Linux VM TCP Tuning for Production
 

@@ -1,4 +1,4 @@
-use crate::metrics::Metrics;
+use pg_walstream_loadtest::metrics::Metrics;
 use hdrhistogram::Histogram;
 use pg_walstream::{
     CancellationToken, ColumnValue, EventType, LogicalReplicationStream, ReplicationSlotOptions,

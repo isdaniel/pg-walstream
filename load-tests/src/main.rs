@@ -1,11 +1,11 @@
 mod consumer;
-mod metrics;
 mod reporter;
 mod sampler;
 
 use consumer::{run_consumer, ConsumerConfig};
 use pg_walstream_loadtest::generator::GeneratorConfig;
-use metrics::{Metrics, ScenarioResult};
+use pg_walstream_loadtest::json_types::{JsonReport, JsonScenarioResult};
+use pg_walstream_loadtest::metrics::{Metrics, ScenarioResult};
 use reporter::generate_report;
 use sampler::ResourceSampler;
 
@@ -14,6 +14,11 @@ use postgres_openssl::MakeTlsConnector;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
+
+#[cfg(feature = "rustls-tls")]
+const BACKEND_LABEL: &str = "rustls-tls";
+#[cfg(feature = "libpq")]
+const BACKEND_LABEL: &str = "libpq";
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 
@@ -536,10 +541,13 @@ async fn main() {
     // Install the aws-lc-rs crypto provider for rustls before any TLS connections.
     // aws-lc-rs provides hardware-accelerated AES-GCM via AES-NI/AVX2, which is
     // faster than ring for bulk TLS decryption on x86_64 CPUs.
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    #[cfg(feature = "rustls-tls")]
+    {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
 
     println!("============================================================");
-    println!("         pg-walstream Load Test Suite                        ");
+    println!("         pg-walstream Load Test Suite ({})           ", BACKEND_LABEL);
     println!("============================================================");
     println!();
 
@@ -587,7 +595,7 @@ async fn main() {
     });
 
     // Generate report
-    let report = generate_report(&results, &bench_output, &vm_info);
+    let report = generate_report(&results, &bench_output, &vm_info, BACKEND_LABEL);
 
     // Write report to reports/ directory
     let reports_dir = std::env::current_dir()
@@ -598,6 +606,23 @@ async fn main() {
     std::fs::create_dir_all(&reports_dir).expect("Failed to create reports directory");
     let report_path = reports_dir.join("LOAD_TEST_REPORT.md");
     std::fs::write(&report_path, &report).expect("Failed to write report");
+
+    // Write JSON results if --json-output was specified
+    let json_output_path = std::env::args()
+        .position(|a| a == "--json-output")
+        .and_then(|i| std::env::args().nth(i + 1));
+
+    if let Some(json_path) = json_output_path {
+        let json_report = JsonReport {
+            backend: BACKEND_LABEL.to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            vm_info: vm_info.clone(),
+            results: results.iter().map(JsonScenarioResult::from).collect(),
+        };
+        let json = serde_json::to_string_pretty(&json_report).unwrap();
+        std::fs::write(&json_path, &json).expect("Failed to write JSON results");
+        println!("JSON results written to: {json_path}");
+    }
 
     println!();
     println!("============================================================");

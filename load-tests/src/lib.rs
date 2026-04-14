@@ -2,3 +2,5 @@
 // Exposes modules so the standalone generator binary can reuse them.
 
 pub mod generator;
+pub mod json_types;
+pub mod metrics;

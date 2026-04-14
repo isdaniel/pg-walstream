@@ -16,9 +16,18 @@ path = "src/main.rs"
 name = "pg-walstream-generator"
 path = "src/bin/generator.rs"
 
+[[bin]]
+name = "pg-walstream-compare"
+path = "src/bin/compare.rs"
+
+[features]
+default = ["rustls-tls"]
+rustls-tls = ["pg_walstream/rustls-tls", "dep:rustls"]
+libpq = ["pg_walstream/libpq"]
+
 [dependencies]
-pg_walstream = { path = "..", default-features = false, features = ["rustls-tls"] }
-rustls = { version = "0.23.37", default-features = false, features = ["aws_lc_rs"] }
+pg_walstream = { path = "..", default-features = false }
+rustls = { version = "0.23.38", default-features = false, features = ["aws_lc_rs"], optional = true }
 tokio = { version = "1.51.1", features = ["full"] }
 tokio-postgres = "0.7.17"
 postgres-openssl = "0.5.3"
@@ -27,3 +36,5 @@ hdrhistogram = "7.5.4"
 chrono = "0.4.44"
 rand = "0.8.5"
 sysinfo = "0.38.4"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"

@@ -1,4 +1,4 @@
-use crate::metrics::{ResourceSample, ScenarioResult};
+use pg_walstream_loadtest::metrics::{ResourceSample, ScenarioResult};
 use chrono::Local;
 
 /// Format a number with comma separators.
@@ -362,11 +362,11 @@ fn analyze_thresholds(results: &[ScenarioResult]) -> String {
 // ─── Report Generation ─────────────────────────────────────────────────────
 
 /// Generate a Markdown report from scenario results.
-pub fn generate_report(results: &[ScenarioResult], bench_output: &str, vm_info: &str) -> String {
+pub fn generate_report(results: &[ScenarioResult], bench_output: &str, vm_info: &str, backend: &str) -> String {
     let now = Local::now().format("%Y-%m-%d %H:%M:%S %Z");
     let mut md = String::with_capacity(16384);
 
-    md.push_str("# pg-walstream Load Test Report\n\n");
+    md.push_str(&format!("# pg-walstream Load Test Report ({})\n\n", backend));
     md.push_str(&format!("**Generated**: {now}\n\n"));
 
     // ── §1 VM Environment ───────────────────────────────────────────────────
