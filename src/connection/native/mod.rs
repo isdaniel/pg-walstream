@@ -8,6 +8,7 @@ pub(crate) mod connection;
 pub(crate) mod conninfo;
 pub(crate) mod copy;
 pub(crate) mod error;
+pub(crate) mod md5;
 pub(crate) mod query;
 pub(crate) mod result;
 pub(crate) mod startup;
