@@ -940,14 +940,12 @@ dependencies = [
  "libpq-sys",
  "md-5",
  "memchr",
- "pin-project-lite",
  "postgres-protocol",
  "rustls",
  "rustls-native-certs",
  "rustls-pki-types",
  "serde",
  "socket2",
- "thiserror",
  "tokio",
  "tokio-rustls",
  "tokio-util",
@@ -1447,26 +1445,6 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-io-kit",
  "windows",
-]
-
-[[package]]
-name = "thiserror"
-version = "2.0.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4288b5bcbc7920c07a1149a35cf9590a2aa808e0bc1eafaade0b80947865fbc4"
-dependencies = [
- "thiserror-impl",
-]
-
-[[package]]
-name = "thiserror-impl"
-version = "2.0.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ebc4ee7f67670e9b64d05fa4253e753e016c6c95ff35b89b7941d6b856dec1d5"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
 ]
 
 [[package]]

@@ -19,9 +19,7 @@ serde = { version = "1.0.228", features = ["derive", "rc"] }
 chrono = { version = "0.4.44", features = ["serde"] }
 bytes = { version = "1.11.1", features = ["serde"] }
 tracing = "0.1.44"
-thiserror = "2.0.18"
 futures-core = "0.3.32"
-pin-project-lite = "0.2.17"
 memchr = "2.8.0"
 
 # libpq backend (default)
