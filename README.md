@@ -436,7 +436,7 @@ Progressive writer concurrency ramp (16 - 192 writers) to find the library's CPU
 - **Backend A**: rustls-tls
 - **Backend B**: libpq 
 
-## 2. CPU Efficiency (DML events/sec per 1% CPU)
+## 1. CPU Efficiency (DML events/sec per 1% CPU)
 
 This is the primary efficiency metric: how many DML events can each backend process for every 1% of CPU it consumes. Higher is better.
 
@@ -450,7 +450,7 @@ This is the primary efficiency metric: how many DML events can each backend proc
 | Payload-2KB | 973 | 776 | +25.3% | **rustls-tls** |
 | Mixed-DML | 1,832 | 1,066 | +71.9% | **rustls-tls** |
 
-## 3. Throughput Comparison
+## 2. Throughput Comparison
 
 | Scenario | rustls-tls ev/s | libpq ev/s | Delta | rustls-tls DML/s | libpq DML/s | Delta | Winner |
 |----------|----------:|----------:|--------:|----------:|----------:|--------:|--------|
@@ -462,7 +462,7 @@ This is the primary efficiency metric: how many DML events can each backend proc
 | Payload-2KB | 1,422 | 1,473 | -3.4% | 1,417 | 1,467 | -3.4% | **libpq** |
 | Mixed-DML | 811 | 799 | +1.5% | 804 | 793 | +1.5% | ~tie |
 
-## 4. Resource Utilization Comparison
+## 3. Resource Utilization Comparison
 
 Process CPU and RSS reflect **only the pg-walstream consumer** (generator runs as a separate OS process).
 
@@ -476,7 +476,7 @@ Process CPU and RSS reflect **only the pg-walstream consumer** (generator runs a
 | Payload-2KB | 1.5 | 1.9 | -22.9% | 17.5 | 18.7 | -6.5% | **rustls-tls** |
 | Mixed-DML | 0.4 | 0.7 | -41.0% | 17.5 | 18.8 | -6.8% | **rustls-tls** |
 
-## 5. Latency Comparison (inter-event, microseconds)
+## 4. Latency Comparison (inter-event, microseconds)
 
 | Scenario | rustls-tls P50 | libpq P50 | rustls-tls P99 | libpq P99 | Winner |
 |----------|----------:|----------:|----------:|----------:|--------|
@@ -488,7 +488,7 @@ Process CPU and RSS reflect **only the pg-walstream consumer** (generator runs a
 | Payload-2KB | 5 | 6 | 882 | 812 | **rustls-tls** |
 | Mixed-DML | 1 | 5 | 1819 | 1804 | **rustls-tls** |
 
-## 6. Stress Ramp Comparison
+## 5. Stress Ramp Comparison
 
 Progressive writer concurrency ramp — comparing throughput and CPU scaling.
 
@@ -511,6 +511,8 @@ Progressive writer concurrency ramp — comparing throughput and CPU scaling.
 | Peak CPU efficiency (DML/s per 1% CPU) | 4,749 | 1,544 |
 | Peak process CPU% | 30.9 | 96.4 |
 | Peak RSS (MB) | 17.8 | 18.8 |
+
+For a detailed comparison across PostgreSQL 16 and 18 with different optimizations (binary mode, direct TLS, COPY protocol), see the [Load Test Comparison Report](LOAD_TEST_COMPARISON.md).
 
 ## Linux VM TCP Tuning for Production
 

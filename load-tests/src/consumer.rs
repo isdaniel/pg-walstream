@@ -28,13 +28,14 @@ pub async fn run_consumer(
     let stream_config = ReplicationStreamConfig::new(
         config.slot_name.clone(),
         config.publication_name.clone(),
-        2,
-        StreamingMode::On,
+        4,
+        StreamingMode::Parallel,
         Duration::from_secs(5),
         Duration::from_secs(30),
         Duration::from_secs(60),
         RetryConfig::default(),
     )
+    .with_binary(true)
     .with_slot_options(ReplicationSlotOptions {
         temporary: true,
         ..Default::default()
