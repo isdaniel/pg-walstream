@@ -195,7 +195,7 @@ impl BufferReader {
         let data_slice = self.data.chunk();
 
         // Find the null terminator using SIMD-accelerated scanning
-        let bytes_to_read = memchr::memchr(0, data_slice).ok_or_else(|| {
+        let bytes_to_read = data_slice.iter().position(|&b| b == 0).ok_or_else(|| {
             ReplicationError::protocol("Unterminated string in buffer".to_string())
         })?;
 
