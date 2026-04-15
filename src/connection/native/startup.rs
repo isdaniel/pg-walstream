@@ -7,16 +7,16 @@
 //! 4. Authentication delegation to `auth.rs`
 //! 5. Backend parameter processing until ReadyForQuery
 
+use super::conninfo::{ConnInfo, SslMode, SslNegotiation};
+use super::wire;
+use crate::error::ReplicationError;
 use bytes::BytesMut;
+use rustls_pki_types::pem::PemObject;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
-
-use super::conninfo::{ConnInfo, SslMode, SslNegotiation};
-use super::wire;
-use crate::error::ReplicationError;
 
 /// Lazily-initialized, cached crypto provider.
 ///
@@ -482,13 +482,14 @@ fn build_root_store(sslrootcert: Option<&str>) -> Result<rustls::RootCertStore, 
             ))
         })?;
         let mut reader = std::io::BufReader::new(file);
-        let certs: Vec<_> = rustls_pemfile::certs(&mut reader)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| {
-                ReplicationError::permanent_connection(format!(
-                    "Failed to parse PEM certificates from '{path}': {e}"
-                ))
-            })?;
+        let certs: Vec<rustls_pki_types::CertificateDer<'static>> =
+            rustls_pki_types::CertificateDer::pem_reader_iter(&mut reader)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| {
+                    ReplicationError::permanent_connection(format!(
+                        "Failed to parse PEM certificates from '{path}': {e}"
+                    ))
+                })?;
         if certs.is_empty() {
             return Err(ReplicationError::permanent_connection(format!(
                 "No certificates found in sslrootcert file '{path}'"
