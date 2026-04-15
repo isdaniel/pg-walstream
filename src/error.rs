@@ -3,62 +3,89 @@
 //! This module provides error types specifically for replication protocol
 //! operations, connection handling, and message parsing.
 
-use thiserror::Error;
-
 /// Comprehensive error types for replication operations
-#[derive(Error, Debug)]
+#[derive(Debug)]
 pub enum ReplicationError {
     /// Protocol parsing errors
-    #[error("Protocol parsing error: {0}")]
     Protocol(String),
 
     /// Buffer operation errors
-    #[error("Buffer error: {0}")]
     Buffer(String),
 
     /// Connection errors that can be retried (transient)
-    #[error("Transient connection error: {0}")]
     TransientConnection(String),
 
     /// Connection errors that should not be retried (permanent)
-    #[error("Permanent connection error: {0}")]
     PermanentConnection(String),
 
     /// Replication connection errors
-    #[error("Replication connection error: {0}")]
     ReplicationConnection(String),
 
     /// Authentication errors
-    #[error("Authentication failed: {0}")]
     Authentication(String),
 
     /// Replication slot errors
-    #[error("Replication slot error: {0}")]
     ReplicationSlot(String),
 
     /// Timeout errors
-    #[error("Operation timed out: {0}")]
     Timeout(String),
 
     /// Operation cancelled errors
-    #[error("Operation was cancelled: {0}")]
     Cancelled(String),
 
     /// Configuration errors
-    #[error("Configuration error: {0}")]
     Config(String),
 
     /// IO errors
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(std::io::Error),
 
     /// String conversion errors (from CString operations)
-    #[error("String conversion error: {0}")]
-    StringConversion(#[from] std::ffi::NulError),
+    StringConversion(std::ffi::NulError),
 
     /// Generic replication errors
-    #[error("Replication error: {0}")]
     Generic(String),
+}
+
+impl std::fmt::Display for ReplicationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Protocol(msg) => write!(f, "Protocol parsing error: {msg}"),
+            Self::Buffer(msg) => write!(f, "Buffer error: {msg}"),
+            Self::TransientConnection(msg) => write!(f, "Transient connection error: {msg}"),
+            Self::PermanentConnection(msg) => write!(f, "Permanent connection error: {msg}"),
+            Self::ReplicationConnection(msg) => write!(f, "Replication connection error: {msg}"),
+            Self::Authentication(msg) => write!(f, "Authentication failed: {msg}"),
+            Self::ReplicationSlot(msg) => write!(f, "Replication slot error: {msg}"),
+            Self::Timeout(msg) => write!(f, "Operation timed out: {msg}"),
+            Self::Cancelled(msg) => write!(f, "Operation was cancelled: {msg}"),
+            Self::Config(msg) => write!(f, "Configuration error: {msg}"),
+            Self::Io(err) => write!(f, "IO error: {err}"),
+            Self::StringConversion(err) => write!(f, "String conversion error: {err}"),
+            Self::Generic(msg) => write!(f, "Replication error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for ReplicationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(err) => Some(err),
+            Self::StringConversion(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for ReplicationError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Io(err)
+    }
+}
+
+impl From<std::ffi::NulError> for ReplicationError {
+    fn from(err: std::ffi::NulError) -> Self {
+        Self::StringConversion(err)
+    }
 }
 
 impl ReplicationError {
@@ -331,5 +358,24 @@ mod tests {
 
         let err_result: Result<i32> = Err(ReplicationError::protocol("test error"));
         assert!(err_result.is_err());
+    }
+
+    #[test]
+    fn test_error_source() {
+        use std::error::Error;
+
+        // Io error should have a source
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
+        let err: ReplicationError = io_err.into();
+        assert!(err.source().is_some());
+
+        // NulError should have a source
+        let nul_err = std::ffi::CString::new("hello\0world").unwrap_err();
+        let err: ReplicationError = nul_err.into();
+        assert!(err.source().is_some());
+
+        // String variants should not have a source
+        let err = ReplicationError::protocol("test");
+        assert!(err.source().is_none());
     }
 }

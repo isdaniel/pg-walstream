@@ -470,7 +470,7 @@ fn build_tls_config(info: &ConnInfo) -> Result<rustls::ClientConfig, Replication
 ///
 /// Priority:
 /// 1. If `sslrootcert` is provided, load ONLY those CAs (exclusive).
-/// 2. Otherwise, load system CAs via `rustls-native-certs` + Mozilla bundle fallback.
+/// 2. Otherwise, load system CAs via rustls-native-certs + Mozilla bundle fallback.
 fn build_root_store(sslrootcert: Option<&str>) -> Result<rustls::RootCertStore, ReplicationError> {
     let mut store = rustls::RootCertStore::empty();
 
@@ -505,18 +505,18 @@ fn build_root_store(sslrootcert: Option<&str>) -> Result<rustls::RootCertStore, 
         return Ok(store);
     }
 
-    // 2. System CA store (best-effort, skip invalid certs)
-    let native_result = rustls_native_certs::load_native_certs();
+    // 2. System CA store via rustls-native-certs (best-effort, skip invalid certs)
+    let native_certs = rustls_native_certs::load_native_certs();
     let mut system_count = 0usize;
-    for cert in native_result.certs {
+    for cert in native_certs.certs {
         if store.add(cert).is_ok() {
             system_count += 1;
         }
     }
-    if !native_result.errors.is_empty() {
+    if !native_certs.errors.is_empty() {
         tracing::warn!(
             "Some system CA certificates could not be loaded: {:?}",
-            native_result.errors
+            native_certs.errors
         );
     }
     tracing::debug!("Loaded {system_count} system CA certificates");
