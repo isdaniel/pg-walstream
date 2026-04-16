@@ -5,7 +5,6 @@
 use super::wire;
 use crate::error::ReplicationError;
 use bytes::BytesMut;
-use std::fmt::Write;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Handle the authentication exchange after the startup message.
@@ -117,32 +116,21 @@ pub async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
 /// Compute an MD5 password hash as PostgreSQL expects:
 /// `"md5" + md5(md5(password + user) + salt)`
 fn md5_password(user: &str, password: &str, salt: &[u8]) -> String {
-    use md5::{Digest, Md5};
-
     // Step 1: md5(password + user)
-    let mut hasher = Md5::new();
-    hasher.update(password.as_bytes());
-    hasher.update(user.as_bytes());
-    let inner_hash = hasher.finalize();
-    let inner = hex_encode(&inner_hash);
+    let mut inner_data = Vec::with_capacity(password.len() + user.len());
+    inner_data.extend_from_slice(password.as_bytes());
+    inner_data.extend_from_slice(user.as_bytes());
+    let inner_hash = compute(&inner_data);
+    let inner = hex_digest(&inner_hash);
 
     // Step 2: md5(inner_hex + salt)
-    let mut hasher = Md5::new();
-    hasher.update(inner.as_bytes());
-    hasher.update(salt);
-    let outer_hash = hasher.finalize();
-    let outer = hex_encode(&outer_hash);
+    let mut outer_data = Vec::with_capacity(inner.len() + salt.len());
+    outer_data.extend_from_slice(inner.as_bytes());
+    outer_data.extend_from_slice(salt);
+    let outer_hash = compute(&outer_data);
+    let outer = hex_digest(&outer_hash);
 
     format!("md5{outer}")
-}
-
-/// Encode bytes as lowercase hex string.
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
 }
 
 /// Handle SCRAM-SHA-256 authentication using `postgres_protocol`.
@@ -335,28 +323,6 @@ mod tests {
         // PostgreSQL MD5 hash for user=test, password=test, salt=[0,0,0,0]
         let result = md5_password("test", "test", &[0, 0, 0, 0]);
         assert!(result.starts_with("md5"));
-    }
-
-    // === hex_encode ===
-
-    #[test]
-    fn test_hex_encode_empty() {
-        assert_eq!(hex_encode(&[]), "");
-    }
-
-    #[test]
-    fn test_hex_encode_known_values() {
-        assert_eq!(hex_encode(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
-    }
-
-    #[test]
-    fn test_hex_encode_zero_bytes() {
-        assert_eq!(hex_encode(&[0x00, 0x00]), "0000");
-    }
-
-    #[test]
-    fn test_hex_encode_ff() {
-        assert_eq!(hex_encode(&[0xff]), "ff");
     }
 
     // === Helper: build auth messages ===

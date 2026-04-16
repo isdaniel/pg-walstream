@@ -914,7 +914,6 @@ dependencies = [
  "futures",
  "futures-core",
  "libpq-sys",
- "md-5",
  "memchr",
  "postgres-protocol",
  "rustls",
