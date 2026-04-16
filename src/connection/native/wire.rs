@@ -185,9 +185,9 @@ pub fn build_terminate() -> BytesMut {
 /// Returns the string and the number of bytes consumed (including the null terminator).
 /// If no null terminator exists, consumes the entire slice.
 ///
-/// Scans for a null byte to delimit the string.
+/// Uses `memchr` for SIMD-accelerated null-byte scanning.
 pub fn read_cstring(data: &[u8]) -> (&str, usize) {
-    match data.iter().position(|&b| b == 0) {
+    match memchr::memchr(0, data) {
         Some(null_pos) => {
             let s = std::str::from_utf8(&data[..null_pos]).unwrap_or("");
             (s, null_pos + 1) // consume string + null byte

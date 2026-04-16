@@ -20,6 +20,7 @@ chrono = { version = "0.4.44", features = ["serde"] }
 bytes = { version = "1.11.1", features = ["serde"] }
 tracing = "0.1.44"
 futures-core = "0.3.32"
+memchr = "2.8.0"
 
 # libpq backend (default)
 libpq-sys = { version = "0.8", optional = true }
