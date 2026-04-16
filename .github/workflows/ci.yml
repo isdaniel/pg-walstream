@@ -160,7 +160,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg_version: [14, 15, 16, 17, 18]
+        # pgoutput protocol v2 (streaming in-progress transactions) requires PG 15+
+        pg_version: [15, 16, 17, 18]
 
     services:
       postgres:
@@ -253,7 +254,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg_version: [14, 15, 16, 17, 18]
+        # pgoutput protocol v2 (streaming in-progress transactions) requires PG 15+
+        pg_version: [15, 16, 17, 18]
 
     services:
       postgres:

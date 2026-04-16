@@ -166,7 +166,7 @@ fn regular_connection() -> PgReplicationConnection {
 // ─── Positive Tests ─────────────────────────────────────────────────────────
 
 /// Verify that sslmode=disable works (plain TCP, no TLS).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires live PostgreSQL with SSL enabled"]
 async fn test_ssl_disable_connection() {
     let slot = "it_ssl_disable";
@@ -189,7 +189,7 @@ async fn test_ssl_disable_connection() {
 }
 
 /// Verify that sslmode=require works (TLS without certificate verification).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires live PostgreSQL with SSL enabled"]
 async fn test_ssl_require_connection() {
     let slot = "it_ssl_require";
@@ -212,7 +212,7 @@ async fn test_ssl_require_connection() {
 }
 
 /// Verify that sslmode=prefer works (TLS preferred, fallback to plain).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires live PostgreSQL with SSL enabled"]
 async fn test_ssl_prefer_connection() {
     let slot = "it_ssl_prefer";
@@ -236,7 +236,7 @@ async fn test_ssl_prefer_connection() {
 
 /// Verify that sslmode=verify-ca works with the correct CA certificate.
 /// The server's certificate chain is validated against the provided CA.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires live PostgreSQL with SSL enabled"]
 async fn test_ssl_verify_ca_connection() {
     let slot = "it_ssl_verify_ca";
@@ -261,7 +261,7 @@ async fn test_ssl_verify_ca_connection() {
 
 /// Verify that sslmode=verify-full works with the correct CA and matching hostname.
 /// Both certificate chain and hostname (localhost matches SAN=DNS:localhost) are validated.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires live PostgreSQL with SSL enabled"]
 async fn test_ssl_verify_full_connection() {
     let slot = "it_ssl_verify_full";
@@ -288,7 +288,7 @@ async fn test_ssl_verify_full_connection() {
 
 /// Verify that sslmode=verify-ca rejects a connection when the server's cert
 /// was NOT signed by the provided CA.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires live PostgreSQL with SSL enabled"]
 async fn test_ssl_verify_ca_rejects_wrong_ca() {
     let slot = "it_ssl_wrong_ca";
@@ -312,7 +312,7 @@ async fn test_ssl_verify_ca_rejects_wrong_ca() {
 /// Verify that sslmode=verify-full rejects a connection when the hostname
 /// does not match the server certificate's SAN.
 /// The server cert has SAN=DNS:localhost but we connect to 127.0.0.1.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires live PostgreSQL with SSL enabled"]
 async fn test_ssl_verify_full_rejects_wrong_hostname() {
     let slot = "it_ssl_wrong_host";
@@ -337,7 +337,7 @@ async fn test_ssl_verify_full_rejects_wrong_hostname() {
 
 /// End-to-end test: verify that WAL events flow correctly over a fully-verified
 /// TLS connection (sslmode=verify-full).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires live PostgreSQL with SSL enabled"]
 async fn test_ssl_verify_full_streaming() {
     let slot = "it_ssl_streaming";
