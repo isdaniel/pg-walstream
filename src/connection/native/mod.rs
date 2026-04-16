@@ -4,6 +4,7 @@
 //! so that `stream.rs` works unchanged.
 
 pub(crate) mod auth;
+pub(crate) mod certs;
 pub(crate) mod connection;
 pub(crate) mod conninfo;
 pub(crate) mod copy;
