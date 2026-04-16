@@ -73,6 +73,10 @@ path = "integration-tests/safe_transaction_consumer.rs"
 name = "complex_types"
 path = "integration-tests/complex_types.rs"
 
+[[test]]
+name = "ssl_connections"
+path = "integration-tests/ssl_connections.rs"
+
 [[bench]]
 name = "wal_pipeline"
 harness = false

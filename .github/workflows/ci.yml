@@ -154,13 +154,18 @@ jobs:
         token: ${{ secrets.CODECOV_TOKEN }}
 
   integration:
-    name: Integration Tests
+    name: Integration Tests (PG ${{ matrix.pg_version }})
     runs-on: ubuntu-latest
     needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        # pgoutput protocol v2 (streaming in-progress transactions) requires PG 15+
+        pg_version: [15, 16, 17, 18]
 
     services:
       postgres:
-        image: postgres:16
+        image: postgres:${{ matrix.pg_version }}
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -242,10 +247,173 @@ jobs:
 
         cargo test --test complex_types -- --ignored --nocapture --test-threads=1
 
+  integration-ssl:
+    name: SSL Integration Tests (PG ${{ matrix.pg_version }})
+    runs-on: ubuntu-latest
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        # pgoutput protocol v2 (streaming in-progress transactions) requires PG 15+
+        pg_version: [15, 16, 17, 18]
+
+    services:
+      postgres:
+        image: postgres:${{ matrix.pg_version }}
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test_walstream
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake pkg-config libssl-dev postgresql-client
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+        key: ${{ runner.os }}-cargo-ssl-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-ssl-
+
+    - name: Generate SSL certificates
+      run: |
+        mkdir -p /tmp/pg-ssl
+
+        # Generate CA key and self-signed certificate
+        openssl req -new -x509 -days 365 -nodes \
+          -newkey rsa:2048 \
+          -keyout /tmp/pg-ssl/ca.key \
+          -out /tmp/pg-ssl/ca.crt \
+          -subj "/CN=pg-walstream-test-ca"
+
+        # Generate server key and CSR
+        openssl req -new -nodes \
+          -newkey rsa:2048 \
+          -keyout /tmp/pg-ssl/server.key \
+          -out /tmp/pg-ssl/server.csr \
+          -subj "/CN=localhost"
+
+        # Write SAN extension config to a file (avoids process substitution issues)
+        echo "subjectAltName=DNS:localhost" > /tmp/pg-ssl/server.ext
+
+        # Sign server cert with CA (SAN=DNS:localhost only, no IP SAN)
+        # This allows verify-full to succeed with localhost but fail with 127.0.0.1
+        openssl x509 -req -days 365 \
+          -in /tmp/pg-ssl/server.csr \
+          -CA /tmp/pg-ssl/ca.crt \
+          -CAkey /tmp/pg-ssl/ca.key \
+          -CAcreateserial \
+          -out /tmp/pg-ssl/server.crt \
+          -extfile /tmp/pg-ssl/server.ext
+
+        # Generate a separate "wrong" CA for negative tests
+        openssl req -new -x509 -days 365 -nodes \
+          -newkey rsa:2048 \
+          -keyout /tmp/pg-ssl/wrong-ca.key \
+          -out /tmp/pg-ssl/wrong-ca.crt \
+          -subj "/CN=wrong-ca"
+
+    - name: Verify generated certificates
+      run: |
+        echo "=== CA Certificate ==="
+        openssl x509 -in /tmp/pg-ssl/ca.crt -noout -subject -issuer
+        echo "=== Server Certificate ==="
+        openssl x509 -in /tmp/pg-ssl/server.crt -noout -subject -issuer
+        echo "=== Server Certificate SAN ==="
+        openssl x509 -in /tmp/pg-ssl/server.crt -noout -ext subjectAltName
+        echo "=== Verify server cert against CA ==="
+        openssl verify -CAfile /tmp/pg-ssl/ca.crt /tmp/pg-ssl/server.crt
+
+    - name: Configure PostgreSQL with SSL and logical replication
+      env:
+        PGPASSWORD: postgres
+      run: |
+        CONTAINER_ID=${{ job.services.postgres.id }}
+
+        # Copy certificates into the PostgreSQL container
+        docker cp /tmp/pg-ssl/server.crt $CONTAINER_ID:/var/lib/postgresql/server.crt
+        docker cp /tmp/pg-ssl/server.key $CONTAINER_ID:/var/lib/postgresql/server.key
+        docker cp /tmp/pg-ssl/ca.crt $CONTAINER_ID:/var/lib/postgresql/ca.crt
+
+        # Set proper ownership and permissions
+        docker exec $CONTAINER_ID chown postgres:postgres \
+          /var/lib/postgresql/server.crt \
+          /var/lib/postgresql/server.key \
+          /var/lib/postgresql/ca.crt
+        docker exec $CONTAINER_ID chmod 0600 /var/lib/postgresql/server.key
+
+        # Configure SSL
+        psql -h localhost -U postgres -d test_walstream -c "ALTER SYSTEM SET ssl = 'on';"
+        psql -h localhost -U postgres -d test_walstream -c "ALTER SYSTEM SET ssl_cert_file = '/var/lib/postgresql/server.crt';"
+        psql -h localhost -U postgres -d test_walstream -c "ALTER SYSTEM SET ssl_key_file = '/var/lib/postgresql/server.key';"
+        psql -h localhost -U postgres -d test_walstream -c "ALTER SYSTEM SET ssl_ca_file = '/var/lib/postgresql/ca.crt';"
+
+        # Configure logical replication
+        psql -h localhost -U postgres -d test_walstream -c "ALTER SYSTEM SET wal_level = 'logical';"
+        psql -h localhost -U postgres -d test_walstream -c "ALTER SYSTEM SET max_replication_slots = 16;"
+        psql -h localhost -U postgres -d test_walstream -c "ALTER SYSTEM SET max_wal_senders = 16;"
+
+        # Restart PostgreSQL to apply changes
+        docker restart $CONTAINER_ID
+
+        # Wait for PostgreSQL to be ready after restart
+        for i in $(seq 1 30); do
+          pg_isready -h localhost -p 5432 -U postgres && break
+          echo "Waiting for PostgreSQL after restart... ($i/30)"
+          sleep 2
+        done
+
+    - name: Verify PostgreSQL SSL and replication config
+      env:
+        PGPASSWORD: postgres
+      run: |
+        psql -h localhost -U postgres -d test_walstream -c "SHOW ssl;"
+        psql -h localhost -U postgres -d test_walstream -c "SHOW wal_level;"
+        psql -h localhost -U postgres -d test_walstream -c "SHOW max_replication_slots;"
+        psql -h localhost -U postgres -d test_walstream -c "SHOW max_wal_senders;"
+        # Verify SSL is actually working from the client side
+        PGSSLMODE=require psql -h localhost -U postgres -d test_walstream \
+          -c "SELECT ssl, version FROM pg_stat_ssl WHERE pid = pg_backend_pid();"
+
+    - name: Build SSL test binary
+      run: cargo test --test ssl_connections --no-default-features --features rustls-tls --no-run
+
+    - name: Run SSL integration tests
+      env:
+        DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/test_walstream?replication=database"
+        DATABASE_URL_REGULAR: "postgresql://postgres:postgres@localhost:5432/test_walstream"
+        SSL_CA_CERT_PATH: "/tmp/pg-ssl/ca.crt"
+        SSL_WRONG_CA_CERT_PATH: "/tmp/pg-ssl/wrong-ca.crt"
+        RUST_BACKTRACE: 1
+      run: |
+        cargo test --test ssl_connections --no-default-features --features rustls-tls -- --ignored --nocapture --test-threads=1
+
+        # Clean up any lingering replication slots between runs
+        PGPASSWORD=postgres psql -h localhost -U postgres -d test_walstream \
+          -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_type = 'logical';" || true
+
   publish:
     name: Publish to crates.io
     runs-on: ubuntu-latest
-    needs: [test, integration, coverage]
+    needs: [test, integration, integration-ssl, coverage]
     if: startsWith(github.ref, 'refs/tags/v')
 
     steps:
