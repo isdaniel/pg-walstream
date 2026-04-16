@@ -279,7 +279,7 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y cmake pkg-config libssl-dev
+        sudo apt-get install -y cmake pkg-config libssl-dev postgresql-client
 
     - name: Cache cargo registry
       uses: actions/cache@v4
@@ -309,6 +309,9 @@ jobs:
           -out /tmp/pg-ssl/server.csr \
           -subj "/CN=localhost"
 
+        # Write SAN extension config to a file (avoids process substitution issues)
+        echo "subjectAltName=DNS:localhost" > /tmp/pg-ssl/server.ext
+
         # Sign server cert with CA (SAN=DNS:localhost only, no IP SAN)
         # This allows verify-full to succeed with localhost but fail with 127.0.0.1
         openssl x509 -req -days 365 \
@@ -317,7 +320,7 @@ jobs:
           -CAkey /tmp/pg-ssl/ca.key \
           -CAcreateserial \
           -out /tmp/pg-ssl/server.crt \
-          -extfile <(echo "subjectAltName=DNS:localhost")
+          -extfile /tmp/pg-ssl/server.ext
 
         # Generate a separate "wrong" CA for negative tests
         openssl req -new -x509 -days 365 -nodes \
@@ -325,6 +328,17 @@ jobs:
           -keyout /tmp/pg-ssl/wrong-ca.key \
           -out /tmp/pg-ssl/wrong-ca.crt \
           -subj "/CN=wrong-ca"
+
+    - name: Verify generated certificates
+      run: |
+        echo "=== CA Certificate ==="
+        openssl x509 -in /tmp/pg-ssl/ca.crt -noout -subject -issuer
+        echo "=== Server Certificate ==="
+        openssl x509 -in /tmp/pg-ssl/server.crt -noout -subject -issuer
+        echo "=== Server Certificate SAN ==="
+        openssl x509 -in /tmp/pg-ssl/server.crt -noout -ext subjectAltName
+        echo "=== Verify server cert against CA ==="
+        openssl verify -CAfile /tmp/pg-ssl/ca.crt /tmp/pg-ssl/server.crt
 
     - name: Configure PostgreSQL with SSL and logical replication
       env:
@@ -373,6 +387,12 @@ jobs:
         psql -h localhost -U postgres -d test_walstream -c "SHOW wal_level;"
         psql -h localhost -U postgres -d test_walstream -c "SHOW max_replication_slots;"
         psql -h localhost -U postgres -d test_walstream -c "SHOW max_wal_senders;"
+        # Verify SSL is actually working from the client side
+        PGSSLMODE=require psql -h localhost -U postgres -d test_walstream \
+          -c "SELECT ssl, version FROM pg_stat_ssl WHERE pid = pg_backend_pid();"
+
+    - name: Build SSL test binary
+      run: cargo test --test ssl_connections --no-default-features --features rustls-tls --no-run
 
     - name: Run SSL integration tests
       env:
@@ -383,6 +403,10 @@ jobs:
         RUST_BACKTRACE: 1
       run: |
         cargo test --test ssl_connections --no-default-features --features rustls-tls -- --ignored --nocapture --test-threads=1
+
+        # Clean up any lingering replication slots between runs
+        PGPASSWORD=postgres psql -h localhost -U postgres -d test_walstream \
+          -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_type = 'logical';" || true
 
   publish:
     name: Publish to crates.io

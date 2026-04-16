@@ -51,9 +51,7 @@ fn replication_conn_string() -> String {
 /// Regular (non-replication) connection string.
 fn regular_conn_string() -> String {
     std::env::var("DATABASE_URL_REGULAR").unwrap_or_else(|_| {
-        let repl = replication_conn_string();
-        repl.replace("?replication=database", "")
-            .replace("&replication=database", "")
+        "postgresql://postgres:postgres@localhost:5432/test_walstream".to_string()
     })
 }
 
@@ -68,26 +66,59 @@ fn wrong_ca_cert_path() -> String {
         .expect("SSL_WRONG_CA_CERT_PATH must be set for SSL tests")
 }
 
+/// Append query parameters to a URL, handling both `?` and `&` delimiters.
+fn append_params(base: &str, params: &[(&str, &str)]) -> String {
+    let mut url = base.to_string();
+    for (key, value) in params {
+        let sep = if url.contains('?') { '&' } else { '?' };
+        url.push(sep);
+        url.push_str(key);
+        url.push('=');
+        url.push_str(value);
+    }
+    url
+}
+
 /// Build a replication connection string with the specified sslmode and optional sslrootcert.
 fn ssl_conn_string(sslmode: &str, sslrootcert: Option<&str>) -> String {
     let base = replication_conn_string();
-    let mut url = format!("{base}&sslmode={sslmode}");
+    let mut params: Vec<(&str, &str)> = vec![("sslmode", sslmode)];
     if let Some(cert) = sslrootcert {
-        url.push_str(&format!("&sslrootcert={cert}"));
+        params.push(("sslrootcert", cert));
     }
-    url
+    append_params(&base, &params)
 }
 
 /// Build a replication connection string connecting to a specific host
 /// (for hostname mismatch testing).
 fn ssl_conn_string_with_host(host: &str, sslmode: &str, sslrootcert: Option<&str>) -> String {
+    // Parse the base URL and replace the host portion between @ and : (or /)
     let base = replication_conn_string();
-    let replaced = base.replace("@localhost:", &format!("@{host}:"));
-    let mut url = format!("{replaced}&sslmode={sslmode}");
+
+    // Replace the host in the authority section: ...@<host>:port/...
+    // Handles both hostname and IP address formats
+    let replaced = if let Some(at_pos) = base.find('@') {
+        let after_at = &base[at_pos + 1..];
+        // Find the end of the host (either ':' for port or '/' for path)
+        let host_end = after_at
+            .find(':')
+            .or_else(|| after_at.find('/'))
+            .unwrap_or(after_at.len());
+        format!(
+            "{}{}{}",
+            &base[..at_pos + 1],
+            host,
+            &base[at_pos + 1 + host_end..]
+        )
+    } else {
+        base.clone()
+    };
+
+    let mut params: Vec<(&str, &str)> = vec![("sslmode", sslmode)];
     if let Some(cert) = sslrootcert {
-        url.push_str(&format!("&sslrootcert={cert}"));
+        params.push(("sslrootcert", cert));
     }
-    url
+    append_params(&replaced, &params)
 }
 
 fn ssl_test_config(slot_name: &str) -> ReplicationStreamConfig {
@@ -115,13 +146,21 @@ fn setup_ssl_schema(conn: &mut PgReplicationConnection) {
     let _ = conn.exec("CREATE PUBLICATION ssl_pub FOR TABLE ssl_test");
 }
 
+/// Clean up a replication slot using sslmode=prefer for SSL-enabled servers.
 fn drop_slot(slot_name: &str) {
-    if let Ok(mut conn) = PgReplicationConnection::connect(&replication_conn_string()) {
+    let conn_str = ssl_conn_string("prefer", None);
+    if let Ok(mut conn) = PgReplicationConnection::connect(&conn_str) {
         let _ = conn.exec(&format!(
             "SELECT pg_drop_replication_slot('{slot_name}') \
              WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '{slot_name}')"
         ));
     }
+}
+
+/// Get a regular connection with sslmode=prefer for SSL-enabled servers.
+fn regular_connection() -> PgReplicationConnection {
+    let conn_str = append_params(&regular_conn_string(), &[("sslmode", "prefer")]);
+    PgReplicationConnection::connect(&conn_str).expect("regular connection with sslmode=prefer")
 }
 
 // ─── Positive Tests ─────────────────────────────────────────────────────────
@@ -134,7 +173,7 @@ async fn test_ssl_disable_connection() {
     drop_slot(slot);
 
     let conn_str = ssl_conn_string("disable", None);
-    println!("Connecting with sslmode=disable");
+    println!("Connecting with sslmode=disable: {conn_str}");
 
     let config = ssl_test_config(slot);
     let mut stream = LogicalReplicationStream::new(&conn_str, config)
@@ -157,7 +196,7 @@ async fn test_ssl_require_connection() {
     drop_slot(slot);
 
     let conn_str = ssl_conn_string("require", None);
-    println!("Connecting with sslmode=require");
+    println!("Connecting with sslmode=require: {conn_str}");
 
     let config = ssl_test_config(slot);
     let mut stream = LogicalReplicationStream::new(&conn_str, config)
@@ -180,7 +219,7 @@ async fn test_ssl_prefer_connection() {
     drop_slot(slot);
 
     let conn_str = ssl_conn_string("prefer", None);
-    println!("Connecting with sslmode=prefer");
+    println!("Connecting with sslmode=prefer: {conn_str}");
 
     let config = ssl_test_config(slot);
     let mut stream = LogicalReplicationStream::new(&conn_str, config)
@@ -304,9 +343,8 @@ async fn test_ssl_verify_full_streaming() {
     let slot = "it_ssl_streaming";
     drop_slot(slot);
 
-    // Set up schema via regular connection
-    let mut regular =
-        PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
+    // Set up schema via regular connection (with sslmode=prefer for SSL-enabled server)
+    let mut regular = regular_connection();
     setup_ssl_schema(&mut regular);
 
     // Connect with verify-full
