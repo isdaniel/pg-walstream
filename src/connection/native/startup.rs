@@ -11,7 +11,7 @@ use super::conninfo::{ConnInfo, SslMode, SslNegotiation};
 use super::wire;
 use crate::error::ReplicationError;
 use bytes::BytesMut;
-use rustls_pki_types::pem::PemObject;
+use rustls::pki_types::pem::PemObject;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
@@ -482,8 +482,8 @@ fn build_root_store(sslrootcert: Option<&str>) -> Result<rustls::RootCertStore, 
             ))
         })?;
         let mut reader = std::io::BufReader::new(file);
-        let certs: Vec<rustls_pki_types::CertificateDer<'static>> =
-            rustls_pki_types::CertificateDer::pem_reader_iter(&mut reader)
+        let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+            rustls::pki_types::CertificateDer::pem_reader_iter(&mut reader)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| {
                     ReplicationError::permanent_connection(format!(

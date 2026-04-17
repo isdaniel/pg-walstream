@@ -143,7 +143,7 @@ pub enum LogicalReplicationMessage {
         flags: u8,
         lsn: XLogRecPtr,
         prefix: String,
-        content: Vec<u8>,
+        content: Bytes,
     },
 
     /// Streaming transaction start
@@ -1022,7 +1022,7 @@ impl LogicalReplicationParser {
         let lsn = reader.read_u64()?;
         let prefix = reader.read_cstring()?;
         let content_length = reader.read_u32()?;
-        let content = reader.read_bytes(content_length as usize)?;
+        let content = reader.read_bytes_buf(content_length as usize)?;
 
         debug!(
             "MESSAGE: flags={}, lsn={}, prefix={}, content_length={}",
@@ -2526,7 +2526,7 @@ mod tests {
                 assert_eq!(flags, 0x01);
                 assert_eq!(lsn, 0xF000);
                 assert_eq!(prefix, "my_prefix");
-                assert_eq!(content, b"hello");
+                assert_eq!(content.as_ref(), b"hello");
             }
             _ => panic!("Expected Message"),
         }

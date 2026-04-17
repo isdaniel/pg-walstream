@@ -266,7 +266,7 @@ impl PgReplicationConnection {
             conn,
             is_replication_conn: false,
             async_fd: None,
-            pending_messages: VecDeque::with_capacity(256),
+            pending_messages: VecDeque::with_capacity(MAX_DRAIN_BATCH),
             read_buf: BytesMut::with_capacity(READ_BUF_INITIAL_CAPACITY),
         })
     }

@@ -918,7 +918,6 @@ dependencies = [
  "postgres-protocol",
  "rustls",
  "rustls-native-certs",
- "rustls-pki-types",
  "serde",
  "socket2",
  "tokio",
