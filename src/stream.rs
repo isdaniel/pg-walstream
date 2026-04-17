@@ -46,7 +46,13 @@ pub struct LogicalReplicationStream {
     pub shared_lsn_feedback: Arc<SharedLsnFeedback>,
     /// The snapshot name exported when the replication slot was created with `EXPORT_SNAPSHOT`.
     exported_snapshot_name: Option<String>,
+    /// Counter that throttles per-event time checks inside `next_event`. We only consult `Instant::now()` once every `FEEDBACK_CHECK_EVENT_INTERVAL` events so the hot path avoids a syscall on every message.
+    feedback_check_counter: u32,
 }
+
+/// How often `next_event` consults `Instant::now()` to decide whether to send
+/// feedback. Must be a power of two so the modulo folds to a bitmask.
+const FEEDBACK_CHECK_EVENT_INTERVAL: u32 = 128;
 
 /// Configuration for the replication stream
 #[derive(Debug, Clone)]
@@ -341,6 +347,7 @@ impl LogicalReplicationStream {
             last_health_check,
             shared_lsn_feedback,
             exported_snapshot_name: None,
+            feedback_check_counter: 0,
         })
     }
 
@@ -569,8 +576,11 @@ impl LogicalReplicationStream {
                 ));
             }
 
-            // Send proactive feedback if enough time has passed
-            self.maybe_send_feedback().await;
+            // Throttle feedback checks: only consult `Instant::now()` and the shared atomic once every FEEDBACK_CHECK_EVENT_INTERVAL iterations, feedback is time-based (10s default), so skipping up to ~511 checks does not delay it perceptibly while removing a per-event syscall.
+            self.feedback_check_counter = self.feedback_check_counter.wrapping_add(1);
+            if self.feedback_check_counter & (FEEDBACK_CHECK_EVENT_INTERVAL - 1) == 0 {
+                self.maybe_send_feedback().await;
+            }
 
             // Get data from replication stream (returns Bytes for zero-copy)
             let data = self
@@ -800,9 +810,7 @@ impl LogicalReplicationStream {
 
     /// Process a WAL data message (zero-copy: uses Bytes slicing)
     fn process_wal_message(&mut self, data: impl Into<Bytes>) -> Result<Option<ChangeEvent>> {
-        let data = data.into();
-        // Use BufferReader with zero-copy Bytes
-        let mut reader = BufferReader::from_bytes(data.clone());
+        let data: Bytes = data.into();
 
         // Check minimum message length (1 + 8 + 8 + 8 = 25 bytes)
         if data.len() < 25 {
@@ -810,6 +818,9 @@ impl LogicalReplicationStream {
                 "WAL message too short".to_string(),
             ));
         }
+
+        // Use BufferReader with zero-copy Bytes (ref-counted, no data copy)
+        let mut reader = BufferReader::from_bytes(data);
 
         // Skip the message type ('w')
         let _msg_type = reader.skip_message_type()?;
@@ -886,18 +897,7 @@ impl LogicalReplicationStream {
                     false
                 };
 
-                let relation_info = RelationInfo::new(
-                    relation_id,
-                    namespace.clone(),
-                    relation_name.clone(),
-                    replica_identity,
-                    columns.clone(),
-                );
-
-                self.state.add_relation(relation_info);
-
                 if schema_changed {
-                    // Convert u8 replica_identity to ReplicaIdentity enum
                     let ri = ReplicaIdentity::from_byte(replica_identity)
                         .unwrap_or(ReplicaIdentity::Default);
                     let relation_columns = columns
@@ -909,6 +909,14 @@ impl LogicalReplicationStream {
                             is_key: c.is_key(),
                         })
                         .collect();
+                    let relation_info = RelationInfo::new(
+                        relation_id,
+                        namespace.clone(),
+                        relation_name.clone(),
+                        replica_identity,
+                        columns,
+                    );
+                    self.state.add_relation(relation_info);
                     ChangeEvent::relation(
                         relation_id,
                         namespace,
@@ -918,6 +926,14 @@ impl LogicalReplicationStream {
                         Lsn::new(lsn),
                     )
                 } else {
+                    let relation_info = RelationInfo::new(
+                        relation_id,
+                        namespace,
+                        relation_name,
+                        replica_identity,
+                        columns,
+                    );
+                    self.state.add_relation(relation_info);
                     return Ok(None);
                 }
             }
@@ -1186,7 +1202,7 @@ impl LogicalReplicationStream {
                     flags,
                     Lsn::new(msg_lsn),
                     Arc::<str>::from(prefix.as_str()),
-                    Bytes::from(content),
+                    content,
                     Lsn::new(lsn),
                 )
             }
@@ -2209,6 +2225,46 @@ mod tests {
         // Trying to update to a lower LSN should not change it
         state.update_received_lsn(500);
         assert_eq!(state.last_received_lsn, 2000);
+    }
+
+    #[test]
+    fn test_feedback_check_interval_is_power_of_two() {
+        // The hot-path gate folds `counter % INTERVAL` into a bitmask via
+        // `counter & (INTERVAL - 1)`, which is only correct when INTERVAL
+        // is a power of two and non-zero.
+        assert!(FEEDBACK_CHECK_EVENT_INTERVAL > 0);
+        assert_eq!(
+            FEEDBACK_CHECK_EVENT_INTERVAL & (FEEDBACK_CHECK_EVENT_INTERVAL - 1),
+            0,
+            "FEEDBACK_CHECK_EVENT_INTERVAL must be a power of two"
+        );
+    }
+
+    #[test]
+    fn test_feedback_check_counter_initialized_zero() {
+        let config = create_test_config();
+        let stream = create_test_stream(config);
+        assert_eq!(stream.feedback_check_counter, 0);
+    }
+
+    #[test]
+    fn test_feedback_check_gate_semantics() {
+        // The gate fires when `(counter + 1) & (INTERVAL - 1) == 0`, i.e. at
+        // event numbers INTERVAL, 2*INTERVAL, 3*INTERVAL, ...
+        let interval = FEEDBACK_CHECK_EVENT_INTERVAL;
+        let mut counter: u32 = 0;
+        let mut fire_events = Vec::new();
+        for event_idx in 1..=(interval * 3) {
+            counter = counter.wrapping_add(1);
+            if counter & (interval - 1) == 0 {
+                fire_events.push(event_idx);
+            }
+        }
+        assert_eq!(
+            fire_events,
+            vec![interval, interval * 2, interval * 3],
+            "gate should fire exactly on multiples of the interval"
+        );
     }
 
     #[test]
@@ -3914,6 +3970,7 @@ mod tests {
             last_health_check: Instant::now(),
             shared_lsn_feedback: SharedLsnFeedback::new_shared(),
             exported_snapshot_name: None,
+            feedback_check_counter: 0,
         }
     }
 
@@ -5225,7 +5282,7 @@ mod tests {
             flags: 1,
             lsn: 0x6000,
             prefix: "test_prefix".to_string(),
-            content: b"hello world".to_vec(),
+            content: Bytes::from_static(b"hello world"),
         });
 
         let result = stream.convert_to_change_event(msg, 0x500).unwrap();
