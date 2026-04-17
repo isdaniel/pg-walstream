@@ -88,6 +88,19 @@ Then add to `Cargo.toml`:
 pg_walstream = { version = "0.5.1", default-features = false, features = ["rustls-tls"] }
 ```
 
+#### TLS trust store
+
+When `sslmode` is `verify-ca` or `verify-full`, the `rustls-tls` backend builds its root certificate store as follows:
+
+1. If `sslrootcert` is set, it loads **only** those CAs from the PEM file (exclusive).
+2. Otherwise, it loads the [Mozilla CA bundle](https://wiki.mozilla.org/CA/Included_Certificates) shipped via `webpki-roots`.
+
+The OS trust store is **not** consulted. If your PostgreSQL server is signed by a corporate/internal CA that is only present in the OS trust store (e.g. `/etc/ssl/certs`), you must point `sslrootcert` at that CA explicitly — for example:
+
+```text
+postgresql://user:pass@host/db?sslmode=verify-full&sslrootcert=/etc/ssl/certs/corporate-ca.pem
+```
+
 ## Quick Start
 
 ### Logical Replication - Stream API

@@ -11,7 +11,7 @@ use super::conninfo::{ConnInfo, SslMode, SslNegotiation};
 use super::wire;
 use crate::error::ReplicationError;
 use bytes::BytesMut;
-use rustls_pki_types::pem::PemObject;
+use rustls::pki_types::pem::PemObject;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
@@ -470,7 +470,7 @@ fn build_tls_config(info: &ConnInfo) -> Result<rustls::ClientConfig, Replication
 ///
 /// Priority:
 /// 1. If `sslrootcert` is provided, load ONLY those CAs (exclusive).
-/// 2. Otherwise, load system CAs via rustls-native-certs + Mozilla bundle fallback.
+/// 2. Otherwise, load the bundled Mozilla CA set via `webpki-roots`.
 fn build_root_store(sslrootcert: Option<&str>) -> Result<rustls::RootCertStore, ReplicationError> {
     let mut store = rustls::RootCertStore::empty();
 
@@ -482,8 +482,8 @@ fn build_root_store(sslrootcert: Option<&str>) -> Result<rustls::RootCertStore, 
             ))
         })?;
         let mut reader = std::io::BufReader::new(file);
-        let certs: Vec<rustls_pki_types::CertificateDer<'static>> =
-            rustls_pki_types::CertificateDer::pem_reader_iter(&mut reader)
+        let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+            rustls::pki_types::CertificateDer::pem_reader_iter(&mut reader)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| {
                     ReplicationError::permanent_connection(format!(
@@ -505,23 +505,7 @@ fn build_root_store(sslrootcert: Option<&str>) -> Result<rustls::RootCertStore, 
         return Ok(store);
     }
 
-    // 2. System CA store via rustls-native-certs (best-effort, skip invalid certs)
-    let native_certs = rustls_native_certs::load_native_certs();
-    let mut system_count = 0usize;
-    for cert in native_certs.certs {
-        if store.add(cert).is_ok() {
-            system_count += 1;
-        }
-    }
-    if !native_certs.errors.is_empty() {
-        tracing::warn!(
-            "Some system CA certificates could not be loaded: {:?}",
-            native_certs.errors
-        );
-    }
-    tracing::debug!("Loaded {system_count} system CA certificates");
-
-    // 3. Mozilla bundle (always add as fallback)
+    // 2. Mozilla CA bundle via webpki-roots
     store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
     Ok(store)
@@ -860,9 +844,9 @@ mod tests {
     fn test_build_root_store_default() {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-        // No sslrootcert → should load system + Mozilla CAs
+        // No sslrootcert → should load Mozilla CA bundle
         let store = build_root_store(None).unwrap();
-        // Mozilla bundle alone has 100+ certs, so we should have at least that
+        // Mozilla bundle has 100+ certs
         assert!(store.len() > 50, "Expected many CAs, got {}", store.len());
     }
 
@@ -878,7 +862,7 @@ mod tests {
         std::fs::write(&pem_path, pem_content).unwrap();
 
         let store = build_root_store(Some(pem_path.to_str().unwrap())).unwrap();
-        // Should contain ONLY the certs from our file, not system/Mozilla
+        // Should contain ONLY the certs from our file, not the Mozilla bundle
         assert!(
             store.len() >= 1,
             "Expected at least 1 CA from custom file, got {}",
@@ -900,6 +884,67 @@ mod tests {
         assert!(
             err.contains("sslrootcert"),
             "Error should mention sslrootcert: {err}"
+        );
+    }
+
+    #[test]
+    fn test_build_root_store_empty_pem_file() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+        let dir = std::env::temp_dir().join("pg_walstream_test_empty");
+        std::fs::create_dir_all(&dir).unwrap();
+        let pem_path = dir.join("empty.pem");
+        std::fs::write(&pem_path, b"").unwrap();
+
+        let result = build_root_store(Some(pem_path.to_str().unwrap()));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("No certificates found"),
+            "Error should mention no certs: {err}"
+        );
+
+        let _ = std::fs::remove_file(&pem_path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_build_root_store_malformed_pem_file() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+        let dir = std::env::temp_dir().join("pg_walstream_test_bad");
+        std::fs::create_dir_all(&dir).unwrap();
+        let pem_path = dir.join("bad.pem");
+        // Valid PEM frame around garbage base64 payload — tickles the parse-error branch.
+        std::fs::write(
+            &pem_path,
+            b"-----BEGIN CERTIFICATE-----\nnot-valid-base64-or-der!!!\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+
+        let result = build_root_store(Some(pem_path.to_str().unwrap()));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.to_lowercase().contains("pem") || err.contains("sslrootcert"),
+            "Error should mention PEM/sslrootcert: {err}"
+        );
+
+        let _ = std::fs::remove_file(&pem_path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_build_root_store_default_uses_webpki_roots() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+        // The default path must return exactly the Mozilla bundle size — this guards
+        // against accidentally reintroducing a system-CA loader.
+        let store = build_root_store(None).unwrap();
+        assert_eq!(
+            store.len(),
+            webpki_roots::TLS_SERVER_ROOTS.len(),
+            "Default root store should contain exactly the Mozilla bundle"
         );
     }
 

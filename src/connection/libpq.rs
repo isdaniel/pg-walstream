@@ -113,7 +113,11 @@ enum DrainResult {
 const MAX_DRAIN_BATCH: usize = 4096;
 
 /// Initial capacity for the reusable read buffer.
-const READ_BUF_INITIAL_CAPACITY: usize = 64 * 1024;
+///
+/// Sized to hold several typical WAL frames without reallocation. Larger than
+/// 64 KiB to amortize `PQgetCopyData` → `BytesMut::put_slice` copies under
+/// bulk WAL traffic.
+const READ_BUF_INITIAL_CAPACITY: usize = 256 * 1024;
 
 /// Safe wrapper around PostgreSQL connection for replication
 ///
@@ -266,7 +270,7 @@ impl PgReplicationConnection {
             conn,
             is_replication_conn: false,
             async_fd: None,
-            pending_messages: VecDeque::with_capacity(256),
+            pending_messages: VecDeque::with_capacity(MAX_DRAIN_BATCH),
             read_buf: BytesMut::with_capacity(READ_BUF_INITIAL_CAPACITY),
         })
     }

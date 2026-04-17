@@ -22,9 +22,12 @@ use crate::types::{
     SlotType, XLogRecPtr, INVALID_XLOG_REC_PTR,
 };
 
-/// Initial capacity for the read buffer (64 KiB).
+/// Initial capacity for the read buffer (256 KiB).
+///
+/// Sized to absorb bursts of WAL frames without reallocating the backing
+/// `BytesMut`. Increased from 64 KiB for bulk WAL throughput.
 #[allow(dead_code)]
-const READ_BUF_INITIAL_CAPACITY: usize = 64 * 1024;
+const READ_BUF_INITIAL_CAPACITY: usize = 256 * 1024;
 
 /// Run an async future synchronously, handling both "inside a runtime" and
 /// "outside a runtime" contexts. When called from within a tokio runtime,
