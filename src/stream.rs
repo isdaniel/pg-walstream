@@ -52,7 +52,7 @@ pub struct LogicalReplicationStream {
 
 /// How often `next_event` consults `Instant::now()` to decide whether to send
 /// feedback. Must be a power of two so the modulo folds to a bitmask.
-const FEEDBACK_CHECK_EVENT_INTERVAL: u32 = 512;
+const FEEDBACK_CHECK_EVENT_INTERVAL: u32 = 128;
 
 /// Configuration for the replication stream
 #[derive(Debug, Clone)]
@@ -897,18 +897,7 @@ impl LogicalReplicationStream {
                     false
                 };
 
-                let relation_info = RelationInfo::new(
-                    relation_id,
-                    namespace.clone(),
-                    relation_name.clone(),
-                    replica_identity,
-                    columns.clone(),
-                );
-
-                self.state.add_relation(relation_info);
-
                 if schema_changed {
-                    // Convert u8 replica_identity to ReplicaIdentity enum
                     let ri = ReplicaIdentity::from_byte(replica_identity)
                         .unwrap_or(ReplicaIdentity::Default);
                     let relation_columns = columns
@@ -920,6 +909,14 @@ impl LogicalReplicationStream {
                             is_key: c.is_key(),
                         })
                         .collect();
+                    let relation_info = RelationInfo::new(
+                        relation_id,
+                        namespace.clone(),
+                        relation_name.clone(),
+                        replica_identity,
+                        columns,
+                    );
+                    self.state.add_relation(relation_info);
                     ChangeEvent::relation(
                         relation_id,
                         namespace,
@@ -929,6 +926,14 @@ impl LogicalReplicationStream {
                         Lsn::new(lsn),
                     )
                 } else {
+                    let relation_info = RelationInfo::new(
+                        relation_id,
+                        namespace,
+                        relation_name,
+                        replica_identity,
+                        columns,
+                    );
+                    self.state.add_relation(relation_info);
                     return Ok(None);
                 }
             }

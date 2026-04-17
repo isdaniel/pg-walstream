@@ -3,8 +3,8 @@
 //! Based on [RFC 1321](https://www.ietf.org/rfc/rfc1321.txt).
 //! Only used for the PostgreSQL MD5 authentication handshake.
 
-/// Compute the MD5 digest of the given data, returning the 16-byte hash.
-pub(crate) fn compute(data: &[u8]) -> [u8; 16] {
+#[cfg(test)]
+fn compute(data: &[u8]) -> [u8; 16] {
     let mut ctx = Context::new();
     ctx.consume(data);
     ctx.finalize()
@@ -304,8 +304,8 @@ mod tests {
         let input = b"1234567890123456789012345678901234567890123456789012345";
         assert_eq!(input.len(), 55);
         let digest = compute(input);
-        // Verified against reference implementation
-        assert_eq!(hex_digest(&digest), "c9ccf168f46840a4adea67ca940b06c9");
+        // Verified against `md5sum`.
+        assert_eq!(hex_digest(&digest), "c9ccf168914a1bcfc3229f1948e67da0");
     }
 
     /// Verify 56-byte input (padding boundary edge case: needs extra block).
@@ -314,8 +314,8 @@ mod tests {
         let input = b"12345678901234567890123456789012345678901234567890123456";
         assert_eq!(input.len(), 56);
         let digest = compute(input);
-        // Verified against reference implementation
-        assert_eq!(hex_digest(&digest), "a2b28d37eaa2801d5d78ecbd47cb50d2");
+        // Verified against `md5sum`.
+        assert_eq!(hex_digest(&digest), "49f193adce178490e34d1b3a4ec0064c");
     }
 
     #[test]
@@ -332,7 +332,7 @@ mod tests {
     fn test_large_data() {
         let data = vec![0u8; 1024 * 1024];
         let digest = compute(&data);
-        assert_eq!(hex_digest(&digest), "b6d81b360a5672d80c27430f39571b33");
+        assert_eq!(hex_digest(&digest), "b6d81b360a5672d80c27430f39153e2c");
     }
 
     /// PostgreSQL MD5 password hash simulation.
