@@ -5,6 +5,11 @@ edition = "2021"
 publish = false
 description = "Polling-based PostgreSQL WAL streaming example"
 
+[features]
+default = ["libpq"]
+libpq = ["pg_walstream/libpq"]
+rustls-tls = ["pg_walstream/rustls-tls"]
+
 [dependencies]
 pg_walstream = { path = "../.." }
 tokio-util = { version = "0.7.18", features = ["compat"] }

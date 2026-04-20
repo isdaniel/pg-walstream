@@ -5,6 +5,11 @@ edition = "2021"
 publish = false
 description = "Demonstrates running LogicalReplicationStream inside tokio::spawn (Send-safe)"
 
+[features]
+default = ["libpq"]
+libpq = ["pg_walstream/libpq"]
+rustls-tls = ["pg_walstream/rustls-tls"]
+
 [dependencies]
 pg_walstream = { path = "../.." }
 tracing = "0.1.44"

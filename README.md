@@ -33,26 +33,35 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-pg_walstream = "0.6.0"
+pg_walstream = "0.6.1"
 ```
 
-By default, this uses the `libpq` backend (C FFI). For a **pure-Rust** build with no system dependencies:
+By default, this uses the `libpq` backend (C FFI). To switch to a **pure-Rust** build:
 
 ```toml
 [dependencies]
-pg_walstream = { version = "0.6.0", default-features = false, features = ["rustls-tls"] }
+pg_walstream = { version = "0.6.1", features = ["rustls-tls"] }
+```
+
+When `rustls-tls` is enabled alongside the default `libpq`, `rustls-tls` takes priority automatically — no need to set `default-features = false`.
+
+For a fully pure-Rust build with **no system dependencies** (avoids building `libpq-sys` entirely):
+
+```toml
+[dependencies]
+pg_walstream = { version = "0.6.1", default-features = false, features = ["rustls-tls"] }
 ```
 
 ## Feature Flags
 
-pg-walstream provides two mutually exclusive connection backends, selected at compile time:
+pg-walstream provides two connection backends, selected at compile time. When both are enabled, `rustls-tls` takes priority:
 
 | Feature | Default | C Dependencies | Description |
 |---------|---------|----------------|-------------|
 | `libpq` | Yes | `libpq-dev`, `libclang-dev` | Uses PostgreSQL's C client library via FFI. Battle-tested, supports all auth methods natively. |
-| `rustls-tls` | No | `cmake`, `gcc` (build-time only) | Pure-Rust implementation using `rustls` with `aws-lc-rs` crypto backend for hardware-accelerated TLS. No runtime C dependencies. |
+| `rustls-tls` | No | `cmake`, `gcc` (build-time only) | Pure-Rust implementation using `rustls` with `aws-lc-rs` crypto backend for hardware-accelerated TLS. No runtime C dependencies. Takes priority when both features are enabled. |
 
-> **Note:** Enabling both features simultaneously will cause a compile error.
+> **Note:** At least one feature must be enabled. Building with no backend features will produce a compile error.
 
 ## System Dependencies
 
@@ -85,7 +94,7 @@ sudo apt-get install cmake gcc
 Then add to `Cargo.toml`:
 
 ```toml
-pg_walstream = { version = "0.5.1", default-features = false, features = ["rustls-tls"] }
+pg_walstream = { version = "0.6.1", features = ["rustls-tls"] }
 ```
 
 #### TLS trust store

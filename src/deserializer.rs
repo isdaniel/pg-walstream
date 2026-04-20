@@ -2830,4 +2830,797 @@ mod tests {
             assert_eq!(parse_pg_bool(s.as_bytes()), None, "input: {s}");
         }
     }
+
+    // -- parse_int_signed edge cases -------------------------------------------
+
+    #[test]
+    fn test_parse_int_signed_leading_plus() {
+        use crate::deserializer::parse_int_signed;
+        assert_eq!(parse_int_signed::<i32>(b"+42"), Some(42));
+        assert_eq!(parse_int_signed::<i64>(b"+0"), Some(0));
+    }
+
+    #[test]
+    fn test_parse_int_signed_bare_sign_rejected() {
+        use crate::deserializer::parse_int_signed;
+        assert_eq!(parse_int_signed::<i32>(b"+"), None);
+        assert_eq!(parse_int_signed::<i32>(b"-"), None);
+    }
+
+    #[test]
+    fn test_parse_int_signed_empty() {
+        use crate::deserializer::parse_int_signed;
+        assert_eq!(parse_int_signed::<i32>(b""), None);
+    }
+
+    #[test]
+    fn test_parse_int_signed_non_digit() {
+        use crate::deserializer::parse_int_signed;
+        assert_eq!(parse_int_signed::<i32>(b"12a3"), None);
+        assert_eq!(parse_int_signed::<i32>(b"abc"), None);
+    }
+
+    #[test]
+    fn test_parse_int_signed_overflow() {
+        use crate::deserializer::parse_int_signed;
+        // i8 range is -128..=127
+        assert_eq!(parse_int_signed::<i8>(b"128"), None);
+        assert_eq!(parse_int_signed::<i8>(b"-129"), None);
+        assert_eq!(parse_int_signed::<i8>(b"127"), Some(127));
+        assert_eq!(parse_int_signed::<i8>(b"-128"), Some(-128));
+    }
+
+    #[test]
+    fn test_parse_int_signed_i64_boundaries() {
+        use crate::deserializer::parse_int_signed;
+        assert_eq!(
+            parse_int_signed::<i64>(b"9223372036854775807"),
+            Some(i64::MAX)
+        );
+        assert_eq!(
+            parse_int_signed::<i64>(b"-9223372036854775808"),
+            Some(i64::MIN)
+        );
+        // overflow
+        assert_eq!(parse_int_signed::<i64>(b"9223372036854775808"), None);
+    }
+
+    // -- parse_int_unsigned edge cases -----------------------------------------
+
+    #[test]
+    fn test_parse_int_unsigned_leading_plus() {
+        use crate::deserializer::parse_int_unsigned;
+        assert_eq!(parse_int_unsigned::<u32>(b"+42"), Some(42));
+    }
+
+    #[test]
+    fn test_parse_int_unsigned_bare_plus_rejected() {
+        use crate::deserializer::parse_int_unsigned;
+        assert_eq!(parse_int_unsigned::<u32>(b"+"), None);
+    }
+
+    #[test]
+    fn test_parse_int_unsigned_empty() {
+        use crate::deserializer::parse_int_unsigned;
+        assert_eq!(parse_int_unsigned::<u32>(b""), None);
+    }
+
+    #[test]
+    fn test_parse_int_unsigned_negative_rejected() {
+        use crate::deserializer::parse_int_unsigned;
+        assert_eq!(parse_int_unsigned::<u32>(b"-1"), None);
+    }
+
+    #[test]
+    fn test_parse_int_unsigned_non_digit() {
+        use crate::deserializer::parse_int_unsigned;
+        assert_eq!(parse_int_unsigned::<u32>(b"12a3"), None);
+    }
+
+    #[test]
+    fn test_parse_int_unsigned_overflow() {
+        use crate::deserializer::parse_int_unsigned;
+        // u8 max = 255
+        assert_eq!(parse_int_unsigned::<u8>(b"256"), None);
+        assert_eq!(parse_int_unsigned::<u8>(b"255"), Some(255));
+        // u64 overflow
+        assert_eq!(parse_int_unsigned::<u64>(b"18446744073709551616"), None);
+    }
+
+    // -- ChangeEvent::deserialize_data for all non-DML types -------------------
+
+    #[test]
+    fn test_deserialize_data_commit_errors() {
+        let ts = chrono::Utc::now();
+        let event = ChangeEvent::commit(ts, Lsn::new(100), Lsn::new(200), Lsn::new(200));
+        let result: crate::error::Result<UserModel> = event.deserialize_data();
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("commit"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_deserialize_data_stream_start_errors() {
+        let event = ChangeEvent {
+            event_type: crate::types::EventType::StreamStart {
+                transaction_id: 1,
+                first_segment: true,
+            },
+            lsn: Lsn::new(100),
+            metadata: None,
+        };
+        let result: crate::error::Result<UserModel> = event.deserialize_data();
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("stream_start"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_deserialize_data_stream_stop_errors() {
+        let event = ChangeEvent {
+            event_type: crate::types::EventType::StreamStop,
+            lsn: Lsn::new(100),
+            metadata: None,
+        };
+        let result: crate::error::Result<UserModel> = event.deserialize_data();
+        assert!(result.is_err());
+    }
+
+    // -- ChangeEvent::deserialize_update deserialization failures ---------------
+
+    #[test]
+    fn test_deserialize_update_old_data_parse_error() {
+        let old = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("not_a_number")),
+            ("username", ColumnValue::text("alice")),
+        ]);
+        let new = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("1")),
+            ("username", ColumnValue::text("bob")),
+        ]);
+        let event = ChangeEvent::update(
+            "public",
+            "users",
+            1,
+            Some(old),
+            new,
+            ReplicaIdentity::Full,
+            vec![Arc::from("id")],
+            Lsn::new(200),
+        );
+        let result: crate::error::Result<(Option<UserModel>, UserModel)> =
+            event.deserialize_update();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_deserialize_update_new_data_parse_error() {
+        let new = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("not_a_number")),
+            ("username", ColumnValue::text("bob")),
+        ]);
+        let event = ChangeEvent::update(
+            "public",
+            "users",
+            1,
+            None,
+            new,
+            ReplicaIdentity::Default,
+            vec![Arc::from("id")],
+            Lsn::new(200),
+        );
+        let result: crate::error::Result<(Option<UserModel>, UserModel)> =
+            event.deserialize_update();
+        assert!(result.is_err());
+    }
+
+    // -- Lenient mode: binary enum errors (structural) -------------------------
+
+    #[test]
+    fn test_try_enum_binary_errors() {
+        let row = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("1")),
+            (
+                "status",
+                ColumnValue::binary_bytes(Bytes::from_static(b"Active")),
+            ),
+        ]);
+        let r = row.try_deserialize_into::<WithEnum>();
+        assert!(r.is_err());
+    }
+
+    // -- Lenient mode: binary bool default false and reports -------------------
+
+    #[test]
+    fn test_try_binary_bool_uses_false_and_reports() {
+        #[derive(Debug, Deserialize)]
+        struct S {
+            flag: bool,
+        }
+        let row = RowData::from_pairs(vec![(
+            "flag",
+            ColumnValue::binary_bytes(Bytes::from_static(&[1])),
+        )]);
+        let r = row.try_deserialize_into::<S>().unwrap();
+        assert!(!r.value.flag);
+        assert_eq!(r.errors.len(), 1);
+        assert!(r.errors[0].message.contains("binary"));
+    }
+
+    // -- Lenient mode: null bool default false and reports ---------------------
+
+    #[test]
+    fn test_try_null_bool_uses_false_and_reports() {
+        #[derive(Debug, Deserialize)]
+        struct S {
+            flag: bool,
+        }
+        let row = RowData::from_pairs(vec![("flag", ColumnValue::Null)]);
+        let r = row.try_deserialize_into::<S>().unwrap();
+        assert!(!r.value.flag);
+        assert_eq!(r.errors.len(), 1);
+        assert!(r.errors[0].message.contains("NULL"));
+    }
+
+    // -- Lenient mode: binary char defaults to '\0' and reports ----------------
+
+    #[test]
+    fn test_try_binary_char_uses_null_char() {
+        #[derive(Debug, Deserialize)]
+        struct S {
+            c: char,
+        }
+        let row = RowData::from_pairs(vec![(
+            "c",
+            ColumnValue::binary_bytes(Bytes::from_static(b"A")),
+        )]);
+        let r = row.try_deserialize_into::<S>().unwrap();
+        assert_eq!(r.value.c, '\0');
+        assert_eq!(r.errors.len(), 1);
+    }
+
+    // -- Lenient mode: null char defaults to '\0' and reports ------------------
+
+    #[test]
+    fn test_try_null_char_uses_null_char() {
+        #[derive(Debug, Deserialize)]
+        struct S {
+            c: char,
+        }
+        let row = RowData::from_pairs(vec![("c", ColumnValue::Null)]);
+        let r = row.try_deserialize_into::<S>().unwrap();
+        assert_eq!(r.value.c, '\0');
+        assert_eq!(r.errors.len(), 1);
+    }
+
+    // -- Lenient mode: overflow defaults to 0 and reports ----------------------
+
+    #[test]
+    fn test_try_signed_overflow_defaults_to_zero() {
+        #[derive(Debug, Deserialize)]
+        struct S {
+            v: i8,
+        }
+        let row = RowData::from_pairs(vec![("v", ColumnValue::text("99999"))]);
+        let r = row.try_deserialize_into::<S>().unwrap();
+        assert_eq!(r.value.v, 0);
+        assert_eq!(r.errors.len(), 1);
+    }
+
+    #[test]
+    fn test_try_unsigned_overflow_defaults_to_zero() {
+        #[derive(Debug, Deserialize)]
+        struct S {
+            v: u8,
+        }
+        let row = RowData::from_pairs(vec![("v", ColumnValue::text("999"))]);
+        let r = row.try_deserialize_into::<S>().unwrap();
+        assert_eq!(r.value.v, 0);
+        assert_eq!(r.errors.len(), 1);
+    }
+
+    // -- Lenient mode: float invalid default to 0.0 ----------------------------
+
+    #[test]
+    fn test_try_float_invalid_defaults_to_zero() {
+        #[derive(Debug, Deserialize)]
+        struct S {
+            a: f32,
+            b: f64,
+        }
+        let row = RowData::from_pairs(vec![
+            ("a", ColumnValue::text("not_float")),
+            ("b", ColumnValue::text("also_bad")),
+        ]);
+        let r = row.try_deserialize_into::<S>().unwrap();
+        assert_eq!(r.value.a, 0.0);
+        assert_eq!(r.value.b, 0.0);
+        assert_eq!(r.errors.len(), 2);
+    }
+
+    // -- Lenient mode: binary for string defaults to empty ---------------------
+
+    #[test]
+    fn test_try_binary_string_uses_empty() {
+        #[derive(Debug, Deserialize)]
+        struct S {
+            name: String,
+        }
+        let row = RowData::from_pairs(vec![(
+            "name",
+            ColumnValue::binary_bytes(Bytes::from_static(b"data")),
+        )]);
+        let r = row.try_deserialize_into::<S>().unwrap();
+        assert_eq!(r.value.name, "");
+        assert_eq!(r.errors.len(), 1);
+        assert!(r.errors[0].message.contains("binary"));
+    }
+
+    // -- Lenient mode: unit_struct on non-null reports -------------------------
+
+    #[test]
+    fn test_try_unit_struct_on_non_null_reports() {
+        #[derive(Debug, Deserialize)]
+        struct Marker;
+        #[derive(Debug, Deserialize)]
+        struct S {
+            #[allow(dead_code)]
+            m: Marker,
+        }
+        let row = RowData::from_pairs(vec![("m", ColumnValue::text("x"))]);
+        let r = row.try_deserialize_into::<S>().unwrap();
+        assert_eq!(r.errors.len(), 1);
+        assert_eq!(r.errors[0].field, "m");
+    }
+
+    // -- Lenient mode: byte_buf null uses empty --------------------------------
+
+    #[test]
+    fn test_try_byte_buf_null_uses_empty() {
+        #[derive(Debug, Deserialize)]
+        struct S {
+            #[serde(with = "serde_bytes")]
+            data: Vec<u8>,
+        }
+        let row = RowData::from_pairs(vec![("data", ColumnValue::Null)]);
+        let r = row.try_deserialize_into::<S>().unwrap();
+        assert!(r.value.data.is_empty());
+        assert_eq!(r.errors.len(), 1);
+    }
+
+    // -- Lenient mode: HashMap deserialization (any path) ----------------------
+
+    #[test]
+    fn test_try_hashmap_passes_through_any() {
+        use std::collections::HashMap;
+        let row = RowData::from_pairs(vec![
+            ("a", ColumnValue::text("hello")),
+            ("b", ColumnValue::Null),
+        ]);
+        let r = row
+            .try_deserialize_into::<HashMap<String, Option<String>>>()
+            .unwrap();
+        assert_eq!(r.value.get("a").unwrap(), &Some("hello".to_string()));
+        assert_eq!(r.value.get("b").unwrap(), &None);
+        assert!(r.is_clean());
+    }
+
+    // -- RowData from_pairs preserves order ------------------------------------
+
+    #[test]
+    fn test_from_pairs_preserves_column_order() {
+        let row = RowData::from_pairs(vec![
+            ("z", ColumnValue::text("1")),
+            ("a", ColumnValue::text("2")),
+            ("m", ColumnValue::text("3")),
+        ]);
+        let names: Vec<&str> = row.iter().map(|(k, _)| k.as_ref()).collect();
+        assert_eq!(names, vec!["z", "a", "m"]);
+    }
+
+    // -- RowData get returns None for missing column ---------------------------
+
+    #[test]
+    fn test_row_data_get_missing_column() {
+        let row = RowData::from_pairs(vec![("id", ColumnValue::text("1"))]);
+        assert!(row.get("nonexistent").is_none());
+    }
+
+    // -- RowData default and is_empty -----------------------------------------
+
+    #[test]
+    fn test_row_data_default_empty() {
+        let row = RowData::default();
+        assert!(row.is_empty());
+        assert_eq!(row.len(), 0);
+    }
+
+    // -- Leading plus sign in integer fields ----------------------------------
+
+    #[test]
+    fn test_positive_sign_prefix_accepted() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct S {
+            signed: i32,
+            unsigned: u32,
+        }
+        let row = RowData::from_pairs(vec![
+            ("signed", ColumnValue::text("+42")),
+            ("unsigned", ColumnValue::text("+100")),
+        ]);
+        let v: S = row.deserialize_into().unwrap();
+        assert_eq!(v.signed, 42);
+        assert_eq!(v.unsigned, 100);
+    }
+
+    // -- Zero values ----------------------------------------------------------
+
+    #[test]
+    fn test_zero_values_all_numeric() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct S {
+            a: i32,
+            b: u32,
+            c: f64,
+        }
+        let row = RowData::from_pairs(vec![
+            ("a", ColumnValue::text("0")),
+            ("b", ColumnValue::text("0")),
+            ("c", ColumnValue::text("0.0")),
+        ]);
+        let v: S = row.deserialize_into().unwrap();
+        assert_eq!(v.a, 0);
+        assert_eq!(v.b, 0);
+        assert_eq!(v.c, 0.0);
+    }
+
+    // -- Float special values -------------------------------------------------
+
+    #[test]
+    fn test_float_inf_and_nan() {
+        #[derive(Debug, Deserialize)]
+        struct S {
+            a: f64,
+            b: f64,
+            c: f64,
+        }
+        let row = RowData::from_pairs(vec![
+            ("a", ColumnValue::text("inf")),
+            ("b", ColumnValue::text("-inf")),
+            ("c", ColumnValue::text("NaN")),
+        ]);
+        let v: S = row.deserialize_into().unwrap();
+        assert!(v.a.is_infinite() && v.a > 0.0);
+        assert!(v.b.is_infinite() && v.b < 0.0);
+        assert!(v.c.is_nan());
+    }
+
+    // -- Large column count ---------------------------------------------------
+
+    #[test]
+    fn test_large_column_count_struct() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct S {
+            #[serde(default)]
+            c1: u32,
+            #[serde(default)]
+            c2: u32,
+            #[serde(default)]
+            c3: u32,
+            #[serde(default)]
+            c4: u32,
+            #[serde(default)]
+            c5: u32,
+        }
+        let mut pairs = Vec::new();
+        for i in 1..=5 {
+            pairs.push((
+                format!("c{i}").leak() as &str,
+                ColumnValue::text(Box::leak(i.to_string().into_boxed_str()) as &str),
+            ));
+        }
+        // add 20 extra columns that should be ignored
+        for i in 6..=25 {
+            pairs.push((
+                format!("extra_{i}").leak() as &str,
+                ColumnValue::text("ignored"),
+            ));
+        }
+        let row = RowData::from_pairs(pairs);
+        let v: S = row.deserialize_into().unwrap();
+        assert_eq!((v.c1, v.c2, v.c3, v.c4, v.c5), (1, 2, 3, 4, 5));
+    }
+
+    // -- ChangeEvent event_type_str coverage ----------------------------------
+
+    #[test]
+    fn test_event_type_str_all_variants() {
+        let ts = chrono::Utc::now();
+
+        let insert = ChangeEvent::insert("public", "t", 1, RowData::new(), Lsn::new(1));
+        assert_eq!(insert.event_type_str(), "insert");
+
+        let delete = ChangeEvent::delete(
+            "public",
+            "t",
+            1,
+            RowData::new(),
+            ReplicaIdentity::Full,
+            vec![],
+            Lsn::new(2),
+        );
+        assert_eq!(delete.event_type_str(), "delete");
+
+        let update = ChangeEvent::update(
+            "public",
+            "t",
+            1,
+            None,
+            RowData::new(),
+            ReplicaIdentity::Default,
+            vec![],
+            Lsn::new(3),
+        );
+        assert_eq!(update.event_type_str(), "update");
+
+        let begin = ChangeEvent::begin(1, Lsn::new(4), ts, Lsn::new(4));
+        assert_eq!(begin.event_type_str(), "begin");
+
+        let commit = ChangeEvent::commit(ts, Lsn::new(5), Lsn::new(5), Lsn::new(6));
+        assert_eq!(commit.event_type_str(), "commit");
+
+        let truncate = ChangeEvent::truncate(vec![Arc::from("t")], Lsn::new(7));
+        assert_eq!(truncate.event_type_str(), "truncate");
+    }
+
+    // -- Lenient mode: binary bytes no error -----------------------------------
+
+    #[test]
+    fn test_try_binary_bytes_ok_no_error() {
+        #[derive(Debug, Deserialize)]
+        struct S {
+            #[serde(with = "serde_bytes")]
+            data: Vec<u8>,
+        }
+        let row = RowData::from_pairs(vec![(
+            "data",
+            ColumnValue::binary_bytes(Bytes::from_static(&[0xCA, 0xFE])),
+        )]);
+        let r = row.try_deserialize_into::<S>().unwrap();
+        assert_eq!(r.value.data, vec![0xCA, 0xFE]);
+        assert!(r.is_clean());
+    }
+
+    // -- Lenient mode: text bytes ok -------------------------------------------
+
+    #[test]
+    fn test_try_text_bytes_ok_no_error() {
+        #[derive(Debug, Deserialize)]
+        struct S {
+            #[serde(with = "serde_bytes")]
+            data: Vec<u8>,
+        }
+        let row = RowData::from_pairs(vec![("data", ColumnValue::text("hello"))]);
+        let r = row.try_deserialize_into::<S>().unwrap();
+        assert_eq!(r.value.data, b"hello");
+        assert!(r.is_clean());
+    }
+
+    // -- Strict mode: float parse error ----------------------------------------
+
+    #[test]
+    fn test_strict_float_parse_error() {
+        #[derive(Debug, Deserialize)]
+        struct S {
+            #[allow(dead_code)]
+            v: f64,
+        }
+        let row = RowData::from_pairs(vec![("v", ColumnValue::text("not_float"))]);
+        let result: crate::error::Result<S> = row.deserialize_into();
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("not_float"), "got: {msg}");
+    }
+
+    // -- Strict mode: binary for char errors -----------------------------------
+
+    #[test]
+    fn test_strict_binary_char_errors() {
+        #[derive(Debug, Deserialize)]
+        struct S {
+            #[allow(dead_code)]
+            c: char,
+        }
+        let row = RowData::from_pairs(vec![(
+            "c",
+            ColumnValue::binary_bytes(Bytes::from_static(b"A")),
+        )]);
+        let result: crate::error::Result<S> = row.deserialize_into();
+        assert!(result.is_err());
+    }
+
+    // -- Strict mode: null for char errors -------------------------------------
+
+    #[test]
+    fn test_strict_null_char_errors() {
+        #[derive(Debug, Deserialize)]
+        struct S {
+            #[allow(dead_code)]
+            c: char,
+        }
+        let row = RowData::from_pairs(vec![("c", ColumnValue::Null)]);
+        let result: crate::error::Result<S> = row.deserialize_into();
+        assert!(result.is_err());
+    }
+
+    // -- RowData encode/decode round trip --------------------------------------
+
+    #[test]
+    fn test_row_data_encode_decode_round_trip() {
+        use crate::buffer::BufferReader;
+        use bytes::BytesMut;
+
+        let original = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("42")),
+            ("name", ColumnValue::text("alice")),
+            (
+                "data",
+                ColumnValue::binary_bytes(Bytes::from_static(&[1, 2, 3])),
+            ),
+            ("empty", ColumnValue::Null),
+        ]);
+
+        let mut buf = BytesMut::new();
+        original.encode(&mut buf);
+
+        let frozen = buf.freeze();
+        let mut reader = BufferReader::new(&frozen);
+        let decoded = RowData::decode(&mut reader).unwrap();
+
+        assert_eq!(original, decoded);
+    }
+
+    // -- RowData with_capacity and push ----------------------------------------
+
+    #[test]
+    fn test_row_data_with_capacity_push() {
+        let mut row = RowData::with_capacity(3);
+        assert!(row.is_empty());
+        row.push(Arc::from("a"), ColumnValue::text("1"));
+        row.push(Arc::from("b"), ColumnValue::text("2"));
+        assert_eq!(row.len(), 2);
+        assert_eq!(row.get("a").and_then(|v| v.as_str()), Some("1"));
+        assert_eq!(row.get("b").and_then(|v| v.as_str()), Some("2"));
+    }
+
+    // -- deserialize_data works for Update (returns new_data) ------------------
+
+    #[test]
+    fn test_deserialize_data_update_returns_new() {
+        let old = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("1")),
+            ("username", ColumnValue::text("old_name")),
+        ]);
+        let new = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("1")),
+            ("username", ColumnValue::text("new_name")),
+        ]);
+        let event = ChangeEvent::update(
+            "public",
+            "users",
+            1,
+            Some(old),
+            new,
+            ReplicaIdentity::Full,
+            vec![],
+            Lsn::new(200),
+        );
+        let user: UserModel = event.deserialize_data().unwrap();
+        assert_eq!(user.username, "new_name");
+    }
+
+    // -- Lenient mode: lenient any with binary/invalid-utf8/null ---------------
+
+    #[test]
+    fn test_try_lenient_any_binary_via_bytebuf() {
+        use std::collections::HashMap;
+        let row = RowData::from_pairs(vec![(
+            "blob",
+            ColumnValue::binary_bytes(Bytes::from_static(&[0xAA, 0xBB])),
+        )]);
+        let r = row
+            .try_deserialize_into::<HashMap<String, serde_bytes::ByteBuf>>()
+            .unwrap();
+        assert_eq!(r.value.get("blob").unwrap().as_ref(), &[0xAA, 0xBB]);
+        assert!(r.is_clean());
+    }
+
+    #[test]
+    fn test_try_lenient_any_invalid_utf8_via_bytebuf() {
+        use std::collections::HashMap;
+        let row = RowData::from_pairs(vec![(
+            "blob",
+            ColumnValue::Text(Bytes::from_static(&[0xFF, 0xFE])),
+        )]);
+        let r = row
+            .try_deserialize_into::<HashMap<String, serde_bytes::ByteBuf>>()
+            .unwrap();
+        assert_eq!(r.value.get("blob").unwrap().as_ref(), &[0xFF, 0xFE]);
+    }
+
+    #[test]
+    fn test_try_lenient_any_null_via_option_hashmap() {
+        use std::collections::HashMap;
+        let row = RowData::from_pairs(vec![
+            ("k", ColumnValue::text("v")),
+            ("n", ColumnValue::Null),
+        ]);
+        let r = row
+            .try_deserialize_into::<HashMap<String, Option<String>>>()
+            .unwrap();
+        assert_eq!(r.value.get("k").unwrap(), &Some("v".to_string()));
+        assert_eq!(r.value.get("n").unwrap(), &None);
+    }
+
+    // -- Lenient mode: enum with binary produces structural error ---------------
+
+    #[test]
+    fn test_try_lenient_enum_binary_structural_error() {
+        #[derive(Debug, Deserialize)]
+        enum E {
+            #[allow(dead_code)]
+            A,
+        }
+        #[derive(Debug, Deserialize)]
+        struct S {
+            #[allow(dead_code)]
+            e: E,
+        }
+        let row = RowData::from_pairs(vec![(
+            "e",
+            ColumnValue::binary_bytes(Bytes::from_static(b"A")),
+        )]);
+        let r = row.try_deserialize_into::<S>();
+        assert!(r.is_err());
+    }
+
+    // -- serde(deny_unknown_fields) works correctly ----------------------------
+
+    #[test]
+    fn test_deny_unknown_fields() {
+        #[derive(Debug, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Strict {
+            #[allow(dead_code)]
+            id: u32,
+        }
+        let row = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("1")),
+            ("extra", ColumnValue::text("oops")),
+        ]);
+        let result: crate::error::Result<Strict> = row.deserialize_into();
+        assert!(result.is_err());
+    }
+
+    // -- Multiple serde attributes combined ------------------------------------
+
+    #[test]
+    fn test_combined_serde_attributes() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct S {
+            #[serde(rename = "user_id")]
+            id: u32,
+            #[serde(default)]
+            score: f64,
+            name: Option<String>,
+        }
+        let row = RowData::from_pairs(vec![
+            ("user_id", ColumnValue::text("42")),
+            ("name", ColumnValue::Null),
+        ]);
+        let v: S = row.deserialize_into().unwrap();
+        assert_eq!(v.id, 42);
+        assert_eq!(v.score, 0.0);
+        assert_eq!(v.name, None);
+    }
 }
