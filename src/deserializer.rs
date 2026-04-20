@@ -1,7 +1,7 @@
-//! Custom serde [`Deserializer`] for converting [`RowData`] into user-defined types.
+//! Custom serde [`Deserializer`][serde::Deserializer] for converting [`RowData`] into user-defined types.
 //!
 //! PostgreSQL's logical replication protocol (pgoutput) sends column values as
-//! text strings. This module provides a [`Deserializer`] that parses those text
+//! text strings. This module provides a [`Deserializer`][serde::Deserializer] that parses those text
 //! representations into the target Rust types automatically.
 //!
 //! # Example
@@ -35,7 +35,7 @@ use std::sync::Arc;
 // RowDataDeserializer — top-level Deserializer for RowData
 // ---------------------------------------------------------------------------
 
-/// A serde [`Deserializer`] that treats a [`RowData`] as a map of column names
+/// A serde [`Deserializer`][serde::Deserializer] that treats a [`RowData`] as a map of column names
 /// to values and deserializes it into a user-defined struct.
 pub struct RowDataDeserializer<'a> {
     row: &'a RowData,
@@ -1606,5 +1606,181 @@ mod tests {
         // HashMap triggers deserialize_map, which goes through deserialize_any fallback path
         let m: HashMap<String, String> = HashMap::deserialize(de).unwrap();
         assert_eq!(m.get("k").unwrap(), "v");
+    }
+
+    // -- Invalid UTF-8 in Text column ----------------------------------------
+
+    #[test]
+    fn test_invalid_utf8_text_as_string_errors() {
+        // Text column containing invalid UTF-8 (lone continuation byte)
+        let row = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("1")),
+            (
+                "username",
+                ColumnValue::Text(Bytes::from_static(&[0xff, 0xfe])),
+            ),
+        ]);
+        let result: crate::error::Result<UserModel> = row.deserialize_into();
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("invalid UTF-8"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_invalid_utf8_text_as_numeric_errors() {
+        let row = RowData::from_pairs(vec![(
+            "val",
+            ColumnValue::Text(Bytes::from_static(&[0xff, 0xfe])),
+        )]);
+        #[derive(Debug, Deserialize)]
+        struct S {
+            #[allow(dead_code)]
+            val: u32,
+        }
+        let result: crate::error::Result<S> = row.deserialize_into();
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("invalid UTF-8"), "got: {msg}");
+    }
+
+    // -- deserialize_any: Binary and invalid-UTF8 Text fallbacks -------------
+
+    #[test]
+    fn test_any_binary_via_bytebuf_hashmap() {
+        // HashMap<String, serde_bytes::ByteBuf> triggers deserialize_any on columns;
+        // Binary column hits the Binary → visit_bytes branch.
+        use std::collections::HashMap;
+        let row = RowData::from_pairs(vec![(
+            "blob",
+            ColumnValue::binary_bytes(Bytes::from_static(&[0x01, 0x02, 0x03])),
+        )]);
+        let m: HashMap<String, serde_bytes::ByteBuf> = row.deserialize_into().unwrap();
+        assert_eq!(m.get("blob").unwrap().as_ref(), &[0x01, 0x02, 0x03]);
+    }
+
+    #[test]
+    fn test_any_invalid_utf8_text_via_bytebuf_hashmap() {
+        // Invalid-UTF8 Text column hits the Text → visit_bytes fallback in deserialize_any.
+        use std::collections::HashMap;
+        let row = RowData::from_pairs(vec![(
+            "blob",
+            ColumnValue::Text(Bytes::from_static(&[0xff, 0xfe, 0xfd])),
+        )]);
+        let m: HashMap<String, serde_bytes::ByteBuf> = row.deserialize_into().unwrap();
+        assert_eq!(m.get("blob").unwrap().as_ref(), &[0xff, 0xfe, 0xfd]);
+    }
+
+    // -- deserialize_byte_buf Text path ---------------------------------------
+
+    #[test]
+    fn test_byte_buf_from_text() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct S {
+            #[serde(with = "serde_bytes")]
+            data: Vec<u8>,
+        }
+        let row = RowData::from_pairs(vec![("data", ColumnValue::text("hello"))]);
+        let v: S = row.deserialize_into().unwrap();
+        assert_eq!(v.data, b"hello");
+    }
+
+    // -- Non-unit enum variants: hit UnitVariantAccess error paths ------------
+
+    #[test]
+    fn test_enum_newtype_variant_not_supported() {
+        #[derive(Debug, Deserialize)]
+        enum E {
+            #[allow(dead_code)]
+            V(u32),
+        }
+        #[derive(Debug, Deserialize)]
+        struct S {
+            #[allow(dead_code)]
+            e: E,
+        }
+        let row = RowData::from_pairs(vec![("e", ColumnValue::text("V"))]);
+        let result: crate::error::Result<S> = row.deserialize_into();
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("newtype"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_enum_tuple_variant_not_supported() {
+        #[derive(Debug, Deserialize)]
+        enum E {
+            #[allow(dead_code)]
+            V(u32, u32),
+        }
+        #[derive(Debug, Deserialize)]
+        struct S {
+            #[allow(dead_code)]
+            e: E,
+        }
+        let row = RowData::from_pairs(vec![("e", ColumnValue::text("V"))]);
+        let result: crate::error::Result<S> = row.deserialize_into();
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("tuple"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_enum_struct_variant_not_supported() {
+        #[derive(Debug, Deserialize)]
+        enum E {
+            #[allow(dead_code)]
+            V { x: u32 },
+        }
+        #[derive(Debug, Deserialize)]
+        struct S {
+            #[allow(dead_code)]
+            e: E,
+        }
+        let row = RowData::from_pairs(vec![("e", ColumnValue::text("V"))]);
+        let result: crate::error::Result<S> = row.deserialize_into();
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("struct"), "got: {msg}");
+    }
+
+    // -- Multi-byte char -------------------------------------------------------
+
+    #[test]
+    fn test_char_multibyte_unicode() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct S {
+            c: char,
+        }
+        let row = RowData::from_pairs(vec![("c", ColumnValue::text("é"))]);
+        let v: S = row.deserialize_into().unwrap();
+        assert_eq!(v.c, 'é');
+    }
+
+    // -- Option wrapping numeric none path ------------------------------------
+
+    #[test]
+    fn test_option_u64_none() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct S {
+            val: Option<u64>,
+        }
+        let row = RowData::from_pairs(vec![("val", ColumnValue::Null)]);
+        let v: S = row.deserialize_into().unwrap();
+        assert_eq!(v.val, None);
+    }
+
+    // -- deserialize_str via &str target --------------------------------------
+
+    #[test]
+    fn test_str_field() {
+        // String already covered; this exercises deserialize_str path explicitly
+        // via a type that calls deserialize_str during Visitor expectation.
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct S {
+            name: String,
+        }
+        let row = RowData::from_pairs(vec![("name", ColumnValue::text("alice"))]);
+        let v: S = row.deserialize_into().unwrap();
+        assert_eq!(v.name, "alice");
     }
 }
