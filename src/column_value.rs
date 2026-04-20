@@ -397,6 +397,100 @@ impl RowData {
         self.columns.iter().map(|(k, v)| (k, v))
     }
 
+    /// Access the underlying column slice (crate-internal).
+    #[inline]
+    pub(crate) fn as_columns(&self) -> &[(Arc<str>, ColumnValue)] {
+        &self.columns
+    }
+
+    /// Deserialize this row into a user-defined type.
+    ///
+    /// PostgreSQL sends column values as text strings via the pgoutput plugin.
+    /// This method parses those text values into the fields of `T` using serde
+    /// deserialization with automatic text-to-type coercion.
+    ///
+    /// # Type Coercion
+    ///
+    /// | PostgreSQL text | Rust type |
+    /// |---|---|
+    /// | `"42"` | `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64` |
+    /// | `"3.14"` | `f32`, `f64` |
+    /// | `"t"` / `"f"` | `bool` |
+    /// | `"hello"` | `String` |
+    /// | NULL | `Option<T>` (yields `None`) |
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use pg_walstream::{RowData, ColumnValue};
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(Deserialize)]
+    /// struct User {
+    ///     id: u32,
+    ///     name: String,
+    /// }
+    ///
+    /// let row = RowData::from_pairs(vec![
+    ///     ("id", ColumnValue::text("42")),
+    ///     ("name", ColumnValue::text("Alice")),
+    /// ]);
+    ///
+    /// let user: User = row.deserialize_into().unwrap();
+    /// assert_eq!(user.id, 42);
+    /// assert_eq!(user.name, "Alice");
+    /// ```
+    pub fn deserialize_into<T: serde::de::DeserializeOwned>(&self) -> crate::error::Result<T> {
+        T::deserialize(crate::deserializer::RowDataDeserializer::new(self))
+    }
+
+    /// Lenient deserialization: returns a [`TryDeserializeResult`] whose `value`
+    /// always contains a populated `T` (with per-type defaults substituted for
+    /// columns that fail to parse) and whose `errors` lists every failing field.
+    ///
+    /// Use this when you want to process partial rows — e.g. log bad columns
+    /// or quarantine rows that exceed an error threshold, while still getting
+    /// the successfully-parsed columns of `T`.
+    ///
+    /// Substituted defaults on field-level failure:
+    /// - numeric types → `0`
+    /// - `bool` → `false`
+    /// - `String` / `&str` → `""`
+    /// - `char` → `'\0'`
+    /// - `Option<T>` → `None` when the column is NULL; otherwise inner parse is attempted
+    /// - bytes / byte_buf → empty slice
+    ///
+    /// Structural errors (unsupported shapes like nested structs / sequences)
+    /// and enum-variant mismatches still return an outer `Err`.
+    ///
+    /// [`TryDeserializeResult`]: crate::TryDeserializeResult
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use pg_walstream::{RowData, ColumnValue};
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(Deserialize)]
+    /// struct User { id: u32, score: i32 }
+    ///
+    /// let row = RowData::from_pairs(vec![
+    ///     ("id", ColumnValue::text("42")),
+    ///     ("score", ColumnValue::text("not_a_number")),
+    /// ]);
+    ///
+    /// let result = row.try_deserialize_into::<User>().unwrap();
+    /// assert_eq!(result.value.id, 42);
+    /// assert_eq!(result.value.score, 0); // default substituted
+    /// assert_eq!(result.errors.len(), 1);
+    /// assert_eq!(result.errors[0].field, "score");
+    /// ```
+    pub fn try_deserialize_into<T: serde::de::DeserializeOwned>(
+        &self,
+    ) -> crate::error::Result<crate::deserializer::TryDeserializeResult<T>> {
+        crate::deserializer::try_deserialize_row(self)
+    }
+
     /// Construct from `(&str, ColumnValue)` pairs — handy for tests and literals.
     #[inline]
     pub fn from_pairs(pairs: Vec<(&str, ColumnValue)>) -> Self {
