@@ -71,6 +71,10 @@ name = "complex_types"
 path = "integration-tests/complex_types.rs"
 
 [[test]]
+name = "typed_deserialization"
+path = "integration-tests/typed_deserialization.rs"
+
+[[test]]
 name = "ssl_connections"
 path = "integration-tests/ssl_connections.rs"
 

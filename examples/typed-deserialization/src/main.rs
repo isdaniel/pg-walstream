@@ -359,12 +359,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 5. Event loop — call next_event() and deserialize into User structs
     loop {
-        match tokio::time::timeout(Duration::from_secs(15), event_stream.next_event()).await {
-            Ok(Ok(event)) => {
+        match event_stream.next_event().await {
+            Ok(event) => {
                 match &event.event_type {
-                    // ---------------------------------------------------------
-                    // INSERT — deserialize into User
-                    // ---------------------------------------------------------
                     EventType::Insert { table, .. } => {
                         match event.deserialize_insert::<User>() {
                             Ok(user) => {
@@ -378,9 +375,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    // ---------------------------------------------------------
-                    // UPDATE — deserialize old and new into User
-                    // ---------------------------------------------------------
                     EventType::Update { table, .. } => {
                         match event.deserialize_update::<User>() {
                             Ok((old_user, new_user)) => {
@@ -395,9 +389,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    // ---------------------------------------------------------
-                    // DELETE — deserialize old row into User
-                    // ---------------------------------------------------------
                     EventType::Delete { table, .. } => {
                         match event.deserialize_delete::<User>() {
                             Ok(user) => {
@@ -428,15 +419,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 event_stream.update_applied_lsn(event.lsn.value());
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 if matches!(e, pg_walstream::ReplicationError::Cancelled(_)) {
                     break;
                 }
                 eprintln!("Stream error: {e}");
-                break;
-            }
-            Err(_) => {
-                println!("\nNo more events (15s timeout). Shutting down.");
                 break;
             }
         }
