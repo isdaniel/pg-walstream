@@ -397,6 +397,53 @@ impl RowData {
         self.columns.iter().map(|(k, v)| (k, v))
     }
 
+    /// Access the underlying column slice (crate-internal).
+    #[inline]
+    pub(crate) fn as_columns(&self) -> &[(Arc<str>, ColumnValue)] {
+        &self.columns
+    }
+
+    /// Deserialize this row into a user-defined type.
+    ///
+    /// PostgreSQL sends column values as text strings via the pgoutput plugin.
+    /// This method parses those text values into the fields of `T` using serde
+    /// deserialization with automatic text-to-type coercion.
+    ///
+    /// # Type Coercion
+    ///
+    /// | PostgreSQL text | Rust type |
+    /// |---|---|
+    /// | `"42"` | `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64` |
+    /// | `"3.14"` | `f32`, `f64` |
+    /// | `"t"` / `"f"` | `bool` |
+    /// | `"hello"` | `String` |
+    /// | NULL | `Option<T>` (yields `None`) |
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use pg_walstream::{RowData, ColumnValue};
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(Deserialize)]
+    /// struct User {
+    ///     id: u32,
+    ///     name: String,
+    /// }
+    ///
+    /// let row = RowData::from_pairs(vec![
+    ///     ("id", ColumnValue::text("42")),
+    ///     ("name", ColumnValue::text("Alice")),
+    /// ]);
+    ///
+    /// let user: User = row.deserialize_into().unwrap();
+    /// assert_eq!(user.id, 42);
+    /// assert_eq!(user.name, "Alice");
+    /// ```
+    pub fn deserialize_into<T: serde::de::DeserializeOwned>(&self) -> crate::error::Result<T> {
+        T::deserialize(crate::deserializer::RowDataDeserializer::new(self))
+    }
+
     /// Construct from `(&str, ColumnValue)` pairs — handy for tests and literals.
     #[inline]
     pub fn from_pairs(pairs: Vec<(&str, ColumnValue)>) -> Self {

@@ -125,6 +125,7 @@
 // Core modules
 pub mod buffer;
 pub mod column_value;
+pub mod deserializer;
 pub mod error;
 pub mod types;
 
@@ -145,6 +146,9 @@ pub use lsn::SharedLsnFeedback;
 
 // Re-export column value types
 pub use column_value::{ColumnValue, RowData};
+
+// Re-export deserializer
+pub use deserializer::RowDataDeserializer;
 
 // Re-export type aliases and utilities
 pub use types::{

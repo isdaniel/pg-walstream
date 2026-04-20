@@ -44,6 +44,9 @@ pub enum ReplicationError {
 
     /// Generic replication errors
     Generic(String),
+
+    /// Deserialization errors (when converting RowData to user types)
+    Deserialize(String),
 }
 
 impl std::fmt::Display for ReplicationError {
@@ -62,6 +65,7 @@ impl std::fmt::Display for ReplicationError {
             Self::Io(err) => write!(f, "IO error: {err}"),
             Self::StringConversion(err) => write!(f, "String conversion error: {err}"),
             Self::Generic(msg) => write!(f, "Replication error: {msg}"),
+            Self::Deserialize(msg) => write!(f, "Deserialization error: {msg}"),
         }
     }
 }
@@ -85,6 +89,12 @@ impl From<std::io::Error> for ReplicationError {
 impl From<std::ffi::NulError> for ReplicationError {
     fn from(err: std::ffi::NulError) -> Self {
         Self::StringConversion(err)
+    }
+}
+
+impl serde::de::Error for ReplicationError {
+    fn custom<T: std::fmt::Display>(msg: T) -> Self {
+        ReplicationError::Deserialize(msg.to_string())
     }
 }
 
@@ -147,6 +157,11 @@ impl ReplicationError {
     /// Create a new generic error
     pub fn generic<S: Into<String>>(msg: S) -> Self {
         ReplicationError::Generic(msg.into())
+    }
+
+    /// Create a new deserialization error
+    pub fn deserialize<S: Into<String>>(msg: S) -> Self {
+        ReplicationError::Deserialize(msg.into())
     }
 
     /// Check if the error is transient (can be retried)
@@ -377,5 +392,48 @@ mod tests {
         // String variants should not have a source
         let err = ReplicationError::protocol("test");
         assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn test_deserialize_error() {
+        let err = ReplicationError::deserialize("field type mismatch");
+        match err {
+            ReplicationError::Deserialize(msg) => assert_eq!(msg, "field type mismatch"),
+            _ => panic!("Expected Deserialize error"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_error_display() {
+        let err = ReplicationError::deserialize("cannot parse 'abc' as u32");
+        assert_eq!(
+            err.to_string(),
+            "Deserialization error: cannot parse 'abc' as u32"
+        );
+    }
+
+    #[test]
+    fn test_deserialize_error_classification() {
+        let err = ReplicationError::deserialize("test");
+        assert!(!err.is_transient());
+        assert!(!err.is_permanent());
+        assert!(!err.is_cancelled());
+    }
+
+    #[test]
+    fn test_deserialize_error_source() {
+        use std::error::Error;
+        let err = ReplicationError::deserialize("test");
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn test_serde_de_error_custom() {
+        use serde::de::Error;
+        let err = ReplicationError::custom("serde custom error");
+        match err {
+            ReplicationError::Deserialize(msg) => assert_eq!(msg, "serde custom error"),
+            _ => panic!("Expected Deserialize error from serde::de::Error::custom"),
+        }
     }
 }
