@@ -5,10 +5,6 @@ edition = "2021"
 publish = false
 description = "Demonstrates external arbitrary generation for pg_walstream types (no internal changes needed)"
 
-[features]
-default = ["libpq"]
-libpq = ["pg_walstream/libpq"]
-rustls-tls = ["pg_walstream/rustls-tls"]
 
 [dependencies]
 pg_walstream = { path = "../.." }

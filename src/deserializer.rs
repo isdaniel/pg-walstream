@@ -3312,19 +3312,20 @@ mod tests {
             #[serde(default)]
             c5: u32,
         }
-        let mut pairs = Vec::new();
+        let mut names: Vec<String> = Vec::new();
+        let mut values: Vec<String> = Vec::new();
         for i in 1..=5 {
-            pairs.push((
-                format!("c{i}").leak() as &str,
-                ColumnValue::text(Box::leak(i.to_string().into_boxed_str()) as &str),
-            ));
+            names.push(format!("c{i}"));
+            values.push(i.to_string());
+        }
+        let mut pairs: Vec<(&str, ColumnValue)> = Vec::new();
+        for i in 0..5 {
+            pairs.push((&names[i], ColumnValue::text(&values[i])));
         }
         // add 20 extra columns that should be ignored
-        for i in 6..=25 {
-            pairs.push((
-                format!("extra_{i}").leak() as &str,
-                ColumnValue::text("ignored"),
-            ));
+        let extra_names: Vec<String> = (6..=25).map(|i| format!("extra_{i}")).collect();
+        for name in &extra_names {
+            pairs.push((name, ColumnValue::text("ignored")));
         }
         let row = RowData::from_pairs(pairs);
         let v: S = row.deserialize_into().unwrap();

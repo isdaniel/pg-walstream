@@ -127,7 +127,7 @@ async fn read_stream_action(
             }
             result = &mut read_fut => {
                 match result {
-                    Ok(data) => StreamAction::Data(data),
+                    Ok(data) => StreamAction::Data(data.to_vec()),
                     Err(e) => {
                         let err_msg = e.to_string();
                         if err_msg.contains("COPY ended") {

@@ -5,11 +5,6 @@ edition = "2021"
 publish = false
 description = "Safe transaction consumer example with ordered commit processing"
 
-[features]
-default = ["libpq"]
-libpq = ["pg_walstream/libpq"]
-rustls-tls = ["pg_walstream/rustls-tls"]
-
 [dependencies]
 pg_walstream = { path = "../.." }
 tracing = "0.1"
