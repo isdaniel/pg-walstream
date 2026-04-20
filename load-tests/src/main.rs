@@ -17,7 +17,7 @@ use std::time::Duration;
 
 #[cfg(feature = "rustls-tls")]
 const BACKEND_LABEL: &str = "rustls-tls";
-#[cfg(feature = "libpq")]
+#[cfg(all(feature = "libpq", not(feature = "rustls-tls")))]
 const BACKEND_LABEL: &str = "libpq";
 
 // ─── Configuration ──────────────────────────────────────────────────────────

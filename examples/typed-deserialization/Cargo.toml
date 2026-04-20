@@ -6,12 +6,12 @@ publish = false
 description = "Demonstrates deserializing WAL events into user-defined Rust structs from a live PostgreSQL database"
 
 [features]
-default = ["rustls-tls"]
-rustls-tls = ["pg_walstream/rustls-tls", "dep:rustls"]
+default = ["libpq"]
 libpq = ["pg_walstream/libpq"]
+rustls-tls = ["pg_walstream/rustls-tls", "dep:rustls"]
 
 [dependencies]
-pg_walstream = { path = "../..", default-features = false }
+pg_walstream = { path = "../.." }
 rustls = { version = "0.23.38", default-features = false, features = ["aws_lc_rs"], optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 tokio = { version = "1.51.1", features = ["full"] }
