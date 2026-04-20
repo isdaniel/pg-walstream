@@ -52,6 +52,7 @@ rustls-tls = [
 tokio = { version = "1.51.1", features = ["full"] }
 criterion = { version = "0.8.2", features = ["html_reports"] }
 futures = "0.3.32"
+serde_bytes = "0.11.19"
 
 [[test]]
 name = "snapshot_export"

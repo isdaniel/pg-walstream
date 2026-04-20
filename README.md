@@ -23,9 +23,9 @@ A high-performance Rust library for PostgreSQL logical and physical replication 
 - **Thread-Safe LSN Tracking**: Atomic LSN feedback for producer-consumer patterns
 - **Connection Management**: Built-in connection handling with exponential backoff retry logic
 - **Type-Safe API**: Strongly typed message parsing with comprehensive error handling
+- **Typed Row Deserialization**: Built-in `serde` deserializer maps WAL rows directly into user-defined Rust structs (numerics, `bool`, `String`, `Option<T>`, enums, bytes)
 - **Replication Slot Management**: Create, alter, read, and drop slots with full option support
 - **Hot Standby Feedback**: Send hot standby feedback messages for physical replication
-- **`Send`-Safe Streams**: `LogicalReplicationStream` is `Send`, compatible with `tokio::spawn`
 
 ## Installation
 
@@ -103,132 +103,18 @@ postgresql://user:pass@host/db?sslmode=verify-full&sslrootcert=/etc/ssl/certs/co
 
 ## Quick Start
 
-### Logical Replication - Stream API
+The [`examples/`](examples/) directory contains runnable examples demonstrating various usage patterns:
 
-The Stream API provides an ergonomic, iterator-like interface:
-
-```rust
-use pg_walstream::{
-    LogicalReplicationStream, ReplicationStreamConfig, ReplicationSlotOptions,
-    RetryConfig, StreamingMode, SharedLsnFeedback, CancellationToken,
-};
-use std::sync::Arc;
-use std::time::Duration;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Configure the replication stream
-    let config = ReplicationStreamConfig::new(
-        "my_slot".to_string(),           // Replication slot name
-        "my_publication".to_string(),     // Publication name
-        2,                                // Protocol version
-        StreamingMode::On,                // Streaming mode
-        Duration::from_secs(10),          // Feedback interval
-        Duration::from_secs(30),          // Connection timeout
-        Duration::from_secs(60),          // Health check interval
-        RetryConfig::default(),           // Retry configuration
-    )
-    // Optional: configure slot creation options
-    .with_slot_options(ReplicationSlotOptions {
-        temporary: true,
-        snapshot: Some("export".to_string()),
-        ..Default::default()
-    });
-
-    // Create and initialize the stream
-    let mut stream = LogicalReplicationStream::new(
-        "postgresql://postgres:password@localhost:5432/mydb?replication=database",
-        config,
-    ).await?;
-
-    // Step 1: Create the replication slot
-    stream.ensure_replication_slot().await?;
-
-    // Step 2: Use the exported snapshot on a SEPARATE regular connection
-    // If the slot was created with EXPORT_SNAPSHOT, use the snapshot name
-    // on a SEPARATE regular connection to read the initial table state:
-    //   BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
-    //   SET TRANSACTION SNAPSHOT '<snapshot_name>';
-    //   COPY my_table TO STDOUT;   -- or SELECT * FROM my_table
-    //   COMMIT;
-    if let Some(snapshot_name) = stream.exported_snapshot_name() {
-        println!("Exported snapshot: {}", snapshot_name);
-    }
-
-    // Step 3: Begin streaming
-    stream.start(None).await?;
-
-    // Create cancellation token for graceful shutdown
-    let cancel_token = CancellationToken::new();
-
-    // Convert to async Stream - provides iterator-like interface
-    let mut event_stream = stream.into_stream(cancel_token);
-
-    // Process events using Stream combinators
-    loop {
-        match event_stream.next_event().await {
-            Ok(event) => {
-                println!("Received event: {:?}", event);
-                // Update LSN feedback using the convenient method
-                event_stream.update_applied_lsn(event.lsn.value());
-            }
-            Err(e) if matches!(e, pg_walstream::ReplicationError::Cancelled(_)) => {
-                println!("Stream cancelled, shutting down gracefully");
-                break;
-            }
-            Err(e) => {
-                eprintln!("Error: {}", e);
-                break;
-            }
-        }
-    }
-
-    Ok(())
-}
-```
-
-> **Note:** The exported snapshot is only valid between `ensure_replication_slot()` and `start()`. Once `START_REPLICATION` is issued, PostgreSQL destroys the snapshot. You must read the snapshot on a separate connection **before** calling `start()`.
-
-### Working with Event Data
-
-Events carry row data as [`RowData`] an ordered list of `(Arc<str>, ColumnValue)` pairs.
-[`ColumnValue`] is a lightweight enum (`Null | Text(Bytes) | Binary(Bytes)`) that preserves
-the raw PostgreSQL wire representation with zero-copy semantics.
-Schema, table, and column names are `Arc<str>` (reference-counted, zero-cost cloning):
-
-```rust
-use pg_walstream::{EventType, RowData, ColumnValue};
-
-// Pattern match on event types
-match &event.event_type {
-    EventType::Insert { schema, table, data, .. } => {
-        println!("INSERT into {}.{}", schema, table);
-
-        // Access columns by name
-        if let Some(id) = data.get("id") {
-            println!("  id = {}", id);
-        }
-
-        // Iterate over all columns
-        for (col_name, value) in data.iter() {
-            println!("  {} = {}", col_name, value);
-        }
-    }
-    EventType::Update { old_data, new_data, key_columns, .. } => {
-        // key_columns is Vec<Arc<str>>
-        println!("Key columns: {:?}", key_columns);
-        println!("New data has {} columns", new_data.len());
-    }
-    EventType::Delete { old_data, .. } => {
-        // Convert to HashMap if needed for downstream compatibility
-        let map = old_data.clone().into_hash_map();
-        println!("Deleted row: {:?}", map);
-    }
-    _ => {}
-}
-```
-
-### Using the Polling API
+| Example | Description |
+|---------|-------------|
+| [`basic-streaming`](examples/basic-streaming) | High-level `futures::Stream` API with stream combinators (`filter`, `take_while`) |
+| [`polling`](examples/polling) | Manual polling loop using `next_event()` for custom integration scenarios |
+| [`safe-transaction-consumer`](examples/safe-transaction-consumer) | Production-grade transaction-aware CDC consumer with ordered commits and safe LSN feedback |
+| [`rate-limited-streaming`](examples/rate-limited-streaming) | Rate-limited consumption using `tokio_stream::StreamExt::throttle` |
+| [`tokio-spawn-streaming`](examples/tokio-spawn-streaming) | Producer/consumer pattern via `tokio::spawn` with `mpsc` channel (demonstrates `Send` safety) |
+| [`typed-deserialization`](examples/typed-deserialization) | Map INSERT/UPDATE/DELETE events directly into user-defined Rust structs via `serde` |
+| [`pg-basebackup`](examples/pg-basebackup) | Full physical backup tool using `BASE_BACKUP` with tar extraction and progress reporting |
+| [`arbitrary-fuzzing`](examples/arbitrary-fuzzing) | Property-based fuzzing of all protocol types using the `arbitrary` crate |
 
 For more control, you can use the traditional polling approach:
 
@@ -352,20 +238,6 @@ The library provides full control over replication slot creation. The correct SQ
 | `failover` | Enable slot synchronization to standbys for HA | 16+ |
 
 > **Note:** If both `two_phase` and `snapshot` are set, `two_phase` takes priority. The `failover` option is not available on PG14 and will return an error.
-
-## Examples
-
-The [`examples/`](examples/) directory contains runnable examples demonstrating various usage patterns:
-
-| Example | Description |
-|---------|-------------|
-| [`basic-streaming`](examples/basic-streaming) | High-level `futures::Stream` API with stream combinators (`filter`, `take_while`) |
-| [`polling`](examples/polling) | Manual polling loop using `next_event()` for custom integration scenarios |
-| [`safe-transaction-consumer`](examples/safe-transaction-consumer) | Production-grade transaction-aware CDC consumer with ordered commits and safe LSN feedback |
-| [`rate-limited-streaming`](examples/rate-limited-streaming) | Rate-limited consumption using `tokio_stream::StreamExt::throttle` |
-| [`tokio-spawn-streaming`](examples/tokio-spawn-streaming) | Producer/consumer pattern via `tokio::spawn` with `mpsc` channel (demonstrates `Send` safety) |
-| [`pg-basebackup`](examples/pg-basebackup) | Full physical backup tool using `BASE_BACKUP` with tar extraction and progress reporting |
-| [`arbitrary-fuzzing`](examples/arbitrary-fuzzing) | Property-based fuzzing of all protocol types using the `arbitrary` crate |
 
 ## Message Types
 
