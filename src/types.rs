@@ -1120,6 +1120,120 @@ impl ChangeEvent {
         }
     }
 
+    /// Deserialize INSERT data into a user-defined type.
+    ///
+    /// Returns `Ok(value)` for Insert events, or an error for other event types.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use pg_walstream::{ChangeEvent, ColumnValue, Lsn, RowData};
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(Deserialize)]
+    /// struct User { id: u32, name: String }
+    ///
+    /// let data = RowData::from_pairs(vec![
+    ///     ("id", ColumnValue::text("1")),
+    ///     ("name", ColumnValue::text("Alice")),
+    /// ]);
+    /// let event = ChangeEvent::insert("public", "users", 1, data, Lsn::new(100));
+    /// let user: User = event.deserialize_insert().unwrap();
+    /// assert_eq!(user.id, 1);
+    /// ```
+    pub fn deserialize_insert<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
+        match &self.event_type {
+            EventType::Insert { data, .. } => data.deserialize_into(),
+            _ => Err(ReplicationError::deserialize(format!(
+                "expected Insert event, got {}",
+                self.event_type_str()
+            ))),
+        }
+    }
+
+    /// Deserialize both old and new data from an UPDATE event in one call.
+    ///
+    /// Returns `Ok((old, new))` where `old` is `Some(T)` if the replica identity
+    /// provided it (e.g. `REPLICA IDENTITY FULL` or when a key column changed)
+    /// and `None` otherwise. Returns an error for non-Update events.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use pg_walstream::{ChangeEvent, ColumnValue, Lsn, RowData, ReplicaIdentity};
+    /// use serde::Deserialize;
+    /// use std::sync::Arc;
+    ///
+    /// #[derive(Deserialize)]
+    /// struct User { id: u32, name: String }
+    ///
+    /// let old = RowData::from_pairs(vec![
+    ///     ("id", ColumnValue::text("1")),
+    ///     ("name", ColumnValue::text("alice")),
+    /// ]);
+    /// let new = RowData::from_pairs(vec![
+    ///     ("id", ColumnValue::text("1")),
+    ///     ("name", ColumnValue::text("bob")),
+    /// ]);
+    /// let event = ChangeEvent::update(
+    ///     "public", "users", 1, Some(old), new,
+    ///     ReplicaIdentity::Full, vec![Arc::from("id")], Lsn::new(200),
+    /// );
+    /// let (old, new): (Option<User>, User) = event.deserialize_update().unwrap();
+    /// assert_eq!(old.unwrap().name, "alice");
+    /// assert_eq!(new.name, "bob");
+    /// ```
+    pub fn deserialize_update<T: serde::de::DeserializeOwned>(&self) -> Result<(Option<T>, T)> {
+        match &self.event_type {
+            EventType::Update {
+                old_data, new_data, ..
+            } => {
+                let old = match old_data {
+                    Some(data) => Some(data.deserialize_into()?),
+                    None => None,
+                };
+                let new = new_data.deserialize_into()?;
+                Ok((old, new))
+            }
+            _ => Err(ReplicationError::deserialize(format!(
+                "expected Update event, got {}",
+                self.event_type_str()
+            ))),
+        }
+    }
+
+    /// Deserialize DELETE data into a user-defined type.
+    ///
+    /// Returns `Ok(value)` for Delete events, or an error for other event types.
+    pub fn deserialize_delete<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
+        match &self.event_type {
+            EventType::Delete { old_data, .. } => old_data.deserialize_into(),
+            _ => Err(ReplicationError::deserialize(format!(
+                "expected Delete event, got {}",
+                self.event_type_str()
+            ))),
+        }
+    }
+
+    /// Deserialize the primary row data from any DML event.
+    ///
+    /// - Insert: deserializes the inserted data
+    /// - Update: deserializes the new data
+    /// - Delete: deserializes the old (deleted) data
+    ///
+    /// Returns an error for non-DML events (Begin, Commit, Truncate, etc.).
+    pub fn deserialize_data<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
+        match &self.event_type {
+            EventType::Insert { data, .. } => data.deserialize_into(),
+            EventType::Update { new_data, .. } => new_data.deserialize_into(),
+            EventType::Delete { old_data, .. } => old_data.deserialize_into(),
+            _ => Err(ReplicationError::deserialize(format!(
+                "event type '{}' does not contain row data",
+                self.event_type_str()
+            ))),
+        }
+    }
+
     pub fn event_type_str(&self) -> &str {
         match self.event_type {
             EventType::Insert { .. } => "insert",

@@ -144,6 +144,26 @@ cd examples/arbitrary-fuzzing
 cargo run
 ```
 
+### 7. typed-deserialization
+
+Demonstrates deserializing WAL event data directly into user-defined Rust structs using `RowData::deserialize_into()`.
+
+- Automatic text-to-type coercion (PostgreSQL sends all values as text)
+- NULL handling with `Option<T>` fields
+- `#[serde(rename)]` for column-to-field name mapping
+- `#[serde(default)]` for missing/evolving columns
+- Enum deserialization from text columns
+- `ChangeEvent` convenience methods (`deserialize_insert`, `deserialize_update`, etc.)
+- Error handling for type mismatches and NULL violations
+
+**Run:**
+```bash
+cd examples/typed-deserialization
+cargo run
+```
+
+**No database required** — this example uses in-memory `RowData` and `ChangeEvent` objects to demonstrate the deserialization API.
+
 ## Prerequisites
 
 ### For Logical Replication Examples (basic_streaming, polling_example, safe_transaction_consumer)

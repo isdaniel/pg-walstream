@@ -52,6 +52,7 @@ rustls-tls = [
 tokio = { version = "1.51.1", features = ["full"] }
 criterion = { version = "0.8.2", features = ["html_reports"] }
 futures = "0.3.32"
+serde_bytes = "0.11.19"
 
 [[test]]
 name = "snapshot_export"
@@ -68,6 +69,10 @@ path = "integration-tests/safe_transaction_consumer.rs"
 [[test]]
 name = "complex_types"
 path = "integration-tests/complex_types.rs"
+
+[[test]]
+name = "typed_deserialization"
+path = "integration-tests/typed_deserialization.rs"
 
 [[test]]
 name = "ssl_connections"
