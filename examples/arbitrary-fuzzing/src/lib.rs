@@ -212,7 +212,7 @@ pub mod generators {
                     flags: u.arbitrary()?,
                     lsn: u.arbitrary()?,
                     prefix: u.arbitrary()?,
-                    content,
+                    content: content.into(),
                 }
             }
             10 => LogicalReplicationMessage::StreamStart {
