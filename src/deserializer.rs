@@ -36,20 +36,99 @@ use std::sync::Arc;
 /// PostgreSQL's pgoutput emits `t`/`f`; `BOOL` input also accepts
 /// `true`/`false`, `1`/`0`, `on`/`off`, `yes`/`no`. Returns `None` on
 /// unrecognized input so callers can surface the offending token.
+///
+/// Operates on bytes — pgoutput guarantees ASCII for boolean text, so
+/// callers can skip UTF-8 validation on the hot path.
 #[inline]
-fn parse_pg_bool(s: &str) -> Option<bool> {
-    if s.len() == 1 {
-        return match s.as_bytes()[0] {
+fn parse_pg_bool(b: &[u8]) -> Option<bool> {
+    if b.len() == 1 {
+        return match b[0] {
             b't' | b'1' => Some(true),
             b'f' | b'0' => Some(false),
             _ => None,
         };
     }
-    match s {
-        "true" | "on" | "yes" => Some(true),
-        "false" | "off" | "no" => Some(false),
+    match b {
+        b"true" | b"on" | b"yes" => Some(true),
+        b"false" | b"off" | b"no" => Some(false),
         _ => None,
     }
+}
+
+/// Fast ASCII signed-integer parser with overflow detection.
+///
+/// Accepts the same syntax as `i64::from_str`: optional `+`/`-`, then one
+/// or more ASCII digits. Returns `None` on empty input, non-digit bytes,
+/// or out-of-range values for `T`. Skips UTF-8 validation since pgoutput
+/// emits ASCII for all integer types.
+#[inline]
+fn parse_int_signed<T>(b: &[u8]) -> Option<T>
+where
+    T: TryFrom<i64>,
+{
+    if b.is_empty() {
+        return None;
+    }
+    let (negative, digits) = match b[0] {
+        b'-' => (true, &b[1..]),
+        b'+' => (false, &b[1..]),
+        _ => (false, b),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let mut acc: i64 = 0;
+    if negative {
+        for &c in digits {
+            let d = c.wrapping_sub(b'0');
+            if d > 9 {
+                return None;
+            }
+            acc = acc.checked_mul(10)?.checked_sub(d as i64)?;
+        }
+    } else {
+        for &c in digits {
+            let d = c.wrapping_sub(b'0');
+            if d > 9 {
+                return None;
+            }
+            acc = acc.checked_mul(10)?.checked_add(d as i64)?;
+        }
+    }
+    T::try_from(acc).ok()
+}
+
+/// Fast ASCII unsigned-integer parser with overflow detection.
+///
+/// Accepts an optional leading `+`. Rejects `-` and non-digits. Uses a
+/// `u64` accumulator and narrows to `T`.
+#[inline]
+fn parse_int_unsigned<T>(b: &[u8]) -> Option<T>
+where
+    T: TryFrom<u64>,
+{
+    if b.is_empty() {
+        return None;
+    }
+    let digits = if b[0] == b'+' { &b[1..] } else { b };
+    if digits.is_empty() {
+        return None;
+    }
+    let mut acc: u64 = 0;
+    for &c in digits {
+        let d = c.wrapping_sub(b'0');
+        if d > 9 {
+            return None;
+        }
+        acc = acc.checked_mul(10)?.checked_add(d as u64)?;
+    }
+    T::try_from(acc).ok()
+}
+
+/// Render a byte slice as a string for error messages, lossy on non-UTF-8.
+#[inline]
+fn lossy_token(b: &[u8]) -> std::borrow::Cow<'_, str> {
+    String::from_utf8_lossy(b)
 }
 
 // ---------------------------------------------------------------------------
@@ -176,7 +255,23 @@ impl<'a> ColumnValueDeserializer<'a> {
         }
     }
 
-    /// Parse text as a numeric type.
+    /// Like [`text_or_err`] but returns raw bytes — skips the UTF-8 pass.
+    /// Use only for paths where the parser itself rejects non-ASCII bytes
+    /// (numeric, bool). String-shaped paths must use `text_or_err`.
+    #[inline]
+    fn bytes_or_err(&self, target: &str) -> Result<&'a [u8], ReplicationError> {
+        match self.value {
+            ColumnValue::Text(b) => Ok(b.as_ref()),
+            ColumnValue::Null => Err(ReplicationError::deserialize(format!(
+                "cannot deserialize NULL as {target} (use Option<{target}>)"
+            ))),
+            ColumnValue::Binary(_) => Err(ReplicationError::deserialize(format!(
+                "cannot deserialize binary column as {target}"
+            ))),
+        }
+    }
+
+    /// Parse text as a numeric type via the std `FromStr` (used for floats).
     #[inline]
     fn parse_text<T: std::str::FromStr>(&self, type_name: &str) -> Result<T, ReplicationError>
     where
@@ -189,6 +284,38 @@ impl<'a> ColumnValueDeserializer<'a> {
                 s, type_name, e
             ))
         })
+    }
+
+    /// Fast signed-int parse from bytes; emits an error string equivalent
+    /// to the std parser (token + type name) so existing tests still match.
+    #[inline]
+    fn parse_signed<T>(&self, type_name: &str) -> Result<T, ReplicationError>
+    where
+        T: TryFrom<i64>,
+    {
+        let b = self.bytes_or_err(type_name)?;
+        parse_int_signed::<T>(b).ok_or_else(|| numeric_parse_error(b, type_name))
+    }
+
+    /// Fast unsigned-int parse from bytes.
+    #[inline]
+    fn parse_unsigned<T>(&self, type_name: &str) -> Result<T, ReplicationError>
+    where
+        T: TryFrom<u64>,
+    {
+        let b = self.bytes_or_err(type_name)?;
+        parse_int_unsigned::<T>(b).ok_or_else(|| numeric_parse_error(b, type_name))
+    }
+}
+
+/// Build a numeric-parse error. Performs UTF-8 validation only on the cold
+/// path so that invalid-UTF-8 inputs still surface the expected diagnostic.
+#[cold]
+#[inline(never)]
+fn numeric_parse_error(b: &[u8], type_name: &str) -> ReplicationError {
+    match std::str::from_utf8(b) {
+        Ok(s) => ReplicationError::deserialize(format!("failed to parse '{s}' as {type_name}")),
+        Err(e) => ReplicationError::deserialize(format!("invalid UTF-8 for {type_name}: {e}")),
     }
 }
 
@@ -209,10 +336,11 @@ impl<'de, 'a> de::Deserializer<'de> for ColumnValueDeserializer<'a> {
 
     #[inline]
     fn deserialize_bool<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        let s = self.text_or_err("bool")?;
-        let val = parse_pg_bool(s).ok_or_else(|| {
+        let b = self.bytes_or_err("bool")?;
+        let val = parse_pg_bool(b).ok_or_else(|| {
             ReplicationError::deserialize(format!(
-                "cannot parse '{s}' as bool (expected t/f/true/false/1/0/on/off/yes/no)"
+                "cannot parse '{}' as bool (expected t/f/true/false/1/0/on/off/yes/no)",
+                lossy_token(b)
             ))
         })?;
         visitor.visit_bool(val)
@@ -220,42 +348,42 @@ impl<'de, 'a> de::Deserializer<'de> for ColumnValueDeserializer<'a> {
 
     #[inline]
     fn deserialize_i8<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_i8(self.parse_text("i8")?)
+        visitor.visit_i8(self.parse_signed::<i8>("i8")?)
     }
 
     #[inline]
     fn deserialize_i16<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_i16(self.parse_text("i16")?)
+        visitor.visit_i16(self.parse_signed::<i16>("i16")?)
     }
 
     #[inline]
     fn deserialize_i32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_i32(self.parse_text("i32")?)
+        visitor.visit_i32(self.parse_signed::<i32>("i32")?)
     }
 
     #[inline]
     fn deserialize_i64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_i64(self.parse_text("i64")?)
+        visitor.visit_i64(self.parse_signed::<i64>("i64")?)
     }
 
     #[inline]
     fn deserialize_u8<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_u8(self.parse_text("u8")?)
+        visitor.visit_u8(self.parse_unsigned::<u8>("u8")?)
     }
 
     #[inline]
     fn deserialize_u16<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_u16(self.parse_text("u16")?)
+        visitor.visit_u16(self.parse_unsigned::<u16>("u16")?)
     }
 
     #[inline]
     fn deserialize_u32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_u32(self.parse_text("u32")?)
+        visitor.visit_u32(self.parse_unsigned::<u32>("u32")?)
     }
 
     #[inline]
     fn deserialize_u64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_u64(self.parse_text("u64")?)
+        visitor.visit_u64(self.parse_unsigned::<u64>("u64")?)
     }
 
     #[inline]
@@ -654,7 +782,7 @@ impl<'de, 'a> de::Deserializer<'de> for LenientColumnValueDeserializer<'a> {
 
     fn deserialize_bool<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         let v = match self.try_text("bool") {
-            Some(s) => parse_pg_bool(s).unwrap_or_else(|| {
+            Some(s) => parse_pg_bool(s.as_bytes()).unwrap_or_else(|| {
                 self.ctx
                     .push(self.field, format!("cannot parse '{s}' as bool"));
                 false
@@ -2693,13 +2821,13 @@ mod tests {
     fn test_parse_pg_bool_all_accepted_forms() {
         use crate::deserializer::parse_pg_bool;
         for s in ["t", "1", "true", "on", "yes"] {
-            assert_eq!(parse_pg_bool(s), Some(true), "input: {s}");
+            assert_eq!(parse_pg_bool(s.as_bytes()), Some(true), "input: {s}");
         }
         for s in ["f", "0", "false", "off", "no"] {
-            assert_eq!(parse_pg_bool(s), Some(false), "input: {s}");
+            assert_eq!(parse_pg_bool(s.as_bytes()), Some(false), "input: {s}");
         }
         for s in ["", "x", "TRUE", "FALSE", "maybe", "2"] {
-            assert_eq!(parse_pg_bool(s), None, "input: {s}");
+            assert_eq!(parse_pg_bool(s.as_bytes()), None, "input: {s}");
         }
     }
 }
