@@ -13,6 +13,7 @@ use crate::types::{
 };
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -258,12 +259,19 @@ impl ColumnInfo {
 /// Tuple (row) data
 #[derive(Debug, Clone)]
 pub struct TupleData {
-    pub columns: Vec<ColumnData>,
+    pub columns: SmallVec<[ColumnData; 4]>,
 }
 
 impl TupleData {
     #[inline(always)]
     pub fn new(columns: Vec<ColumnData>) -> Self {
+        Self {
+            columns: SmallVec::from_vec(columns),
+        }
+    }
+
+    #[inline(always)]
+    pub fn from_smallvec(columns: SmallVec<[ColumnData; 4]>) -> Self {
         Self { columns }
     }
 
@@ -1281,8 +1289,8 @@ impl LogicalReplicationParser {
     /// Parse tuple data (column values)
     #[inline]
     fn parse_tuple_data(&mut self, reader: &mut BufferReader) -> Result<TupleData> {
-        let column_count = reader.read_u16()?;
-        let mut columns = Vec::with_capacity(column_count as usize);
+        let column_count = reader.read_u16()? as usize;
+        let mut columns: SmallVec<[ColumnData; 4]> = SmallVec::with_capacity(column_count);
 
         for _ in 0..column_count {
             let column_type = reader.read_u8()? as char;
@@ -1310,7 +1318,7 @@ impl LogicalReplicationParser {
             columns.push(column_data);
         }
 
-        Ok(TupleData::new(columns))
+        Ok(TupleData::from_smallvec(columns))
     }
 }
 

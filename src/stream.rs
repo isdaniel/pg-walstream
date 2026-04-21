@@ -942,7 +942,7 @@ impl LogicalReplicationStream {
                 if let Some(relation) = self.state.get_relation(relation_id) {
                     let schema_name = Arc::clone(&relation.namespace);
                     let table_name = Arc::clone(&relation.relation_name);
-                    let data = tuple_to_data(&tuple, relation)?;
+                    let data = tuple_to_data(tuple, relation)?;
 
                     ChangeEvent {
                         event_type: EventType::Insert {
@@ -970,11 +970,11 @@ impl LogicalReplicationStream {
                     self.relation_metadata(relation_id, key_type)
                 {
                     let old_data = if let Some(old_tuple) = old_tuple {
-                        Some(tuple_to_data(&old_tuple, relation)?)
+                        Some(tuple_to_data(old_tuple, relation)?)
                     } else {
                         None
                     };
-                    let new_data = tuple_to_data(&new_tuple, relation)?;
+                    let new_data = tuple_to_data(new_tuple, relation)?;
 
                     ChangeEvent {
                         event_type: EventType::Update {
@@ -1003,7 +1003,7 @@ impl LogicalReplicationStream {
                 if let Some((schema_name, table_name, replica_identity, key_columns, relation)) =
                     self.relation_metadata(relation_id, Some(key_type))
                 {
-                    let old_data = tuple_to_data(&old_tuple, relation)?;
+                    let old_data = tuple_to_data(old_tuple, relation)?;
 
                     ChangeEvent {
                         event_type: EventType::Delete {
@@ -2093,25 +2093,23 @@ async fn timeout_or_error<T>(
 /// Text columns become [`ColumnValue::Text`] (zero-copy), binary columns
 /// become [`ColumnValue::Binary`], and null/unknown become [`ColumnValue::Null`].
 /// Unchanged TOAST columns are skipped.
+///
+/// Consumes the `TupleData` so each column's `Bytes` handle is moved (not cloned),
+/// saving one atomic refcount bump per non-null column.
 #[inline]
-fn tuple_to_data(tuple: &TupleData, relation: &RelationInfo) -> Result<RowData> {
+fn tuple_to_data(tuple: TupleData, relation: &RelationInfo) -> Result<RowData> {
     let mut data = RowData::with_capacity(tuple.columns.len());
 
-    for (i, column_data) in tuple.columns.iter().enumerate() {
-        if column_data.is_unchanged() {
-            continue;
-        }
+    for (i, column_data) in tuple.columns.into_iter().enumerate() {
+        let data_type = column_data.data_type;
+        let value = match data_type {
+            'u' => continue,
+            'n' => ColumnValue::Null,
+            't' => ColumnValue::text_bytes(column_data.into_bytes()),
+            'b' => ColumnValue::binary_bytes(column_data.into_bytes()),
+            _ => ColumnValue::Null,
+        };
         if let Some(column_info) = relation.get_column_by_index(i) {
-            let value = if column_data.is_null() {
-                ColumnValue::Null
-            } else if column_data.is_text() {
-                ColumnValue::text_bytes(column_data.raw_bytes())
-            } else if column_data.is_binary() {
-                ColumnValue::binary_bytes(column_data.raw_bytes())
-            } else {
-                ColumnValue::Null
-            };
-
             data.push(Arc::clone(&column_info.name), value);
         }
     }
@@ -2528,7 +2526,7 @@ mod tests {
             crate::protocol::ColumnData::text(b"value".to_vec()),
         ]);
 
-        let data = tuple_to_data(&tuple, &relation).unwrap();
+        let data = tuple_to_data(tuple, &relation).unwrap();
         assert_eq!(data.len(), 1);
         assert_eq!(data.get("col2").unwrap(), "value");
     }
@@ -2546,7 +2544,7 @@ mod tests {
             RelationInfo::new(1, "public".to_string(), "test".to_string(), b'd', columns);
 
         let tuple = TupleData::new(vec![crate::protocol::ColumnData::text(Vec::new())]);
-        let data = tuple_to_data(&tuple, &relation).unwrap();
+        let data = tuple_to_data(tuple, &relation).unwrap();
         assert_eq!(data.get("col1").unwrap(), "");
     }
 
@@ -3834,7 +3832,7 @@ mod tests {
 
         let tuple = TupleData::new(vec![ColumnData::binary(vec![0xDE, 0xAD, 0xBE, 0xEF])]);
 
-        let data = tuple_to_data(&tuple, &relation).unwrap();
+        let data = tuple_to_data(tuple, &relation).unwrap();
         let val = data.get("binary_col").unwrap();
         assert!(matches!(val, ColumnValue::Binary(_)));
         assert_eq!(val.as_bytes(), &[0xDE, 0xAD, 0xBE, 0xEF]);
@@ -3849,7 +3847,7 @@ mod tests {
 
         let tuple = TupleData::new(vec![ColumnData::null()]);
 
-        let data = tuple_to_data(&tuple, &relation).unwrap();
+        let data = tuple_to_data(tuple, &relation).unwrap();
         assert_eq!(data.get("nullable").unwrap(), &ColumnValue::Null);
     }
 
@@ -3870,7 +3868,7 @@ mod tests {
             ColumnData::text(b"new_value".to_vec()),
         ]);
 
-        let data = tuple_to_data(&tuple, &relation).unwrap();
+        let data = tuple_to_data(tuple, &relation).unwrap();
         assert_eq!(data.len(), 2);
     }
 
@@ -3882,7 +3880,7 @@ mod tests {
         let relation = RelationInfo::new(1, "public".to_string(), "t".to_string(), b'd', columns);
         let tuple = TupleData::new(vec![]);
 
-        let data = tuple_to_data(&tuple, &relation).unwrap();
+        let data = tuple_to_data(tuple, &relation).unwrap();
         assert!(data.is_empty());
     }
 

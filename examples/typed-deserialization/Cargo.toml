@@ -14,7 +14,7 @@ rustls-tls = ["pg_walstream/rustls-tls", "dep:rustls"]
 pg_walstream = { path = "../.." }
 rustls = { version = "0.23.38", default-features = false, features = ["aws_lc_rs"], optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
-tokio = { version = "1.51.1", features = ["full"] }
+tokio = { version = "1.52.1", features = ["full"] }
 tokio-postgres = "0.7.17"
 postgres-openssl = "0.5.3"
 openssl = "0.10.76"

@@ -220,6 +220,7 @@ pub fn parse_lsn(lsn_str: &str) -> Result<XLogRecPtr> {
 /// let lsn_str = format_lsn(0);
 /// assert_eq!(lsn_str, "0/0");
 /// ```
+#[inline]
 pub fn format_lsn(lsn: XLogRecPtr) -> String {
     format!("{:X}/{:X}", lsn >> 32, lsn & 0xFFFFFFFF)
 }
