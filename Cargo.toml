@@ -13,7 +13,7 @@ keywords = ["postgresql", "replication", "wal", "logical-decoding", "streaming"]
 categories = ["database", "parsing", "network-programming"]
 
 [dependencies]
-tokio = { version = "1.51.1", features = ["io-util", "net", "time", "macros", "rt", "rt-multi-thread"] }
+tokio = { version = "1.52.1", features = ["io-util", "net", "time", "macros", "rt", "rt-multi-thread"] }
 tokio-util = "0.7.18"
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 chrono = { version = "0.4.44", features = ["serde"] }
@@ -21,6 +21,7 @@ bytes = { version = "1.11.1", features = ["serde"] }
 tracing = "0.1.44"
 futures-core = "0.3.32"
 memchr = "2.8.0"
+smallvec = "1.15.1"
 
 # libpq backend (default)
 libpq-sys = { version = "0.8", optional = true }
@@ -49,7 +50,7 @@ rustls-tls = [
 ]
 
 [dev-dependencies]
-tokio = { version = "1.51.1", features = ["full"] }
+tokio = { version = "1.52.1", features = ["full"] }
 criterion = { version = "0.8.2", features = ["html_reports"] }
 futures = "0.3.32"
 serde_bytes = "0.11.19"
