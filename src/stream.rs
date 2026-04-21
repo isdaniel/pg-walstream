@@ -13,7 +13,6 @@
 //! you can easily wrap it using `futures::stream::unfold`. See the EventStream
 //! documentation for an example.
 
-use crate::column_value::{ColumnValue, RowData};
 use crate::error::{ReplicationError, Result};
 use crate::lsn::SharedLsnFeedback;
 use crate::types::{
@@ -23,7 +22,7 @@ use crate::{
     format_lsn, parse_keepalive_message, postgres_timestamp_to_chrono, BufferReader,
     LogicalReplicationMessage, LogicalReplicationParser, PgReplicationConnection, RelationInfo,
     ReplicationConnectionRetry, ReplicationState, RetryConfig, StreamingReplicationMessage,
-    TupleData, XLogRecPtr, INVALID_XLOG_REC_PTR,
+    XLogRecPtr, INVALID_XLOG_REC_PTR,
 };
 use bytes::Bytes;
 use std::sync::Arc;
@@ -592,19 +591,19 @@ impl LogicalReplicationStream {
                 continue;
             }
 
-            match data[0] as char {
-                'w' => {
+            match data[0] {
+                b'w' => {
                     // WAL data message (zero-copy: Bytes slicing avoids copies)
                     if let Some(event) = self.process_wal_message(data)? {
                         return Ok(event);
                     }
                 }
-                'k' => {
+                b'k' => {
                     // Keepalive message
                     self.process_keepalive_message(&data).await?;
                 }
-                _ => {
-                    warn!("Received unknown message type: {}", data[0] as char);
+                other => {
+                    warn!("Received unknown message type: {}", other as char);
                 }
             }
         }
@@ -942,7 +941,7 @@ impl LogicalReplicationStream {
                 if let Some(relation) = self.state.get_relation(relation_id) {
                     let schema_name = Arc::clone(&relation.namespace);
                     let table_name = Arc::clone(&relation.relation_name);
-                    let data = tuple_to_data(tuple, relation)?;
+                    let data = tuple.into_row_data(relation);
 
                     ChangeEvent {
                         event_type: EventType::Insert {
@@ -969,12 +968,8 @@ impl LogicalReplicationStream {
                 if let Some((schema_name, table_name, replica_identity, key_columns, relation)) =
                     self.relation_metadata(relation_id, key_type)
                 {
-                    let old_data = if let Some(old_tuple) = old_tuple {
-                        Some(tuple_to_data(old_tuple, relation)?)
-                    } else {
-                        None
-                    };
-                    let new_data = tuple_to_data(new_tuple, relation)?;
+                    let old_data = old_tuple.map(|t| t.into_row_data(relation));
+                    let new_data = new_tuple.into_row_data(relation);
 
                     ChangeEvent {
                         event_type: EventType::Update {
@@ -1003,7 +998,7 @@ impl LogicalReplicationStream {
                 if let Some((schema_name, table_name, replica_identity, key_columns, relation)) =
                     self.relation_metadata(relation_id, Some(key_type))
                 {
-                    let old_data = tuple_to_data(old_tuple, relation)?;
+                    let old_data = old_tuple.into_row_data(relation);
 
                     ChangeEvent {
                         event_type: EventType::Delete {
@@ -1444,12 +1439,8 @@ impl LogicalReplicationStream {
         // Get key columns based on the relation's replica identity and key_type from protocol
         match key_type {
             Some('K') => {
-                // Key tuple - use replica identity index columns or primary key
-                relation
-                    .get_key_columns()
-                    .iter()
-                    .map(|col| Arc::clone(&col.name))
-                    .collect()
+                // Key tuple - replica-identity/primary-key columns.
+                relation.key_column_names().collect()
             }
             Some('O') => {
                 // Old tuple - means REPLICA IDENTITY FULL, use all columns
@@ -1460,32 +1451,13 @@ impl LogicalReplicationStream {
                     .collect()
             }
             None => {
-                // No old tuple data - means REPLICA IDENTITY NOTHING or DEFAULT without changes to key columns
-                // Fall back to using any available key columns from relation info
-                let key_cols: Vec<Arc<str>> = relation
-                    .get_key_columns()
-                    .iter()
-                    .map(|col| Arc::clone(&col.name))
-                    .collect();
-                if key_cols.is_empty() {
-                    // Try to infer primary key from column flags or use all columns as last resort
-                    relation
-                        .columns
-                        .iter()
-                        .filter(|col| col.is_key())
-                        .map(|col| Arc::clone(&col.name))
-                        .collect()
-                } else {
-                    key_cols
-                }
+                // No old tuple data - means REPLICA IDENTITY NOTHING or DEFAULT
+                // without changes to key columns. Fall back to key columns.
+                relation.key_column_names().collect()
             }
             _ => {
-                // Unknown key type, use available key columns
-                relation
-                    .get_key_columns()
-                    .iter()
-                    .map(|col| Arc::clone(&col.name))
-                    .collect()
+                // Unknown key type, fall back to key columns.
+                relation.key_column_names().collect()
             }
         }
     }
@@ -2088,39 +2060,11 @@ async fn timeout_or_error<T>(
     }
 }
 
-/// Convert tuple data to a [`RowData`] for [`ChangeEvent`].
-///
-/// Text columns become [`ColumnValue::Text`] (zero-copy), binary columns
-/// become [`ColumnValue::Binary`], and null/unknown become [`ColumnValue::Null`].
-/// Unchanged TOAST columns are skipped.
-///
-/// Consumes the `TupleData` so each column's `Bytes` handle is moved (not cloned),
-/// saving one atomic refcount bump per non-null column.
-#[inline]
-fn tuple_to_data(tuple: TupleData, relation: &RelationInfo) -> Result<RowData> {
-    let mut data = RowData::with_capacity(tuple.columns.len());
-
-    for (i, column_data) in tuple.columns.into_iter().enumerate() {
-        let data_type = column_data.data_type;
-        let value = match data_type {
-            'u' => continue,
-            'n' => ColumnValue::Null,
-            't' => ColumnValue::text_bytes(column_data.into_bytes()),
-            'b' => ColumnValue::binary_bytes(column_data.into_bytes()),
-            _ => ColumnValue::Null,
-        };
-        if let Some(column_info) = relation.get_column_by_index(i) {
-            data.push(Arc::clone(&column_info.name), value);
-        }
-    }
-
-    Ok(data)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::column_value::{ColumnValue, RowData};
+    use crate::protocol::TupleData;
     use crate::types::{parse_lsn, ReplicaIdentity};
 
     // ========================================
@@ -2526,7 +2470,7 @@ mod tests {
             crate::protocol::ColumnData::text(b"value".to_vec()),
         ]);
 
-        let data = tuple_to_data(tuple, &relation).unwrap();
+        let data = tuple.into_row_data(&relation);
         assert_eq!(data.len(), 1);
         assert_eq!(data.get("col2").unwrap(), "value");
     }
@@ -2544,7 +2488,7 @@ mod tests {
             RelationInfo::new(1, "public".to_string(), "test".to_string(), b'd', columns);
 
         let tuple = TupleData::new(vec![crate::protocol::ColumnData::text(Vec::new())]);
-        let data = tuple_to_data(tuple, &relation).unwrap();
+        let data = tuple.into_row_data(&relation);
         assert_eq!(data.get("col1").unwrap(), "");
     }
 
@@ -3832,7 +3776,7 @@ mod tests {
 
         let tuple = TupleData::new(vec![ColumnData::binary(vec![0xDE, 0xAD, 0xBE, 0xEF])]);
 
-        let data = tuple_to_data(tuple, &relation).unwrap();
+        let data = tuple.into_row_data(&relation);
         let val = data.get("binary_col").unwrap();
         assert!(matches!(val, ColumnValue::Binary(_)));
         assert_eq!(val.as_bytes(), &[0xDE, 0xAD, 0xBE, 0xEF]);
@@ -3847,7 +3791,7 @@ mod tests {
 
         let tuple = TupleData::new(vec![ColumnData::null()]);
 
-        let data = tuple_to_data(tuple, &relation).unwrap();
+        let data = tuple.into_row_data(&relation);
         assert_eq!(data.get("nullable").unwrap(), &ColumnValue::Null);
     }
 
@@ -3868,7 +3812,7 @@ mod tests {
             ColumnData::text(b"new_value".to_vec()),
         ]);
 
-        let data = tuple_to_data(tuple, &relation).unwrap();
+        let data = tuple.into_row_data(&relation);
         assert_eq!(data.len(), 2);
     }
 
@@ -3880,7 +3824,7 @@ mod tests {
         let relation = RelationInfo::new(1, "public".to_string(), "t".to_string(), b'd', columns);
         let tuple = TupleData::new(vec![]);
 
-        let data = tuple_to_data(tuple, &relation).unwrap();
+        let data = tuple.into_row_data(&relation);
         assert!(data.is_empty());
     }
 

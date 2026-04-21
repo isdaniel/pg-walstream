@@ -16,9 +16,47 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::debug;
+
+/// Identity hasher for `u32` OIDs.
+///
+/// PostgreSQL OIDs are already 32 bits of good entropy, so a full hash is
+/// wasted work. This hasher passes the OID through to the lower bits of the
+/// returned `u64`, eliminating SipHash overhead on the per-row hot path.
+#[derive(Default)]
+pub struct OidHasher(u64);
+
+impl Hasher for OidHasher {
+    #[inline(always)]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline(always)]
+    fn write(&mut self, bytes: &[u8]) {
+        // HashMap::get::<&u32> routes through write_u32, so this should not fire
+        // on the hot path; handle it defensively by hashing tail bytes.
+        for &b in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(b);
+        }
+    }
+
+    #[inline(always)]
+    fn write_u32(&mut self, n: u32) {
+        self.0 = u64::from(n);
+    }
+
+    #[inline(always)]
+    fn write_u64(&mut self, n: u64) {
+        self.0 = n;
+    }
+}
+
+/// `HashMap` keyed by `Oid` using the identity hasher.
+pub type RelationMap = HashMap<Oid, RelationInfo, BuildHasherDefault<OidHasher>>;
 
 /// Message type constants for logical replication protocol
 pub mod message_types {
@@ -259,7 +297,7 @@ impl ColumnInfo {
 /// Tuple (row) data
 #[derive(Debug, Clone)]
 pub struct TupleData {
-    pub columns: SmallVec<[ColumnData; 4]>,
+    pub columns: SmallVec<[ColumnData; 16]>,
 }
 
 impl TupleData {
@@ -271,7 +309,7 @@ impl TupleData {
     }
 
     #[inline(always)]
-    pub fn from_smallvec(columns: SmallVec<[ColumnData; 4]>) -> Self {
+    pub fn from_smallvec(columns: SmallVec<[ColumnData; 16]>) -> Self {
         Self { columns }
     }
 
@@ -289,23 +327,28 @@ impl TupleData {
 
     /// Convert to a [`RowData`] with column names from the relation.
     ///
+    /// Consumes the tuple so each column's `Bytes` handle is moved (not cloned),
+    /// saving one atomic refcount bump per non-null column.
+    ///
     /// Text columns are stored as [`ColumnValue::Text`] with zero-copy `Bytes`,
     /// binary columns as [`ColumnValue::Binary`], and null / unknown as
-    /// [`ColumnValue::Null`].  Unchanged TOAST columns are skipped.
-    pub fn to_row_data(&self, relation: &RelationInfo) -> RowData {
+    /// [`ColumnValue::Null`]. Unchanged TOAST columns are skipped.
+    #[inline]
+    pub fn into_row_data(self, relation: &RelationInfo) -> RowData {
         let mut data = RowData::with_capacity(self.columns.len());
 
-        for (i, col_data) in self.columns.iter().enumerate() {
-            if let Some(column_info) = relation.get_column_by_index(i) {
-                let value = match col_data.data_type {
-                    'n' => ColumnValue::Null,
-                    't' => ColumnValue::text_bytes(col_data.raw_bytes()),
-                    'b' => ColumnValue::binary_bytes(col_data.raw_bytes()),
-                    'u' => continue, // Skip unchanged TOAST values
-                    _ => ColumnValue::Null,
-                };
-                data.push(Arc::clone(&column_info.name), value);
-            }
+        for (i, col_data) in self.columns.into_iter().enumerate() {
+            let Some(column_info) = relation.get_column_by_index(i) else {
+                continue;
+            };
+            let value = match col_data.data_type {
+                b'u' => continue, // Skip unchanged TOAST values
+                b'n' => ColumnValue::Null,
+                b't' => ColumnValue::text_bytes(col_data.into_bytes()),
+                b'b' => ColumnValue::binary_bytes(col_data.into_bytes()),
+                _ => ColumnValue::Null,
+            };
+            data.push(Arc::clone(&column_info.name), value);
         }
 
         data
@@ -315,7 +358,7 @@ impl TupleData {
 /// Data for a single column
 #[derive(Debug, Clone)]
 pub struct ColumnData {
-    pub data_type: char, // 'n' = null, 't' = text, 'b' = binary, 'u' = unchanged toast
+    pub data_type: u8, // b'n' = null, b't' = text, b'b' = binary, b'u' = unchanged toast
     data: bytes::Bytes,
 }
 
@@ -323,7 +366,7 @@ impl ColumnData {
     #[inline(always)]
     pub const fn null() -> Self {
         Self {
-            data_type: 'n',
+            data_type: b'n',
             data: bytes::Bytes::from_static(b""),
         }
     }
@@ -331,7 +374,7 @@ impl ColumnData {
     #[inline(always)]
     pub fn text_bytes(data: bytes::Bytes) -> Self {
         Self {
-            data_type: 't',
+            data_type: b't',
             data,
         }
     }
@@ -339,7 +382,7 @@ impl ColumnData {
     #[inline(always)]
     pub fn text(data: Vec<u8>) -> Self {
         Self {
-            data_type: 't',
+            data_type: b't',
             data: bytes::Bytes::from(data),
         }
     }
@@ -347,7 +390,7 @@ impl ColumnData {
     #[inline(always)]
     pub fn binary_bytes(data: bytes::Bytes) -> Self {
         Self {
-            data_type: 'b',
+            data_type: b'b',
             data,
         }
     }
@@ -355,7 +398,7 @@ impl ColumnData {
     #[inline(always)]
     pub fn binary(data: Vec<u8>) -> Self {
         Self {
-            data_type: 'b',
+            data_type: b'b',
             data: bytes::Bytes::from(data),
         }
     }
@@ -363,29 +406,29 @@ impl ColumnData {
     #[inline(always)]
     pub const fn unchanged() -> Self {
         Self {
-            data_type: 'u',
+            data_type: b'u',
             data: bytes::Bytes::from_static(b""),
         }
     }
 
     #[inline(always)]
     pub fn is_null(&self) -> bool {
-        self.data_type == 'n'
+        self.data_type == b'n'
     }
 
     #[inline(always)]
     pub fn is_unchanged(&self) -> bool {
-        self.data_type == 'u'
+        self.data_type == b'u'
     }
 
     #[inline(always)]
     pub fn is_binary(&self) -> bool {
-        self.data_type == 'b'
+        self.data_type == b'b'
     }
 
     #[inline(always)]
     pub fn is_text(&self) -> bool {
-        self.data_type == 't'
+        self.data_type == b't'
     }
 
     /// Convert to string, returning a Cow to avoid allocation when possible
@@ -393,7 +436,7 @@ impl ColumnData {
     /// Works for both text ('t') and binary ('b') format columns
     #[inline]
     pub fn as_str(&self) -> Option<Cow<'_, str>> {
-        if self.data.is_empty() || (self.data_type != 't' && self.data_type != 'b') {
+        if self.data.is_empty() || (self.data_type != b't' && self.data_type != b'b') {
             return None;
         }
 
@@ -480,6 +523,19 @@ impl RelationInfo {
     pub fn get_key_columns(&self) -> Vec<&ColumnInfo> {
         self.columns.iter().filter(|col| col.is_key()).collect()
     }
+
+    /// Iterate over the names of key columns (replica-identity columns).
+    ///
+    /// Zero-allocation: returns an iterator of cheap `Arc<str>` clones so
+    /// callers can `.collect()` directly into a `Vec<Arc<str>>` without the
+    /// intermediate `Vec<&ColumnInfo>` that `get_key_columns` produces.
+    #[inline]
+    pub fn key_column_names(&self) -> impl Iterator<Item = Arc<str>> + '_ {
+        self.columns
+            .iter()
+            .filter(|c| c.is_key())
+            .map(|c| Arc::clone(&c.name))
+    }
 }
 
 /// Replication message with streaming context
@@ -530,7 +586,7 @@ impl StreamingReplicationMessage {
 #[derive(Debug)]
 pub struct ReplicationState {
     /// Relations by OID
-    pub relations: HashMap<Oid, RelationInfo>,
+    pub relations: RelationMap,
     /// Last received LSN (write_lsn in pg_stat_replication)
     pub last_received_lsn: XLogRecPtr,
     /// Last flushed LSN
@@ -548,7 +604,7 @@ impl ReplicationState {
     #[inline]
     pub fn new() -> Self {
         Self {
-            relations: HashMap::with_capacity(64),
+            relations: RelationMap::with_capacity_and_hasher(64, BuildHasherDefault::default()),
             last_received_lsn: 0,
             last_flushed_lsn: 0,
             last_applied_lsn: 0,
@@ -1290,27 +1346,28 @@ impl LogicalReplicationParser {
     #[inline]
     fn parse_tuple_data(&mut self, reader: &mut BufferReader) -> Result<TupleData> {
         let column_count = reader.read_u16()? as usize;
-        let mut columns: SmallVec<[ColumnData; 4]> = SmallVec::with_capacity(column_count);
+        let mut columns: SmallVec<[ColumnData; 16]> = SmallVec::with_capacity(column_count);
 
         for _ in 0..column_count {
-            let column_type = reader.read_u8()? as char;
+            let column_type = reader.read_u8()?;
 
             let column_data = match column_type {
-                'n' => ColumnData::null(),
-                'u' => ColumnData::unchanged(),
-                't' => {
+                b'n' => ColumnData::null(),
+                b'u' => ColumnData::unchanged(),
+                b't' => {
                     let length = reader.read_u32()?;
                     let data = reader.read_bytes_buf(length as usize)?;
                     ColumnData::text_bytes(data)
                 }
-                'b' => {
+                b'b' => {
                     let length = reader.read_u32()?;
                     let data = reader.read_bytes_buf(length as usize)?;
                     ColumnData::binary_bytes(data)
                 }
                 _ => {
                     return Err(ReplicationError::protocol(format!(
-                        "Unknown column data type: '{column_type}'"
+                        "Unknown column data type: '{}'",
+                        column_type as char
                     )));
                 }
             };
@@ -1323,6 +1380,11 @@ impl LogicalReplicationParser {
 }
 
 /// Parse keepalive message from the replication stream
+///
+/// Keepalives are tiny fixed-layout messages (18 bytes). We decode them
+/// directly from the slice instead of constructing a `BufferReader`, which
+/// would otherwise allocate a `Bytes` copy per keepalive.
+#[inline]
 pub fn parse_keepalive_message(data: &[u8]) -> Result<KeepaliveMessage> {
     if data.len() < 18 {
         return Err(ReplicationError::protocol(
@@ -1330,11 +1392,10 @@ pub fn parse_keepalive_message(data: &[u8]) -> Result<KeepaliveMessage> {
         ));
     }
 
-    let mut reader = BufferReader::new(data);
-    let _msg_type = reader.skip_message_type()?;
-    let wal_end = reader.read_u64()?;
-    let timestamp = reader.read_i64()?;
-    let reply_requested = reader.read_u8()? != 0;
+    // Layout: 'k' (1) + wal_end (8) + timestamp (8) + reply_requested (1)
+    let wal_end = u64::from_be_bytes(data[1..9].try_into().unwrap());
+    let timestamp = i64::from_be_bytes(data[9..17].try_into().unwrap());
+    let reply_requested = data[17] != 0;
 
     Ok(KeepaliveMessage {
         wal_end,
@@ -1404,16 +1465,16 @@ mod tests {
     fn test_column_data_creation() {
         let null_col = ColumnData::null();
         assert!(null_col.is_null());
-        assert_eq!(null_col.data_type, 'n');
+        assert_eq!(null_col.data_type, b'n');
 
         let text_col = ColumnData::text(b"test".to_vec());
         assert!(!text_col.is_null());
-        assert_eq!(text_col.data_type, 't');
+        assert_eq!(text_col.data_type, b't');
         assert_eq!(text_col.as_string(), Some("test".to_string()));
 
         let unchanged_col = ColumnData::unchanged();
         assert!(unchanged_col.is_unchanged());
-        assert_eq!(unchanged_col.data_type, 'u');
+        assert_eq!(unchanged_col.data_type, b'u');
     }
 
     #[test]
@@ -1479,7 +1540,7 @@ mod tests {
         let binary_col = ColumnData::binary(vec![0x00, 0x01, 0x02, 0xFF]);
         assert!(binary_col.is_binary());
         assert!(!binary_col.is_text());
-        assert_eq!(binary_col.data_type, 'b');
+        assert_eq!(binary_col.data_type, b'b');
         assert_eq!(binary_col.as_bytes(), &[0x00, 0x01, 0x02, 0xFF]);
     }
 
@@ -1839,7 +1900,7 @@ mod tests {
             ColumnData::text(b"Alice".to_vec()),
         ]);
 
-        let row = tuple.to_row_data(&relation);
+        let row = tuple.into_row_data(&relation);
         assert_eq!(row.len(), 2);
         assert_eq!(row.get("id").unwrap(), "42");
         assert_eq!(row.get("name").unwrap(), "Alice");
@@ -2062,7 +2123,7 @@ mod tests {
 
         let tuple = TupleData::new(vec![ColumnData::text(b"42".to_vec()), ColumnData::null()]);
 
-        let row = tuple.to_row_data(&relation);
+        let row = tuple.into_row_data(&relation);
         assert_eq!(row.get("id").unwrap(), "42");
         assert_eq!(row.get("name").unwrap(), &ColumnValue::Null);
     }
@@ -2080,7 +2141,7 @@ mod tests {
             ColumnData::unchanged(), // unchanged TOAST should be skipped
         ]);
 
-        let row = tuple.to_row_data(&relation);
+        let row = tuple.into_row_data(&relation);
         assert_eq!(row.len(), 1);
         assert_eq!(row.get("id").unwrap(), "42");
         assert!(row.get("name").is_none());
@@ -2095,7 +2156,7 @@ mod tests {
 
         let tuple = TupleData::new(vec![ColumnData::binary(b"binary data".to_vec())]);
 
-        let row = tuple.to_row_data(&relation);
+        let row = tuple.into_row_data(&relation);
         let val = row.get("data").unwrap();
         assert!(matches!(val, ColumnValue::Binary(_)));
     }
@@ -2107,11 +2168,11 @@ mod tests {
         let relation = RelationInfo::new(1, "public".to_string(), "t".to_string(), b'd', columns);
 
         let col = ColumnData {
-            data_type: 't',
+            data_type: b't',
             data: bytes::Bytes::new(),
         };
         let tuple = TupleData::new(vec![col]);
-        let row = tuple.to_row_data(&relation);
+        let row = tuple.into_row_data(&relation);
         // Empty text data yields Text(empty Bytes)
         let val = row.get("col").unwrap();
         assert!(matches!(val, ColumnValue::Text(_)));
@@ -2124,11 +2185,11 @@ mod tests {
         let relation = RelationInfo::new(1, "public".to_string(), "t".to_string(), b'd', columns);
 
         let col = ColumnData {
-            data_type: 'x',
+            data_type: b'x',
             data: bytes::Bytes::from_static(&[1, 2, 3]),
         };
         let tuple = TupleData::new(vec![col]);
-        let row = tuple.to_row_data(&relation);
+        let row = tuple.into_row_data(&relation);
         assert!(row.get("col").unwrap().is_null());
     }
 
@@ -2143,7 +2204,7 @@ mod tests {
             ColumnData::text(b"val1".to_vec()),
             ColumnData::text(b"val2".to_vec()),
         ]);
-        let row = tuple.to_row_data(&relation);
+        let row = tuple.into_row_data(&relation);
         assert_eq!(row.len(), 1); // Only the first column maps
         assert_eq!(row.get("col1").unwrap(), "val1");
     }

@@ -178,13 +178,13 @@ fn main() {
         "Should produce diverse LogicalReplicationMessage variants"
     );
 
-    // --- TupleData.to_row_data roundtrip ---
-    println!("\n--- TupleData.to_row_data roundtrip ---");
+    // --- TupleData.into_row_data roundtrip ---
+    println!("\n--- TupleData.into_row_data roundtrip ---");
     if let (Ok(ri), Ok(td)) = (
         generators::arbitrary_relation_info(&mut u),
         generators::arbitrary_tuple_data(&mut u),
     ) {
-        let row = td.to_row_data(&ri);
+        let row = td.into_row_data(&ri);
         println!("  RowData entries: {}", row.len());
     }
 

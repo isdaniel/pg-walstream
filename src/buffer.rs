@@ -225,8 +225,9 @@ impl BufferReader {
     #[inline]
     pub fn read_bytes(&mut self, length: usize) -> Result<Vec<u8>> {
         self.ensure_bytes(length)?;
-        let bytes = self.data.copy_to_bytes(length);
-        Ok(bytes.to_vec())
+        let mut out = vec![0u8; length];
+        self.data.copy_to_slice(&mut out);
+        Ok(out)
     }
 
     /// Get raw bytes as Bytes (zero-copy when possible)
