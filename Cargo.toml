@@ -21,17 +21,17 @@ bytes = { version = "1.11.1", features = ["serde"] }
 tracing = "0.1.44"
 futures-core = "0.3.32"
 memchr = "2.8.0"
-smallvec = "1.15.1"
+smallvec = { version = "1.15.1", features = ["serde"] }
 
 # libpq backend (default)
 libpq-sys = { version = "0.8", optional = true }
 
 # rustls-tls
 tokio-rustls = { version = "0.26.4", optional = true }
-rustls = { version = "0.23.38", default-features = false, features = ["std", "tls12"], optional = true }
-webpki-roots = { version = "1.0.6", optional = true }
+rustls = { version = "0.23.39", default-features = false, features = ["std", "tls12"], optional = true }
+webpki-roots = { version = "1.0.7", optional = true }
 postgres-protocol = { version = "0.6.11", optional = true }
-aws-lc-rs = { version = "1.16.2", optional = true }
+aws-lc-rs = { version = "1.16.3", optional = true }
 socket2 = { version = "0.6.3", features = ["all"], optional = true }
 
 [features]

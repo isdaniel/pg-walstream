@@ -10,6 +10,7 @@ use crate::error::{ReplicationError, Result};
 use bytes::{Bytes, BytesMut};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 use std::sync::Arc;
 
 /// Encode a byte slice as lowercase hex string.
@@ -344,7 +345,7 @@ impl<'de> Deserialize<'de> for ColumnValue {
 /// ```
 #[derive(Debug, Clone, Eq)]
 pub struct RowData {
-    columns: Vec<(Arc<str>, ColumnValue)>,
+    columns: SmallVec<[(Arc<str>, ColumnValue); 8]>,
 }
 
 impl RowData {
@@ -352,7 +353,7 @@ impl RowData {
     #[inline]
     pub fn new() -> Self {
         Self {
-            columns: Vec::new(),
+            columns: SmallVec::new(),
         }
     }
 
@@ -360,7 +361,7 @@ impl RowData {
     #[inline]
     pub fn with_capacity(cap: usize) -> Self {
         Self {
-            columns: Vec::with_capacity(cap),
+            columns: SmallVec::with_capacity(cap),
         }
     }
 
@@ -517,7 +518,7 @@ impl RowData {
     /// Decode a `RowData` from a [`BufferReader`].
     pub fn decode(reader: &mut BufferReader) -> Result<Self> {
         let count = reader.read_u16()? as usize;
-        let mut columns = Vec::with_capacity(count);
+        let mut columns = SmallVec::with_capacity(count);
         for _ in 0..count {
             let name_len = reader.read_u16()? as usize;
             let name_bytes = reader.read_bytes(name_len)?;
@@ -575,7 +576,7 @@ impl<'de> Deserialize<'de> for RowData {
                 self,
                 mut map: M,
             ) -> std::result::Result<RowData, M::Error> {
-                let mut cols = Vec::with_capacity(map.size_hint().unwrap_or(0));
+                let mut cols = SmallVec::with_capacity(map.size_hint().unwrap_or(0));
                 while let Some((k, v)) = map.next_entry::<String, ColumnValue>()? {
                     cols.push((Arc::from(k), v));
                 }
@@ -984,5 +985,51 @@ mod tests {
         ]);
         let cloned = row.clone();
         assert_eq!(row, cloned);
+    }
+
+    #[test]
+    fn test_rowdata_wide_exceeds_inline_capacity() {
+        static NAMES: [&str; 12] = [
+            "c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "c11",
+        ];
+        let mut row = RowData::with_capacity(12);
+        for (i, &name) in NAMES.iter().enumerate() {
+            let val = format!("val_{i}");
+            row.push(Arc::from(name), ColumnValue::text(&val));
+        }
+        assert_eq!(row.len(), 12);
+        assert_eq!(row.get("c0").unwrap(), "val_0");
+        assert_eq!(row.get("c11").unwrap(), "val_11");
+    }
+
+    #[test]
+    fn test_rowdata_wide_encode_decode_round_trip() {
+        use crate::buffer::BufferReader;
+
+        static NAMES: [&str; 12] = [
+            "c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "c11",
+        ];
+        let mut row = RowData::with_capacity(12);
+        for (i, &name) in NAMES.iter().enumerate() {
+            let val = if i % 3 == 0 {
+                ColumnValue::Null
+            } else if i % 3 == 1 {
+                let s = format!("text_{i}");
+                ColumnValue::text(&s)
+            } else {
+                ColumnValue::binary_bytes(Bytes::from(vec![i as u8; 4]))
+            };
+            row.push(Arc::from(name), val);
+        }
+
+        let mut buf = BytesMut::new();
+        row.encode(&mut buf);
+
+        let frozen = buf.freeze();
+        let mut reader = BufferReader::new(&frozen);
+        let decoded = RowData::decode(&mut reader).unwrap();
+
+        assert_eq!(row, decoded);
+        assert_eq!(decoded.len(), 12);
     }
 }
