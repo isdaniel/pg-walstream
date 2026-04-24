@@ -181,16 +181,15 @@ pub fn postgres_timestamp_to_chrono(ts: i64) -> chrono::DateTime<chrono::Utc> {
 /// assert_eq!(lsn, 0);
 /// ```
 pub fn parse_lsn(lsn_str: &str) -> Result<XLogRecPtr> {
-    let parts: Vec<&str> = lsn_str.split('/').collect();
-    if parts.len() != 2 {
-        return Err(ReplicationError::protocol(format!(
+    let (high_str, low_str) = lsn_str.split_once('/').ok_or_else(|| {
+        ReplicationError::protocol(format!(
             "Invalid LSN format: {lsn_str}. Expected format: high/low"
-        )));
-    }
+        ))
+    })?;
 
-    let high = u64::from_str_radix(parts[0], 16)
+    let high = u64::from_str_radix(high_str, 16)
         .map_err(|e| ReplicationError::protocol(format!("Invalid LSN high part: {e}")))?;
-    let low = u64::from_str_radix(parts[1], 16)
+    let low = u64::from_str_radix(low_str, 16)
         .map_err(|e| ReplicationError::protocol(format!("Invalid LSN low part: {e}")))?;
 
     Ok((high << 32) | low)
@@ -2111,6 +2110,9 @@ mod tests {
         assert!(parse_lsn("/12345678").is_err());
         assert!(parse_lsn("GGGG/12345678").is_err());
         assert!(parse_lsn("0/GGGG").is_err());
+        // Multiple slashes: split_once takes first '/', remainder fails hex parse
+        assert!(parse_lsn("1/2/3").is_err());
+        assert!(parse_lsn("A/B/C/D").is_err());
     }
 
     #[test]

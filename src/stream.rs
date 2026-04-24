@@ -4437,7 +4437,10 @@ mod tests {
             } => {
                 assert!(old_data.is_some());
                 assert_eq!(new_data.get("name").unwrap(), "New");
-                assert_eq!(key_columns, vec![Arc::from("id"), Arc::from("name")]);
+                assert_eq!(
+                    key_columns.as_slice(),
+                    &[Arc::from("id"), Arc::from("name")]
+                );
                 // 'O' = all columns
             }
             _ => panic!("Expected Update event"),
