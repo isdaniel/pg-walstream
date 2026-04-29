@@ -97,14 +97,6 @@ impl BufferReader {
         )))
     }
 
-    /// Skip the message type byte and return current position
-    #[inline]
-    pub fn skip_message_type(&mut self) -> Result<usize> {
-        self.ensure_bytes(1)?;
-        self.data.advance(1);
-        Ok(self.data.len())
-    }
-
     /// Read a single byte
     ///
     /// # Returns
@@ -606,15 +598,6 @@ mod tests {
     }
 
     #[test]
-    fn test_buffer_reader_skip_message_type() {
-        let data = [0x42, 0x01, 0x02, 0x03]; // 'B' message type
-        let mut reader = BufferReader::new(&data);
-
-        reader.skip_message_type().unwrap();
-        assert_eq!(reader.read_u8().unwrap(), 0x01);
-    }
-
-    #[test]
     fn test_buffer_writer_signed_integers() {
         let mut writer = BufferWriter::new();
 
@@ -888,12 +871,5 @@ mod tests {
         );
         assert!(s.contains("Need 5"), "expected 'Need 5', got: {s}");
         assert!(s.contains("have 2"), "expected 'have 2', got: {s}");
-    }
-
-    #[test]
-    fn test_buffer_reader_skip_message_type_empty() {
-        let data: &[u8] = &[];
-        let mut reader = BufferReader::new(data);
-        assert!(reader.skip_message_type().is_err());
     }
 }

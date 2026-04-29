@@ -23,7 +23,7 @@ use crate::{
     LogicalReplicationParser, PgReplicationConnection, RelationInfo, ReplicationConnectionRetry,
     ReplicationState, RetryConfig, StreamingReplicationMessage, XLogRecPtr, INVALID_XLOG_REC_PTR,
 };
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use std::sync::Arc;
 
 use std::future::Future;
@@ -833,12 +833,11 @@ impl LogicalReplicationStream {
             ));
         }
 
-        // Parse fixed XLogData header directly from the byte slice. The
-        // `try_into().unwrap()` calls are infallible: we verified `data.len() >= 25`.
-        let header = &data[..25];
-        let start_lsn = u64::from_be_bytes(header[1..9].try_into().unwrap());
-        let end_lsn = u64::from_be_bytes(header[9..17].try_into().unwrap());
-        // header[17..25] is send_time, ignored.
+        // Parse WAL message header: Format: 'w' + start_lsn (8) + end_lsn (8) + send_time (8) + message_data
+        let mut header = &data[1..25];
+        let start_lsn = header.get_u64();
+        let end_lsn = header.get_u64();
+        let _send_time = header.get_i64();
 
         // Update LSN tracking using the server's WAL end position for this message
         if end_lsn > 0 {

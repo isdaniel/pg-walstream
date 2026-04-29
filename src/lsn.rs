@@ -107,7 +107,7 @@ impl SharedLsnFeedback {
             return;
         }
 
-        let mut current = self.flushed_lsn.load(Ordering::Relaxed);
+        let mut current = self.flushed_lsn.load(Ordering::Acquire);
         loop {
             if lsn <= current {
                 return;
@@ -141,7 +141,7 @@ impl SharedLsnFeedback {
             return;
         }
 
-        let mut current = self.applied_lsn.load(Ordering::Relaxed);
+        let mut current = self.applied_lsn.load(Ordering::Acquire);
         let mut advanced = false;
         loop {
             if lsn <= current {
