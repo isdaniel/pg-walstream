@@ -84,13 +84,17 @@ impl BufferReader {
     #[inline]
     fn ensure_bytes(&self, count: usize) -> Result<()> {
         if self.data.remaining() < count {
-            return Err(ReplicationError::protocol(format!(
-                "Not enough bytes remaining. Need {}, have {}",
-                count,
-                self.data.remaining()
-            )));
+            return Self::short_buffer_err(count, self.data.remaining());
         }
         Ok(())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn short_buffer_err(needed: usize, have: usize) -> Result<()> {
+        Err(ReplicationError::protocol(format!(
+            "Not enough bytes remaining. Need {needed}, have {have}"
+        )))
     }
 
     /// Skip the message type byte and return current position

@@ -1365,10 +1365,7 @@ impl LogicalReplicationParser {
                     ColumnData::binary_bytes(data)
                 }
                 _ => {
-                    return Err(ReplicationError::protocol(format!(
-                        "Unknown column data type: '{}'",
-                        column_type as char
-                    )));
+                    return Self::unknown_column_type_err(column_type);
                 }
             };
 
@@ -1376,6 +1373,15 @@ impl LogicalReplicationParser {
         }
 
         Ok(TupleData::from_smallvec(columns))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn unknown_column_type_err(column_type: u8) -> Result<TupleData> {
+        Err(ReplicationError::protocol(format!(
+            "Unknown column data type: '{}'",
+            column_type as char
+        )))
     }
 }
 

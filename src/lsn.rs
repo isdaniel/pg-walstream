@@ -101,13 +101,14 @@ impl SharedLsnFeedback {
     ///
     /// This should be called when data has been written/flushed to the destination
     /// database, but not yet committed (e.g., during batch writes).
+    #[inline]
     pub fn update_flushed_lsn(&self, lsn: XLogRecPtr) {
         if lsn == 0 {
             return;
         }
 
+        let mut current = self.flushed_lsn.load(Ordering::Relaxed);
         loop {
-            let current = self.flushed_lsn.load(Ordering::Acquire);
             if lsn <= current {
                 return;
             }
@@ -124,7 +125,7 @@ impl SharedLsnFeedback {
                     );
                     return;
                 }
-                Err(_) => continue,
+                Err(actual) => current = actual,
             }
         }
     }
@@ -134,12 +135,15 @@ impl SharedLsnFeedback {
     /// This should be called when a transaction has been successfully committed
     /// to the destination database. This is the most important LSN as PostgreSQL
     /// uses it to determine which WAL can be recycled.
+    #[inline]
     pub fn update_applied_lsn(&self, lsn: XLogRecPtr) {
         if lsn == 0 {
             return;
         }
+
+        let mut current = self.applied_lsn.load(Ordering::Relaxed);
+        let mut advanced = false;
         loop {
-            let current = self.applied_lsn.load(Ordering::Acquire);
             if lsn <= current {
                 break;
             }
@@ -154,14 +158,18 @@ impl SharedLsnFeedback {
                         "SharedLsnFeedback: Updated applied LSN from {} to {}",
                         current, lsn
                     );
+                    advanced = true;
                     break;
                 }
-                Err(_) => continue,
+                Err(actual) => current = actual,
             }
         }
 
-        // Applied data is implicitly flushed, update flushed as well
-        self.update_flushed_lsn(lsn);
+        // Applied data is implicitly flushed. Only chase the flushed CAS when
+        // we actually moved applied forward; otherwise flushed cannot be behind.
+        if advanced {
+            self.update_flushed_lsn(lsn);
+        }
     }
 
     /// Get the current flushed LSN

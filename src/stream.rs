@@ -19,10 +19,9 @@ use crate::types::{
     ChangeEvent, EventType, Lsn, RelationColumn, ReplicaIdentity, ReplicationSlotOptions, SlotType,
 };
 use crate::{
-    format_lsn, parse_keepalive_message, postgres_timestamp_to_chrono, BufferReader,
-    LogicalReplicationMessage, LogicalReplicationParser, PgReplicationConnection, RelationInfo,
-    ReplicationConnectionRetry, ReplicationState, RetryConfig, StreamingReplicationMessage,
-    XLogRecPtr, INVALID_XLOG_REC_PTR,
+    format_lsn, parse_keepalive_message, postgres_timestamp_to_chrono, LogicalReplicationMessage,
+    LogicalReplicationParser, PgReplicationConnection, RelationInfo, ReplicationConnectionRetry,
+    ReplicationState, RetryConfig, StreamingReplicationMessage, XLogRecPtr, INVALID_XLOG_REC_PTR,
 };
 use bytes::Bytes;
 use std::sync::Arc;
@@ -52,6 +51,12 @@ pub struct LogicalReplicationStream {
 /// How often `next_event` consults `Instant::now()` to decide whether to send
 /// feedback. Must be a power of two so the modulo folds to a bitmask.
 const FEEDBACK_CHECK_EVENT_INTERVAL: u32 = 128;
+
+/// How often `next_event_with_retry` performs the connection health check.
+/// Must be a power of two. The health check itself is time-gated, but its
+/// `Instant::now()` call is a vDSO syscall, so we additionally amortize it
+/// across this many events on the hot path.
+const HEALTH_CHECK_EVENT_INTERVAL: u32 = 1024;
 
 /// Configuration for the replication stream
 #[derive(Debug, Clone)]
@@ -738,10 +743,14 @@ impl LogicalReplicationStream {
         &mut self,
         cancellation_token: &CancellationToken,
     ) -> Result<ChangeEvent> {
-        // Perform periodic health check
-        if let Err(e) = self.check_connection_health().await {
-            warn!("Health check failed: {}", e);
-            // Don't fail immediately, try to continue
+        // Perform periodic health check.
+        //
+        // The check itself is cheap when nothing is wrong (it just compares `Instant::now()` against `last_health_check`), but `Instant::now()` is a vDSO syscall on Linux. At 100k+ rps that adds up, so we gate the health check on the per-event feedback counter and let it amortize across `HEALTH_CHECK_EVENT_INTERVAL` events. The actual time-based interval inside `check_connection_health()` still applies, this just skips the syscall on the inner-loop hot path.
+        if self.feedback_check_counter & (HEALTH_CHECK_EVENT_INTERVAL - 1) == 0 {
+            if let Err(e) = self.check_connection_health().await {
+                warn!("Health check failed: {}", e);
+                // Don't fail immediately, try to continue
+            }
         }
 
         // Try to get the next event with retry logic for transient connection errors
@@ -808,40 +817,41 @@ impl LogicalReplicationStream {
     }
 
     /// Process a WAL data message (zero-copy: uses Bytes slicing)
+    ///
+    /// The XLogData header is fixed-layout (25 bytes), so we decode it directly
+    /// from the slice instead of constructing a `BufferReader` — mirroring the
+    /// keepalive fast path. This avoids per-event bounds-check overhead and an
+    /// extra `Bytes` slice for the header region.
+    #[inline]
     fn process_wal_message(&mut self, data: impl Into<Bytes>) -> Result<Option<ChangeEvent>> {
         let data: Bytes = data.into();
 
-        // Check minimum message length (1 + 8 + 8 + 8 = 25 bytes)
+        // 'w' (1) + start_lsn (8) + end_lsn (8) + send_time (8) = 25 bytes
         if data.len() < 25 {
             return Err(ReplicationError::protocol(
                 "WAL message too short".to_string(),
             ));
         }
 
-        // Use BufferReader with zero-copy Bytes (ref-counted, no data copy)
-        let mut reader = BufferReader::from_bytes(data);
-
-        // Skip the message type ('w')
-        let _msg_type = reader.skip_message_type()?;
-
-        // Parse WAL message header
-        // Format: 'w' + start_lsn (8) + end_lsn (8) + send_time (8) + message_data
-        let start_lsn = reader.read_u64()?;
-        let end_lsn = reader.read_u64()?;
-        let _send_time = reader.read_i64()?;
+        // Parse fixed XLogData header directly from the byte slice. The
+        // `try_into().unwrap()` calls are infallible: we verified `data.len() >= 25`.
+        let header = &data[..25];
+        let start_lsn = u64::from_be_bytes(header[1..9].try_into().unwrap());
+        let end_lsn = u64::from_be_bytes(header[9..17].try_into().unwrap());
+        // header[17..25] is send_time, ignored.
 
         // Update LSN tracking using the server's WAL end position for this message
         if end_lsn > 0 {
             self.state.update_received_lsn(end_lsn);
         }
 
-        // Check if there's message data remaining
-        if reader.remaining() == 0 {
+        // No payload after the header → nothing to convert.
+        if data.len() == 25 {
             return Ok(None);
         }
 
-        // Get the remaining bytes for message parsing (zero-copy Bytes slice)
-        let message_data = reader.read_bytes_buf(reader.remaining())?;
+        // Zero-copy slice for the message body — refcount-only, no memcpy.
+        let message_data = data.slice(25..);
         let replication_message = self.parser.parse_wal_message_bytes(message_data)?;
         self.convert_to_change_event(replication_message, start_lsn)
     }
