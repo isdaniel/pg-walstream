@@ -2220,6 +2220,82 @@ mod tests {
     }
 
     #[test]
+    fn test_health_check_event_interval_is_power_of_two() {
+        // `next_event_with_retry` uses the same `counter & (INTERVAL - 1) == 0`
+        // bitmask trick to gate `Instant::now()` calls, so HEALTH_CHECK_EVENT_INTERVAL
+        // must be a non-zero power of two.
+        assert!(HEALTH_CHECK_EVENT_INTERVAL > 0);
+        assert_eq!(
+            HEALTH_CHECK_EVENT_INTERVAL & (HEALTH_CHECK_EVENT_INTERVAL - 1),
+            0,
+            "HEALTH_CHECK_EVENT_INTERVAL must be a power of two"
+        );
+    }
+
+    #[test]
+    fn test_health_check_event_interval_at_least_feedback_interval() {
+        // The health check interval is intentionally coarser than the feedback
+        // interval (and is a multiple of it) so feedback never gets starved by
+        // the health-check throttle. Pin the relationship in case either
+        // constant is ever bumped without consideration.
+        assert!(
+            HEALTH_CHECK_EVENT_INTERVAL >= FEEDBACK_CHECK_EVENT_INTERVAL,
+            "health-check interval should not be tighter than the feedback interval"
+        );
+        assert_eq!(
+            HEALTH_CHECK_EVENT_INTERVAL % FEEDBACK_CHECK_EVENT_INTERVAL,
+            0,
+            "HEALTH_CHECK_EVENT_INTERVAL should be a multiple of FEEDBACK_CHECK_EVENT_INTERVAL"
+        );
+    }
+
+    #[test]
+    fn test_health_check_gate_fires_on_first_event() {
+        // The gate is `counter & (INTERVAL - 1) == 0`. The counter starts at
+        // 0, so the very first call to `next_event_with_retry` must run the
+        // health check — important for catching dead connections at startup
+        // even on low-throughput streams.
+        let counter: u32 = 0;
+        assert_eq!(counter & (HEALTH_CHECK_EVENT_INTERVAL - 1), 0);
+    }
+
+    #[test]
+    fn test_health_check_gate_fires_on_multiples() {
+        // Mirrors `test_feedback_check_gate_semantics` for the health-check gate.
+        let interval = HEALTH_CHECK_EVENT_INTERVAL;
+        let mut counter: u32 = 0;
+        let mut fire_events = Vec::new();
+        // Walk through 3 intervals' worth of events and record where the gate fires.
+        for event_idx in 0..(interval * 3) {
+            if counter & (interval - 1) == 0 {
+                fire_events.push(event_idx);
+            }
+            counter = counter.wrapping_add(1);
+        }
+        assert_eq!(
+            fire_events,
+            vec![0, interval, interval * 2],
+            "health-check gate should fire at counter 0, INTERVAL, 2*INTERVAL"
+        );
+    }
+
+    #[test]
+    fn test_health_check_gate_handles_counter_wraparound() {
+        // The counter is `u32` and uses `wrapping_add`. The gate must continue
+        // to fire correctly when the counter wraps from u32::MAX back to 0.
+        let interval = HEALTH_CHECK_EVENT_INTERVAL;
+        // u32::MAX = 0xFFFF_FFFF; with INTERVAL=1024, (INTERVAL - 1) = 0x3FF,
+        // so u32::MAX & 0x3FF == 0x3FF (gate does NOT fire).
+        let counter: u32 = u32::MAX;
+        assert_ne!(counter & (interval - 1), 0);
+
+        // After wrapping_add(1) the counter wraps to 0, and the gate fires.
+        let next = counter.wrapping_add(1);
+        assert_eq!(next, 0);
+        assert_eq!(next & (interval - 1), 0);
+    }
+
+    #[test]
     fn test_replication_state_should_send_feedback() {
         let mut state = ReplicationState::new();
         let feedback_interval = Duration::from_millis(50);

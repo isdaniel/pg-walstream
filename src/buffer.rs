@@ -872,6 +872,24 @@ mod tests {
         assert!(reader.read_bytes_buf(5).is_err());
     }
 
+    /// Pin the error message format produced by the `#[cold]`
+    /// `short_buffer_err` helper. Several layers above (parser, stream)
+    /// surface this string in logs, so format regressions would silently
+    /// degrade diagnostics.
+    #[test]
+    fn test_buffer_reader_short_buffer_err_message_format() {
+        let data = [0x01, 0x02];
+        let mut reader = BufferReader::new(&data);
+        let err = reader.read_bytes_buf(5).unwrap_err();
+        let s = err.to_string();
+        assert!(
+            s.contains("Not enough bytes remaining"),
+            "expected 'Not enough bytes remaining' in error, got: {s}"
+        );
+        assert!(s.contains("Need 5"), "expected 'Need 5', got: {s}");
+        assert!(s.contains("have 2"), "expected 'have 2', got: {s}");
+    }
+
     #[test]
     fn test_buffer_reader_skip_message_type_empty() {
         let data: &[u8] = &[];
