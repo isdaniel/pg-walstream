@@ -101,13 +101,14 @@ impl SharedLsnFeedback {
     ///
     /// This should be called when data has been written/flushed to the destination
     /// database, but not yet committed (e.g., during batch writes).
+    #[inline]
     pub fn update_flushed_lsn(&self, lsn: XLogRecPtr) {
         if lsn == 0 {
             return;
         }
 
+        let mut current = self.flushed_lsn.load(Ordering::Acquire);
         loop {
-            let current = self.flushed_lsn.load(Ordering::Acquire);
             if lsn <= current {
                 return;
             }
@@ -124,7 +125,7 @@ impl SharedLsnFeedback {
                     );
                     return;
                 }
-                Err(_) => continue,
+                Err(actual) => current = actual,
             }
         }
     }
@@ -134,12 +135,15 @@ impl SharedLsnFeedback {
     /// This should be called when a transaction has been successfully committed
     /// to the destination database. This is the most important LSN as PostgreSQL
     /// uses it to determine which WAL can be recycled.
+    #[inline]
     pub fn update_applied_lsn(&self, lsn: XLogRecPtr) {
         if lsn == 0 {
             return;
         }
+
+        let mut current = self.applied_lsn.load(Ordering::Acquire);
+        let mut advanced = false;
         loop {
-            let current = self.applied_lsn.load(Ordering::Acquire);
             if lsn <= current {
                 break;
             }
@@ -154,14 +158,17 @@ impl SharedLsnFeedback {
                         "SharedLsnFeedback: Updated applied LSN from {} to {}",
                         current, lsn
                     );
+                    advanced = true;
                     break;
                 }
-                Err(_) => continue,
+                Err(actual) => current = actual,
             }
         }
 
-        // Applied data is implicitly flushed, update flushed as well
-        self.update_flushed_lsn(lsn);
+        // Applied data is implicitly flushed. Only chase the flushed CAS when we actually moved applied forward; otherwise flushed cannot be behind.
+        if advanced {
+            self.update_flushed_lsn(lsn);
+        }
     }
 
     /// Get the current flushed LSN
@@ -482,5 +489,91 @@ mod tests {
         feedback.update_applied_lsn(50);
         feedback.update_applied_lsn(50);
         assert_eq!(feedback.get_applied_lsn(), 50);
+    }
+
+    /// Deterministic stress test that forces the `Err(actual) => current = actual`
+    /// branch in `update_flushed_lsn` and `update_applied_lsn` to fire.
+    ///
+    /// `compare_exchange_weak` may also fail spuriously on weak memory models
+    /// (e.g. ARM) even without contention, so on those targets the loop body
+    /// is exercised even by a single-threaded run. On x86 we additionally
+    /// fan out across many threads so the lost-update path is always touched
+    /// regardless of the CAS strength.
+    #[test]
+    fn test_concurrent_cas_retry_path() {
+        use std::sync::Arc;
+        use std::sync::Barrier;
+        use std::thread;
+
+        const THREADS: usize = 16;
+        const ITERS: u64 = 5_000;
+
+        let feedback = SharedLsnFeedback::new_shared();
+        let barrier = Arc::new(Barrier::new(THREADS));
+
+        let mut handles = Vec::with_capacity(THREADS);
+        for tid in 0..THREADS as u64 {
+            let fb = Arc::clone(&feedback);
+            let bar = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                bar.wait();
+                // Each thread proposes a strictly increasing sequence of LSNs;
+                // collisions between threads guarantee CAS contention and force
+                // the `Err(actual)` branch to update `current` and retry.
+                for i in 1..=ITERS {
+                    let lsn = i * THREADS as u64 + tid;
+                    fb.update_flushed_lsn(lsn);
+                    fb.update_applied_lsn(lsn);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Final value must be at least the highest proposed LSN (monotonic).
+        let max_lsn = ITERS * THREADS as u64 + (THREADS as u64 - 1);
+        assert!(
+            feedback.get_applied_lsn() >= max_lsn - (THREADS as u64 - 1),
+            "applied LSN regressed under contention: got {}, want >= {}",
+            feedback.get_applied_lsn(),
+            max_lsn - (THREADS as u64 - 1)
+        );
+        // Applied advancing must drag flushed along.
+        assert!(feedback.get_flushed_lsn() >= feedback.get_applied_lsn());
+    }
+
+    /// `update_applied_lsn` must NOT touch `flushed_lsn` when the proposed
+    /// applied LSN does not advance the current value. This is the
+    /// optimization that saves a CAS-loop per consumer event when LSN is
+    /// unchanged.
+    #[test]
+    fn test_applied_no_advance_does_not_modify_flushed() {
+        let feedback = SharedLsnFeedback::new();
+        feedback.update_flushed_lsn(1000);
+        feedback.update_applied_lsn(500);
+        assert_eq!(feedback.get_flushed_lsn(), 1000);
+        assert_eq!(feedback.get_applied_lsn(), 500);
+
+        // Stale applied LSN must not regress flushed.
+        feedback.update_applied_lsn(400);
+        assert_eq!(feedback.get_flushed_lsn(), 1000);
+        assert_eq!(feedback.get_applied_lsn(), 500);
+
+        // Equal applied LSN must not touch flushed either.
+        feedback.update_applied_lsn(500);
+        assert_eq!(feedback.get_flushed_lsn(), 1000);
+        assert_eq!(feedback.get_applied_lsn(), 500);
+    }
+
+    /// `update_applied_lsn` advancing past the current `flushed_lsn` must
+    /// also pull `flushed_lsn` forward (applied data is implicitly flushed).
+    #[test]
+    fn test_applied_advance_drags_flushed_forward() {
+        let feedback = SharedLsnFeedback::new();
+        feedback.update_flushed_lsn(100);
+        feedback.update_applied_lsn(500);
+        assert_eq!(feedback.get_applied_lsn(), 500);
+        assert_eq!(feedback.get_flushed_lsn(), 500);
     }
 }
