@@ -1365,10 +1365,7 @@ impl LogicalReplicationParser {
                     ColumnData::binary_bytes(data)
                 }
                 _ => {
-                    return Err(ReplicationError::protocol(format!(
-                        "Unknown column data type: '{}'",
-                        column_type as char
-                    )));
+                    return Self::unknown_column_type_err(column_type);
                 }
             };
 
@@ -1376,6 +1373,15 @@ impl LogicalReplicationParser {
         }
 
         Ok(TupleData::from_smallvec(columns))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn unknown_column_type_err(column_type: u8) -> Result<TupleData> {
+        Err(ReplicationError::protocol(format!(
+            "Unknown column data type: '{}'",
+            column_type as char
+        )))
     }
 }
 
@@ -3145,5 +3151,46 @@ mod tests {
             }
             _ => panic!("Expected Relation message"),
         }
+    }
+
+    /// Covers the cold error path `LogicalReplicationParser::unknown_column_type_err`.
+    ///
+    /// Crafts a synthetic `INSERT` WAL message whose tuple contains a column
+    /// with an unrecognised type byte (`b'x'`). `parse_tuple_data` must reject
+    /// it via the `#[cold]` helper.
+    #[test]
+    fn test_parse_tuple_data_unknown_column_type() {
+        let mut parser = LogicalReplicationParser::with_protocol_version(1);
+
+        // INSERT message: 'I' + relation_id (u32) + 'N' + tuple_data
+        // tuple_data: column_count (u16) + per-column { type (u8) [+ length + payload] }
+        let mut msg = Vec::new();
+        msg.push(b'I');
+        msg.extend_from_slice(&42u32.to_be_bytes()); // relation_id
+        msg.push(b'N'); // new tuple marker
+        msg.extend_from_slice(&1u16.to_be_bytes()); // 1 column
+        msg.push(b'x'); // unknown column type → triggers the cold helper
+
+        let err = parser.parse_wal_message(&msg).unwrap_err();
+        let msg_str = err.to_string();
+        assert!(
+            msg_str.contains("Unknown column data type"),
+            "expected 'Unknown column data type' in error, got: {msg_str}"
+        );
+        assert!(
+            msg_str.contains("'x'"),
+            "expected the offending byte to be reported, got: {msg_str}"
+        );
+    }
+
+    /// Direct unit test for the cold error helper itself, so it is reachable
+    /// without parser-level setup. Pins the message format that callers may
+    /// rely on for log-grep diagnostics.
+    #[test]
+    fn test_unknown_column_type_err_message_format() {
+        let err = LogicalReplicationParser::unknown_column_type_err(b'?').unwrap_err();
+        let s = err.to_string();
+        assert!(s.contains("Unknown column data type"));
+        assert!(s.contains("'?'"));
     }
 }

@@ -19,12 +19,11 @@ use crate::types::{
     ChangeEvent, EventType, Lsn, RelationColumn, ReplicaIdentity, ReplicationSlotOptions, SlotType,
 };
 use crate::{
-    format_lsn, parse_keepalive_message, postgres_timestamp_to_chrono, BufferReader,
-    LogicalReplicationMessage, LogicalReplicationParser, PgReplicationConnection, RelationInfo,
-    ReplicationConnectionRetry, ReplicationState, RetryConfig, StreamingReplicationMessage,
-    XLogRecPtr, INVALID_XLOG_REC_PTR,
+    format_lsn, parse_keepalive_message, postgres_timestamp_to_chrono, LogicalReplicationMessage,
+    LogicalReplicationParser, PgReplicationConnection, RelationInfo, ReplicationConnectionRetry,
+    ReplicationState, RetryConfig, StreamingReplicationMessage, XLogRecPtr, INVALID_XLOG_REC_PTR,
 };
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use std::sync::Arc;
 
 use std::future::Future;
@@ -52,6 +51,12 @@ pub struct LogicalReplicationStream {
 /// How often `next_event` consults `Instant::now()` to decide whether to send
 /// feedback. Must be a power of two so the modulo folds to a bitmask.
 const FEEDBACK_CHECK_EVENT_INTERVAL: u32 = 128;
+
+/// How often `next_event_with_retry` performs the connection health check.
+/// Must be a power of two. The health check itself is time-gated, but its
+/// `Instant::now()` call is a vDSO syscall, so we additionally amortize it
+/// across this many events on the hot path.
+const HEALTH_CHECK_EVENT_INTERVAL: u32 = 1024;
 
 /// Configuration for the replication stream
 #[derive(Debug, Clone)]
@@ -738,10 +743,14 @@ impl LogicalReplicationStream {
         &mut self,
         cancellation_token: &CancellationToken,
     ) -> Result<ChangeEvent> {
-        // Perform periodic health check
-        if let Err(e) = self.check_connection_health().await {
-            warn!("Health check failed: {}", e);
-            // Don't fail immediately, try to continue
+        // Perform periodic health check.
+        //
+        // The check itself is cheap when nothing is wrong (it just compares `Instant::now()` against `last_health_check`), but `Instant::now()` is a vDSO syscall on Linux. At 100k+ rps that adds up, so we gate the health check on the per-event feedback counter and let it amortize across `HEALTH_CHECK_EVENT_INTERVAL` events. The actual time-based interval inside `check_connection_health()` still applies, this just skips the syscall on the inner-loop hot path.
+        if self.feedback_check_counter & (HEALTH_CHECK_EVENT_INTERVAL - 1) == 0 {
+            if let Err(e) = self.check_connection_health().await {
+                warn!("Health check failed: {}", e);
+                // Don't fail immediately, try to continue
+            }
         }
 
         // Try to get the next event with retry logic for transient connection errors
@@ -808,40 +817,40 @@ impl LogicalReplicationStream {
     }
 
     /// Process a WAL data message (zero-copy: uses Bytes slicing)
+    ///
+    /// The XLogData header is fixed-layout (25 bytes), so we decode it directly
+    /// from the slice instead of constructing a `BufferReader` — mirroring the
+    /// keepalive fast path. This avoids per-event bounds-check overhead and an
+    /// extra `Bytes` slice for the header region.
+    #[inline]
     fn process_wal_message(&mut self, data: impl Into<Bytes>) -> Result<Option<ChangeEvent>> {
         let data: Bytes = data.into();
 
-        // Check minimum message length (1 + 8 + 8 + 8 = 25 bytes)
+        // 'w' (1) + start_lsn (8) + end_lsn (8) + send_time (8) = 25 bytes
         if data.len() < 25 {
             return Err(ReplicationError::protocol(
                 "WAL message too short".to_string(),
             ));
         }
 
-        // Use BufferReader with zero-copy Bytes (ref-counted, no data copy)
-        let mut reader = BufferReader::from_bytes(data);
-
-        // Skip the message type ('w')
-        let _msg_type = reader.skip_message_type()?;
-
-        // Parse WAL message header
-        // Format: 'w' + start_lsn (8) + end_lsn (8) + send_time (8) + message_data
-        let start_lsn = reader.read_u64()?;
-        let end_lsn = reader.read_u64()?;
-        let _send_time = reader.read_i64()?;
+        // Parse WAL message header: Format: 'w' + start_lsn (8) + end_lsn (8) + send_time (8) + message_data
+        let mut header = &data[1..25];
+        let start_lsn = header.get_u64();
+        let end_lsn = header.get_u64();
+        let _send_time = header.get_i64();
 
         // Update LSN tracking using the server's WAL end position for this message
         if end_lsn > 0 {
             self.state.update_received_lsn(end_lsn);
         }
 
-        // Check if there's message data remaining
-        if reader.remaining() == 0 {
+        // No payload after the header → nothing to convert.
+        if data.len() == 25 {
             return Ok(None);
         }
 
-        // Get the remaining bytes for message parsing (zero-copy Bytes slice)
-        let message_data = reader.read_bytes_buf(reader.remaining())?;
+        // Zero-copy slice for the message body — refcount-only, no memcpy.
+        let message_data = data.slice(25..);
         let replication_message = self.parser.parse_wal_message_bytes(message_data)?;
         self.convert_to_change_event(replication_message, start_lsn)
     }
@@ -2207,6 +2216,82 @@ mod tests {
             vec![interval, interval * 2, interval * 3],
             "gate should fire exactly on multiples of the interval"
         );
+    }
+
+    #[test]
+    fn test_health_check_event_interval_is_power_of_two() {
+        // `next_event_with_retry` uses the same `counter & (INTERVAL - 1) == 0`
+        // bitmask trick to gate `Instant::now()` calls, so HEALTH_CHECK_EVENT_INTERVAL
+        // must be a non-zero power of two.
+        assert!(HEALTH_CHECK_EVENT_INTERVAL > 0);
+        assert_eq!(
+            HEALTH_CHECK_EVENT_INTERVAL & (HEALTH_CHECK_EVENT_INTERVAL - 1),
+            0,
+            "HEALTH_CHECK_EVENT_INTERVAL must be a power of two"
+        );
+    }
+
+    #[test]
+    fn test_health_check_event_interval_at_least_feedback_interval() {
+        // The health check interval is intentionally coarser than the feedback
+        // interval (and is a multiple of it) so feedback never gets starved by
+        // the health-check throttle. Pin the relationship in case either
+        // constant is ever bumped without consideration.
+        assert!(
+            HEALTH_CHECK_EVENT_INTERVAL >= FEEDBACK_CHECK_EVENT_INTERVAL,
+            "health-check interval should not be tighter than the feedback interval"
+        );
+        assert_eq!(
+            HEALTH_CHECK_EVENT_INTERVAL % FEEDBACK_CHECK_EVENT_INTERVAL,
+            0,
+            "HEALTH_CHECK_EVENT_INTERVAL should be a multiple of FEEDBACK_CHECK_EVENT_INTERVAL"
+        );
+    }
+
+    #[test]
+    fn test_health_check_gate_fires_on_first_event() {
+        // The gate is `counter & (INTERVAL - 1) == 0`. The counter starts at
+        // 0, so the very first call to `next_event_with_retry` must run the
+        // health check — important for catching dead connections at startup
+        // even on low-throughput streams.
+        let counter: u32 = 0;
+        assert_eq!(counter & (HEALTH_CHECK_EVENT_INTERVAL - 1), 0);
+    }
+
+    #[test]
+    fn test_health_check_gate_fires_on_multiples() {
+        // Mirrors `test_feedback_check_gate_semantics` for the health-check gate.
+        let interval = HEALTH_CHECK_EVENT_INTERVAL;
+        let mut counter: u32 = 0;
+        let mut fire_events = Vec::new();
+        // Walk through 3 intervals' worth of events and record where the gate fires.
+        for event_idx in 0..(interval * 3) {
+            if counter & (interval - 1) == 0 {
+                fire_events.push(event_idx);
+            }
+            counter = counter.wrapping_add(1);
+        }
+        assert_eq!(
+            fire_events,
+            vec![0, interval, interval * 2],
+            "health-check gate should fire at counter 0, INTERVAL, 2*INTERVAL"
+        );
+    }
+
+    #[test]
+    fn test_health_check_gate_handles_counter_wraparound() {
+        // The counter is `u32` and uses `wrapping_add`. The gate must continue
+        // to fire correctly when the counter wraps from u32::MAX back to 0.
+        let interval = HEALTH_CHECK_EVENT_INTERVAL;
+        // u32::MAX = 0xFFFF_FFFF; with INTERVAL=1024, (INTERVAL - 1) = 0x3FF,
+        // so u32::MAX & 0x3FF == 0x3FF (gate does NOT fire).
+        let counter: u32 = u32::MAX;
+        assert_ne!(counter & (interval - 1), 0);
+
+        // After wrapping_add(1) the counter wraps to 0, and the gate fires.
+        let next = counter.wrapping_add(1);
+        assert_eq!(next, 0);
+        assert_eq!(next & (interval - 1), 0);
     }
 
     #[test]

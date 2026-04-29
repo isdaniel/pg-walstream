@@ -84,21 +84,17 @@ impl BufferReader {
     #[inline]
     fn ensure_bytes(&self, count: usize) -> Result<()> {
         if self.data.remaining() < count {
-            return Err(ReplicationError::protocol(format!(
-                "Not enough bytes remaining. Need {}, have {}",
-                count,
-                self.data.remaining()
-            )));
+            return Self::short_buffer_err(count, self.data.remaining());
         }
         Ok(())
     }
 
-    /// Skip the message type byte and return current position
-    #[inline]
-    pub fn skip_message_type(&mut self) -> Result<usize> {
-        self.ensure_bytes(1)?;
-        self.data.advance(1);
-        Ok(self.data.len())
+    #[cold]
+    #[inline(never)]
+    fn short_buffer_err(needed: usize, have: usize) -> Result<()> {
+        Err(ReplicationError::protocol(format!(
+            "Not enough bytes remaining. Need {needed}, have {have}"
+        )))
     }
 
     /// Read a single byte
@@ -602,15 +598,6 @@ mod tests {
     }
 
     #[test]
-    fn test_buffer_reader_skip_message_type() {
-        let data = [0x42, 0x01, 0x02, 0x03]; // 'B' message type
-        let mut reader = BufferReader::new(&data);
-
-        reader.skip_message_type().unwrap();
-        assert_eq!(reader.read_u8().unwrap(), 0x01);
-    }
-
-    #[test]
     fn test_buffer_writer_signed_integers() {
         let mut writer = BufferWriter::new();
 
@@ -868,10 +855,21 @@ mod tests {
         assert!(reader.read_bytes_buf(5).is_err());
     }
 
+    /// Pin the error message format produced by the `#[cold]`
+    /// `short_buffer_err` helper. Several layers above (parser, stream)
+    /// surface this string in logs, so format regressions would silently
+    /// degrade diagnostics.
     #[test]
-    fn test_buffer_reader_skip_message_type_empty() {
-        let data: &[u8] = &[];
-        let mut reader = BufferReader::new(data);
-        assert!(reader.skip_message_type().is_err());
+    fn test_buffer_reader_short_buffer_err_message_format() {
+        let data = [0x01, 0x02];
+        let mut reader = BufferReader::new(&data);
+        let err = reader.read_bytes_buf(5).unwrap_err();
+        let s = err.to_string();
+        assert!(
+            s.contains("Not enough bytes remaining"),
+            "expected 'Not enough bytes remaining' in error, got: {s}"
+        );
+        assert!(s.contains("Need 5"), "expected 'Need 5', got: {s}");
+        assert!(s.contains("have 2"), "expected 'have 2', got: {s}");
     }
 }
