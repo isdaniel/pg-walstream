@@ -127,6 +127,7 @@ pub mod buffer;
 pub mod column_value;
 pub mod deserializer;
 pub mod error;
+pub mod sql_builder;
 pub mod types;
 
 // Protocol implementation
@@ -198,3 +199,9 @@ pub use connection::{PgReplicationConnection, PgResult};
 
 // Re-export retry types
 pub use retry::{ExponentialBackoff, ReplicationConnectionRetry, RetryConfig};
+
+// Re-export SQL builder utilities
+pub use sql_builder::{
+    build_create_subscription_sql, build_detach_slot_sql, build_disable_subscription_sql,
+    build_drop_subscription_sql, quote_ident, quote_literal, CreateSubscriptionOptions,
+};
