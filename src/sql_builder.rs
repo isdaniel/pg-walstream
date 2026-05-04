@@ -6,10 +6,10 @@
 //! to avoid intermediate allocations.
 
 use crate::error::{ReplicationError, Result};
-use crate::types::{format_lsn, BaseBackupOptions, ReplicationSlotOptions, SlotType, XLogRecPtr};
-
-/// Invalid/zero LSN pointer (re-imported for internal use).
-const INVALID_XLOG_REC_PTR: u64 = 0;
+use crate::types::{
+    format_lsn, BaseBackupOptions, ReplicationSlotOptions, SlotType, XLogRecPtr,
+    INVALID_XLOG_REC_PTR,
+};
 
 /// Quote a PostgreSQL identifier by wrapping in double quotes and escaping
 /// internal double quotes (doubling them).
