@@ -2193,4 +2193,75 @@ mod tests {
         .unwrap();
         assert!(sql.contains(r#""evil""slot""#));
     }
+
+    // ========================================
+    // Public method error propagation tests
+    // (exercises the `?` on builder calls in production methods)
+    // ========================================
+
+    #[test]
+    fn test_alter_replication_slot_rejects_null_byte() {
+        let mut conn = PgReplicationConnection::null_for_testing();
+        let result = conn.alter_replication_slot("slot\0x", Some(true), None);
+        let err = result.err().expect("expected error");
+        assert!(err.to_string().contains("null bytes"));
+    }
+
+    #[test]
+    fn test_drop_replication_slot_rejects_null_byte() {
+        let mut conn = PgReplicationConnection::null_for_testing();
+        let err = conn.drop_replication_slot("slot\0x", false).unwrap_err();
+        assert!(err.to_string().contains("null bytes"));
+    }
+
+    #[test]
+    fn test_read_replication_slot_rejects_null_byte() {
+        let mut conn = PgReplicationConnection::null_for_testing();
+        let err = conn.read_replication_slot("slot\0x").unwrap_err();
+        assert!(err.to_string().contains("null bytes"));
+    }
+
+    #[test]
+    fn test_start_physical_replication_rejects_null_byte() {
+        let mut conn = PgReplicationConnection::null_for_testing();
+        let err = conn
+            .start_physical_replication(Some("slot\0x"), 0, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("null bytes"));
+    }
+
+    #[test]
+    fn test_base_backup_rejects_null_byte_in_label() {
+        let mut conn = PgReplicationConnection::null_for_testing();
+        let opts = BaseBackupOptions {
+            label: Some("label\0x".to_string()),
+            ..Default::default()
+        };
+        let result = conn.base_backup(&opts);
+        let err = result.err().expect("expected error");
+        assert!(err.to_string().contains("null bytes"));
+    }
+
+    #[test]
+    fn test_start_replication_rejects_null_byte() {
+        let mut conn = PgReplicationConnection::null_for_testing();
+        let err = conn
+            .start_replication("slot\0x", 0, &[("proto_version", "1")])
+            .unwrap_err();
+        assert!(err.to_string().contains("null bytes"));
+    }
+
+    #[test]
+    fn test_create_replication_slot_rejects_null_byte() {
+        let mut conn = PgReplicationConnection::null_for_testing();
+        let opts = ReplicationSlotOptions::default();
+        let result = conn.create_replication_slot_with_options(
+            "slot\0x",
+            SlotType::Logical,
+            Some("pgoutput"),
+            &opts,
+        );
+        let err = result.err().expect("expected error");
+        assert!(err.to_string().contains("null bytes"));
+    }
 }
