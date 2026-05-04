@@ -19,7 +19,7 @@ use crate::error::{ReplicationError, Result};
 use crate::protocol::build_hot_standby_feedback_message;
 use crate::types::{
     format_lsn, system_time_to_postgres_timestamp, BaseBackupOptions, ReplicationSlotOptions,
-    SlotType, XLogRecPtr, INVALID_XLOG_REC_PTR,
+    SlotType, XLogRecPtr,
 };
 
 /// Initial capacity for the read buffer (256 KiB).
@@ -44,25 +44,6 @@ fn run_sync<F: std::future::Future>(fut: F) -> F::Output {
             .expect("failed to create runtime for sync bridge");
         rt.block_on(fut)
     }
-}
-
-/// Sanitize a string value for use in PostgreSQL replication protocol commands
-/// by escaping single quotes (replacing ' with '')
-#[inline]
-fn sanitize_sql_string_value(value: &str) -> String {
-    value.replace('\'', "''")
-}
-
-/// Sanitize a string value and wrap it in single quotes for SQL
-#[inline]
-fn quote_sql_string_value(value: &str) -> String {
-    format!("'{}'", sanitize_sql_string_value(value))
-}
-
-/// Quote a SQL identifier by escaping internal double quotes.
-#[inline]
-fn quote_sql_identifier(identifier: &str) -> String {
-    format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
 /// Pure-Rust PostgreSQL connection for replication.
@@ -174,27 +155,7 @@ impl NativeConnection {
         start_lsn: XLogRecPtr,
         options: &[(&str, &str)],
     ) -> Result<()> {
-        let quoted_slot = quote_sql_identifier(slot_name);
-        let mut options_str = String::new();
-        for (i, (key, value)) in options.iter().enumerate() {
-            if i > 0 {
-                options_str.push_str(", ");
-            }
-            let quoted_key = quote_sql_identifier(key);
-            let sanitized_value = sanitize_sql_string_value(value);
-            options_str.push_str(&format!("{quoted_key} '{sanitized_value}'"));
-        }
-
-        let sql = if start_lsn == INVALID_XLOG_REC_PTR {
-            format!("START_REPLICATION SLOT {quoted_slot} LOGICAL 0/0 ({options_str})")
-        } else {
-            format!(
-                "START_REPLICATION SLOT {} LOGICAL {} ({})",
-                quoted_slot,
-                format_lsn(start_lsn),
-                options_str
-            )
-        };
+        let sql = crate::sql_builder::build_start_replication_sql(slot_name, start_lsn, options);
 
         debug!("Starting replication: {}", sql);
 
@@ -331,58 +292,7 @@ impl NativeConnection {
         output_plugin: Option<&str>,
         options: &ReplicationSlotOptions,
     ) -> Result<String> {
-        let mut parts: Vec<&str> = Vec::new();
-        let quoted_slot = quote_sql_identifier(slot_name);
-
-        parts.push("CREATE_REPLICATION_SLOT");
-        parts.push(&quoted_slot);
-
-        if options.temporary {
-            parts.push("TEMPORARY");
-        }
-
-        parts.push(slot_type.as_str());
-
-        let quoted_plugin: String;
-
-        match slot_type {
-            SlotType::Physical => {
-                if options.reserve_wal {
-                    parts.push("RESERVE_WAL");
-                }
-            }
-            SlotType::Logical => {
-                let plugin = output_plugin.ok_or_else(|| {
-                    ReplicationError::protocol(
-                        "Output plugin required for LOGICAL slots".to_string(),
-                    )
-                })?;
-                quoted_plugin = quote_sql_identifier(plugin);
-                parts.push(&quoted_plugin);
-
-                if options.two_phase {
-                    parts.push("TWO_PHASE");
-                } else if let Some(ref snapshot) = options.snapshot {
-                    match snapshot.as_str() {
-                        "export" => parts.push("EXPORT_SNAPSHOT"),
-                        "nothing" => parts.push("NOEXPORT_SNAPSHOT"),
-                        "use" => parts.push("USE_SNAPSHOT"),
-                        other => {
-                            return Err(ReplicationError::config(format!(
-                                "Invalid snapshot option '{}': expected 'export', 'nothing', or 'use'",
-                                other
-                            )));
-                        }
-                    }
-                }
-
-                if options.failover {
-                    parts.push("FAILOVER");
-                }
-            }
-        }
-
-        Ok(format!("{};", parts.join(" ")))
+        crate::sql_builder::build_create_slot_sql(slot_name, slot_type, output_plugin, options)
     }
 
     /// Alter a replication slot (logical slots only).
@@ -392,25 +302,7 @@ impl NativeConnection {
         two_phase: Option<bool>,
         failover: Option<bool>,
     ) -> Result<NativePgResult> {
-        let mut opts = Vec::new();
-
-        if let Some(tp) = two_phase {
-            opts.push(format!("TWO_PHASE {}", tp));
-        }
-
-        if let Some(failover_value) = failover {
-            opts.push(format!("FAILOVER {}", failover_value));
-        }
-
-        if opts.is_empty() {
-            return Err(ReplicationError::protocol(
-                "At least one option must be specified for ALTER_REPLICATION_SLOT".to_string(),
-            ));
-        }
-
-        let options_str = Self::build_sql_options(&opts);
-        let quoted_slot = quote_sql_identifier(slot_name);
-        let sql = format!("ALTER_REPLICATION_SLOT {}{};", quoted_slot, options_str);
+        let sql = crate::sql_builder::build_alter_slot_sql(slot_name, two_phase, failover)?;
 
         debug!("Altering replication slot: {}", sql);
         let result = self.exec(&sql)?;
@@ -418,21 +310,8 @@ impl NativeConnection {
         Ok(result)
     }
 
-    fn build_sql_options(options: &[String]) -> String {
-        if options.is_empty() {
-            String::new()
-        } else {
-            format!(" ({})", options.join(", "))
-        }
-    }
-
     fn build_drop_slot_sql(slot_name: &str, wait: bool) -> String {
-        let quoted_slot = quote_sql_identifier(slot_name);
-        if wait {
-            format!("DROP_REPLICATION_SLOT {} WAIT;", quoted_slot)
-        } else {
-            format!("DROP_REPLICATION_SLOT {};", quoted_slot)
-        }
+        crate::sql_builder::build_drop_slot_sql(slot_name, wait)
     }
 
     /// Drop a replication slot.
@@ -454,8 +333,7 @@ impl NativeConnection {
     }
 
     fn build_read_slot_sql(slot_name: &str) -> String {
-        let quoted_slot = quote_sql_identifier(slot_name);
-        format!("READ_REPLICATION_SLOT {};", quoted_slot)
+        crate::sql_builder::build_read_slot_sql(slot_name)
     }
 
     /// Read information about a replication slot.
@@ -497,25 +375,11 @@ impl NativeConnection {
         start_lsn: XLogRecPtr,
         timeline_id: Option<u32>,
     ) -> Result<()> {
-        let mut sql = String::from("START_REPLICATION ");
-
-        if let Some(slot) = slot_name {
-            let quoted_slot = quote_sql_identifier(slot);
-            sql.push_str(&format!("SLOT {} ", quoted_slot));
-        }
-
-        sql.push_str("PHYSICAL ");
-
-        let lsn_str = if start_lsn == INVALID_XLOG_REC_PTR {
-            "0/0".to_string()
-        } else {
-            format_lsn(start_lsn)
-        };
-        sql.push_str(&lsn_str);
-
-        if let Some(tli) = timeline_id {
-            sql.push_str(&format!(" TIMELINE {}", tli));
-        }
+        let sql = crate::sql_builder::build_start_physical_replication_sql(
+            slot_name,
+            start_lsn,
+            timeline_id,
+        );
 
         debug!("Starting physical replication: {}", sql);
 
@@ -542,71 +406,7 @@ impl NativeConnection {
 
     /// Start a base backup with options.
     pub fn base_backup(&mut self, options: &BaseBackupOptions) -> Result<NativePgResult> {
-        let mut opts = Vec::new();
-
-        if let Some(ref label) = options.label {
-            opts.push(format!("LABEL {}", quote_sql_string_value(label)));
-        }
-        if let Some(ref target) = options.target {
-            opts.push(format!("TARGET {}", quote_sql_string_value(target)));
-        }
-        if let Some(ref target_detail) = options.target_detail {
-            opts.push(format!(
-                "TARGET_DETAIL {}",
-                quote_sql_string_value(target_detail)
-            ));
-        }
-        if options.progress {
-            opts.push("PROGRESS true".to_string());
-        }
-        if let Some(ref checkpoint) = options.checkpoint {
-            opts.push(format!("CHECKPOINT {}", quote_sql_string_value(checkpoint)));
-        }
-        if options.wal {
-            opts.push("WAL true".to_string());
-        }
-        if options.wait {
-            opts.push("WAIT true".to_string());
-        }
-        if let Some(ref compression) = options.compression {
-            opts.push(format!(
-                "COMPRESSION {}",
-                quote_sql_string_value(compression)
-            ));
-        }
-        if let Some(ref compression_detail) = options.compression_detail {
-            opts.push(format!(
-                "COMPRESSION_DETAIL {}",
-                quote_sql_string_value(compression_detail)
-            ));
-        }
-        if let Some(max_rate) = options.max_rate {
-            opts.push(format!("MAX_RATE {}", max_rate));
-        }
-        if options.tablespace_map {
-            opts.push("TABLESPACE_MAP true".to_string());
-        }
-        if options.verify_checksums {
-            opts.push("VERIFY_CHECKSUMS true".to_string());
-        }
-        if let Some(ref manifest) = options.manifest {
-            opts.push(format!("MANIFEST {}", quote_sql_string_value(manifest)));
-        }
-        if let Some(ref manifest_checksums) = options.manifest_checksums {
-            opts.push(format!(
-                "MANIFEST_CHECKSUMS {}",
-                quote_sql_string_value(manifest_checksums)
-            ));
-        }
-        if options.incremental {
-            opts.push("INCREMENTAL".to_string());
-        }
-
-        let sql = if opts.is_empty() {
-            "BASE_BACKUP".to_string()
-        } else {
-            format!("BASE_BACKUP ({})", opts.join(", "))
-        };
+        let sql = crate::sql_builder::build_base_backup_sql(options);
 
         debug!("Starting base backup: {}", sql);
         let result = self.exec(&sql)?;
@@ -705,6 +505,20 @@ impl NativeConnection {
 mod tests {
     use super::*;
     use crate::types::{ReplicationSlotOptions, SlotType};
+
+    fn sanitize_sql_string_value(value: &str) -> String {
+        let quoted = crate::sql_builder::quote_literal(value);
+        // Strip surrounding quotes to get just the sanitized interior
+        quoted[1..quoted.len() - 1].to_string()
+    }
+
+    fn quote_sql_string_value(value: &str) -> String {
+        crate::sql_builder::quote_literal(value)
+    }
+
+    fn quote_sql_identifier(identifier: &str) -> String {
+        crate::sql_builder::quote_ident(identifier)
+    }
 
     // === sanitize_sql_string_value ===
 
@@ -844,14 +658,14 @@ mod tests {
     #[test]
     fn test_build_sql_options_empty() {
         let options: Vec<String> = vec![];
-        assert_eq!(NativeConnection::build_sql_options(&options), "");
+        assert_eq!(crate::sql_builder::build_sql_options(&options), "");
     }
 
     #[test]
     fn test_build_sql_options_single() {
         let options = vec!["proto_version '2'".to_string()];
         assert_eq!(
-            NativeConnection::build_sql_options(&options),
+            crate::sql_builder::build_sql_options(&options),
             " (proto_version '2')"
         );
     }
@@ -864,7 +678,7 @@ mod tests {
             "streaming 'on'".to_string(),
         ];
         assert_eq!(
-            NativeConnection::build_sql_options(&options),
+            crate::sql_builder::build_sql_options(&options),
             " (proto_version '2', publication_names '\"my_pub\"', streaming 'on')"
         );
     }

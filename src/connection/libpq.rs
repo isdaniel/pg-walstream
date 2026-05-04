@@ -48,44 +48,6 @@ use tokio::io::unix::AsyncFd;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-/// Sanitize a string value for use in PostgreSQL replication protocol commands
-/// by escaping single quotes (replacing ' with '')
-///
-/// This prevents SQL injection when values are used in replication commands.
-///
-/// # Arguments
-/// * `value` - The string value to sanitize
-///
-/// # Returns
-/// A sanitized string safe for use in SQL string literals
-#[inline]
-fn sanitize_sql_string_value(value: &str) -> String {
-    value.replace('\'', "''")
-}
-
-/// Sanitize a string value and wrap it in single quotes for SQL
-#[inline]
-fn quote_sql_string_value(value: &str) -> String {
-    format!("'{}'", sanitize_sql_string_value(value))
-}
-
-/// Quote a SQL identifier by escaping internal double quotes and wrapping in double quotes.
-///
-/// In PostgreSQL, identifiers wrapped in double quotes must have any internal
-/// double quotes escaped by doubling them (e.g., `"` becomes `""`).
-///
-/// # Examples
-/// ```ignore
-/// assert_eq!(quote_sql_identifier("my_slot"), r#""my_slot""#);
-/// assert_eq!(quote_sql_identifier(r#"a"b"#), r#""a""b""#);
-/// ```
-#[inline]
-fn quote_sql_identifier(identifier: &str) -> String {
-    format!("\"{}\"", identifier.replace('"', "\"\""))
-}
-
-pub use crate::types::INVALID_XLOG_REC_PTR;
-
 /// Result of attempting to read from libpq's internal buffer
 #[derive(Debug)]
 enum ReadResult {
@@ -341,27 +303,7 @@ impl PgReplicationConnection {
         start_lsn: XLogRecPtr,
         options: &[(&str, &str)],
     ) -> String {
-        let quoted_slot = quote_sql_identifier(slot_name);
-        let mut options_str = String::new();
-        for (i, (key, value)) in options.iter().enumerate() {
-            if i > 0 {
-                options_str.push_str(", ");
-            }
-            let quoted_key = quote_sql_identifier(key);
-            let sanitized_value = sanitize_sql_string_value(value);
-            options_str.push_str(&format!("{quoted_key} '{sanitized_value}'"));
-        }
-
-        if start_lsn == INVALID_XLOG_REC_PTR {
-            format!("START_REPLICATION SLOT {quoted_slot} LOGICAL 0/0 ({options_str})")
-        } else {
-            format!(
-                "START_REPLICATION SLOT {} LOGICAL {} ({})",
-                quoted_slot,
-                format_lsn(start_lsn),
-                options_str
-            )
-        }
+        crate::sql_builder::build_start_replication_sql(slot_name, start_lsn, options)
     }
 
     /// Start logical replication
@@ -631,15 +573,6 @@ impl PgReplicationConnection {
         }
     }
 
-    /// Helper: Build SQL options string from key-value pairs
-    fn build_sql_options(options: &[String]) -> String {
-        if options.is_empty() {
-            String::new()
-        } else {
-            format!(" ({})", options.join(", "))
-        }
-    }
-
     /// Check if the connection is still alive
     pub fn is_alive(&self) -> bool {
         if self.conn.is_null() {
@@ -693,64 +626,7 @@ impl PgReplicationConnection {
         output_plugin: Option<&str>,
         options: &ReplicationSlotOptions,
     ) -> Result<String> {
-        let mut parts: Vec<&str> = Vec::new();
-
-        // Quoted slot name — owned, kept alive for the borrow.
-        let quoted_slot = quote_sql_identifier(slot_name);
-
-        parts.push("CREATE_REPLICATION_SLOT");
-        parts.push(&quoted_slot);
-
-        if options.temporary {
-            parts.push("TEMPORARY");
-        }
-
-        parts.push(slot_type.as_str());
-
-        // Owned strings that may be needed below; declared here so
-        // borrows into `parts` remain valid until the join.
-        let quoted_plugin: String;
-
-        match slot_type {
-            SlotType::Physical => {
-                if options.reserve_wal {
-                    parts.push("RESERVE_WAL");
-                }
-            }
-            SlotType::Logical => {
-                let plugin = output_plugin.ok_or_else(|| {
-                    ReplicationError::protocol(
-                        "Output plugin required for LOGICAL slots".to_string(),
-                    )
-                })?;
-                quoted_plugin = quote_sql_identifier(plugin);
-                parts.push(&quoted_plugin);
-
-                // Only ONE of TWO_PHASE / snapshot keywords is allowed.
-                if options.two_phase {
-                    parts.push("TWO_PHASE");
-                } else if let Some(ref snapshot) = options.snapshot {
-                    match snapshot.as_str() {
-                        "export" => parts.push("EXPORT_SNAPSHOT"),
-                        "nothing" => parts.push("NOEXPORT_SNAPSHOT"),
-                        "use" => parts.push("USE_SNAPSHOT"),
-                        other => {
-                            return Err(ReplicationError::config(format!(
-                                "Invalid snapshot option '{}': \
-                                 expected 'export', 'nothing', or 'use'",
-                                other
-                            )));
-                        }
-                    }
-                }
-
-                if options.failover {
-                    parts.push("FAILOVER");
-                }
-            }
-        }
-
-        Ok(format!("{};", parts.join(" ")))
+        crate::sql_builder::build_create_slot_sql(slot_name, slot_type, output_plugin, options)
     }
 
     /// Build the SQL string for `ALTER_REPLICATION_SLOT`.
@@ -759,28 +635,7 @@ impl PgReplicationConnection {
         two_phase: Option<bool>,
         failover: Option<bool>,
     ) -> Result<String> {
-        let mut opts = Vec::new();
-
-        if let Some(tp) = two_phase {
-            opts.push(format!("TWO_PHASE {}", tp));
-        }
-
-        if let Some(failover_value) = failover {
-            opts.push(format!("FAILOVER {}", failover_value));
-        }
-
-        if opts.is_empty() {
-            return Err(ReplicationError::protocol(
-                "At least one option must be specified for ALTER_REPLICATION_SLOT".to_string(),
-            ));
-        }
-
-        let options_str = Self::build_sql_options(&opts);
-        let quoted_slot = quote_sql_identifier(slot_name);
-        Ok(format!(
-            "ALTER_REPLICATION_SLOT {}{};",
-            quoted_slot, options_str
-        ))
+        crate::sql_builder::build_alter_slot_sql(slot_name, two_phase, failover)
     }
 
     /// Alter a replication slot (logical slots only)
@@ -800,12 +655,7 @@ impl PgReplicationConnection {
 
     /// Build the SQL string for `DROP_REPLICATION_SLOT`.
     fn build_drop_slot_sql(slot_name: &str, wait: bool) -> String {
-        let quoted_slot = quote_sql_identifier(slot_name);
-        if wait {
-            format!("DROP_REPLICATION_SLOT {} WAIT;", quoted_slot)
-        } else {
-            format!("DROP_REPLICATION_SLOT {};", quoted_slot)
-        }
+        crate::sql_builder::build_drop_slot_sql(slot_name, wait)
     }
 
     /// Drop a replication slot
@@ -837,8 +687,7 @@ impl PgReplicationConnection {
 
     /// Build the SQL string for `READ_REPLICATION_SLOT`.
     fn build_read_slot_sql(slot_name: &str) -> String {
-        let quoted_slot = quote_sql_identifier(slot_name);
-        format!("READ_REPLICATION_SLOT {};", quoted_slot)
+        crate::sql_builder::build_read_slot_sql(slot_name)
     }
 
     /// Read information about a replication slot
@@ -885,27 +734,7 @@ impl PgReplicationConnection {
         start_lsn: XLogRecPtr,
         timeline_id: Option<u32>,
     ) -> String {
-        let mut sql = String::from("START_REPLICATION ");
-
-        if let Some(slot) = slot_name {
-            let quoted_slot = quote_sql_identifier(slot);
-            sql.push_str(&format!("SLOT {} ", quoted_slot));
-        }
-
-        sql.push_str("PHYSICAL ");
-
-        let lsn_str = if start_lsn == INVALID_XLOG_REC_PTR {
-            "0/0".to_string()
-        } else {
-            format_lsn(start_lsn)
-        };
-        sql.push_str(&lsn_str);
-
-        if let Some(tli) = timeline_id {
-            sql.push_str(&format!(" TIMELINE {}", tli));
-        }
-
-        sql
+        crate::sql_builder::build_start_physical_replication_sql(slot_name, start_lsn, timeline_id)
     }
 
     /// Start physical replication
@@ -951,85 +780,7 @@ impl PgReplicationConnection {
 
     /// Build the SQL string for `BASE_BACKUP`.
     fn build_base_backup_sql(options: &BaseBackupOptions) -> String {
-        let mut opts = Vec::new();
-
-        if let Some(ref label) = options.label {
-            opts.push(format!("LABEL {}", quote_sql_string_value(label)));
-        }
-
-        if let Some(ref target) = options.target {
-            opts.push(format!("TARGET {}", quote_sql_string_value(target)));
-        }
-
-        if let Some(ref target_detail) = options.target_detail {
-            opts.push(format!(
-                "TARGET_DETAIL {}",
-                quote_sql_string_value(target_detail)
-            ));
-        }
-
-        if options.progress {
-            opts.push("PROGRESS true".to_string());
-        }
-
-        if let Some(ref checkpoint) = options.checkpoint {
-            opts.push(format!("CHECKPOINT {}", quote_sql_string_value(checkpoint)));
-        }
-
-        if options.wal {
-            opts.push("WAL true".to_string());
-        }
-
-        if options.wait {
-            opts.push("WAIT true".to_string());
-        }
-
-        if let Some(ref compression) = options.compression {
-            opts.push(format!(
-                "COMPRESSION {}",
-                quote_sql_string_value(compression)
-            ));
-        }
-
-        if let Some(ref compression_detail) = options.compression_detail {
-            opts.push(format!(
-                "COMPRESSION_DETAIL {}",
-                quote_sql_string_value(compression_detail)
-            ));
-        }
-
-        if let Some(max_rate) = options.max_rate {
-            opts.push(format!("MAX_RATE {}", max_rate));
-        }
-
-        if options.tablespace_map {
-            opts.push("TABLESPACE_MAP true".to_string());
-        }
-
-        if options.verify_checksums {
-            opts.push("VERIFY_CHECKSUMS true".to_string());
-        }
-
-        if let Some(ref manifest) = options.manifest {
-            opts.push(format!("MANIFEST {}", quote_sql_string_value(manifest)));
-        }
-
-        if let Some(ref manifest_checksums) = options.manifest_checksums {
-            opts.push(format!(
-                "MANIFEST_CHECKSUMS {}",
-                quote_sql_string_value(manifest_checksums)
-            ));
-        }
-
-        if options.incremental {
-            opts.push("INCREMENTAL".to_string());
-        }
-
-        if opts.is_empty() {
-            "BASE_BACKUP".to_string()
-        } else {
-            format!("BASE_BACKUP ({})", opts.join(", "))
-        }
+        crate::sql_builder::build_base_backup_sql(options)
     }
 
     /// Start a base backup with options
@@ -1280,6 +1031,21 @@ fn drain_buffered_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql_builder::{quote_ident, quote_literal};
+    use crate::INVALID_XLOG_REC_PTR;
+
+    fn sanitize_sql_string_value(value: &str) -> String {
+        let quoted = quote_literal(value);
+        quoted[1..quoted.len() - 1].to_owned()
+    }
+
+    fn quote_sql_string_value(value: &str) -> String {
+        quote_literal(value)
+    }
+
+    fn quote_sql_identifier(identifier: &str) -> String {
+        quote_ident(identifier)
+    }
 
     #[test]
     fn test_sanitize_sql_string_value_no_quotes() {
@@ -1403,14 +1169,14 @@ mod tests {
     #[test]
     fn test_build_sql_options_empty() {
         let options: Vec<String> = vec![];
-        let result = PgReplicationConnection::build_sql_options(&options);
+        let result = crate::sql_builder::build_sql_options(&options);
         assert_eq!(result, "");
     }
 
     #[test]
     fn test_build_sql_options_single() {
         let options = vec!["proto_version '2'".to_string()];
-        let result = PgReplicationConnection::build_sql_options(&options);
+        let result = crate::sql_builder::build_sql_options(&options);
         assert_eq!(result, " (proto_version '2')");
     }
 
@@ -1421,7 +1187,7 @@ mod tests {
             "publication_names '\"my_pub\"'".to_string(),
             "streaming 'on'".to_string(),
         ];
-        let result = PgReplicationConnection::build_sql_options(&options);
+        let result = crate::sql_builder::build_sql_options(&options);
         assert_eq!(
             result,
             " (proto_version '2', publication_names '\"my_pub\"', streaming 'on')"
@@ -2266,7 +2032,7 @@ mod tests {
             INVALID_XLOG_REC_PTR,
             &[],
         );
-        assert_eq!(sql, r#"START_REPLICATION SLOT "slot1" LOGICAL 0/0 ()"#);
+        assert_eq!(sql, r#"START_REPLICATION SLOT "slot1" LOGICAL 0/0"#);
     }
 
     #[test]
