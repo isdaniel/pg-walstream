@@ -1481,18 +1481,16 @@ mod tests {
     #[test]
     fn create_slot_rejects_null_in_slot_name() {
         let opts = ReplicationSlotOptions::default();
-        let err =
-            build_create_slot_sql("slot\0name", SlotType::Logical, Some("pgoutput"), &opts)
-                .unwrap_err();
+        let err = build_create_slot_sql("slot\0name", SlotType::Logical, Some("pgoutput"), &opts)
+            .unwrap_err();
         assert!(err.to_string().contains("null bytes"));
     }
 
     #[test]
     fn create_slot_rejects_null_in_plugin() {
         let opts = ReplicationSlotOptions::default();
-        let err =
-            build_create_slot_sql("slot", SlotType::Logical, Some("pg\0output"), &opts)
-                .unwrap_err();
+        let err = build_create_slot_sql("slot", SlotType::Logical, Some("pg\0output"), &opts)
+            .unwrap_err();
         assert!(err.to_string().contains("null bytes"));
     }
 
@@ -1516,22 +1514,19 @@ mod tests {
 
     #[test]
     fn start_replication_rejects_null_in_slot_name() {
-        let err =
-            build_start_replication_sql("slot\0x", 0, &[("proto_version", "1")]).unwrap_err();
+        let err = build_start_replication_sql("slot\0x", 0, &[("proto_version", "1")]).unwrap_err();
         assert!(err.to_string().contains("null bytes"));
     }
 
     #[test]
     fn start_replication_rejects_null_in_option_key() {
-        let err =
-            build_start_replication_sql("slot", 0, &[("key\0x", "value")]).unwrap_err();
+        let err = build_start_replication_sql("slot", 0, &[("key\0x", "value")]).unwrap_err();
         assert!(err.to_string().contains("null bytes"));
     }
 
     #[test]
     fn start_replication_rejects_null_in_option_value() {
-        let err =
-            build_start_replication_sql("slot", 0, &[("key", "val\0ue")]).unwrap_err();
+        let err = build_start_replication_sql("slot", 0, &[("key", "val\0ue")]).unwrap_err();
         assert!(err.to_string().contains("null bytes"));
     }
 
