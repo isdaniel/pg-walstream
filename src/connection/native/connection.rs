@@ -155,7 +155,7 @@ impl NativeConnection {
         start_lsn: XLogRecPtr,
         options: &[(&str, &str)],
     ) -> Result<()> {
-        let sql = crate::sql_builder::build_start_replication_sql(slot_name, start_lsn, options);
+        let sql = crate::sql_builder::build_start_replication_sql(slot_name, start_lsn, options)?;
 
         debug!("Starting replication: {}", sql);
 
@@ -310,13 +310,13 @@ impl NativeConnection {
         Ok(result)
     }
 
-    fn build_drop_slot_sql(slot_name: &str, wait: bool) -> String {
+    fn build_drop_slot_sql(slot_name: &str, wait: bool) -> Result<String> {
         crate::sql_builder::build_drop_slot_sql(slot_name, wait)
     }
 
     /// Drop a replication slot.
     pub fn drop_replication_slot(&mut self, slot_name: &str, wait: bool) -> Result<()> {
-        let sql = Self::build_drop_slot_sql(slot_name, wait);
+        let sql = Self::build_drop_slot_sql(slot_name, wait)?;
         debug!("Dropping replication slot: {}", sql);
         let result = self.exec(&sql)?;
         if !result.is_ok() {
@@ -332,7 +332,7 @@ impl NativeConnection {
         Ok(())
     }
 
-    fn build_read_slot_sql(slot_name: &str) -> String {
+    fn build_read_slot_sql(slot_name: &str) -> Result<String> {
         crate::sql_builder::build_read_slot_sql(slot_name)
     }
 
@@ -341,7 +341,7 @@ impl NativeConnection {
         &mut self,
         slot_name: &str,
     ) -> Result<crate::types::ReplicationSlotInfo> {
-        let sql = Self::build_read_slot_sql(slot_name);
+        let sql = Self::build_read_slot_sql(slot_name)?;
         debug!("Reading replication slot: {}", sql);
         let result = self.exec(&sql)?;
         if !result.is_ok() {
@@ -379,7 +379,7 @@ impl NativeConnection {
             slot_name,
             start_lsn,
             timeline_id,
-        );
+        )?;
 
         debug!("Starting physical replication: {}", sql);
 
@@ -406,7 +406,7 @@ impl NativeConnection {
 
     /// Start a base backup with options.
     pub fn base_backup(&mut self, options: &BaseBackupOptions) -> Result<NativePgResult> {
-        let sql = crate::sql_builder::build_base_backup_sql(options);
+        let sql = crate::sql_builder::build_base_backup_sql(options)?;
 
         debug!("Starting base backup: {}", sql);
         let result = self.exec(&sql)?;
@@ -507,17 +507,17 @@ mod tests {
     use crate::types::{ReplicationSlotOptions, SlotType};
 
     fn sanitize_sql_string_value(value: &str) -> String {
-        let quoted = crate::sql_builder::quote_literal(value);
+        let quoted = crate::sql_builder::quote_literal(value).unwrap();
         // Strip surrounding quotes to get just the sanitized interior
         quoted[1..quoted.len() - 1].to_string()
     }
 
     fn quote_sql_string_value(value: &str) -> String {
-        crate::sql_builder::quote_literal(value)
+        crate::sql_builder::quote_literal(value).unwrap()
     }
 
     fn quote_sql_identifier(identifier: &str) -> String {
-        crate::sql_builder::quote_ident(identifier)
+        crate::sql_builder::quote_ident(identifier).unwrap()
     }
 
     // === sanitize_sql_string_value ===
@@ -937,7 +937,7 @@ mod tests {
     #[test]
     fn test_build_drop_slot_sql_without_wait() {
         assert_eq!(
-            NativeConnection::build_drop_slot_sql("my_slot", false),
+            NativeConnection::build_drop_slot_sql("my_slot", false).unwrap(),
             r#"DROP_REPLICATION_SLOT "my_slot";"#
         );
     }
@@ -945,7 +945,7 @@ mod tests {
     #[test]
     fn test_build_drop_slot_sql_with_wait() {
         assert_eq!(
-            NativeConnection::build_drop_slot_sql("my_slot", true),
+            NativeConnection::build_drop_slot_sql("my_slot", true).unwrap(),
             r#"DROP_REPLICATION_SLOT "my_slot" WAIT;"#
         );
     }
@@ -953,7 +953,7 @@ mod tests {
     #[test]
     fn test_build_drop_slot_sql_injection() {
         assert_eq!(
-            NativeConnection::build_drop_slot_sql(r#"evil"slot"#, false),
+            NativeConnection::build_drop_slot_sql(r#"evil"slot"#, false).unwrap(),
             r#"DROP_REPLICATION_SLOT "evil""slot";"#
         );
     }
@@ -961,7 +961,7 @@ mod tests {
     #[test]
     fn test_build_drop_slot_sql_injection_with_wait() {
         assert_eq!(
-            NativeConnection::build_drop_slot_sql(r#"evil"slot"#, true),
+            NativeConnection::build_drop_slot_sql(r#"evil"slot"#, true).unwrap(),
             r#"DROP_REPLICATION_SLOT "evil""slot" WAIT;"#
         );
     }
@@ -971,7 +971,7 @@ mod tests {
     #[test]
     fn test_build_read_slot_sql_basic() {
         assert_eq!(
-            NativeConnection::build_read_slot_sql("my_slot"),
+            NativeConnection::build_read_slot_sql("my_slot").unwrap(),
             r#"READ_REPLICATION_SLOT "my_slot";"#
         );
     }
@@ -979,7 +979,7 @@ mod tests {
     #[test]
     fn test_build_read_slot_sql_injection() {
         assert_eq!(
-            NativeConnection::build_read_slot_sql(r#"evil"slot"#),
+            NativeConnection::build_read_slot_sql(r#"evil"slot"#).unwrap(),
             r#"READ_REPLICATION_SLOT "evil""slot";"#
         );
     }

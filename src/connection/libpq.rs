@@ -302,7 +302,7 @@ impl PgReplicationConnection {
         slot_name: &str,
         start_lsn: XLogRecPtr,
         options: &[(&str, &str)],
-    ) -> String {
+    ) -> Result<String> {
         crate::sql_builder::build_start_replication_sql(slot_name, start_lsn, options)
     }
 
@@ -313,7 +313,7 @@ impl PgReplicationConnection {
         start_lsn: XLogRecPtr,
         options: &[(&str, &str)],
     ) -> Result<()> {
-        let sql = Self::build_start_replication_sql(slot_name, start_lsn, options);
+        let sql = Self::build_start_replication_sql(slot_name, start_lsn, options)?;
 
         debug!("Starting replication: {}", sql);
         let _result = self.exec(&sql)?;
@@ -654,7 +654,7 @@ impl PgReplicationConnection {
     }
 
     /// Build the SQL string for `DROP_REPLICATION_SLOT`.
-    fn build_drop_slot_sql(slot_name: &str, wait: bool) -> String {
+    fn build_drop_slot_sql(slot_name: &str, wait: bool) -> Result<String> {
         crate::sql_builder::build_drop_slot_sql(slot_name, wait)
     }
 
@@ -668,7 +668,7 @@ impl PgReplicationConnection {
     /// * `wait` - If true, the command waits until the slot becomes inactive
     ///            instead of returning an error when the slot is in use
     pub fn drop_replication_slot(&mut self, slot_name: &str, wait: bool) -> Result<()> {
-        let sql = Self::build_drop_slot_sql(slot_name, wait);
+        let sql = Self::build_drop_slot_sql(slot_name, wait)?;
 
         debug!("Dropping replication slot: {}", sql);
         let result = self.exec(&sql)?;
@@ -686,7 +686,7 @@ impl PgReplicationConnection {
     }
 
     /// Build the SQL string for `READ_REPLICATION_SLOT`.
-    fn build_read_slot_sql(slot_name: &str) -> String {
+    fn build_read_slot_sql(slot_name: &str) -> Result<String> {
         crate::sql_builder::build_read_slot_sql(slot_name)
     }
 
@@ -700,7 +700,7 @@ impl PgReplicationConnection {
         &mut self,
         slot_name: &str,
     ) -> Result<crate::types::ReplicationSlotInfo> {
-        let sql = Self::build_read_slot_sql(slot_name);
+        let sql = Self::build_read_slot_sql(slot_name)?;
 
         debug!("Reading replication slot: {}", sql);
         let result = self.exec(&sql)?;
@@ -733,7 +733,7 @@ impl PgReplicationConnection {
         slot_name: Option<&str>,
         start_lsn: XLogRecPtr,
         timeline_id: Option<u32>,
-    ) -> String {
+    ) -> Result<String> {
         crate::sql_builder::build_start_physical_replication_sql(slot_name, start_lsn, timeline_id)
     }
 
@@ -744,7 +744,7 @@ impl PgReplicationConnection {
         start_lsn: XLogRecPtr,
         timeline_id: Option<u32>,
     ) -> Result<()> {
-        let sql = Self::build_start_physical_replication_sql(slot_name, start_lsn, timeline_id);
+        let sql = Self::build_start_physical_replication_sql(slot_name, start_lsn, timeline_id)?;
 
         debug!("Starting physical replication: {}", sql);
         let _result = self.exec(&sql)?;
@@ -779,13 +779,13 @@ impl PgReplicationConnection {
     }
 
     /// Build the SQL string for `BASE_BACKUP`.
-    fn build_base_backup_sql(options: &BaseBackupOptions) -> String {
+    fn build_base_backup_sql(options: &BaseBackupOptions) -> Result<String> {
         crate::sql_builder::build_base_backup_sql(options)
     }
 
     /// Start a base backup with options
     pub fn base_backup(&mut self, options: &BaseBackupOptions) -> Result<PgResult> {
-        let base_backup_sql = Self::build_base_backup_sql(options);
+        let base_backup_sql = Self::build_base_backup_sql(options)?;
 
         debug!("Starting base backup: {}", base_backup_sql);
         let result = self.exec(&base_backup_sql)?;
@@ -1035,16 +1035,16 @@ mod tests {
     use crate::INVALID_XLOG_REC_PTR;
 
     fn sanitize_sql_string_value(value: &str) -> String {
-        let quoted = quote_literal(value);
+        let quoted = quote_literal(value).unwrap();
         quoted[1..quoted.len() - 1].to_owned()
     }
 
     fn quote_sql_string_value(value: &str) -> String {
-        quote_literal(value)
+        quote_literal(value).unwrap()
     }
 
     fn quote_sql_identifier(identifier: &str) -> String {
-        quote_ident(identifier)
+        quote_ident(identifier).unwrap()
     }
 
     #[test]
@@ -1651,25 +1651,25 @@ mod tests {
 
     #[test]
     fn test_build_drop_slot_sql_without_wait() {
-        let sql = PgReplicationConnection::build_drop_slot_sql("my_slot", false);
+        let sql = PgReplicationConnection::build_drop_slot_sql("my_slot", false).unwrap();
         assert_eq!(sql, r#"DROP_REPLICATION_SLOT "my_slot";"#);
     }
 
     #[test]
     fn test_build_drop_slot_sql_with_wait() {
-        let sql = PgReplicationConnection::build_drop_slot_sql("my_slot", true);
+        let sql = PgReplicationConnection::build_drop_slot_sql("my_slot", true).unwrap();
         assert_eq!(sql, r#"DROP_REPLICATION_SLOT "my_slot" WAIT;"#);
     }
 
     #[test]
     fn test_build_drop_slot_sql_injection() {
-        let sql = PgReplicationConnection::build_drop_slot_sql(r#"evil"slot"#, false);
+        let sql = PgReplicationConnection::build_drop_slot_sql(r#"evil"slot"#, false).unwrap();
         assert_eq!(sql, r#"DROP_REPLICATION_SLOT "evil""slot";"#);
     }
 
     #[test]
     fn test_build_drop_slot_sql_injection_with_wait() {
-        let sql = PgReplicationConnection::build_drop_slot_sql(r#"evil"slot"#, true);
+        let sql = PgReplicationConnection::build_drop_slot_sql(r#"evil"slot"#, true).unwrap();
         assert_eq!(sql, r#"DROP_REPLICATION_SLOT "evil""slot" WAIT;"#);
     }
 
@@ -1679,13 +1679,13 @@ mod tests {
 
     #[test]
     fn test_build_read_slot_sql_basic() {
-        let sql = PgReplicationConnection::build_read_slot_sql("my_slot");
+        let sql = PgReplicationConnection::build_read_slot_sql("my_slot").unwrap();
         assert_eq!(sql, r#"READ_REPLICATION_SLOT "my_slot";"#);
     }
 
     #[test]
     fn test_build_read_slot_sql_injection() {
-        let sql = PgReplicationConnection::build_read_slot_sql(r#"evil"slot"#);
+        let sql = PgReplicationConnection::build_read_slot_sql(r#"evil"slot"#).unwrap();
         assert_eq!(sql, r#"READ_REPLICATION_SLOT "evil""slot";"#);
     }
 
@@ -1785,7 +1785,7 @@ mod tests {
     #[test]
     fn test_base_backup_sql_default_options() {
         let opts = BaseBackupOptions::default();
-        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts).unwrap();
         assert_eq!(sql, "BASE_BACKUP");
     }
 
@@ -1795,7 +1795,7 @@ mod tests {
             label: Some("my_backup".to_string()),
             ..Default::default()
         };
-        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts).unwrap();
         assert_eq!(sql, "BASE_BACKUP (LABEL 'my_backup')");
     }
 
@@ -1805,7 +1805,7 @@ mod tests {
             target: Some("client".to_string()),
             ..Default::default()
         };
-        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts).unwrap();
         assert_eq!(sql, "BASE_BACKUP (TARGET 'client')");
     }
 
@@ -1816,7 +1816,7 @@ mod tests {
             target_detail: Some("/var/backups".to_string()),
             ..Default::default()
         };
-        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts).unwrap();
         assert_eq!(
             sql,
             "BASE_BACKUP (TARGET 'server', TARGET_DETAIL '/var/backups')"
@@ -1829,7 +1829,7 @@ mod tests {
             progress: true,
             ..Default::default()
         };
-        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts).unwrap();
         assert_eq!(sql, "BASE_BACKUP (PROGRESS true)");
     }
 
@@ -1839,7 +1839,7 @@ mod tests {
             checkpoint: Some("fast".to_string()),
             ..Default::default()
         };
-        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts).unwrap();
         assert_eq!(sql, "BASE_BACKUP (CHECKPOINT 'fast')");
     }
 
@@ -1849,7 +1849,7 @@ mod tests {
             wal: true,
             ..Default::default()
         };
-        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts).unwrap();
         assert_eq!(sql, "BASE_BACKUP (WAL true)");
     }
 
@@ -1859,7 +1859,7 @@ mod tests {
             wait: true,
             ..Default::default()
         };
-        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts).unwrap();
         assert_eq!(sql, "BASE_BACKUP (WAIT true)");
     }
 
@@ -1869,7 +1869,7 @@ mod tests {
             compression: Some("gzip".to_string()),
             ..Default::default()
         };
-        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts).unwrap();
         assert_eq!(sql, "BASE_BACKUP (COMPRESSION 'gzip')");
     }
 
@@ -1880,7 +1880,7 @@ mod tests {
             compression_detail: Some("level=3".to_string()),
             ..Default::default()
         };
-        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts).unwrap();
         assert_eq!(
             sql,
             "BASE_BACKUP (COMPRESSION 'zstd', COMPRESSION_DETAIL 'level=3')"
@@ -1893,7 +1893,7 @@ mod tests {
             max_rate: Some(32768),
             ..Default::default()
         };
-        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts).unwrap();
         assert_eq!(sql, "BASE_BACKUP (MAX_RATE 32768)");
     }
 
@@ -1903,7 +1903,7 @@ mod tests {
             tablespace_map: true,
             ..Default::default()
         };
-        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts).unwrap();
         assert_eq!(sql, "BASE_BACKUP (TABLESPACE_MAP true)");
     }
 
@@ -1913,7 +1913,7 @@ mod tests {
             verify_checksums: true,
             ..Default::default()
         };
-        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts).unwrap();
         assert_eq!(sql, "BASE_BACKUP (VERIFY_CHECKSUMS true)");
     }
 
@@ -1923,7 +1923,7 @@ mod tests {
             manifest: Some("yes".to_string()),
             ..Default::default()
         };
-        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts).unwrap();
         assert_eq!(sql, "BASE_BACKUP (MANIFEST 'yes')");
     }
 
@@ -1934,7 +1934,7 @@ mod tests {
             manifest_checksums: Some("SHA256".to_string()),
             ..Default::default()
         };
-        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts).unwrap();
         assert_eq!(
             sql,
             "BASE_BACKUP (MANIFEST 'yes', MANIFEST_CHECKSUMS 'SHA256')"
@@ -1947,7 +1947,7 @@ mod tests {
             incremental: true,
             ..Default::default()
         };
-        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts).unwrap();
         assert_eq!(sql, "BASE_BACKUP (INCREMENTAL)");
     }
 
@@ -1961,7 +1961,7 @@ mod tests {
             verify_checksums: true,
             ..Default::default()
         };
-        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts).unwrap();
         assert_eq!(
             sql,
             "BASE_BACKUP (LABEL 'full_backup', PROGRESS true, CHECKPOINT 'fast', WAL true, VERIFY_CHECKSUMS true)"
@@ -1974,7 +1974,7 @@ mod tests {
             label: Some("evil'label".to_string()),
             ..Default::default()
         };
-        let sql = PgReplicationConnection::build_base_backup_sql(&opts);
+        let sql = PgReplicationConnection::build_base_backup_sql(&opts).unwrap();
         assert_eq!(sql, "BASE_BACKUP (LABEL 'evil''label')");
     }
 
@@ -1988,7 +1988,8 @@ mod tests {
             "my_slot",
             INVALID_XLOG_REC_PTR,
             &[("proto_version", "1"), ("publication_names", "my_pub")],
-        );
+        )
+        .unwrap();
         assert_eq!(
             sql,
             r#"START_REPLICATION SLOT "my_slot" LOGICAL 0/0 ("proto_version" '1', "publication_names" 'my_pub')"#
@@ -2002,7 +2003,8 @@ mod tests {
             "test_slot",
             lsn,
             &[("proto_version", "2")],
-        );
+        )
+        .unwrap();
         assert!(sql.contains("START_REPLICATION SLOT \"test_slot\" LOGICAL"));
         assert!(sql.contains("(\"proto_version\" '2')"));
         // Should NOT contain "0/0" since we provided a valid LSN
@@ -2019,7 +2021,8 @@ mod tests {
                 ("publication_names", "pub1"),
                 ("messages", "true"),
             ],
-        );
+        )
+        .unwrap();
         assert!(
             sql.contains(r#""proto_version" '1', "publication_names" 'pub1', "messages" 'true'"#)
         );
@@ -2031,7 +2034,8 @@ mod tests {
             "slot1",
             INVALID_XLOG_REC_PTR,
             &[],
-        );
+        )
+        .unwrap();
         assert_eq!(sql, r#"START_REPLICATION SLOT "slot1" LOGICAL 0/0"#);
     }
 
@@ -2041,7 +2045,8 @@ mod tests {
             r#"evil"slot"#,
             INVALID_XLOG_REC_PTR,
             &[("key", "it's")],
-        );
+        )
+        .unwrap();
         // Slot name should be quoted, value should be sanitized
         assert!(sql.contains(r#""evil""slot""#));
         assert!(sql.contains("'it''s'"));
@@ -2053,7 +2058,8 @@ mod tests {
             "my_slot",
             INVALID_XLOG_REC_PTR,
             &[("proto_version", "1")],
-        );
+        )
+        .unwrap();
         assert_eq!(
             sql,
             r#"START_REPLICATION SLOT "my_slot" LOGICAL 0/0 ("proto_version" '1')"#
@@ -2127,7 +2133,8 @@ mod tests {
             None,
             INVALID_XLOG_REC_PTR,
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(sql, "START_REPLICATION PHYSICAL 0/0");
     }
 
@@ -2137,7 +2144,8 @@ mod tests {
             Some("phys_slot"),
             INVALID_XLOG_REC_PTR,
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(sql, r#"START_REPLICATION SLOT "phys_slot" PHYSICAL 0/0"#);
     }
 
@@ -2147,14 +2155,16 @@ mod tests {
             None,
             INVALID_XLOG_REC_PTR,
             Some(3),
-        );
+        )
+        .unwrap();
         assert_eq!(sql, "START_REPLICATION PHYSICAL 0/0 TIMELINE 3");
     }
 
     #[test]
     fn test_physical_replication_sql_with_valid_lsn() {
         let lsn: XLogRecPtr = 0x0000_0001_0000_0000; // 1/0
-        let sql = PgReplicationConnection::build_start_physical_replication_sql(None, lsn, None);
+        let sql =
+            PgReplicationConnection::build_start_physical_replication_sql(None, lsn, None).unwrap();
         assert!(sql.starts_with("START_REPLICATION PHYSICAL "));
         assert!(!sql.contains("0/0"));
     }
@@ -2165,7 +2175,8 @@ mod tests {
             Some("my_slot"),
             INVALID_XLOG_REC_PTR,
             Some(2),
-        );
+        )
+        .unwrap();
         assert_eq!(
             sql,
             r#"START_REPLICATION SLOT "my_slot" PHYSICAL 0/0 TIMELINE 2"#
@@ -2178,7 +2189,8 @@ mod tests {
             Some(r#"evil"slot"#),
             INVALID_XLOG_REC_PTR,
             None,
-        );
+        )
+        .unwrap();
         assert!(sql.contains(r#""evil""slot""#));
     }
 }

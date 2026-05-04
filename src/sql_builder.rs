@@ -14,9 +14,9 @@ const INVALID_XLOG_REC_PTR: u64 = 0;
 /// Quote a PostgreSQL identifier by wrapping in double quotes and escaping
 /// internal double quotes (doubling them).
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if `name` contains a null byte (`\0`), which is invalid in
+/// Returns an error if `name` contains a null byte (`\0`), which is invalid in
 /// PostgreSQL identifiers and could cause truncation-based injection via
 /// the C-string wire protocol.
 ///
@@ -25,15 +25,17 @@ const INVALID_XLOG_REC_PTR: u64 = 0;
 /// ```
 /// use pg_walstream::sql_builder::quote_ident;
 ///
-/// assert_eq!(quote_ident("my_slot"), r#""my_slot""#);
-/// assert_eq!(quote_ident(r#"a"b"#), r#""a""b""#);
+/// assert_eq!(quote_ident("my_slot").unwrap(), r#""my_slot""#);
+/// assert_eq!(quote_ident(r#"a"b"#).unwrap(), r#""a""b""#);
+/// assert!(quote_ident("bad\0name").is_err());
 /// ```
 #[inline]
-pub fn quote_ident(name: &str) -> String {
-    assert!(
-        !name.contains('\0'),
-        "SQL identifier must not contain null bytes"
-    );
+pub fn quote_ident(name: &str) -> Result<String> {
+    if name.contains('\0') {
+        return Err(ReplicationError::config(
+            "SQL identifier must not contain null bytes".to_string(),
+        ));
+    }
     let mut out = String::with_capacity(name.len() + 2);
     out.push('"');
     for ch in name.chars() {
@@ -43,15 +45,15 @@ pub fn quote_ident(name: &str) -> String {
         out.push(ch);
     }
     out.push('"');
-    out
+    Ok(out)
 }
 
 /// Quote a PostgreSQL string literal by wrapping in single quotes and escaping
 /// internal single quotes (doubling them).
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if `value` contains a null byte (`\0`), which is invalid in
+/// Returns an error if `value` contains a null byte (`\0`), which is invalid in
 /// PostgreSQL string literals and could cause truncation-based injection via
 /// the C-string wire protocol.
 ///
@@ -60,15 +62,17 @@ pub fn quote_ident(name: &str) -> String {
 /// ```
 /// use pg_walstream::sql_builder::quote_literal;
 ///
-/// assert_eq!(quote_literal("hello"), "'hello'");
-/// assert_eq!(quote_literal("it's"), "'it''s'");
+/// assert_eq!(quote_literal("hello").unwrap(), "'hello'");
+/// assert_eq!(quote_literal("it's").unwrap(), "'it''s'");
+/// assert!(quote_literal("bad\0value").is_err());
 /// ```
 #[inline]
-pub fn quote_literal(value: &str) -> String {
-    assert!(
-        !value.contains('\0'),
-        "SQL literal must not contain null bytes"
-    );
+pub fn quote_literal(value: &str) -> Result<String> {
+    if value.contains('\0') {
+        return Err(ReplicationError::config(
+            "SQL literal must not contain null bytes".to_string(),
+        ));
+    }
     let mut out = String::with_capacity(value.len() + 2);
     out.push('\'');
     for ch in value.chars() {
@@ -78,7 +82,7 @@ pub fn quote_literal(value: &str) -> String {
         out.push(ch);
     }
     out.push('\'');
-    out
+    Ok(out)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -105,7 +109,7 @@ pub fn build_create_slot_sql(
 ) -> Result<String> {
     let mut parts: Vec<&str> = Vec::with_capacity(6);
 
-    let quoted_slot = quote_ident(slot_name);
+    let quoted_slot = quote_ident(slot_name)?;
 
     parts.push("CREATE_REPLICATION_SLOT");
     parts.push(&quoted_slot);
@@ -128,7 +132,7 @@ pub fn build_create_slot_sql(
             let plugin = output_plugin.ok_or_else(|| {
                 ReplicationError::protocol("Output plugin required for LOGICAL slots".to_string())
             })?;
-            quoted_plugin = quote_ident(plugin);
+            quoted_plugin = quote_ident(plugin)?;
             parts.push(&quoted_plugin);
 
             if options.two_phase {
@@ -189,7 +193,7 @@ pub fn build_alter_slot_sql(
     }
 
     let options_str = build_sql_options(&opts);
-    let quoted_slot = quote_ident(slot_name);
+    let quoted_slot = quote_ident(slot_name)?;
     Ok(format!(
         "ALTER_REPLICATION_SLOT {}{};",
         quoted_slot, options_str
@@ -203,16 +207,16 @@ pub fn build_alter_slot_sql(
 /// ```
 /// use pg_walstream::sql_builder::build_drop_slot_sql;
 ///
-/// assert_eq!(build_drop_slot_sql("my_slot", false), r#"DROP_REPLICATION_SLOT "my_slot";"#);
-/// assert_eq!(build_drop_slot_sql("my_slot", true), r#"DROP_REPLICATION_SLOT "my_slot" WAIT;"#);
+/// assert_eq!(build_drop_slot_sql("my_slot", false).unwrap(), r#"DROP_REPLICATION_SLOT "my_slot";"#);
+/// assert_eq!(build_drop_slot_sql("my_slot", true).unwrap(), r#"DROP_REPLICATION_SLOT "my_slot" WAIT;"#);
 /// ```
 #[inline]
-pub fn build_drop_slot_sql(slot_name: &str, wait: bool) -> String {
-    let quoted_slot = quote_ident(slot_name);
+pub fn build_drop_slot_sql(slot_name: &str, wait: bool) -> Result<String> {
+    let quoted_slot = quote_ident(slot_name)?;
     if wait {
-        format!("DROP_REPLICATION_SLOT {} WAIT;", quoted_slot)
+        Ok(format!("DROP_REPLICATION_SLOT {} WAIT;", quoted_slot))
     } else {
-        format!("DROP_REPLICATION_SLOT {};", quoted_slot)
+        Ok(format!("DROP_REPLICATION_SLOT {};", quoted_slot))
     }
 }
 
@@ -223,12 +227,12 @@ pub fn build_drop_slot_sql(slot_name: &str, wait: bool) -> String {
 /// ```
 /// use pg_walstream::sql_builder::build_read_slot_sql;
 ///
-/// assert_eq!(build_read_slot_sql("my_slot"), r#"READ_REPLICATION_SLOT "my_slot";"#);
+/// assert_eq!(build_read_slot_sql("my_slot").unwrap(), r#"READ_REPLICATION_SLOT "my_slot";"#);
 /// ```
 #[inline]
-pub fn build_read_slot_sql(slot_name: &str) -> String {
-    let quoted_slot = quote_ident(slot_name);
-    format!("READ_REPLICATION_SLOT {};", quoted_slot)
+pub fn build_read_slot_sql(slot_name: &str) -> Result<String> {
+    let quoted_slot = quote_ident(slot_name)?;
+    Ok(format!("READ_REPLICATION_SLOT {};", quoted_slot))
 }
 
 /// Build the SQL for `START_REPLICATION SLOT ... LOGICAL`.
@@ -238,15 +242,15 @@ pub fn build_read_slot_sql(slot_name: &str) -> String {
 /// ```
 /// use pg_walstream::sql_builder::build_start_replication_sql;
 ///
-/// let sql = build_start_replication_sql("my_slot", 0, &[("proto_version", "1")]);
+/// let sql = build_start_replication_sql("my_slot", 0, &[("proto_version", "1")]).unwrap();
 /// assert_eq!(sql, r#"START_REPLICATION SLOT "my_slot" LOGICAL 0/0 ("proto_version" '1')"#);
 /// ```
 pub fn build_start_replication_sql(
     slot_name: &str,
     start_lsn: XLogRecPtr,
     options: &[(&str, &str)],
-) -> String {
-    let quoted_slot = quote_ident(slot_name);
+) -> Result<String> {
+    let quoted_slot = quote_ident(slot_name)?;
     let lsn_str = if start_lsn == INVALID_XLOG_REC_PTR {
         "0/0".to_string()
     } else {
@@ -254,16 +258,20 @@ pub fn build_start_replication_sql(
     };
 
     if options.is_empty() {
-        return format!("START_REPLICATION SLOT {quoted_slot} LOGICAL {lsn_str}");
+        return Ok(format!(
+            "START_REPLICATION SLOT {quoted_slot} LOGICAL {lsn_str}"
+        ));
     }
 
-    let options_str = options
-        .iter()
-        .map(|(k, v)| format!("{} {}", quote_ident(k), quote_literal(v)))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let mut options_parts = Vec::with_capacity(options.len());
+    for (k, v) in options {
+        options_parts.push(format!("{} {}", quote_ident(k)?, quote_literal(v)?));
+    }
+    let options_str = options_parts.join(", ");
 
-    format!("START_REPLICATION SLOT {quoted_slot} LOGICAL {lsn_str} ({options_str})")
+    Ok(format!(
+        "START_REPLICATION SLOT {quoted_slot} LOGICAL {lsn_str} ({options_str})"
+    ))
 }
 
 /// Build the SQL for `START_REPLICATION ... PHYSICAL`.
@@ -273,19 +281,19 @@ pub fn build_start_replication_sql(
 /// ```
 /// use pg_walstream::sql_builder::build_start_physical_replication_sql;
 ///
-/// let sql = build_start_physical_replication_sql(Some("my_slot"), 0, None);
+/// let sql = build_start_physical_replication_sql(Some("my_slot"), 0, None).unwrap();
 /// assert_eq!(sql, r#"START_REPLICATION SLOT "my_slot" PHYSICAL 0/0"#);
 /// ```
 pub fn build_start_physical_replication_sql(
     slot_name: Option<&str>,
     start_lsn: XLogRecPtr,
     timeline_id: Option<u32>,
-) -> String {
+) -> Result<String> {
     let mut sql = String::with_capacity(64);
     sql.push_str("START_REPLICATION ");
 
     if let Some(slot) = slot_name {
-        let quoted_slot = quote_ident(slot);
+        let quoted_slot = quote_ident(slot)?;
         sql.push_str("SLOT ");
         sql.push_str(&quoted_slot);
         sql.push(' ');
@@ -304,7 +312,7 @@ pub fn build_start_physical_replication_sql(
         sql.push_str(&tli.to_string());
     }
 
-    sql
+    Ok(sql)
 }
 
 /// Build the SQL for `BASE_BACKUP`.
@@ -316,21 +324,21 @@ pub fn build_start_physical_replication_sql(
 /// use pg_walstream::types::BaseBackupOptions;
 ///
 /// let opts = BaseBackupOptions::default();
-/// assert_eq!(build_base_backup_sql(&opts), "BASE_BACKUP");
+/// assert_eq!(build_base_backup_sql(&opts).unwrap(), "BASE_BACKUP");
 /// ```
-pub fn build_base_backup_sql(options: &BaseBackupOptions) -> String {
+pub fn build_base_backup_sql(options: &BaseBackupOptions) -> Result<String> {
     let mut opts = Vec::new();
 
     if let Some(ref label) = options.label {
-        opts.push(format!("LABEL {}", quote_literal(label)));
+        opts.push(format!("LABEL {}", quote_literal(label)?));
     }
 
     if let Some(ref target) = options.target {
-        opts.push(format!("TARGET {}", quote_literal(target)));
+        opts.push(format!("TARGET {}", quote_literal(target)?));
     }
 
     if let Some(ref target_detail) = options.target_detail {
-        opts.push(format!("TARGET_DETAIL {}", quote_literal(target_detail)));
+        opts.push(format!("TARGET_DETAIL {}", quote_literal(target_detail)?));
     }
 
     if options.progress {
@@ -338,7 +346,7 @@ pub fn build_base_backup_sql(options: &BaseBackupOptions) -> String {
     }
 
     if let Some(ref checkpoint) = options.checkpoint {
-        opts.push(format!("CHECKPOINT {}", quote_literal(checkpoint)));
+        opts.push(format!("CHECKPOINT {}", quote_literal(checkpoint)?));
     }
 
     if options.wal {
@@ -350,13 +358,13 @@ pub fn build_base_backup_sql(options: &BaseBackupOptions) -> String {
     }
 
     if let Some(ref compression) = options.compression {
-        opts.push(format!("COMPRESSION {}", quote_literal(compression)));
+        opts.push(format!("COMPRESSION {}", quote_literal(compression)?));
     }
 
     if let Some(ref compression_detail) = options.compression_detail {
         opts.push(format!(
             "COMPRESSION_DETAIL {}",
-            quote_literal(compression_detail)
+            quote_literal(compression_detail)?
         ));
     }
 
@@ -373,13 +381,13 @@ pub fn build_base_backup_sql(options: &BaseBackupOptions) -> String {
     }
 
     if let Some(ref manifest) = options.manifest {
-        opts.push(format!("MANIFEST {}", quote_literal(manifest)));
+        opts.push(format!("MANIFEST {}", quote_literal(manifest)?));
     }
 
     if let Some(ref manifest_checksums) = options.manifest_checksums {
         opts.push(format!(
             "MANIFEST_CHECKSUMS {}",
-            quote_literal(manifest_checksums)
+            quote_literal(manifest_checksums)?
         ));
     }
 
@@ -388,9 +396,9 @@ pub fn build_base_backup_sql(options: &BaseBackupOptions) -> String {
     }
 
     if opts.is_empty() {
-        "BASE_BACKUP".to_string()
+        Ok("BASE_BACKUP".to_string())
     } else {
-        format!("BASE_BACKUP ({})", opts.join(", "))
+        Ok(format!("BASE_BACKUP ({})", opts.join(", ")))
     }
 }
 
@@ -453,25 +461,24 @@ impl<'a> Default for CreateSubscriptionOptions<'a> {
 ///     slot_name: "my_slot",
 ///     ..Default::default()
 /// };
-/// let sql = build_create_subscription_sql(&opts);
+/// let sql = build_create_subscription_sql(&opts).unwrap();
 /// assert!(sql.starts_with("CREATE SUBSCRIPTION"));
-/// assert!(sql.contains("create_slot = false"));
 /// ```
-pub fn build_create_subscription_sql(opts: &CreateSubscriptionOptions<'_>) -> String {
-    let sub = quote_ident(opts.subscription_name);
-    let conn = quote_literal(opts.connection_string);
-    let pubname = quote_ident(opts.publication);
-    let slot = quote_literal(opts.slot_name);
+pub fn build_create_subscription_sql(opts: &CreateSubscriptionOptions<'_>) -> Result<String> {
+    let sub = quote_ident(opts.subscription_name)?;
+    let conn = quote_literal(opts.connection_string)?;
+    let pubname = quote_ident(opts.publication)?;
+    let slot = quote_literal(opts.slot_name)?;
 
     let create_slot_str = if opts.create_slot { "true" } else { "false" };
     let enabled_str = if opts.enabled { "true" } else { "false" };
     let copy_data_str = if opts.copy_data { "true" } else { "false" };
 
-    format!(
+    Ok(format!(
         "CREATE SUBSCRIPTION {sub} CONNECTION {conn} PUBLICATION {pubname} \
          WITH (create_slot = {create_slot_str}, slot_name = {slot}, \
          enabled = {enabled_str}, copy_data = {copy_data_str})"
-    )
+    ))
 }
 
 /// Build an `ALTER SUBSCRIPTION ... DISABLE` statement.
@@ -481,12 +488,12 @@ pub fn build_create_subscription_sql(opts: &CreateSubscriptionOptions<'_>) -> St
 /// ```
 /// use pg_walstream::sql_builder::build_disable_subscription_sql;
 ///
-/// let sql = build_disable_subscription_sql("my_sub");
+/// let sql = build_disable_subscription_sql("my_sub").unwrap();
 /// assert_eq!(sql, r#"ALTER SUBSCRIPTION "my_sub" DISABLE"#);
 /// ```
 #[inline]
-pub fn build_disable_subscription_sql(name: &str) -> String {
-    format!("ALTER SUBSCRIPTION {} DISABLE", quote_ident(name))
+pub fn build_disable_subscription_sql(name: &str) -> Result<String> {
+    Ok(format!("ALTER SUBSCRIPTION {} DISABLE", quote_ident(name)?))
 }
 
 /// Build an `ALTER SUBSCRIPTION ... SET (slot_name = NONE)` statement to detach a slot.
@@ -496,15 +503,15 @@ pub fn build_disable_subscription_sql(name: &str) -> String {
 /// ```
 /// use pg_walstream::sql_builder::build_detach_slot_sql;
 ///
-/// let sql = build_detach_slot_sql("my_sub");
+/// let sql = build_detach_slot_sql("my_sub").unwrap();
 /// assert_eq!(sql, r#"ALTER SUBSCRIPTION "my_sub" SET (slot_name = NONE)"#);
 /// ```
 #[inline]
-pub fn build_detach_slot_sql(name: &str) -> String {
-    format!(
+pub fn build_detach_slot_sql(name: &str) -> Result<String> {
+    Ok(format!(
         "ALTER SUBSCRIPTION {} SET (slot_name = NONE)",
-        quote_ident(name)
-    )
+        quote_ident(name)?
+    ))
 }
 
 /// Build a `DROP SUBSCRIPTION` statement.
@@ -514,12 +521,12 @@ pub fn build_detach_slot_sql(name: &str) -> String {
 /// ```
 /// use pg_walstream::sql_builder::build_drop_subscription_sql;
 ///
-/// let sql = build_drop_subscription_sql("my_sub");
+/// let sql = build_drop_subscription_sql("my_sub").unwrap();
 /// assert_eq!(sql, r#"DROP SUBSCRIPTION "my_sub""#);
 /// ```
 #[inline]
-pub fn build_drop_subscription_sql(name: &str) -> String {
-    format!("DROP SUBSCRIPTION {}", quote_ident(name))
+pub fn build_drop_subscription_sql(name: &str) -> Result<String> {
+    Ok(format!("DROP SUBSCRIPTION {}", quote_ident(name)?))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -545,102 +552,103 @@ mod tests {
 
     #[test]
     fn quote_ident_simple() {
-        assert_eq!(quote_ident("my_slot"), r#""my_slot""#);
+        assert_eq!(quote_ident("my_slot").unwrap(), r#""my_slot""#);
     }
 
     #[test]
     fn quote_ident_with_internal_double_quote() {
-        assert_eq!(quote_ident(r#"a"b"#), r#""a""b""#);
+        assert_eq!(quote_ident(r#"a"b"#).unwrap(), r#""a""b""#);
     }
 
     #[test]
     fn quote_ident_multiple_quotes() {
-        assert_eq!(quote_ident(r#"a""b"#), r#""a""""b""#);
+        assert_eq!(quote_ident(r#"a""b"#).unwrap(), r#""a""""b""#);
     }
 
     #[test]
     fn quote_ident_empty() {
-        assert_eq!(quote_ident(""), r#""""#);
+        assert_eq!(quote_ident("").unwrap(), r#""""#);
     }
 
     #[test]
     fn quote_ident_special_chars() {
         assert_eq!(
-            quote_ident("slot; DROP TABLE users; --"),
+            quote_ident("slot; DROP TABLE users; --").unwrap(),
             r#""slot; DROP TABLE users; --""#
         );
     }
 
     #[test]
     fn quote_ident_unicode() {
-        assert_eq!(quote_ident("テスト"), r#""テスト""#);
+        assert_eq!(quote_ident("テスト").unwrap(), r#""テスト""#);
     }
 
     #[test]
     fn quote_ident_mixed_unicode_and_quotes() {
-        assert_eq!(quote_ident(r#"名前"テスト"#), r#""名前""テスト""#);
+        assert_eq!(quote_ident(r#"名前"テスト"#).unwrap(), r#""名前""テスト""#);
     }
 
     #[test]
-    #[should_panic(expected = "null bytes")]
     fn quote_ident_rejects_null_byte() {
-        quote_ident("evil\0injection");
+        assert!(quote_ident("evil\0injection").is_err());
     }
 
     // ── quote_literal ────────────────────────────────────────────────────
 
     #[test]
     fn quote_literal_simple() {
-        assert_eq!(quote_literal("hello"), "'hello'");
+        assert_eq!(quote_literal("hello").unwrap(), "'hello'");
     }
 
     #[test]
     fn quote_literal_with_internal_single_quote() {
-        assert_eq!(quote_literal("it's"), "'it''s'");
+        assert_eq!(quote_literal("it's").unwrap(), "'it''s'");
     }
 
     #[test]
     fn quote_literal_multiple_quotes() {
-        assert_eq!(quote_literal("a''b"), "'a''''b'");
+        assert_eq!(quote_literal("a''b").unwrap(), "'a''''b'");
     }
 
     #[test]
     fn quote_literal_empty() {
-        assert_eq!(quote_literal(""), "''");
+        assert_eq!(quote_literal("").unwrap(), "''");
     }
 
     #[test]
     fn quote_literal_sql_injection_attempt() {
         assert_eq!(
-            quote_literal("'; DROP TABLE users; --"),
+            quote_literal("'; DROP TABLE users; --").unwrap(),
             "'''; DROP TABLE users; --'"
         );
     }
 
     #[test]
     fn quote_literal_unicode() {
-        assert_eq!(quote_literal("日本語"), "'日本語'");
+        assert_eq!(quote_literal("日本語").unwrap(), "'日本語'");
     }
 
     #[test]
     fn quote_literal_newlines() {
-        assert_eq!(quote_literal("line1\nline2"), "'line1\nline2'");
+        assert_eq!(quote_literal("line1\nline2").unwrap(), "'line1\nline2'");
     }
 
     #[test]
     fn quote_literal_complex_injection() {
-        assert_eq!(quote_literal("value' OR '1'='1"), "'value'' OR ''1''=''1'");
+        assert_eq!(
+            quote_literal("value' OR '1'='1").unwrap(),
+            "'value'' OR ''1''=''1'"
+        );
     }
 
     #[test]
     fn quote_literal_backslash_and_quote() {
-        assert_eq!(quote_literal("test\\'value"), "'test\\''value'");
+        assert_eq!(quote_literal("test\\'value").unwrap(), "'test\\''value'");
     }
 
     #[test]
-    #[should_panic(expected = "null bytes")]
     fn quote_literal_rejects_null_byte() {
-        quote_literal("evil\0injection");
+        assert!(quote_literal("evil\0injection").is_err());
     }
 
     // ── build_create_slot_sql ────────────────────────────────────────────
@@ -873,7 +881,7 @@ mod tests {
     #[test]
     fn drop_slot_without_wait() {
         assert_eq!(
-            build_drop_slot_sql("my_slot", false),
+            build_drop_slot_sql("my_slot", false).unwrap(),
             r#"DROP_REPLICATION_SLOT "my_slot";"#
         );
     }
@@ -881,14 +889,14 @@ mod tests {
     #[test]
     fn drop_slot_with_wait() {
         assert_eq!(
-            build_drop_slot_sql("my_slot", true),
+            build_drop_slot_sql("my_slot", true).unwrap(),
             r#"DROP_REPLICATION_SLOT "my_slot" WAIT;"#
         );
     }
 
     #[test]
     fn drop_slot_injection() {
-        let sql = build_drop_slot_sql(r#"evil"slot"#, false);
+        let sql = build_drop_slot_sql(r#"evil"slot"#, false).unwrap();
         assert_eq!(sql, r#"DROP_REPLICATION_SLOT "evil""slot";"#);
     }
 
@@ -897,7 +905,7 @@ mod tests {
     #[test]
     fn read_slot_basic() {
         assert_eq!(
-            build_read_slot_sql("my_slot"),
+            build_read_slot_sql("my_slot").unwrap(),
             r#"READ_REPLICATION_SLOT "my_slot";"#
         );
     }
@@ -905,7 +913,7 @@ mod tests {
     #[test]
     fn read_slot_injection() {
         assert_eq!(
-            build_read_slot_sql(r#"evil"slot"#),
+            build_read_slot_sql(r#"evil"slot"#).unwrap(),
             r#"READ_REPLICATION_SLOT "evil""slot";"#
         );
     }
@@ -918,7 +926,8 @@ mod tests {
             "my_slot",
             0,
             &[("proto_version", "1"), ("publication_names", "my_pub")],
-        );
+        )
+        .unwrap();
         assert_eq!(
             sql,
             r#"START_REPLICATION SLOT "my_slot" LOGICAL 0/0 ("proto_version" '1', "publication_names" 'my_pub')"#
@@ -928,7 +937,7 @@ mod tests {
     #[test]
     fn start_replication_valid_lsn() {
         let lsn: XLogRecPtr = 0x0000_0001_0000_0000;
-        let sql = build_start_replication_sql("test_slot", lsn, &[("proto_version", "2")]);
+        let sql = build_start_replication_sql("test_slot", lsn, &[("proto_version", "2")]).unwrap();
         assert!(sql.contains("START_REPLICATION SLOT \"test_slot\" LOGICAL"));
         assert!(sql.contains("(\"proto_version\" '2')"));
         assert!(!sql.contains("0/0"));
@@ -944,7 +953,8 @@ mod tests {
                 ("publication_names", "pub1"),
                 ("messages", "true"),
             ],
-        );
+        )
+        .unwrap();
         assert!(
             sql.contains(r#""proto_version" '1', "publication_names" 'pub1', "messages" 'true'"#)
         );
@@ -952,20 +962,20 @@ mod tests {
 
     #[test]
     fn start_replication_empty_options() {
-        let sql = build_start_replication_sql("slot1", 0, &[]);
+        let sql = build_start_replication_sql("slot1", 0, &[]).unwrap();
         assert_eq!(sql, r#"START_REPLICATION SLOT "slot1" LOGICAL 0/0"#);
     }
 
     #[test]
     fn start_replication_option_injection() {
-        let sql = build_start_replication_sql(r#"evil"slot"#, 0, &[("key", "it's")]);
+        let sql = build_start_replication_sql(r#"evil"slot"#, 0, &[("key", "it's")]).unwrap();
         assert!(sql.contains(r#""evil""slot""#));
         assert!(sql.contains("'it''s'"));
     }
 
     #[test]
     fn start_replication_single_option() {
-        let sql = build_start_replication_sql("my_slot", 0, &[("proto_version", "1")]);
+        let sql = build_start_replication_sql("my_slot", 0, &[("proto_version", "1")]).unwrap();
         assert_eq!(
             sql,
             r#"START_REPLICATION SLOT "my_slot" LOGICAL 0/0 ("proto_version" '1')"#
@@ -976,27 +986,27 @@ mod tests {
 
     #[test]
     fn start_physical_with_slot_zero_lsn() {
-        let sql = build_start_physical_replication_sql(Some("my_slot"), 0, None);
+        let sql = build_start_physical_replication_sql(Some("my_slot"), 0, None).unwrap();
         assert_eq!(sql, r#"START_REPLICATION SLOT "my_slot" PHYSICAL 0/0"#);
     }
 
     #[test]
     fn start_physical_no_slot() {
-        let sql = build_start_physical_replication_sql(None, 0, None);
+        let sql = build_start_physical_replication_sql(None, 0, None).unwrap();
         assert_eq!(sql, "START_REPLICATION PHYSICAL 0/0");
     }
 
     #[test]
     fn start_physical_with_lsn() {
         let lsn: XLogRecPtr = 0x0000_0001_0000_0000;
-        let sql = build_start_physical_replication_sql(Some("slot"), lsn, None);
+        let sql = build_start_physical_replication_sql(Some("slot"), lsn, None).unwrap();
         assert!(sql.contains("PHYSICAL 1/0"));
         assert!(!sql.contains("0/0"));
     }
 
     #[test]
     fn start_physical_with_timeline() {
-        let sql = build_start_physical_replication_sql(Some("slot"), 0, Some(3));
+        let sql = build_start_physical_replication_sql(Some("slot"), 0, Some(3)).unwrap();
         assert_eq!(
             sql,
             r#"START_REPLICATION SLOT "slot" PHYSICAL 0/0 TIMELINE 3"#
@@ -1005,13 +1015,13 @@ mod tests {
 
     #[test]
     fn start_physical_no_slot_with_timeline() {
-        let sql = build_start_physical_replication_sql(None, 0, Some(5));
+        let sql = build_start_physical_replication_sql(None, 0, Some(5)).unwrap();
         assert_eq!(sql, "START_REPLICATION PHYSICAL 0/0 TIMELINE 5");
     }
 
     #[test]
     fn start_physical_slot_injection() {
-        let sql = build_start_physical_replication_sql(Some(r#"evil"slot"#), 0, None);
+        let sql = build_start_physical_replication_sql(Some(r#"evil"slot"#), 0, None).unwrap();
         assert!(sql.contains(r#"SLOT "evil""slot""#));
     }
 
@@ -1020,7 +1030,7 @@ mod tests {
     #[test]
     fn base_backup_default() {
         let opts = BaseBackupOptions::default();
-        assert_eq!(build_base_backup_sql(&opts), "BASE_BACKUP");
+        assert_eq!(build_base_backup_sql(&opts).unwrap(), "BASE_BACKUP");
     }
 
     #[test]
@@ -1030,7 +1040,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            build_base_backup_sql(&opts),
+            build_base_backup_sql(&opts).unwrap(),
             "BASE_BACKUP (LABEL 'my_backup')"
         );
     }
@@ -1042,7 +1052,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            build_base_backup_sql(&opts),
+            build_base_backup_sql(&opts).unwrap(),
             "BASE_BACKUP (TARGET 'client')"
         );
     }
@@ -1055,7 +1065,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            build_base_backup_sql(&opts),
+            build_base_backup_sql(&opts).unwrap(),
             "BASE_BACKUP (TARGET 'server', TARGET_DETAIL '/var/backups')"
         );
     }
@@ -1066,7 +1076,10 @@ mod tests {
             progress: true,
             ..Default::default()
         };
-        assert_eq!(build_base_backup_sql(&opts), "BASE_BACKUP (PROGRESS true)");
+        assert_eq!(
+            build_base_backup_sql(&opts).unwrap(),
+            "BASE_BACKUP (PROGRESS true)"
+        );
     }
 
     #[test]
@@ -1076,7 +1089,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            build_base_backup_sql(&opts),
+            build_base_backup_sql(&opts).unwrap(),
             "BASE_BACKUP (CHECKPOINT 'fast')"
         );
     }
@@ -1087,7 +1100,10 @@ mod tests {
             wal: true,
             ..Default::default()
         };
-        assert_eq!(build_base_backup_sql(&opts), "BASE_BACKUP (WAL true)");
+        assert_eq!(
+            build_base_backup_sql(&opts).unwrap(),
+            "BASE_BACKUP (WAL true)"
+        );
     }
 
     #[test]
@@ -1096,7 +1112,10 @@ mod tests {
             wait: true,
             ..Default::default()
         };
-        assert_eq!(build_base_backup_sql(&opts), "BASE_BACKUP (WAIT true)");
+        assert_eq!(
+            build_base_backup_sql(&opts).unwrap(),
+            "BASE_BACKUP (WAIT true)"
+        );
     }
 
     #[test]
@@ -1106,7 +1125,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            build_base_backup_sql(&opts),
+            build_base_backup_sql(&opts).unwrap(),
             "BASE_BACKUP (COMPRESSION 'gzip')"
         );
     }
@@ -1119,7 +1138,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            build_base_backup_sql(&opts),
+            build_base_backup_sql(&opts).unwrap(),
             "BASE_BACKUP (COMPRESSION 'zstd', COMPRESSION_DETAIL 'level=3')"
         );
     }
@@ -1130,7 +1149,10 @@ mod tests {
             max_rate: Some(1024),
             ..Default::default()
         };
-        assert_eq!(build_base_backup_sql(&opts), "BASE_BACKUP (MAX_RATE 1024)");
+        assert_eq!(
+            build_base_backup_sql(&opts).unwrap(),
+            "BASE_BACKUP (MAX_RATE 1024)"
+        );
     }
 
     #[test]
@@ -1140,7 +1162,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            build_base_backup_sql(&opts),
+            build_base_backup_sql(&opts).unwrap(),
             "BASE_BACKUP (TABLESPACE_MAP true)"
         );
     }
@@ -1152,7 +1174,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            build_base_backup_sql(&opts),
+            build_base_backup_sql(&opts).unwrap(),
             "BASE_BACKUP (VERIFY_CHECKSUMS true)"
         );
     }
@@ -1163,7 +1185,10 @@ mod tests {
             manifest: Some("yes".to_string()),
             ..Default::default()
         };
-        assert_eq!(build_base_backup_sql(&opts), "BASE_BACKUP (MANIFEST 'yes')");
+        assert_eq!(
+            build_base_backup_sql(&opts).unwrap(),
+            "BASE_BACKUP (MANIFEST 'yes')"
+        );
     }
 
     #[test]
@@ -1174,7 +1199,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            build_base_backup_sql(&opts),
+            build_base_backup_sql(&opts).unwrap(),
             "BASE_BACKUP (MANIFEST 'yes', MANIFEST_CHECKSUMS 'SHA256')"
         );
     }
@@ -1185,7 +1210,10 @@ mod tests {
             incremental: true,
             ..Default::default()
         };
-        assert_eq!(build_base_backup_sql(&opts), "BASE_BACKUP (INCREMENTAL)");
+        assert_eq!(
+            build_base_backup_sql(&opts).unwrap(),
+            "BASE_BACKUP (INCREMENTAL)"
+        );
     }
 
     #[test]
@@ -1198,7 +1226,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            build_base_backup_sql(&opts),
+            build_base_backup_sql(&opts).unwrap(),
             "BASE_BACKUP (LABEL 'backup', PROGRESS true, WAL true, VERIFY_CHECKSUMS true)"
         );
     }
@@ -1210,7 +1238,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            build_base_backup_sql(&opts),
+            build_base_backup_sql(&opts).unwrap(),
             "BASE_BACKUP (LABEL 'evil''; DROP TABLE users; --')"
         );
     }
@@ -1252,7 +1280,7 @@ mod tests {
             slot_name: "my_slot",
             ..Default::default()
         };
-        let sql = build_create_subscription_sql(&opts);
+        let sql = build_create_subscription_sql(&opts).unwrap();
         assert_eq!(
             sql,
             "CREATE SUBSCRIPTION \"my_sub\" \
@@ -1271,7 +1299,7 @@ mod tests {
             slot_name: "slot'name",
             ..Default::default()
         };
-        let sql = build_create_subscription_sql(&opts);
+        let sql = build_create_subscription_sql(&opts).unwrap();
         assert_eq!(
             sql,
             "CREATE SUBSCRIPTION \"sub\"\"name\" \
@@ -1290,7 +1318,7 @@ mod tests {
             slot_name: "",
             ..Default::default()
         };
-        let sql = build_create_subscription_sql(&opts);
+        let sql = build_create_subscription_sql(&opts).unwrap();
         assert_eq!(
             sql,
             "CREATE SUBSCRIPTION \"\" \
@@ -1310,7 +1338,7 @@ mod tests {
             create_slot: true,
             ..Default::default()
         };
-        let sql = build_create_subscription_sql(&opts);
+        let sql = build_create_subscription_sql(&opts).unwrap();
         assert!(sql.contains("create_slot = true"));
         assert!(sql.contains("enabled = true"));
         assert!(sql.contains("copy_data = false"));
@@ -1326,7 +1354,7 @@ mod tests {
             copy_data: true,
             ..Default::default()
         };
-        let sql = build_create_subscription_sql(&opts);
+        let sql = build_create_subscription_sql(&opts).unwrap();
         assert!(sql.contains("copy_data = true"));
     }
 
@@ -1340,7 +1368,7 @@ mod tests {
             enabled: false,
             ..Default::default()
         };
-        let sql = build_create_subscription_sql(&opts);
+        let sql = build_create_subscription_sql(&opts).unwrap();
         assert!(sql.contains("enabled = false"));
     }
 
@@ -1355,7 +1383,7 @@ mod tests {
             enabled: true,
             copy_data: true,
         };
-        let sql = build_create_subscription_sql(&opts);
+        let sql = build_create_subscription_sql(&opts).unwrap();
         assert_eq!(
             sql,
             "CREATE SUBSCRIPTION \"sub\" \
@@ -1376,7 +1404,7 @@ mod tests {
             enabled: false,
             copy_data: false,
         };
-        let sql = build_create_subscription_sql(&opts);
+        let sql = build_create_subscription_sql(&opts).unwrap();
         assert_eq!(
             sql,
             "CREATE SUBSCRIPTION \"sub\" \
@@ -1391,7 +1419,7 @@ mod tests {
     #[test]
     fn disable_subscription_basic() {
         assert_eq!(
-            build_disable_subscription_sql("my_sub"),
+            build_disable_subscription_sql("my_sub").unwrap(),
             r#"ALTER SUBSCRIPTION "my_sub" DISABLE"#
         );
     }
@@ -1399,7 +1427,7 @@ mod tests {
     #[test]
     fn disable_subscription_with_quotes() {
         assert_eq!(
-            build_disable_subscription_sql(r#"sub"name"#),
+            build_disable_subscription_sql(r#"sub"name"#).unwrap(),
             r#"ALTER SUBSCRIPTION "sub""name" DISABLE"#
         );
     }
@@ -1409,7 +1437,7 @@ mod tests {
     #[test]
     fn detach_slot_basic() {
         assert_eq!(
-            build_detach_slot_sql("my_sub"),
+            build_detach_slot_sql("my_sub").unwrap(),
             r#"ALTER SUBSCRIPTION "my_sub" SET (slot_name = NONE)"#
         );
     }
@@ -1417,7 +1445,7 @@ mod tests {
     #[test]
     fn detach_slot_with_quotes() {
         assert_eq!(
-            build_detach_slot_sql(r#"sub"x"#),
+            build_detach_slot_sql(r#"sub"x"#).unwrap(),
             r#"ALTER SUBSCRIPTION "sub""x" SET (slot_name = NONE)"#
         );
     }
@@ -1427,7 +1455,7 @@ mod tests {
     #[test]
     fn drop_subscription_basic() {
         assert_eq!(
-            build_drop_subscription_sql("my_sub"),
+            build_drop_subscription_sql("my_sub").unwrap(),
             r#"DROP SUBSCRIPTION "my_sub""#
         );
     }
@@ -1435,7 +1463,7 @@ mod tests {
     #[test]
     fn drop_subscription_with_quotes() {
         assert_eq!(
-            build_drop_subscription_sql(r#"sub"name"#),
+            build_drop_subscription_sql(r#"sub"name"#).unwrap(),
             r#"DROP SUBSCRIPTION "sub""name""#
         );
     }
@@ -1443,9 +1471,174 @@ mod tests {
     #[test]
     fn drop_subscription_injection_attempt() {
         assert_eq!(
-            build_drop_subscription_sql("evil\"; DROP TABLE users; --"),
+            build_drop_subscription_sql("evil\"; DROP TABLE users; --").unwrap(),
             "DROP SUBSCRIPTION \"evil\"\"; DROP TABLE users; --\""
         );
+    }
+
+    // ── Null byte error propagation through builders ───────────────────
+
+    #[test]
+    fn create_slot_rejects_null_in_slot_name() {
+        let opts = ReplicationSlotOptions::default();
+        let err =
+            build_create_slot_sql("slot\0name", SlotType::Logical, Some("pgoutput"), &opts)
+                .unwrap_err();
+        assert!(err.to_string().contains("null bytes"));
+    }
+
+    #[test]
+    fn create_slot_rejects_null_in_plugin() {
+        let opts = ReplicationSlotOptions::default();
+        let err =
+            build_create_slot_sql("slot", SlotType::Logical, Some("pg\0output"), &opts)
+                .unwrap_err();
+        assert!(err.to_string().contains("null bytes"));
+    }
+
+    #[test]
+    fn alter_slot_rejects_null_in_slot_name() {
+        let err = build_alter_slot_sql("slot\0x", Some(true), None).unwrap_err();
+        assert!(err.to_string().contains("null bytes"));
+    }
+
+    #[test]
+    fn drop_slot_rejects_null_in_slot_name() {
+        let err = build_drop_slot_sql("slot\0x", false).unwrap_err();
+        assert!(err.to_string().contains("null bytes"));
+    }
+
+    #[test]
+    fn read_slot_rejects_null_in_slot_name() {
+        let err = build_read_slot_sql("slot\0x").unwrap_err();
+        assert!(err.to_string().contains("null bytes"));
+    }
+
+    #[test]
+    fn start_replication_rejects_null_in_slot_name() {
+        let err =
+            build_start_replication_sql("slot\0x", 0, &[("proto_version", "1")]).unwrap_err();
+        assert!(err.to_string().contains("null bytes"));
+    }
+
+    #[test]
+    fn start_replication_rejects_null_in_option_key() {
+        let err =
+            build_start_replication_sql("slot", 0, &[("key\0x", "value")]).unwrap_err();
+        assert!(err.to_string().contains("null bytes"));
+    }
+
+    #[test]
+    fn start_replication_rejects_null_in_option_value() {
+        let err =
+            build_start_replication_sql("slot", 0, &[("key", "val\0ue")]).unwrap_err();
+        assert!(err.to_string().contains("null bytes"));
+    }
+
+    #[test]
+    fn start_physical_rejects_null_in_slot_name() {
+        let err = build_start_physical_replication_sql(Some("slot\0x"), 0, None).unwrap_err();
+        assert!(err.to_string().contains("null bytes"));
+    }
+
+    #[test]
+    fn base_backup_rejects_null_in_label() {
+        let opts = BaseBackupOptions {
+            label: Some("label\0x".to_string()),
+            ..Default::default()
+        };
+        let err = build_base_backup_sql(&opts).unwrap_err();
+        assert!(err.to_string().contains("null bytes"));
+    }
+
+    #[test]
+    fn base_backup_rejects_null_in_target() {
+        let opts = BaseBackupOptions {
+            target: Some("target\0x".to_string()),
+            ..Default::default()
+        };
+        let err = build_base_backup_sql(&opts).unwrap_err();
+        assert!(err.to_string().contains("null bytes"));
+    }
+
+    #[test]
+    fn base_backup_rejects_null_in_compression() {
+        let opts = BaseBackupOptions {
+            compression: Some("gzip\0x".to_string()),
+            ..Default::default()
+        };
+        let err = build_base_backup_sql(&opts).unwrap_err();
+        assert!(err.to_string().contains("null bytes"));
+    }
+
+    #[test]
+    fn create_subscription_rejects_null_in_name() {
+        let opts = CreateSubscriptionOptions {
+            subscription_name: "sub\0x",
+            connection_string: "host=localhost",
+            publication: "pub",
+            slot_name: "slot",
+            ..Default::default()
+        };
+        let err = build_create_subscription_sql(&opts).unwrap_err();
+        assert!(err.to_string().contains("null bytes"));
+    }
+
+    #[test]
+    fn create_subscription_rejects_null_in_connection() {
+        let opts = CreateSubscriptionOptions {
+            subscription_name: "sub",
+            connection_string: "host=\0localhost",
+            publication: "pub",
+            slot_name: "slot",
+            ..Default::default()
+        };
+        let err = build_create_subscription_sql(&opts).unwrap_err();
+        assert!(err.to_string().contains("null bytes"));
+    }
+
+    #[test]
+    fn create_subscription_rejects_null_in_publication() {
+        let opts = CreateSubscriptionOptions {
+            subscription_name: "sub",
+            connection_string: "host=localhost",
+            publication: "pub\0x",
+            slot_name: "slot",
+            ..Default::default()
+        };
+        let err = build_create_subscription_sql(&opts).unwrap_err();
+        assert!(err.to_string().contains("null bytes"));
+    }
+
+    #[test]
+    fn create_subscription_rejects_null_in_slot_name() {
+        let opts = CreateSubscriptionOptions {
+            subscription_name: "sub",
+            connection_string: "host=localhost",
+            publication: "pub",
+            slot_name: "slot\0x",
+            ..Default::default()
+        };
+        let err = build_create_subscription_sql(&opts).unwrap_err();
+        assert!(err.to_string().contains("null bytes"));
+    }
+
+    #[test]
+    fn disable_subscription_rejects_null() {
+        let err = build_disable_subscription_sql("sub\0x").unwrap_err();
+        assert!(err.to_string().contains("null bytes"));
+    }
+
+    #[test]
+    fn detach_slot_rejects_null() {
+        let err = build_detach_slot_sql("sub\0x").unwrap_err();
+        assert!(err.to_string().contains("null bytes"));
+    }
+
+    #[test]
+    fn drop_subscription_rejects_null() {
+        let err = build_drop_subscription_sql("sub\0x").unwrap_err();
+        assert!(err.to_string().contains("null bytes"));
     }
 
     // ── Compatibility with existing behavior ─────────────────────────────
@@ -1462,7 +1655,11 @@ mod tests {
         ];
         for input in cases {
             let legacy = format!("\"{}\"", input.replace('"', "\"\""));
-            assert_eq!(quote_ident(input), legacy, "mismatch for input: {input:?}");
+            assert_eq!(
+                quote_ident(input).unwrap(),
+                legacy,
+                "mismatch for input: {input:?}"
+            );
         }
     }
 
@@ -1480,7 +1677,7 @@ mod tests {
         for input in cases {
             let legacy = format!("'{}'", input.replace('\'', "''"));
             assert_eq!(
-                quote_literal(input),
+                quote_literal(input).unwrap(),
                 legacy,
                 "mismatch for input: {input:?}"
             );
