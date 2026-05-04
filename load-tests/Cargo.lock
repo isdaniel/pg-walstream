@@ -915,7 +915,7 @@ dependencies = [
 
 [[package]]
 name = "pg_walstream"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "aws-lc-rs",
  "bytes",

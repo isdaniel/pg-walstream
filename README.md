@@ -33,14 +33,14 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-pg_walstream = "0.6.2"
+pg_walstream = "0.6.3"
 ```
 
 By default, this uses the `libpq` backend (C FFI). To switch to a **pure-Rust** build:
 
 ```toml
 [dependencies]
-pg_walstream = { version = "0.6.2", features = ["rustls-tls"] }
+pg_walstream = { version = "0.6.3", features = ["rustls-tls"] }
 ```
 
 When `rustls-tls` is enabled alongside the default `libpq`, `rustls-tls` takes priority automatically — no need to set `default-features = false`.
@@ -49,7 +49,7 @@ For a fully pure-Rust build with **no system dependencies** (avoids building `li
 
 ```toml
 [dependencies]
-pg_walstream = { version = "0.6.2", default-features = false, features = ["rustls-tls"] }
+pg_walstream = { version = "0.6.3", default-features = false, features = ["rustls-tls"] }
 ```
 
 ## Feature Flags
@@ -94,7 +94,7 @@ sudo apt-get install cmake gcc
 Then add to `Cargo.toml`:
 
 ```toml
-pg_walstream = { version = "0.6.2", features = ["rustls-tls"] }
+pg_walstream = { version = "0.6.3", features = ["rustls-tls"] }
 ```
 
 #### TLS trust store
