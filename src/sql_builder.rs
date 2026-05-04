@@ -257,17 +257,11 @@ pub fn build_start_replication_sql(
         return format!("START_REPLICATION SLOT {quoted_slot} LOGICAL {lsn_str}");
     }
 
-    let mut options_str = String::new();
-    for (i, (key, value)) in options.iter().enumerate() {
-        if i > 0 {
-            options_str.push_str(", ");
-        }
-        let quoted_key = quote_ident(key);
-        let quoted_value = quote_literal(value);
-        options_str.push_str(&quoted_key);
-        options_str.push(' ');
-        options_str.push_str(&quoted_value);
-    }
+    let options_str = options
+        .iter()
+        .map(|(k, v)| format!("{} {}", quote_ident(k), quote_literal(v)))
+        .collect::<Vec<_>>()
+        .join(", ");
 
     format!("START_REPLICATION SLOT {quoted_slot} LOGICAL {lsn_str} ({options_str})")
 }
@@ -473,35 +467,11 @@ pub fn build_create_subscription_sql(opts: &CreateSubscriptionOptions<'_>) -> St
     let enabled_str = if opts.enabled { "true" } else { "false" };
     let copy_data_str = if opts.copy_data { "true" } else { "false" };
 
-    let estimated = "CREATE SUBSCRIPTION ".len()
-        + sub.len()
-        + " CONNECTION ".len()
-        + conn.len()
-        + " PUBLICATION ".len()
-        + pubname.len()
-        + " WITH (create_slot = , slot_name = , enabled = , copy_data = )".len()
-        + slot.len()
-        + create_slot_str.len()
-        + enabled_str.len()
-        + copy_data_str.len();
-
-    let mut sql = String::with_capacity(estimated);
-    sql.push_str("CREATE SUBSCRIPTION ");
-    sql.push_str(&sub);
-    sql.push_str(" CONNECTION ");
-    sql.push_str(&conn);
-    sql.push_str(" PUBLICATION ");
-    sql.push_str(&pubname);
-    sql.push_str(" WITH (create_slot = ");
-    sql.push_str(create_slot_str);
-    sql.push_str(", slot_name = ");
-    sql.push_str(&slot);
-    sql.push_str(", enabled = ");
-    sql.push_str(enabled_str);
-    sql.push_str(", copy_data = ");
-    sql.push_str(copy_data_str);
-    sql.push(')');
-    sql
+    format!(
+        "CREATE SUBSCRIPTION {sub} CONNECTION {conn} PUBLICATION {pubname} \
+         WITH (create_slot = {create_slot_str}, slot_name = {slot}, \
+         enabled = {enabled_str}, copy_data = {copy_data_str})"
+    )
 }
 
 /// Build an `ALTER SUBSCRIPTION ... DISABLE` statement.
@@ -516,13 +486,7 @@ pub fn build_create_subscription_sql(opts: &CreateSubscriptionOptions<'_>) -> St
 /// ```
 #[inline]
 pub fn build_disable_subscription_sql(name: &str) -> String {
-    let quoted = quote_ident(name);
-    let mut sql =
-        String::with_capacity("ALTER SUBSCRIPTION ".len() + quoted.len() + " DISABLE".len());
-    sql.push_str("ALTER SUBSCRIPTION ");
-    sql.push_str(&quoted);
-    sql.push_str(" DISABLE");
-    sql
+    format!("ALTER SUBSCRIPTION {} DISABLE", quote_ident(name))
 }
 
 /// Build an `ALTER SUBSCRIPTION ... SET (slot_name = NONE)` statement to detach a slot.
@@ -537,14 +501,10 @@ pub fn build_disable_subscription_sql(name: &str) -> String {
 /// ```
 #[inline]
 pub fn build_detach_slot_sql(name: &str) -> String {
-    let quoted = quote_ident(name);
-    let mut sql = String::with_capacity(
-        "ALTER SUBSCRIPTION ".len() + quoted.len() + " SET (slot_name = NONE)".len(),
-    );
-    sql.push_str("ALTER SUBSCRIPTION ");
-    sql.push_str(&quoted);
-    sql.push_str(" SET (slot_name = NONE)");
-    sql
+    format!(
+        "ALTER SUBSCRIPTION {} SET (slot_name = NONE)",
+        quote_ident(name)
+    )
 }
 
 /// Build a `DROP SUBSCRIPTION` statement.
@@ -559,11 +519,7 @@ pub fn build_detach_slot_sql(name: &str) -> String {
 /// ```
 #[inline]
 pub fn build_drop_subscription_sql(name: &str) -> String {
-    let quoted = quote_ident(name);
-    let mut sql = String::with_capacity("DROP SUBSCRIPTION ".len() + quoted.len());
-    sql.push_str("DROP SUBSCRIPTION ");
-    sql.push_str(&quoted);
-    sql
+    format!("DROP SUBSCRIPTION {}", quote_ident(name))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
