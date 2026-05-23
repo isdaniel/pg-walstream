@@ -68,12 +68,6 @@ impl BufferReader {
         }
     }
 
-    /// Get current position in the buffer
-    #[inline]
-    pub fn position(&self) -> usize {
-        self.data.len()
-    }
-
     /// Get remaining bytes in the buffer
     #[inline]
     pub fn remaining(&self) -> usize {
@@ -97,67 +91,28 @@ impl BufferReader {
         )))
     }
 
-    /// Read a single byte
-    ///
-    /// # Returns
-    ///
-    /// Returns the next byte from the buffer.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if there are insufficient bytes remaining in the buffer.
+    /// Read a single byte from the buffer.
     #[inline]
     pub fn read_u8(&mut self) -> Result<u8> {
         self.ensure_bytes(1)?;
         Ok(self.data.get_u8())
     }
 
-    /// Read a 16-bit unsigned integer in network byte order
-    ///
-    /// Reads 2 bytes and interprets them as a big-endian u16.
-    ///
-    /// # Returns
-    ///
-    /// Returns the next 16-bit unsigned integer.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if there are insufficient bytes remaining.
+    /// Read a big-endian u16.
     #[inline]
     pub fn read_u16(&mut self) -> Result<u16> {
         self.ensure_bytes(2)?;
         Ok(self.data.get_u16())
     }
 
-    /// Read a 32-bit unsigned integer in network byte order
-    ///
-    /// Reads 4 bytes and interprets them as a big-endian u32.
-    ///
-    /// # Returns
-    ///
-    /// Returns the next 32-bit unsigned integer.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if there are insufficient bytes remaining.
+    /// Read a big-endian u32.
     #[inline]
     pub fn read_u32(&mut self) -> Result<u32> {
         self.ensure_bytes(4)?;
         Ok(self.data.get_u32())
     }
 
-    /// Read a 64-bit unsigned integer in network byte order
-    ///
-    /// Reads 8 bytes and interprets them as a big-endian u64.
-    /// This is commonly used for reading LSN values.
-    ///
-    /// # Returns
-    ///
-    /// Returns the next 64-bit unsigned integer.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if there are insufficient bytes remaining.
+    /// Read a big-endian u64.
     #[inline]
     pub fn read_u64(&mut self) -> Result<u64> {
         self.ensure_bytes(8)?;
@@ -204,6 +159,25 @@ impl BufferReader {
         self.data.advance(bytes_to_read + 1);
 
         Ok(result)
+    }
+
+    /// Read a null-terminated string directly into `Arc<str>` (avoids intermediate String allocation).
+    #[inline]
+    pub fn read_cstring_arc(&mut self) -> Result<std::sync::Arc<str>> {
+        let data_slice = self.data.chunk();
+
+        let bytes_to_read = memchr::memchr(0, data_slice).ok_or_else(|| {
+            ReplicationError::protocol("Unterminated string in buffer".to_string())
+        })?;
+
+        let result = std::str::from_utf8(&data_slice[..bytes_to_read])
+            .map_err(|e| ReplicationError::protocol(format!("Invalid UTF-8 in string: {e}")))?;
+
+        let arc: std::sync::Arc<str> = std::sync::Arc::from(result);
+
+        self.data.advance(bytes_to_read + 1);
+
+        Ok(arc)
     }
 
     /// Read a fixed-length string without null terminator
@@ -291,52 +265,52 @@ impl BufferWriter {
         self.data.to_vec()
     }
 
-    /// Write a single byte
-    pub fn write_u8(&mut self, value: u8) -> Result<()> {
+    /// Write a single byte.
+    #[inline]
+    pub fn write_u8(&mut self, value: u8) {
         self.data.put_u8(value);
-        Ok(())
     }
 
-    /// Write a 16-bit unsigned integer in network byte order
-    pub fn write_u16(&mut self, value: u16) -> Result<()> {
+    /// Write a big-endian u16.
+    #[inline]
+    pub fn write_u16(&mut self, value: u16) {
         self.data.put_u16(value);
-        Ok(())
     }
 
-    /// Write a 16-bit signed integer in network byte order
-    pub fn write_i16(&mut self, value: i16) -> Result<()> {
+    /// Write a big-endian i16.
+    #[inline]
+    pub fn write_i16(&mut self, value: i16) {
         self.data.put_i16(value);
-        Ok(())
     }
 
-    /// Write a 32-bit unsigned integer in network byte order
-    pub fn write_u32(&mut self, value: u32) -> Result<()> {
+    /// Write a big-endian u32.
+    #[inline]
+    pub fn write_u32(&mut self, value: u32) {
         self.data.put_u32(value);
-        Ok(())
     }
 
-    /// Write a 64-bit unsigned integer in network byte order
-    pub fn write_u64(&mut self, value: u64) -> Result<()> {
+    /// Write a big-endian u64.
+    #[inline]
+    pub fn write_u64(&mut self, value: u64) {
         self.data.put_u64(value);
-        Ok(())
     }
 
-    /// Write a 32-bit signed integer in network byte order
-    pub fn write_i32(&mut self, value: i32) -> Result<()> {
+    /// Write a big-endian i32.
+    #[inline]
+    pub fn write_i32(&mut self, value: i32) {
         self.data.put_i32(value);
-        Ok(())
     }
 
-    /// Write a 64-bit signed integer in network byte order
-    pub fn write_i64(&mut self, value: i64) -> Result<()> {
+    /// Write a big-endian i64.
+    #[inline]
+    pub fn write_i64(&mut self, value: i64) {
         self.data.put_i64(value);
-        Ok(())
     }
 
-    /// Write raw bytes
-    pub fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+    /// Write raw bytes.
+    #[inline]
+    pub fn write_bytes(&mut self, bytes: &[u8]) {
         self.data.put_slice(bytes);
-        Ok(())
     }
 
     /// Write a null-terminated string
@@ -354,10 +328,10 @@ impl BufferWriter {
         Ok(())
     }
 
-    /// Write a string without null terminator
-    pub fn write_string(&mut self, s: &str) -> Result<()> {
+    /// Write a string without null terminator.
+    #[inline]
+    pub fn write_string(&mut self, s: &str) {
         self.data.put_slice(s.as_bytes());
-        Ok(())
     }
 
     /// Reserve capacity for at least additional bytes
@@ -425,9 +399,9 @@ mod tests {
     fn test_buffer_writer_basic() {
         let mut writer = BufferWriter::new();
 
-        writer.write_u8(0x01).unwrap();
-        writer.write_u16(0x0203).unwrap();
-        writer.write_u32(0x04050607).unwrap();
+        writer.write_u8(0x01);
+        writer.write_u16(0x0203);
+        writer.write_u32(0x04050607);
 
         assert_eq!(writer.bytes_written(), 7);
 
@@ -448,11 +422,36 @@ mod tests {
     }
 
     #[test]
+    fn test_buffer_reader_read_cstring_arc() {
+        let data = b"hello\x00rest";
+        let mut reader = BufferReader::new(data);
+        let arc = reader.read_cstring_arc().unwrap();
+        assert_eq!(&*arc, "hello");
+        assert_eq!(reader.remaining(), 4);
+    }
+
+    #[test]
+    fn test_buffer_reader_read_cstring_arc_empty() {
+        let data = [0x00, 0x01];
+        let mut reader = BufferReader::new(&data);
+        let arc = reader.read_cstring_arc().unwrap();
+        assert_eq!(&*arc, "");
+        assert_eq!(reader.remaining(), 1);
+    }
+
+    #[test]
+    fn test_buffer_reader_read_cstring_arc_unterminated() {
+        let data = b"no null";
+        let mut reader = BufferReader::new(data);
+        assert!(reader.read_cstring_arc().is_err());
+    }
+
+    #[test]
     fn test_buffer_writer_strings() {
         let mut writer = BufferWriter::new();
 
         writer.write_cstring("hello").unwrap();
-        writer.write_string("world").unwrap();
+        writer.write_string("world");
 
         let data = writer.freeze();
         assert_eq!(&data[..], b"hello\x00world");
@@ -601,9 +600,9 @@ mod tests {
     fn test_buffer_writer_signed_integers() {
         let mut writer = BufferWriter::new();
 
-        writer.write_i16(-2).unwrap();
-        writer.write_i32(-2).unwrap();
-        writer.write_i64(-2).unwrap();
+        writer.write_i16(-2);
+        writer.write_i32(-2);
+        writer.write_i64(-2);
 
         let data = writer.freeze();
         assert_eq!(data.len(), 2 + 4 + 8);
@@ -617,15 +616,15 @@ mod tests {
     #[test]
     fn test_buffer_writer_with_capacity() {
         let mut writer = BufferWriter::with_capacity(100);
-        writer.write_u64(0x0102030405060708).unwrap();
+        writer.write_u64(0x0102030405060708);
         assert_eq!(writer.bytes_written(), 8);
     }
 
     #[test]
     fn test_buffer_writer_bytes() {
         let mut writer = BufferWriter::new();
-        writer.write_bytes(&[0x01, 0x02, 0x03]).unwrap();
-        writer.write_bytes(&[0x04, 0x05]).unwrap();
+        writer.write_bytes(&[0x01, 0x02, 0x03]);
+        writer.write_bytes(&[0x04, 0x05]);
 
         let data = writer.freeze();
         assert_eq!(&data[..], &[0x01, 0x02, 0x03, 0x04, 0x05]);
@@ -670,7 +669,7 @@ mod tests {
     #[test]
     fn test_buffer_writer_write_i16() {
         let mut writer = BufferWriter::new();
-        writer.write_i16(0x1234).unwrap();
+        writer.write_i16(0x1234);
         let data = writer.freeze();
         assert_eq!(&data[..], &[0x12, 0x34]);
     }
@@ -678,7 +677,7 @@ mod tests {
     #[test]
     fn test_buffer_writer_write_i32() {
         let mut writer = BufferWriter::new();
-        writer.write_i32(0x12345678).unwrap();
+        writer.write_i32(0x12345678);
         let data = writer.freeze();
         assert_eq!(&data[..], &[0x12, 0x34, 0x56, 0x78]);
     }
@@ -686,7 +685,7 @@ mod tests {
     #[test]
     fn test_buffer_writer_write_i64() {
         let mut writer = BufferWriter::new();
-        writer.write_i64(0x0102030405060708).unwrap();
+        writer.write_i64(0x0102030405060708);
         let data = writer.freeze();
         assert_eq!(&data[..], &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
     }
@@ -714,7 +713,7 @@ mod tests {
     #[test]
     fn test_buffer_writer_write_string() {
         let mut writer = BufferWriter::new();
-        writer.write_string("hello").unwrap();
+        writer.write_string("hello");
         let data = writer.freeze();
         assert_eq!(&data[..], b"hello");
     }
@@ -729,8 +728,8 @@ mod tests {
     #[test]
     fn test_buffer_writer_clear() {
         let mut writer = BufferWriter::new();
-        writer.write_u8(0x01).unwrap();
-        writer.write_u8(0x02).unwrap();
+        writer.write_u8(0x01);
+        writer.write_u8(0x02);
         assert_eq!(writer.bytes_written(), 2);
 
         writer.clear();
@@ -747,15 +746,15 @@ mod tests {
     #[test]
     fn test_buffer_writer_as_bytes() {
         let mut writer = BufferWriter::new();
-        writer.write_u8(0xAA).unwrap();
-        writer.write_u8(0xBB).unwrap();
+        writer.write_u8(0xAA);
+        writer.write_u8(0xBB);
         assert_eq!(writer.as_bytes(), &[0xAA, 0xBB]);
     }
 
     #[test]
     fn test_buffer_writer_as_ref() {
         let mut writer = BufferWriter::new();
-        writer.write_u8(0x01).unwrap();
+        writer.write_u8(0x01);
         let slice: &[u8] = writer.as_ref();
         assert_eq!(slice, &[0x01]);
     }
@@ -763,15 +762,15 @@ mod tests {
     #[test]
     fn test_buffer_writer_default() {
         let mut writer = BufferWriter::default();
-        writer.write_u8(0xFF).unwrap();
+        writer.write_u8(0xFF);
         assert_eq!(writer.bytes_written(), 1);
     }
 
     #[test]
     fn test_buffer_writer_into_vec() {
         let mut writer = BufferWriter::new();
-        writer.write_u8(0x01).unwrap();
-        writer.write_u16(0x0203).unwrap();
+        writer.write_u8(0x01);
+        writer.write_u16(0x0203);
         let vec = writer.into_vec();
         assert_eq!(vec, vec![0x01, 0x02, 0x03]);
     }
@@ -784,33 +783,32 @@ mod tests {
     }
 
     #[test]
-    fn test_buffer_reader_position() {
+    fn test_buffer_reader_remaining_initial() {
         let data = [0x01, 0x02, 0x03, 0x04];
         let reader = BufferReader::new(&data);
-        // position returns data.len() which is the remaining bytes
-        assert_eq!(reader.position(), 4);
+        assert_eq!(reader.remaining(), 4);
     }
 
     #[test]
     fn test_buffer_writer_position() {
         let mut writer = BufferWriter::new();
         assert_eq!(writer.position(), 0);
-        writer.write_u32(0x12345678).unwrap();
+        writer.write_u32(0x12345678);
         assert_eq!(writer.position(), 4);
     }
 
     #[test]
     fn test_buffer_roundtrip_complex() {
         let mut writer = BufferWriter::new();
-        writer.write_u8(0x42).unwrap();
-        writer.write_u16(0x1234).unwrap();
-        writer.write_u32(0xDEADBEEF).unwrap();
-        writer.write_u64(0xCAFEBABE12345678).unwrap();
-        writer.write_i16(-100).unwrap();
-        writer.write_i32(-200).unwrap();
-        writer.write_i64(-300).unwrap();
+        writer.write_u8(0x42);
+        writer.write_u16(0x1234);
+        writer.write_u32(0xDEADBEEF);
+        writer.write_u64(0xCAFEBABE12345678);
+        writer.write_i16(-100);
+        writer.write_i32(-200);
+        writer.write_i64(-300);
         writer.write_cstring("hello").unwrap();
-        writer.write_bytes(&[0x01, 0x02]).unwrap();
+        writer.write_bytes(&[0x01, 0x02]);
 
         let data = writer.freeze();
         let mut reader = BufferReader::from_bytes(data);

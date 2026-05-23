@@ -891,8 +891,8 @@ impl LogicalReplicationStream {
                 // Detect schema changes: if we already have this relation cached
                 // and the schema differs, emit a Relation event before updating.
                 let schema_changed = if let Some(existing) = self.state.get_relation(relation_id) {
-                    existing.namespace.as_ref() != namespace.as_str()
-                        || existing.relation_name.as_ref() != relation_name.as_str()
+                    existing.namespace.as_ref() != namespace.as_ref()
+                        || existing.relation_name.as_ref() != relation_name.as_ref()
                         || existing.replica_identity != replica_identity
                         || existing.columns.len() != columns.len()
                         || existing.columns.iter().zip(columns.iter()).any(|(a, b)| {
@@ -2336,8 +2336,8 @@ mod tests {
 
         let relation = RelationInfo::new(
             16384,
-            "public".to_string(),
-            "users".to_string(),
+            Arc::from("public"),
+            Arc::from("users"),
             b'd',
             columns,
         );
@@ -2350,13 +2350,8 @@ mod tests {
 
     #[test]
     fn test_relation_info_full_name() {
-        let relation = RelationInfo::new(
-            16384,
-            "public".to_string(),
-            "users".to_string(),
-            b'd',
-            vec![],
-        );
+        let relation =
+            RelationInfo::new(16384, Arc::from("public"), Arc::from("users"), b'd', vec![]);
 
         assert_eq!(relation.full_name(), "public.users");
     }
@@ -2380,8 +2375,8 @@ mod tests {
 
         let relation = RelationInfo::new(
             16384,
-            "public".to_string(),
-            "users".to_string(),
+            Arc::from("public"),
+            Arc::from("users"),
             b'd',
             columns,
         );
@@ -2413,8 +2408,8 @@ mod tests {
 
         let relation = RelationInfo::new(
             16384,
-            "public".to_string(),
-            "users".to_string(),
+            Arc::from("public"),
+            Arc::from("users"),
             b'd',
             columns,
         );
@@ -2547,8 +2542,7 @@ mod tests {
             },
         ];
 
-        let relation =
-            RelationInfo::new(1, "public".to_string(), "test".to_string(), b'd', columns);
+        let relation = RelationInfo::new(1, Arc::from("public"), Arc::from("test"), b'd', columns);
 
         let tuple = TupleData::new(vec![
             crate::protocol::ColumnData::unchanged(),
@@ -2569,8 +2563,7 @@ mod tests {
             type_modifier: -1,
         }];
 
-        let relation =
-            RelationInfo::new(1, "public".to_string(), "test".to_string(), b'd', columns);
+        let relation = RelationInfo::new(1, Arc::from("public"), Arc::from("test"), b'd', columns);
 
         let tuple = TupleData::new(vec![crate::protocol::ColumnData::text(Vec::new())]);
         let data = tuple.into_row_data(&relation);
@@ -2921,13 +2914,8 @@ mod tests {
 
     #[test]
     fn test_relation_info_empty_columns() {
-        let relation = RelationInfo::new(
-            12345,
-            "schema".to_string(),
-            "table".to_string(),
-            b'd',
-            vec![],
-        );
+        let relation =
+            RelationInfo::new(12345, Arc::from("schema"), Arc::from("table"), b'd', vec![]);
 
         assert_eq!(relation.columns.len(), 0);
         assert!(relation.get_column_by_index(0).is_none());
@@ -2959,8 +2947,8 @@ mod tests {
 
         let relation = RelationInfo::new(
             12345,
-            "public".to_string(),
-            "composite_key_table".to_string(),
+            Arc::from("public"),
+            Arc::from("composite_key_table"),
             b'd',
             columns,
         );
@@ -2974,21 +2962,19 @@ mod tests {
     #[test]
     fn test_relation_info_different_replica_identities() {
         // Test Default
-        let rel_default =
-            RelationInfo::new(1, "public".to_string(), "t1".to_string(), b'd', vec![]);
+        let rel_default = RelationInfo::new(1, Arc::from("public"), Arc::from("t1"), b'd', vec![]);
         assert_eq!(rel_default.replica_identity, b'd');
 
         // Test Full
-        let rel_full = RelationInfo::new(2, "public".to_string(), "t2".to_string(), b'f', vec![]);
+        let rel_full = RelationInfo::new(2, Arc::from("public"), Arc::from("t2"), b'f', vec![]);
         assert_eq!(rel_full.replica_identity, b'f');
 
         // Test Nothing
-        let rel_nothing =
-            RelationInfo::new(3, "public".to_string(), "t3".to_string(), b'n', vec![]);
+        let rel_nothing = RelationInfo::new(3, Arc::from("public"), Arc::from("t3"), b'n', vec![]);
         assert_eq!(rel_nothing.replica_identity, b'n');
 
         // Test Index
-        let rel_index = RelationInfo::new(4, "public".to_string(), "t4".to_string(), b'i', vec![]);
+        let rel_index = RelationInfo::new(4, Arc::from("public"), Arc::from("t4"), b'i', vec![]);
         assert_eq!(rel_index.replica_identity, b'i');
     }
 
@@ -3405,8 +3391,8 @@ mod tests {
 
         let relation = RelationInfo::new(
             16384,
-            "tenant_1".to_string(),
-            "user_events".to_string(),
+            Arc::from("tenant_1"),
+            Arc::from("user_events"),
             b'i', // index replica identity
             columns,
         );
@@ -3598,8 +3584,8 @@ mod tests {
 
         let relation = RelationInfo::new(
             12345,
-            "public".to_string(),
-            "wide_table".to_string(),
+            Arc::from("public"),
+            Arc::from("wide_table"),
             b'd',
             columns,
         );
@@ -3857,7 +3843,7 @@ mod tests {
         let columns = vec![
             ColumnInfo::new(0, "binary_col".to_string(), 17, -1), // bytea
         ];
-        let relation = RelationInfo::new(1, "public".to_string(), "t".to_string(), b'd', columns);
+        let relation = RelationInfo::new(1, Arc::from("public"), Arc::from("t"), b'd', columns);
 
         let tuple = TupleData::new(vec![ColumnData::binary(vec![0xDE, 0xAD, 0xBE, 0xEF])]);
 
@@ -3872,7 +3858,7 @@ mod tests {
         use crate::protocol::{ColumnData, ColumnInfo, RelationInfo, TupleData};
 
         let columns = vec![ColumnInfo::new(0, "nullable".to_string(), 25, -1)];
-        let relation = RelationInfo::new(1, "public".to_string(), "t".to_string(), b'd', columns);
+        let relation = RelationInfo::new(1, Arc::from("public"), Arc::from("t"), b'd', columns);
 
         let tuple = TupleData::new(vec![ColumnData::null()]);
 
@@ -3889,7 +3875,7 @@ mod tests {
             ColumnInfo::new(0, "unchanged_col".to_string(), 25, -1),
             ColumnInfo::new(0, "updated".to_string(), 25, -1),
         ];
-        let relation = RelationInfo::new(1, "public".to_string(), "t".to_string(), b'd', columns);
+        let relation = RelationInfo::new(1, Arc::from("public"), Arc::from("t"), b'd', columns);
 
         let tuple = TupleData::new(vec![
             ColumnData::text(b"1".to_vec()),
@@ -3906,7 +3892,7 @@ mod tests {
         use crate::protocol::{ColumnInfo, RelationInfo, TupleData};
 
         let columns: Vec<ColumnInfo> = vec![];
-        let relation = RelationInfo::new(1, "public".to_string(), "t".to_string(), b'd', columns);
+        let relation = RelationInfo::new(1, Arc::from("public"), Arc::from("t"), b'd', columns);
         let tuple = TupleData::new(vec![]);
 
         let data = tuple.into_row_data(&relation);
@@ -4232,8 +4218,7 @@ mod tests {
             ColumnInfo::new(0, "name".to_string(), 25, -1),  // not key
             ColumnInfo::new(1, "email".to_string(), 25, -1), // key
         ];
-        let relation =
-            RelationInfo::new(1, "public".to_string(), "users".to_string(), b'd', columns);
+        let relation = RelationInfo::new(1, Arc::from("public"), Arc::from("users"), b'd', columns);
 
         let stream = create_test_stream(create_test_config());
         let keys = stream.get_key_columns_for_relation(&relation, Some('K'));
@@ -4247,8 +4232,7 @@ mod tests {
             ColumnInfo::new(1, "id".to_string(), 23, -1),
             ColumnInfo::new(0, "name".to_string(), 25, -1),
         ];
-        let relation =
-            RelationInfo::new(1, "public".to_string(), "users".to_string(), b'f', columns);
+        let relation = RelationInfo::new(1, Arc::from("public"), Arc::from("users"), b'f', columns);
 
         let stream = create_test_stream(create_test_config());
         let keys = stream.get_key_columns_for_relation(&relation, Some('O'));
@@ -4263,8 +4247,7 @@ mod tests {
             ColumnInfo::new(1, "id".to_string(), 23, -1),
             ColumnInfo::new(0, "name".to_string(), 25, -1),
         ];
-        let relation =
-            RelationInfo::new(1, "public".to_string(), "users".to_string(), b'd', columns);
+        let relation = RelationInfo::new(1, Arc::from("public"), Arc::from("users"), b'd', columns);
 
         let stream = create_test_stream(create_test_config());
         let keys = stream.get_key_columns_for_relation(&relation, None);
@@ -4279,7 +4262,7 @@ mod tests {
             ColumnInfo::new(0, "data1".to_string(), 25, -1),
             ColumnInfo::new(0, "data2".to_string(), 25, -1),
         ];
-        let relation = RelationInfo::new(1, "public".to_string(), "t".to_string(), b'n', columns);
+        let relation = RelationInfo::new(1, Arc::from("public"), Arc::from("t"), b'n', columns);
 
         let stream = create_test_stream(create_test_config());
         let keys = stream.get_key_columns_for_relation(&relation, None);
@@ -4294,8 +4277,7 @@ mod tests {
             ColumnInfo::new(1, "id".to_string(), 23, -1),
             ColumnInfo::new(0, "name".to_string(), 25, -1),
         ];
-        let relation =
-            RelationInfo::new(1, "public".to_string(), "users".to_string(), b'd', columns);
+        let relation = RelationInfo::new(1, Arc::from("public"), Arc::from("users"), b'd', columns);
 
         let stream = create_test_stream(create_test_config());
         let keys = stream.get_key_columns_for_relation(&relation, Some('X'));
@@ -4311,8 +4293,8 @@ mod tests {
 
         let relation = RelationInfo::new(
             100,
-            "myschema".to_string(),
-            "mytable".to_string(),
+            Arc::from("myschema"),
+            Arc::from("mytable"),
             b'd',
             vec![
                 ColumnInfo::new(1, "pk_col".to_string(), 23, -1),
@@ -4399,8 +4381,8 @@ mod tests {
 
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Relation {
             relation_id: 100,
-            namespace: "public".to_string(),
-            relation_name: "test_table".to_string(),
+            namespace: Arc::from("public"),
+            relation_name: Arc::from("test_table"),
             replica_identity: b'd',
             columns: vec![ColumnInfo::new(1, "id".to_string(), 23, -1)],
         });
@@ -4423,8 +4405,8 @@ mod tests {
         // First add a relation
         let relation = RelationInfo::new(
             100,
-            "public".to_string(),
-            "users".to_string(),
+            Arc::from("public"),
+            Arc::from("users"),
             b'd',
             vec![
                 ColumnInfo::new(1, "id".to_string(), 23, -1),
@@ -4487,8 +4469,8 @@ mod tests {
 
         let relation = RelationInfo::new(
             100,
-            "public".to_string(),
-            "users".to_string(),
+            Arc::from("public"),
+            Arc::from("users"),
             b'd',
             vec![
                 ColumnInfo::new(1, "id".to_string(), 23, -1),
@@ -4561,8 +4543,8 @@ mod tests {
 
         let relation = RelationInfo::new(
             100,
-            "public".to_string(),
-            "users".to_string(),
+            Arc::from("public"),
+            Arc::from("users"),
             b'd',
             vec![
                 ColumnInfo::new(1, "id".to_string(), 23, -1),
@@ -4624,8 +4606,8 @@ mod tests {
 
         let relation = RelationInfo::new(
             100,
-            "public".to_string(),
-            "users".to_string(),
+            Arc::from("public"),
+            Arc::from("users"),
             b'd',
             vec![ColumnInfo::new(1, "id".to_string(), 23, -1)],
         );
@@ -4814,8 +4796,8 @@ mod tests {
         // Relation with no namespace (empty string) - creates single-part full_name
         let relation = RelationInfo::new(
             100,
-            "".to_string(),
-            "just_table".to_string(),
+            Arc::from(""),
+            Arc::from("just_table"),
             b'f',
             vec![ColumnInfo::new(1, "id".to_string(), 23, -1)],
         );
@@ -5365,8 +5347,8 @@ mod tests {
 
         let relation = RelationInfo::new(
             100,
-            "public".to_string(),
-            "users".to_string(),
+            Arc::from("public"),
+            Arc::from("users"),
             b'd',
             vec![
                 ColumnInfo::new(1, "id".to_string(), 23, -1),
@@ -5605,8 +5587,8 @@ mod tests {
 
         let relation = RelationInfo::new(
             100,
-            "public".to_string(),
-            "users".to_string(),
+            Arc::from("public"),
+            Arc::from("users"),
             b'd',
             vec![
                 ColumnInfo::new(1, "id".to_string(), 23, -1),
@@ -7855,8 +7837,8 @@ mod tests {
         // First time seeing this relation — should cache it and return None
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Relation {
             relation_id: 200,
-            namespace: "public".to_string(),
-            relation_name: "orders".to_string(),
+            namespace: Arc::from("public"),
+            relation_name: Arc::from("orders"),
             replica_identity: b'd',
             columns: vec![
                 ColumnInfo::new(1, "id".to_string(), 23, -1),
@@ -7882,8 +7864,8 @@ mod tests {
         // Pre-populate cache
         let relation = RelationInfo::new(
             300,
-            "public".to_string(),
-            "items".to_string(),
+            Arc::from("public"),
+            Arc::from("items"),
             b'd',
             vec![
                 ColumnInfo::new(1, "id".to_string(), 23, -1),
@@ -7895,8 +7877,8 @@ mod tests {
         // Send identical relation message — no schema change
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Relation {
             relation_id: 300,
-            namespace: "public".to_string(),
-            relation_name: "items".to_string(),
+            namespace: Arc::from("public"),
+            relation_name: Arc::from("items"),
             replica_identity: b'd',
             columns: vec![
                 ColumnInfo::new(1, "id".to_string(), 23, -1),
@@ -7922,8 +7904,8 @@ mod tests {
         // Pre-populate cache with 2 columns
         let relation = RelationInfo::new(
             400,
-            "public".to_string(),
-            "accounts".to_string(),
+            Arc::from("public"),
+            Arc::from("accounts"),
             b'd',
             vec![
                 ColumnInfo::new(1, "id".to_string(), 23, -1),
@@ -7935,8 +7917,8 @@ mod tests {
         // Send relation message with an extra column — schema change!
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Relation {
             relation_id: 400,
-            namespace: "public".to_string(),
-            relation_name: "accounts".to_string(),
+            namespace: Arc::from("public"),
+            relation_name: Arc::from("accounts"),
             replica_identity: b'd',
             columns: vec![
                 ColumnInfo::new(1, "id".to_string(), 23, -1),
@@ -7982,8 +7964,8 @@ mod tests {
         // Pre-populate with type_id=25 (text)
         let relation = RelationInfo::new(
             500,
-            "public".to_string(),
-            "products".to_string(),
+            Arc::from("public"),
+            Arc::from("products"),
             b'd',
             vec![
                 ColumnInfo::new(1, "id".to_string(), 23, -1),
@@ -7995,8 +7977,8 @@ mod tests {
         // Send relation with price changed to type_id=1700 (numeric)
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Relation {
             relation_id: 500,
-            namespace: "public".to_string(),
-            relation_name: "products".to_string(),
+            namespace: Arc::from("public"),
+            relation_name: Arc::from("products"),
             replica_identity: b'd',
             columns: vec![
                 ColumnInfo::new(1, "id".to_string(), 23, -1),
@@ -8024,8 +8006,8 @@ mod tests {
         // Pre-populate with replica_identity = 'd' (Default)
         let relation = RelationInfo::new(
             600,
-            "public".to_string(),
-            "logs".to_string(),
+            Arc::from("public"),
+            Arc::from("logs"),
             b'd',
             vec![ColumnInfo::new(1, "id".to_string(), 23, -1)],
         );
@@ -8034,8 +8016,8 @@ mod tests {
         // Send relation with replica_identity changed to 'f' (Full)
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Relation {
             relation_id: 600,
-            namespace: "public".to_string(),
-            relation_name: "logs".to_string(),
+            namespace: Arc::from("public"),
+            relation_name: Arc::from("logs"),
             replica_identity: b'f',
             columns: vec![ColumnInfo::new(1, "id".to_string(), 23, -1)],
         });
@@ -8067,8 +8049,8 @@ mod tests {
         // Pre-populate
         let relation = RelationInfo::new(
             700,
-            "public".to_string(),
-            "events".to_string(),
+            Arc::from("public"),
+            Arc::from("events"),
             b'd',
             vec![
                 ColumnInfo::new(1, "id".to_string(), 23, -1),
@@ -8080,8 +8062,8 @@ mod tests {
         // Column renamed: "name" -> "title"
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Relation {
             relation_id: 700,
-            namespace: "public".to_string(),
-            relation_name: "events".to_string(),
+            namespace: Arc::from("public"),
+            relation_name: Arc::from("events"),
             replica_identity: b'd',
             columns: vec![
                 ColumnInfo::new(1, "id".to_string(), 23, -1),
@@ -8113,8 +8095,8 @@ mod tests {
         // Pre-populate in "public" schema
         let relation = RelationInfo::new(
             800,
-            "public".to_string(),
-            "data".to_string(),
+            Arc::from("public"),
+            Arc::from("data"),
             b'd',
             vec![ColumnInfo::new(1, "id".to_string(), 23, -1)],
         );
@@ -8123,8 +8105,8 @@ mod tests {
         // Same relation_id but moved to "archive" schema
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Relation {
             relation_id: 800,
-            namespace: "archive".to_string(),
-            relation_name: "data".to_string(),
+            namespace: Arc::from("archive"),
+            relation_name: Arc::from("data"),
             replica_identity: b'd',
             columns: vec![ColumnInfo::new(1, "id".to_string(), 23, -1)],
         });
@@ -8153,8 +8135,8 @@ mod tests {
         // Pre-populate: "email" is NOT a key column (flags=0)
         let relation = RelationInfo::new(
             900,
-            "public".to_string(),
-            "users".to_string(),
+            Arc::from("public"),
+            Arc::from("users"),
             b'd',
             vec![
                 ColumnInfo::new(1, "id".to_string(), 23, -1),
@@ -8166,8 +8148,8 @@ mod tests {
         // Now "email" becomes a key column (flags=1)
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Relation {
             relation_id: 900,
-            namespace: "public".to_string(),
-            relation_name: "users".to_string(),
+            namespace: Arc::from("public"),
+            relation_name: Arc::from("users"),
             replica_identity: b'd',
             columns: vec![
                 ColumnInfo::new(1, "id".to_string(), 23, -1),

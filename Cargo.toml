@@ -13,7 +13,7 @@ keywords = ["postgresql", "replication", "wal", "logical-decoding", "streaming"]
 categories = ["database", "parsing", "network-programming"]
 
 [dependencies]
-tokio = { version = "1.52.1", features = ["io-util", "net", "time", "macros", "rt", "rt-multi-thread"] }
+tokio = { version = "1.52.3", features = ["io-util", "net", "time", "macros", "rt", "rt-multi-thread"] }
 tokio-util = "0.7.18"
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 chrono = { version = "0.4.44", features = ["serde"] }
