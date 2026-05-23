@@ -137,8 +137,8 @@ pub enum LogicalReplicationMessage {
     /// Relation information (table schema)
     Relation {
         relation_id: Oid,
-        namespace: String,
-        relation_name: String,
+        namespace: Arc<str>,
+        relation_name: Arc<str>,
         replica_identity: u8,
         columns: Vec<ColumnInfo>,
     },
@@ -486,15 +486,15 @@ impl RelationInfo {
     #[inline]
     pub fn new(
         relation_id: Oid,
-        namespace: String,
-        relation_name: String,
+        namespace: impl Into<Arc<str>>,
+        relation_name: impl Into<Arc<str>>,
         replica_identity: u8,
         columns: Vec<ColumnInfo>,
     ) -> Self {
         Self {
             relation_id,
-            namespace: Arc::from(namespace),
-            relation_name: Arc::from(relation_name),
+            namespace: namespace.into(),
+            relation_name: relation_name.into(),
             replica_identity,
             columns,
         }
@@ -744,11 +744,6 @@ impl LogicalReplicationParser {
     ) -> Result<StreamingReplicationMessage> {
         let message_type = reader.read_u8()?;
 
-        debug!(
-            "Parsing message type: {} ('{}')",
-            message_type, message_type as char
-        );
-
         let message = match message_type {
             message_types::BEGIN => self.parse_begin_message(reader)?,
             message_types::COMMIT => self.parse_commit_message(reader)?,
@@ -808,13 +803,6 @@ impl LogicalReplicationParser {
         let timestamp = reader.read_i64()?;
         let xid = reader.read_u32()?;
 
-        debug!(
-            "BEGIN: final_lsn={}, timestamp={}, xid={}",
-            format_lsn(final_lsn),
-            timestamp,
-            xid
-        );
-
         Ok(LogicalReplicationMessage::Begin {
             final_lsn,
             timestamp,
@@ -831,14 +819,6 @@ impl LogicalReplicationParser {
         let commit_lsn = reader.read_u64()?;
         let end_lsn = reader.read_u64()?;
         let timestamp = reader.read_i64()?;
-
-        debug!(
-            "COMMIT: flags={}, commit_lsn={}, end_lsn={}, timestamp={}",
-            flags,
-            format_lsn(commit_lsn),
-            format_lsn(end_lsn),
-            timestamp
-        );
 
         Ok(LogicalReplicationMessage::Commit {
             flags,
@@ -858,8 +838,8 @@ impl LogicalReplicationParser {
         }
 
         let relation_id = reader.read_u32()?;
-        let namespace = reader.read_cstring()?;
-        let relation_name = reader.read_cstring()?;
+        let namespace = reader.read_cstring_arc()?;
+        let relation_name = reader.read_cstring_arc()?;
         let replica_identity = reader.read_u8()?;
         let column_count = reader.read_u16()?;
 
@@ -905,14 +885,6 @@ impl LogicalReplicationParser {
         let relation_id = reader.read_u32()?;
         let tuple_type = reader.read_u8()?;
 
-        debug!(
-            "INSERT: relation_id={}, tuple_type={} (0x{:02x}), streaming={}",
-            relation_id,
-            tuple_type as char,
-            tuple_type,
-            self.is_streaming()
-        );
-
         if tuple_type != b'N' {
             return Err(ReplicationError::protocol(format!(
                 "Unexpected tuple type in INSERT: '{}' (0x{:02x}) (expected 'N'), streaming={}, protocol_version={}",
@@ -937,12 +909,6 @@ impl LogicalReplicationParser {
 
         let relation_id = reader.read_u32()?;
 
-        debug!(
-            "UPDATE: relation_id={}, streaming={}",
-            relation_id,
-            self.is_streaming()
-        );
-
         let mut old_tuple = None;
         let mut key_type = None;
 
@@ -952,7 +918,6 @@ impl LogicalReplicationParser {
                 reader.read_u8()?;
                 key_type = Some(tuple_type as char);
                 old_tuple = Some(self.parse_tuple_data(reader)?);
-                debug!("  Old tuple type: {}", tuple_type as char);
             }
         }
 
@@ -988,13 +953,6 @@ impl LogicalReplicationParser {
 
         let relation_id = reader.read_u32()?;
         let key_type = reader.read_u8()? as char;
-
-        debug!(
-            "DELETE: relation_id={}, key_type={}, streaming={}",
-            relation_id,
-            key_type,
-            self.is_streaming()
-        );
 
         let old_tuple = self.parse_tuple_data(reader)?;
 
@@ -1452,12 +1410,12 @@ pub fn build_hot_standby_feedback_message(
     let timestamp = system_time_to_postgres_timestamp(SystemTime::now());
     let mut buffer = BufferWriter::with_capacity(25);
 
-    buffer.write_u8(message_types::HOT_STANDBY_FEEDBACK)?;
-    buffer.write_i64(timestamp)?;
-    buffer.write_u32(xmin)?;
-    buffer.write_u32(xmin_epoch)?;
-    buffer.write_u32(catalog_xmin)?;
-    buffer.write_u32(catalog_xmin_epoch)?;
+    buffer.write_u8(message_types::HOT_STANDBY_FEEDBACK);
+    buffer.write_i64(timestamp);
+    buffer.write_u32(xmin);
+    buffer.write_u32(xmin_epoch);
+    buffer.write_u32(catalog_xmin);
+    buffer.write_u32(catalog_xmin_epoch);
 
     Ok(buffer.freeze())
 }
@@ -1490,8 +1448,7 @@ mod tests {
             ColumnInfo::new(0, "name".to_string(), 25, -1),
         ];
 
-        let relation =
-            RelationInfo::new(12345, "public".to_string(), "users".to_string(), 1, columns);
+        let relation = RelationInfo::new(12345, "public", "users", 1, columns);
 
         assert_eq!(relation.full_name(), "public.users");
         assert_eq!(relation.get_key_columns().len(), 1);
@@ -1687,8 +1644,8 @@ mod tests {
                 columns,
             } => {
                 assert_eq!(relation_id, 12345);
-                assert_eq!(namespace, "public");
-                assert_eq!(relation_name, "users");
+                assert_eq!(&*namespace, "public");
+                assert_eq!(&*relation_name, "users");
                 assert_eq!(replica_identity, b'd');
                 assert_eq!(columns.len(), 2);
                 assert_eq!(&*columns[0].name, "id");
@@ -1898,8 +1855,7 @@ mod tests {
             ColumnInfo::new(0, "id".to_string(), 23, -1),
             ColumnInfo::new(0, "name".to_string(), 25, -1),
         ];
-        let relation =
-            RelationInfo::new(12345, "public".to_string(), "users".to_string(), 1, columns);
+        let relation = RelationInfo::new(12345, "public", "users", 1, columns);
 
         let tuple = TupleData::new(vec![
             ColumnData::text(b"42".to_vec()),
@@ -2125,7 +2081,7 @@ mod tests {
             ColumnInfo::new(0, "id".to_string(), 23, -1),
             ColumnInfo::new(0, "name".to_string(), 25, -1),
         ];
-        let relation = RelationInfo::new(1, "public".to_string(), "t".to_string(), b'd', columns);
+        let relation = RelationInfo::new(1, "public", "t", b'd', columns);
 
         let tuple = TupleData::new(vec![ColumnData::text(b"42".to_vec()), ColumnData::null()]);
 
@@ -2140,7 +2096,7 @@ mod tests {
             ColumnInfo::new(0, "id".to_string(), 23, -1),
             ColumnInfo::new(0, "name".to_string(), 25, -1),
         ];
-        let relation = RelationInfo::new(1, "public".to_string(), "t".to_string(), b'd', columns);
+        let relation = RelationInfo::new(1, "public", "t", b'd', columns);
 
         let tuple = TupleData::new(vec![
             ColumnData::text(b"42".to_vec()),
@@ -2158,7 +2114,7 @@ mod tests {
         let columns = vec![
             ColumnInfo::new(0, "data".to_string(), 17, -1), // bytea
         ];
-        let relation = RelationInfo::new(1, "public".to_string(), "t".to_string(), b'd', columns);
+        let relation = RelationInfo::new(1, "public", "t", b'd', columns);
 
         let tuple = TupleData::new(vec![ColumnData::binary(b"binary data".to_vec())]);
 
@@ -2171,7 +2127,7 @@ mod tests {
     fn test_tuple_data_to_hash_map_text_empty_data() {
         // Text column with empty data
         let columns = vec![ColumnInfo::new(0, "col".to_string(), 25, -1)];
-        let relation = RelationInfo::new(1, "public".to_string(), "t".to_string(), b'd', columns);
+        let relation = RelationInfo::new(1, "public", "t", b'd', columns);
 
         let col = ColumnData {
             data_type: b't',
@@ -2188,7 +2144,7 @@ mod tests {
     fn test_tuple_data_to_hash_map_unknown_data_type() {
         // Unknown data type (e.g., 'x') hits the catch-all arm
         let columns = vec![ColumnInfo::new(0, "col".to_string(), 25, -1)];
-        let relation = RelationInfo::new(1, "public".to_string(), "t".to_string(), b'd', columns);
+        let relation = RelationInfo::new(1, "public", "t", b'd', columns);
 
         let col = ColumnData {
             data_type: b'x',
@@ -2203,7 +2159,7 @@ mod tests {
     fn test_tuple_data_to_hash_map_more_columns_than_relation() {
         // Tuple has more columns than the relation definition
         let columns = vec![ColumnInfo::new(0, "col1".to_string(), 25, -1)];
-        let relation = RelationInfo::new(1, "public".to_string(), "t".to_string(), b'd', columns);
+        let relation = RelationInfo::new(1, "public", "t", b'd', columns);
 
         // 2 tuple columns but only 1 relation column
         let tuple = TupleData::new(vec![
@@ -2289,8 +2245,8 @@ mod tests {
         let mut state = ReplicationState::new();
         let relation = RelationInfo::new(
             12345,
-            "public".to_string(),
-            "users".to_string(),
+            Arc::from("public"),
+            Arc::from("users"),
             b'd',
             vec![ColumnInfo::new(1, "id".to_string(), 23, -1)],
         );
@@ -2322,8 +2278,7 @@ mod tests {
             ColumnInfo::new(0, "name".to_string(), 25, -1),
             ColumnInfo::new(0, "email".to_string(), 25, -1),
         ];
-        let relation =
-            RelationInfo::new(1, "public".to_string(), "users".to_string(), b'd', columns);
+        let relation = RelationInfo::new(1, "public", "users", b'd', columns);
 
         assert_eq!(relation.get_column_by_name("id").unwrap().type_id, 23);
         assert_eq!(relation.get_column_by_name("name").unwrap().type_id, 25);
@@ -2551,7 +2506,7 @@ mod tests {
                 type_name,
             } => {
                 assert_eq!(type_id, 12345);
-                assert_eq!(namespace, "public");
+                assert_eq!(&*namespace, "public");
                 assert_eq!(type_name, "my_type");
             }
             _ => panic!("Expected Type message"),
@@ -3145,8 +3100,8 @@ mod tests {
                 ..
             } => {
                 assert_eq!(relation_id, 200);
-                assert_eq!(namespace, "myschema");
-                assert_eq!(relation_name, "mytable");
+                assert_eq!(&*namespace, "myschema");
+                assert_eq!(&*relation_name, "mytable");
                 assert_eq!(columns.len(), 2);
             }
             _ => panic!("Expected Relation message"),

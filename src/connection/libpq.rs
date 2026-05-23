@@ -342,12 +342,12 @@ impl PgReplicationConnection {
         // Build the standby status update message using BufferWriter
         let mut buffer = BufferWriter::with_capacity(34); // 1 + 8 + 8 + 8 + 8 + 1
 
-        buffer.write_u8(b'r')?; // Message type
-        buffer.write_u64(received_lsn)?;
-        buffer.write_u64(flushed_lsn)?;
-        buffer.write_u64(applied_lsn)?;
-        buffer.write_i64(timestamp)?;
-        buffer.write_u8(if reply_requested { 1 } else { 0 })?;
+        buffer.write_u8(b'r'); // Message type
+        buffer.write_u64(received_lsn);
+        buffer.write_u64(flushed_lsn);
+        buffer.write_u64(applied_lsn);
+        buffer.write_i64(timestamp);
+        buffer.write_u8(if reply_requested { 1 } else { 0 });
 
         let reply_data = buffer.freeze();
         self.put_copy_data_and_flush(&reply_data).await?;

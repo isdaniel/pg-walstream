@@ -216,12 +216,12 @@ impl NativeConnection {
         let timestamp = system_time_to_postgres_timestamp(SystemTime::now());
 
         let mut buffer = BufferWriter::with_capacity(34);
-        buffer.write_u8(b'r')?;
-        buffer.write_u64(received_lsn)?;
-        buffer.write_u64(flushed_lsn)?;
-        buffer.write_u64(applied_lsn)?;
-        buffer.write_i64(timestamp)?;
-        buffer.write_u8(if reply_requested { 1 } else { 0 })?;
+        buffer.write_u8(b'r');
+        buffer.write_u64(received_lsn);
+        buffer.write_u64(flushed_lsn);
+        buffer.write_u64(applied_lsn);
+        buffer.write_i64(timestamp);
+        buffer.write_u8(if reply_requested { 1 } else { 0 });
 
         let reply_data = buffer.freeze();
         copy::put_copy_data(&mut self.transport, &reply_data).await?;
