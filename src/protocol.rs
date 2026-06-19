@@ -848,7 +848,8 @@ impl LogicalReplicationParser {
             relation_id, namespace, relation_name, replica_identity, column_count
         );
 
-        let mut columns = Vec::with_capacity(column_count as usize);
+        // Cap pre-alloc to buffer size (>= 10 bytes/column) against a bogus count.
+        let mut columns = Vec::with_capacity((column_count as usize).min(reader.remaining() / 10));
         for i in 0..column_count {
             let flags = reader.read_u8()?;
             let name = reader.read_cstring()?;
@@ -980,7 +981,9 @@ impl LogicalReplicationParser {
             relation_count, flags
         );
 
-        let mut relation_ids = Vec::with_capacity(relation_count as usize);
+        // Cap pre-alloc to buffer size (4 bytes/id) against a bogus count (DoS).
+        let mut relation_ids =
+            Vec::with_capacity((relation_count as usize).min(reader.remaining() / 4));
         for _ in 0..relation_count {
             let relation_id = reader.read_u32()?;
             relation_ids.push(relation_id);
@@ -1304,7 +1307,9 @@ impl LogicalReplicationParser {
     #[inline]
     fn parse_tuple_data(&mut self, reader: &mut BufferReader) -> Result<TupleData> {
         let column_count = reader.read_u16()? as usize;
-        let mut columns: SmallVec<[ColumnData; 16]> = SmallVec::with_capacity(column_count);
+        // Cap pre-alloc to remaining bytes (>= 1 byte/column) against a bogus count.
+        let mut columns: SmallVec<[ColumnData; 16]> =
+            SmallVec::with_capacity(column_count.min(reader.remaining()));
 
         for _ in 0..column_count {
             let column_type = reader.read_u8()?;
@@ -3147,5 +3152,45 @@ mod tests {
         let s = err.to_string();
         assert!(s.contains("Unknown column data type"));
         assert!(s.contains("'?'"));
+    }
+
+    /// Regression (fuzz-found): a huge `relation_count` must not pre-allocate.
+    #[test]
+    fn truncate_with_bogus_count_does_not_overallocate() {
+        let mut bytes = vec![message_types::TRUNCATE];
+        bytes.extend_from_slice(&u32::MAX.to_be_bytes());
+        bytes.push(0); // flags, no relation_ids follow
+        let mut parser = LogicalReplicationParser::with_protocol_version(1);
+        assert!(parser.parse_wal_message(&bytes).is_err());
+    }
+
+    /// A well-formed TRUNCATE still parses correctly after the allocation cap.
+    #[test]
+    fn truncate_well_formed_still_parses() {
+        let mut bytes = vec![message_types::TRUNCATE];
+        bytes.extend_from_slice(&2u32.to_be_bytes());
+        bytes.push(0b11);
+        bytes.extend_from_slice(&10u32.to_be_bytes());
+        bytes.extend_from_slice(&20u32.to_be_bytes());
+        let mut parser = LogicalReplicationParser::with_protocol_version(1);
+        let msg = parser.parse_wal_message(&bytes).unwrap().message;
+        assert_eq!(
+            msg,
+            LogicalReplicationMessage::Truncate {
+                relation_ids: vec![10, 20],
+                flags: 0b11,
+            }
+        );
+    }
+
+    /// Regression (fuzz-found): a huge tuple column count must not pre-allocate.
+    #[test]
+    fn insert_with_bogus_column_count_does_not_overallocate() {
+        let mut bytes = vec![message_types::INSERT];
+        bytes.extend_from_slice(&1u32.to_be_bytes()); // relation_id
+        bytes.push(b'N');
+        bytes.extend_from_slice(&u16::MAX.to_be_bytes()); // column_count, no columns follow
+        let mut parser = LogicalReplicationParser::with_protocol_version(1);
+        assert!(parser.parse_wal_message(&bytes).is_err());
     }
 }
