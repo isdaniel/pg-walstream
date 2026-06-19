@@ -132,6 +132,7 @@ pub mod types;
 
 // Protocol implementation
 pub mod lsn;
+pub mod pgoutput_encode;
 pub mod protocol;
 
 // High-level stream management
@@ -184,6 +185,9 @@ pub use protocol::{
     LogicalReplicationMessage, LogicalReplicationParser, MessageType, RelationInfo,
     ReplicationState, StreamingReplicationMessage, TupleData,
 };
+
+// pgoutput encoder. `encode_message` emits pgoutput, unlike `ChangeEvent::encode`.
+pub use pgoutput_encode::{encode_message, encode_message_to_bytes};
 
 // Re-export stream types
 pub use stream::{

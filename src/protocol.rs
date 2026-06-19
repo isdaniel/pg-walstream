@@ -117,7 +117,7 @@ pub enum MessageType {
 }
 
 /// Unified logical replication message enum
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LogicalReplicationMessage {
     /// Begin transaction
     Begin {
@@ -264,7 +264,7 @@ pub enum LogicalReplicationMessage {
 }
 
 /// Column information in a relation
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColumnInfo {
     /// Column flags (bit 0 = key column)
     pub flags: u8,
@@ -295,7 +295,7 @@ impl ColumnInfo {
 }
 
 /// Tuple (row) data
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TupleData {
     pub columns: SmallVec<[ColumnData; 16]>,
 }
@@ -356,7 +356,7 @@ impl TupleData {
 }
 
 /// Data for a single column
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnData {
     pub data_type: u8, // b'n' = null, b't' = text, b'b' = binary, b'u' = unchanged toast
     data: bytes::Bytes,
