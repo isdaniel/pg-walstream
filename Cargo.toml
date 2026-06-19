@@ -80,6 +80,10 @@ path = "integration-tests/typed_deserialization.rs"
 name = "ssl_connections"
 path = "integration-tests/ssl_connections.rs"
 
+[[test]]
+name = "pgoutput_fidelity"
+path = "integration-tests/pgoutput_fidelity.rs"
+
 [[bench]]
 name = "wal_pipeline"
 harness = false
