@@ -1,0 +1,38 @@
+[package]
+name = "pg_walstream-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+arbitrary = "1"
+pg_walstream = { path = ".." }
+pg-walstream-arbitrary-fuzzing = { path = "../examples/arbitrary-fuzzing" }
+
+# Keep debug assertions live: a firing is a real bug, not fuzzing noise.
+[profile.release]
+debug = 1
+debug-assertions = true
+overflow-checks = true
+
+[[bin]]
+name = "roundtrip_bytes"
+path = "fuzz_targets/roundtrip_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roundtrip_message"
+path = "fuzz_targets/roundtrip_message.rs"
+test = false
+doc = false
+bench = false
+
+# Standalone workspace so the fuzz crate does not try to join the parent package.
+[workspace]
