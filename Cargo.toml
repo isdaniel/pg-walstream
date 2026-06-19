@@ -84,6 +84,10 @@ path = "integration-tests/ssl_connections.rs"
 name = "pgoutput_fidelity"
 path = "integration-tests/pgoutput_fidelity.rs"
 
+[[test]]
+name = "streaming_decode"
+path = "integration-tests/streaming_decode.rs"
+
 [[bench]]
 name = "wal_pipeline"
 harness = false
