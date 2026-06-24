@@ -1,0 +1,69 @@
+name: Fuzz
+
+on:
+  pull_request:
+    branches: [ "*" ]
+  schedule:
+    - cron: '30 3 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [roundtrip_bytes, roundtrip_message, roundtrip_stream]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpq-dev pkg-config
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      - name: Restore corpus cache
+        if: github.event_name != 'pull_request'
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
+      - name: Select fuzz budget
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "FUZZ_BUDGET=60" >> "$GITHUB_ENV"
+          else
+            echo "FUZZ_BUDGET=300" >> "$GITHUB_ENV"
+          fi
+
+      - name: Run fuzz target
+        run: |
+          set -o pipefail
+          cargo fuzz run ${{ matrix.target }} --target x86_64-unknown-linux-gnu -- \
+            -max_total_time=$FUZZ_BUDGET -timeout=10 \
+            2>&1 | tee fuzz-${{ matrix.target }}.log
+
+      - name: Upload fuzz report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-report-${{ matrix.target }}
+          path: |
+            fuzz-${{ matrix.target }}.log
+            fuzz/artifacts/**
+          if-no-files-found: ignore

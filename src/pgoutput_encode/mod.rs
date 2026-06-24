@@ -9,9 +9,9 @@
 //! [`LogicalReplicationParser`]: crate::protocol::LogicalReplicationParser
 //! [`ChangeEvent::encode`]: crate::types::ChangeEvent::encode
 
+mod base;
 mod streaming;
 mod two_phase;
-mod v1;
 mod wire;
 
 #[cfg(test)]
@@ -50,20 +50,20 @@ fn encode_inner(
             final_lsn,
             timestamp,
             xid,
-        } => v1::encode_begin(buf, *final_lsn, *timestamp, *xid),
+        } => base::encode_begin(buf, *final_lsn, *timestamp, *xid),
         M::Commit {
             flags,
             commit_lsn,
             end_lsn,
             timestamp,
-        } => v1::encode_commit(buf, *flags, *commit_lsn, *end_lsn, *timestamp),
+        } => base::encode_commit(buf, *flags, *commit_lsn, *end_lsn, *timestamp),
         M::Relation {
             relation_id,
             namespace,
             relation_name,
             replica_identity,
             columns,
-        } => v1::encode_relation(
+        } => base::encode_relation(
             buf,
             in_stream_xid,
             *relation_id,
@@ -73,14 +73,14 @@ fn encode_inner(
             columns,
         ),
         M::Insert { relation_id, tuple } => {
-            v1::encode_insert(buf, in_stream_xid, *relation_id, tuple)
+            base::encode_insert(buf, in_stream_xid, *relation_id, tuple)
         }
         M::Update {
             relation_id,
             old_tuple,
             new_tuple,
             key_type,
-        } => v1::encode_update(
+        } => base::encode_update(
             buf,
             in_stream_xid,
             *relation_id,
@@ -92,26 +92,26 @@ fn encode_inner(
             relation_id,
             old_tuple,
             key_type,
-        } => v1::encode_delete(buf, in_stream_xid, *relation_id, old_tuple, *key_type),
+        } => base::encode_delete(buf, in_stream_xid, *relation_id, old_tuple, *key_type),
         M::Truncate {
             relation_ids,
             flags,
-        } => v1::encode_truncate(buf, in_stream_xid, relation_ids, *flags),
+        } => base::encode_truncate(buf, in_stream_xid, relation_ids, *flags),
         M::Type {
             type_id,
             namespace,
             type_name,
-        } => v1::encode_type(buf, in_stream_xid, *type_id, namespace, type_name),
+        } => base::encode_type(buf, in_stream_xid, *type_id, namespace, type_name),
         M::Origin {
             origin_lsn,
             origin_name,
-        } => v1::encode_origin(buf, *origin_lsn, origin_name),
+        } => base::encode_origin(buf, *origin_lsn, origin_name),
         M::Message {
             flags,
             lsn,
             prefix,
             content,
-        } => v1::encode_logical_message(buf, in_stream_xid, *flags, *lsn, prefix, content),
+        } => base::encode_logical_message(buf, in_stream_xid, *flags, *lsn, prefix, content),
         M::StreamStart { xid, first_segment } => {
             streaming::encode_stream_start(buf, *xid, *first_segment)
         }
