@@ -14,9 +14,30 @@
 //! export DATABASE_URL="postgresql://postgres:postgres@localhost:5433/postgres?replication=database"
 //! cargo test --test streaming_decode -- --ignored --test-threads=1 --nocapture
 //! ```
+//!
+//! ## Wire-path validation matrix
+//!
+//! Every pgoutput wire path maps to a validation method, so an unanchored cell
+//! is a visible residual rather than an invisible gap:
+//!
+//! - non-streaming `B C R Y I U D T M b P K r` and column tags `t n b u`: real-PG
+//!   byte fidelity in `pgoutput_fidelity` via the SQL decode functions.
+//! - streaming control `S E c` and the in-stream xid prefix on `R Y I U D T M`:
+//!   `streaming_bytes_reencode_identically` re-encodes the raw streamed bytes from
+//!   the live protocol and asserts byte identity.
+//! - `StreamAbort A` with the protocol-v4 abort_lsn/timestamp tail:
+//!   `aborted_stream_bytes_reencode_identically` re-encodes the raw StreamStart,
+//!   StreamStop, and StreamAbort framing PostgreSQL streams for a rolled-back
+//!   transaction and asserts byte identity.
+//! - `Origin O`: real-PG byte fidelity through a replication-origin session in
+//!   `pgoutput_fidelity`.
+//! - `StreamPrepare p` (streaming and two-phase together):
+//!   `streamed_prepare_bytes_reencode_identically` re-encodes the raw bytes of a
+//!   large transaction prepared while streaming and asserts byte identity.
 
 use pg_walstream::{
-    CancellationToken, ChangeEvent, EventStream, EventType, LogicalReplicationStream,
+    encode_streaming_message_to_bytes, CancellationToken, ChangeEvent, EventStream, EventType,
+    LogicalReplicationMessage, LogicalReplicationParser, LogicalReplicationStream,
     PgReplicationConnection, ReplicationSlotOptions, ReplicationStreamConfig, RetryConfig,
     StreamingMode,
 };
@@ -122,6 +143,79 @@ fn stream_starts(events: &[ChangeEvent]) -> Vec<u32> {
             _ => None,
         })
         .collect()
+}
+
+/// Outcome of draining and re-encoding one streamed transaction from `repl`.
+struct ReencodeDrain {
+    saw_stream_start: bool,
+    data_messages: usize,
+    reencoded_msgs: usize,
+    /// The message that matched `is_terminal`, if the drain stopped on one.
+    terminal: Option<LogicalReplicationMessage>,
+}
+
+/// Drain raw WAL from `repl`, re-encode every pgoutput body at `proto` with
+/// `encode_streaming_message_to_bytes`, and assert it reproduces PostgreSQL's
+/// bytes exactly. Stops on the first message matching `is_terminal` (returned in
+/// `terminal`), the stream end, or the cancellation timer. This is
+/// `encode_streaming_message(parse(raw)) == raw` over the live protocol.
+async fn drain_reencode(
+    repl: &mut PgReplicationConnection,
+    proto: u8,
+    cancel: &CancellationToken,
+    is_terminal: impl Fn(&LogicalReplicationMessage) -> bool,
+) -> ReencodeDrain {
+    let mut parser = LogicalReplicationParser::with_protocol_version(proto as u32);
+    let mut saw_stream_start = false;
+    let mut data_messages = 0usize;
+    let mut reencoded_msgs = 0usize;
+    let mut terminal = None;
+
+    loop {
+        let data = match repl.get_copy_data_async(cancel).await {
+            Ok(d) => d,
+            Err(pg_walstream::ReplicationError::Cancelled(_)) => break,
+            Err(e) => panic!("copy data error: {e}"),
+        };
+        if data.is_empty() || data[0] != b'w' || data.len() <= 25 {
+            continue;
+        }
+        // XLogData framing: 'w' + 24-byte header, then the pgoutput message body.
+        let body = &data[25..];
+        let parsed = parser
+            .parse_wal_message(body)
+            .expect("streamed message must parse");
+        let reencoded = encode_streaming_message_to_bytes(&parsed, proto);
+        assert_eq!(
+            &reencoded[..],
+            body,
+            "re-encode != PostgreSQL bytes for tag '{}'",
+            body[0] as char
+        );
+        reencoded_msgs += 1;
+        match &parsed.message {
+            LogicalReplicationMessage::StreamStart { .. } => saw_stream_start = true,
+            LogicalReplicationMessage::Relation { .. }
+            | LogicalReplicationMessage::Type { .. }
+            | LogicalReplicationMessage::Insert { .. }
+            | LogicalReplicationMessage::Update { .. }
+            | LogicalReplicationMessage::Delete { .. }
+            | LogicalReplicationMessage::Truncate { .. }
+            | LogicalReplicationMessage::Message { .. } => data_messages += 1,
+            _ => {}
+        }
+        if is_terminal(&parsed.message) {
+            terminal = Some(parsed.message);
+            break;
+        }
+    }
+
+    ReencodeDrain {
+        saw_stream_start,
+        data_messages,
+        reencoded_msgs,
+        terminal,
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -316,4 +410,218 @@ async fn streams_large_aborted_transaction_v4() {
         "protocol v4 StreamAbort should carry abort_timestamp"
     );
     println!("v4 streaming abort: xid={xid}, subxid={subxid}, abort_lsn={abort_lsn:?}");
+}
+
+/// Real-PG byte anchor for the streaming path: re-encoding the raw bytes
+/// PostgreSQL streams must reproduce them exactly, the in-stream xid prefix on
+/// data messages included. This is `encode_streaming_message(parse(raw)) == raw`
+/// over the live protocol, the only check that pins the streaming encoder to the
+/// server's own bytes (the SQL decode functions never stream).
+#[tokio::test]
+#[ignore = "requires live PostgreSQL with wal_level=logical and low logical_decoding_work_mem"]
+async fn streaming_bytes_reencode_identically() {
+    let slot = "it_stream_raw";
+    drop_slot(slot);
+
+    let mut regular =
+        PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
+    setup(&mut regular);
+
+    let mut repl = PgReplicationConnection::connect(&replication_conn_string())
+        .expect("replication connection");
+    // Temporary logical slot owned by this replication session; captures WAL from here.
+    repl.exec("CREATE_REPLICATION_SLOT \"it_stream_raw\" TEMPORARY LOGICAL \"pgoutput\"")
+        .expect("create temporary slot");
+
+    regular
+        .exec(&format!(
+            "INSERT INTO stream_test (payload) \
+             SELECT repeat('x', 200) FROM generate_series(1, {ROWS})"
+        ))
+        .expect("forced-streaming insert");
+
+    repl.start_replication(
+        slot,
+        0,
+        &[
+            ("proto_version", "2"),
+            ("publication_names", "\"stream_pub\""),
+            ("streaming", "on"),
+        ],
+    )
+    .expect("start replication");
+
+    let cancel = CancellationToken::new();
+    spawn_cancel(&cancel, 30);
+
+    let drain = drain_reencode(&mut repl, 2, &cancel, |m| {
+        matches!(m, LogicalReplicationMessage::StreamCommit { .. })
+    })
+    .await;
+
+    assert!(drain.saw_stream_start, "expected a StreamStart");
+    assert!(
+        matches!(
+            drain.terminal,
+            Some(LogicalReplicationMessage::StreamCommit { .. })
+        ),
+        "expected a StreamCommit"
+    );
+    assert!(
+        drain.data_messages >= 1,
+        "expected at least one re-encoded in-stream data message"
+    );
+    println!(
+        "streaming raw re-encode: {} in-stream data messages byte-identical",
+        drain.data_messages
+    );
+}
+
+/// Real-PG byte anchor for the StreamAbort path and its protocol-v4
+/// abort_lsn/timestamp tail. A rolled-back transaction is delivered over the
+/// streaming framing (StreamStart, StreamStop, StreamAbort), and re-encoding the
+/// raw bytes PostgreSQL streams must reproduce them exactly. The committed
+/// transaction anchor never produces an abort, so this is the only check that
+/// pins the StreamAbort message and its v4 tail to the server's own bytes.
+#[tokio::test]
+#[ignore = "requires live PostgreSQL with wal_level=logical and low logical_decoding_work_mem"]
+async fn aborted_stream_bytes_reencode_identically() {
+    let slot = "it_stream_abort_raw_v4";
+    drop_slot(slot);
+
+    let mut regular =
+        PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
+    setup(&mut regular);
+
+    let mut repl = PgReplicationConnection::connect(&replication_conn_string())
+        .expect("replication connection");
+    repl.exec("CREATE_REPLICATION_SLOT \"it_stream_abort_raw_v4\" TEMPORARY LOGICAL \"pgoutput\"")
+        .expect("create temporary slot");
+
+    // Stream from here, then run and roll back the transaction. By the time the
+    // decoder reaches it the transaction has aborted, so PostgreSQL delivers the
+    // empty streaming framing and a StreamAbort. Protocol v4 with parallel
+    // streaming is what carries the abort_lsn/timestamp tail.
+    repl.start_replication(
+        slot,
+        0,
+        &[
+            ("proto_version", "4"),
+            ("publication_names", "\"stream_pub\""),
+            ("streaming", "parallel"),
+        ],
+    )
+    .expect("start replication");
+
+    regular.exec("BEGIN").expect("begin");
+    regular
+        .exec(&format!(
+            "INSERT INTO stream_test (payload) \
+             SELECT repeat('x', 200) FROM generate_series(1, {ROWS})"
+        ))
+        .expect("forced-streaming insert");
+    regular.exec("ROLLBACK").expect("rollback");
+
+    let cancel = CancellationToken::new();
+    spawn_cancel(&cancel, 30);
+
+    let drain = drain_reencode(&mut repl, 4, &cancel, |m| {
+        matches!(m, LogicalReplicationMessage::StreamAbort { .. })
+    })
+    .await;
+
+    assert!(drain.saw_stream_start, "expected a StreamStart");
+    assert!(
+        matches!(
+            drain.terminal,
+            Some(LogicalReplicationMessage::StreamAbort {
+                abort_lsn: Some(_),
+                ..
+            })
+        ),
+        "expected a StreamAbort carrying the protocol-v4 abort_lsn/timestamp tail"
+    );
+    println!(
+        "aborted streaming raw re-encode: {} message(s) byte-identical, v4 abort tail present",
+        drain.reencoded_msgs
+    );
+}
+
+/// Real-PG byte anchor for the StreamPrepare path: a large two-phase transaction
+/// that is prepared while streaming terminates in a StreamPrepare, and
+/// re-encoding the raw bytes PostgreSQL streams must reproduce them exactly. The
+/// SQL decode functions never stream, so this is the only check that pins `p` to
+/// the server's own bytes.
+#[tokio::test]
+#[ignore = "requires live PostgreSQL with wal_level=logical and low logical_decoding_work_mem"]
+async fn streamed_prepare_bytes_reencode_identically() {
+    let slot = "it_stream_prepare_raw";
+    let gid = "it_sp_gid";
+    drop_slot(slot);
+
+    let mut regular =
+        PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
+    // Roll back any prepared transaction left by a previous failed run before setup
+    // truncates the table it would otherwise lock.
+    let _ = regular.exec(&format!("ROLLBACK PREPARED '{gid}'"));
+    setup(&mut regular);
+
+    let mut repl = PgReplicationConnection::connect(&replication_conn_string())
+        .expect("replication connection");
+    repl.exec(
+        "CREATE_REPLICATION_SLOT \"it_stream_prepare_raw\" TEMPORARY LOGICAL \"pgoutput\" TWO_PHASE",
+    )
+    .expect("create two-phase slot");
+
+    // Prepare the large transaction after the slot is consistent, so it decodes
+    // as a streamed prepare rather than folding into a later commit.
+    regular.exec("BEGIN").expect("begin");
+    regular
+        .exec(&format!(
+            "INSERT INTO stream_test (payload) \
+             SELECT repeat('x', 200) FROM generate_series(1, {ROWS})"
+        ))
+        .expect("forced-streaming insert");
+    regular
+        .exec(&format!("PREPARE TRANSACTION '{gid}'"))
+        .expect("prepare transaction");
+
+    repl.start_replication(
+        slot,
+        0,
+        &[
+            ("proto_version", "3"),
+            ("publication_names", "\"stream_pub\""),
+            ("streaming", "on"),
+            ("two_phase", "on"),
+        ],
+    )
+    .expect("start replication");
+
+    let cancel = CancellationToken::new();
+    spawn_cancel(&cancel, 30);
+
+    let drain = drain_reencode(&mut repl, 3, &cancel, |m| {
+        matches!(m, LogicalReplicationMessage::StreamPrepare { .. })
+    })
+    .await;
+
+    let _ = regular.exec(&format!("ROLLBACK PREPARED '{gid}'"));
+
+    assert!(drain.saw_stream_start, "expected a StreamStart");
+    assert!(
+        matches!(
+            drain.terminal,
+            Some(LogicalReplicationMessage::StreamPrepare { .. })
+        ),
+        "expected a StreamPrepare"
+    );
+    assert!(
+        drain.data_messages >= 1,
+        "expected at least one re-encoded in-stream data message"
+    );
+    println!(
+        "streamed prepare raw re-encode: {} message(s) byte-identical, {} in-stream data, StreamPrepare present",
+        drain.reencoded_msgs, drain.data_messages
+    );
 }

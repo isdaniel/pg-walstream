@@ -190,7 +190,10 @@ pub use protocol::{
 };
 
 // pgoutput encoder. `encode_message` emits pgoutput, unlike `ChangeEvent::encode`.
-pub use pgoutput_encode::{encode_message, encode_message_to_bytes};
+pub use pgoutput_encode::{
+    encode_message, encode_message_to_bytes, encode_streaming_message,
+    encode_streaming_message_to_bytes,
+};
 
 // Re-export stream types
 #[cfg(any(feature = "libpq", feature = "rustls-tls"))]

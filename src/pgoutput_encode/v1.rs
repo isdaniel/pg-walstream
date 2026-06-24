@@ -5,6 +5,15 @@ use crate::protocol::{message_types, ColumnInfo, TupleData};
 use crate::types::{Oid, TimestampTz, XLogRecPtr, Xid};
 use bytes::{BufMut, BytesMut};
 
+/// Emit the in-stream `Int32` transaction id present on data messages inside a
+/// streamed transaction (protocol v2+). `None` is the non-streaming framing.
+#[inline]
+fn write_xid_prefix(buf: &mut BytesMut, in_stream_xid: Option<Xid>) {
+    if let Some(xid) = in_stream_xid {
+        buf.put_u32(xid);
+    }
+}
+
 pub(super) fn encode_begin(
     buf: &mut BytesMut,
     final_lsn: XLogRecPtr,
@@ -33,6 +42,7 @@ pub(super) fn encode_commit(
 
 pub(super) fn encode_relation(
     buf: &mut BytesMut,
+    in_stream_xid: Option<Xid>,
     relation_id: Oid,
     namespace: &str,
     relation_name: &str,
@@ -40,6 +50,7 @@ pub(super) fn encode_relation(
     columns: &[ColumnInfo],
 ) {
     buf.put_u8(message_types::RELATION);
+    write_xid_prefix(buf, in_stream_xid);
     buf.put_u32(relation_id);
     write_cstring(buf, namespace);
     write_cstring(buf, relation_name);
@@ -57,8 +68,14 @@ pub(super) fn encode_relation(
     }
 }
 
-pub(super) fn encode_insert(buf: &mut BytesMut, relation_id: Oid, tuple: &TupleData) {
+pub(super) fn encode_insert(
+    buf: &mut BytesMut,
+    in_stream_xid: Option<Xid>,
+    relation_id: Oid,
+    tuple: &TupleData,
+) {
     buf.put_u8(message_types::INSERT);
+    write_xid_prefix(buf, in_stream_xid);
     buf.put_u32(relation_id);
     buf.put_u8(b'N');
     write_tuple_data(buf, tuple);
@@ -66,12 +83,14 @@ pub(super) fn encode_insert(buf: &mut BytesMut, relation_id: Oid, tuple: &TupleD
 
 pub(super) fn encode_update(
     buf: &mut BytesMut,
+    in_stream_xid: Option<Xid>,
     relation_id: Oid,
     old_tuple: Option<&TupleData>,
     new_tuple: &TupleData,
     key_type: Option<char>,
 ) {
     buf.put_u8(message_types::UPDATE);
+    write_xid_prefix(buf, in_stream_xid);
     buf.put_u32(relation_id);
     // Old-tuple block only with a key/full image. Byte is 'K' or 'O'.
     if let Some(old) = old_tuple {
@@ -89,11 +108,13 @@ pub(super) fn encode_update(
 
 pub(super) fn encode_delete(
     buf: &mut BytesMut,
+    in_stream_xid: Option<Xid>,
     relation_id: Oid,
     old_tuple: &TupleData,
     key_type: char,
 ) {
     buf.put_u8(message_types::DELETE);
+    write_xid_prefix(buf, in_stream_xid);
     buf.put_u32(relation_id);
     // Parser accepts any byte here, must fit one byte for the cast.
     debug_assert!(
@@ -104,8 +125,14 @@ pub(super) fn encode_delete(
     write_tuple_data(buf, old_tuple);
 }
 
-pub(super) fn encode_truncate(buf: &mut BytesMut, relation_ids: &[Oid], flags: u8) {
+pub(super) fn encode_truncate(
+    buf: &mut BytesMut,
+    in_stream_xid: Option<Xid>,
+    relation_ids: &[Oid],
+    flags: u8,
+) {
     buf.put_u8(message_types::TRUNCATE);
+    write_xid_prefix(buf, in_stream_xid);
     debug_assert!(
         relation_ids.len() <= u32::MAX as usize,
         "truncate relation count exceeds int32"
@@ -117,8 +144,15 @@ pub(super) fn encode_truncate(buf: &mut BytesMut, relation_ids: &[Oid], flags: u
     }
 }
 
-pub(super) fn encode_type(buf: &mut BytesMut, type_id: Oid, namespace: &str, type_name: &str) {
+pub(super) fn encode_type(
+    buf: &mut BytesMut,
+    in_stream_xid: Option<Xid>,
+    type_id: Oid,
+    namespace: &str,
+    type_name: &str,
+) {
     buf.put_u8(message_types::TYPE);
+    write_xid_prefix(buf, in_stream_xid);
     buf.put_u32(type_id);
     write_cstring(buf, namespace);
     write_cstring(buf, type_name);
@@ -132,12 +166,14 @@ pub(super) fn encode_origin(buf: &mut BytesMut, origin_lsn: XLogRecPtr, origin_n
 
 pub(super) fn encode_logical_message(
     buf: &mut BytesMut,
+    in_stream_xid: Option<Xid>,
     flags: u8,
     lsn: XLogRecPtr,
     prefix: &str,
     content: &[u8],
 ) {
     buf.put_u8(message_types::MESSAGE);
+    write_xid_prefix(buf, in_stream_xid);
     buf.put_u8(flags);
     buf.put_u64(lsn);
     write_cstring(buf, prefix);

@@ -1,9 +1,13 @@
 //! Cross-cutting property tests: round-trip across all variants and versions,
 //! parser robustness on arbitrary bytes, and byte fidelity on spec bytes.
 
-use super::{encode_message, encode_message_to_bytes};
+use super::{
+    encode_message, encode_message_to_bytes, encode_streaming_message,
+    encode_streaming_message_to_bytes,
+};
 use crate::protocol::{
-    ColumnData, ColumnInfo, LogicalReplicationMessage as M, LogicalReplicationParser, TupleData,
+    message_types, ColumnData, ColumnInfo, LogicalReplicationMessage as M,
+    LogicalReplicationParser, StreamingReplicationMessage, TupleData,
 };
 use bytes::{Bytes, BytesMut};
 use proptest::prelude::*;
@@ -710,6 +714,90 @@ fn encode_message_to_bytes_matches_encode_message() {
             &encode_message_to_bytes(msg, *version)[..],
             encode(msg, *version).as_slice(),
             "to_bytes mismatch for {msg:?}"
+        );
+    }
+}
+
+/// A parser already in streaming context for `xid` (a StreamStart was fed
+/// first), so a subsequent data message is parsed with its in-stream xid prefix.
+fn parse_in_stream(xid: u32, proto: u8, bytes: &[u8]) -> StreamingReplicationMessage {
+    let mut parser = LogicalReplicationParser::with_protocol_version(proto as u32);
+    let mut ss = vec![message_types::STREAM_START];
+    ss.extend_from_slice(&xid.to_be_bytes());
+    ss.push(1);
+    parser.parse_wal_message(&ss).expect("stream start");
+    parser
+        .parse_wal_message(bytes)
+        .expect("data message parsed in stream")
+}
+
+fn arb_data_message() -> BoxedStrategy<M> {
+    prop_oneof![
+        arb_relation(),
+        arb_type(),
+        arb_insert(),
+        arb_update(),
+        arb_delete(),
+        arb_truncate(),
+        arb_message(),
+    ]
+    .boxed()
+}
+
+proptest! {
+    /// A streamed data message must encode as its non-streaming bytes with the
+    /// Int32 xid inserted right after the tag, and must round-trip through a
+    /// parser that is mid-stream. This is the inverse of the parser's in-stream
+    /// xid read (protocol v2+).
+    #[test]
+    fn streaming_data_message_round_trip(
+        msg in arb_data_message(),
+        xid in any::<u32>(),
+        proto in 2u8..=4,
+    ) {
+        let wrapper = StreamingReplicationMessage::new_streaming(msg.clone(), xid);
+        let mut buf = BytesMut::new();
+        encode_streaming_message(&wrapper, proto, &mut buf);
+        let streamed = buf.to_vec();
+
+        let plain = encode(&msg, proto);
+        let mut expected = Vec::with_capacity(plain.len() + 4);
+        expected.push(plain[0]);
+        expected.extend_from_slice(&xid.to_be_bytes());
+        expected.extend_from_slice(&plain[1..]);
+        prop_assert_eq!(&streamed, &expected, "in-stream xid prefix missing or misplaced");
+
+        let parsed = parse_in_stream(xid, proto, &streamed);
+        prop_assert_eq!(&parsed.message, &msg);
+        prop_assert!(parsed.is_streaming);
+        prop_assert_eq!(parsed.xid, Some(xid));
+    }
+}
+
+proptest! {
+    /// `encode_streaming_message_to_bytes` matches `encode_streaming_message`.
+    #[test]
+    fn streaming_to_bytes_matches_encode_streaming(
+        msg in arb_data_message(),
+        xid in any::<u32>(),
+        proto in 2u8..=4,
+    ) {
+        let wrapper = StreamingReplicationMessage::new_streaming(msg, xid);
+        let mut buf = BytesMut::new();
+        encode_streaming_message(&wrapper, proto, &mut buf);
+        prop_assert_eq!(buf, encode_streaming_message_to_bytes(&wrapper, proto));
+    }
+}
+
+proptest! {
+    /// A non-streaming wrapper (the parser's output outside a stream) encodes
+    /// identically to `encode_message`: no in-stream xid prefix is added.
+    #[test]
+    fn non_streaming_wrapper_matches_encode_message((version, msg) in arb_message_and_version()) {
+        let wrapper = StreamingReplicationMessage::new(msg.clone());
+        prop_assert_eq!(
+            encode_streaming_message_to_bytes(&wrapper, version),
+            encode_message_to_bytes(&msg, version)
         );
     }
 }

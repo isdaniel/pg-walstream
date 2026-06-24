@@ -22,3 +22,6 @@ target
 
 pg2any_last_lsn
 reports/*
+
+# proptest regression seeds (generated on test failure)
+proptest-regressions/

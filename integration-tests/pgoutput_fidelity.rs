@@ -7,10 +7,11 @@
 //! against PostgreSQL's output. The text-DML test additionally pins decoded
 //! values to what was inserted, so a compensating parser+encoder bug cannot hide.
 //!
-//! Coverage against real PG: messages B/C/R/Y/I/U/D/T/M/b/P/K/r and column tags
-//! t/n/b/u. Streaming (S/E/c/A) and Origin (O) are not reachable through the SQL
-//! capture function (streaming is in-progress-only over the replication protocol),
-//! so those remain covered by the unit round-trip / golden tests.
+//! Coverage against real PG in this file: messages B/C/R/Y/I/U/D/T/M/b/P/K/r/O
+//! and column tags t/n/b/u. Streaming (S/E/c/A/p and the in-stream xid prefix) is
+//! not reachable through the SQL capture function (streaming is in-progress-only
+//! over the replication protocol), so it is anchored against real PG in
+//! `streaming_decode.rs` instead.
 //!
 //! Prerequisites: PostgreSQL 15+ with `wal_level = logical` and, for the
 //! two-phase test, `max_prepared_transactions > 0`. Run serially (each test owns
@@ -362,4 +363,80 @@ fn encoder_reproduces_two_phase_commit() {
 
     let _ = c.exec("DROP PUBLICATION IF EXISTS fid_tp_pub");
     let _ = c.exec("DROP TABLE IF EXISTS fid_tp");
+}
+
+#[test]
+#[ignore = "requires PostgreSQL with wal_level=logical; run with --ignored --test-threads=1"]
+fn encoder_reproduces_origin() {
+    let mut c = connect();
+
+    // Clean up leftovers from a prior run.
+    let _ = c.exec("SELECT pg_replication_origin_session_reset()");
+    let _ = c.exec(
+        "SELECT pg_drop_replication_slot('fid_origin_slot') \
+         WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'fid_origin_slot')",
+    );
+    let _ = c.exec(
+        "SELECT pg_replication_origin_drop('fid_origin') \
+         WHERE EXISTS (SELECT 1 FROM pg_replication_origin WHERE roname = 'fid_origin')",
+    );
+    let _ = c.exec("DROP PUBLICATION IF EXISTS fid_origin_pub");
+    let _ = c.exec("DROP TABLE IF EXISTS fid_origin_t");
+
+    c.exec("CREATE TABLE fid_origin_t (id int PRIMARY KEY)")
+        .expect("create table");
+    c.exec("CREATE PUBLICATION fid_origin_pub FOR TABLE fid_origin_t")
+        .expect("create publication");
+    c.exec("SELECT pg_create_logical_replication_slot('fid_origin_slot', 'pgoutput', true)")
+        .expect("create slot");
+
+    // Attribute a transaction to a replication origin so pgoutput prefixes its
+    // first change with an ORIGIN ('O') message naming the origin.
+    c.exec("SELECT pg_replication_origin_create('fid_origin')")
+        .expect("create origin");
+    c.exec("SELECT pg_replication_origin_session_setup('fid_origin')")
+        .expect("origin session setup");
+    c.exec("BEGIN").expect("begin");
+    c.exec("SELECT pg_replication_origin_xact_setup('0/AABBCCDD', now())")
+        .expect("origin xact setup");
+    c.exec("INSERT INTO fid_origin_t (id) VALUES (1)")
+        .expect("insert");
+    c.exec("COMMIT").expect("commit");
+    c.exec("SELECT pg_replication_origin_session_reset()")
+        .expect("origin session reset");
+
+    // Capture with origin='any' so origin-tagged changes (and the O message) are sent.
+    let res = c
+        .exec(
+            "SELECT encode(data, 'hex') FROM pg_logical_slot_get_binary_changes(\
+             'fid_origin_slot', NULL, NULL, \
+             'proto_version', '1', 'publication_names', 'fid_origin_pub', 'origin', 'any')",
+        )
+        .expect("get binary changes");
+    let raws: Vec<Vec<u8>> = (0..res.ntuples())
+        .map(|r| hex_decode(&res.get_value(r, 0).expect("hex value")))
+        .collect();
+
+    // Cleanup before asserting so a failure does not leak the slot/origin.
+    let _ = c.exec("SELECT pg_drop_replication_slot('fid_origin_slot')");
+    let _ = c.exec("SELECT pg_replication_origin_drop('fid_origin')");
+
+    assert!(!raws.is_empty(), "expected pgoutput messages");
+    let msgs = roundtrip(&raws, 1);
+    assert!(
+        tags(&raws).contains(&b'O'),
+        "expected an Origin ('O') message, got tags {:?}",
+        tags(&raws)
+    );
+
+    // Encoder teeth: pin the decoded origin name to the one we created.
+    let origin_name = msgs.iter().find_map(|m| match m {
+        M::Origin { origin_name, .. } => Some(origin_name.to_string()),
+        _ => None,
+    });
+    assert_eq!(
+        origin_name.as_deref(),
+        Some("fid_origin"),
+        "origin name pinned to what was created"
+    );
 }

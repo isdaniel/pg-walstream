@@ -34,5 +34,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "roundtrip_stream"
+path = "fuzz_targets/roundtrip_stream.rs"
+test = false
+doc = false
+bench = false
+
 # Standalone workspace so the fuzz crate does not try to join the parent package.
 [workspace]
