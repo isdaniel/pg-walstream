@@ -5,7 +5,11 @@
 
 use bytes::{Bytes, BytesMut};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc as std_mpsc;
+use std::sync::Arc;
 use std::time::SystemTime;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
@@ -29,40 +33,230 @@ use crate::types::{
 #[allow(dead_code)]
 const READ_BUF_INITIAL_CAPACITY: usize = 256 * 1024;
 
-/// Run an async future synchronously, handling both "inside a runtime" and
-/// "outside a runtime" contexts. When called from within a tokio runtime,
-/// uses `block_in_place` to release the worker thread and drives the future
-/// on the current runtime's handle. When called outside a runtime, creates
-/// a temporary one.
-fn run_sync<F: std::future::Future>(fut: F) -> F::Output {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        tokio::task::block_in_place(|| handle.block_on(fut))
-    } else {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("failed to create runtime for sync bridge");
-        rt.block_on(fut)
+// ── Worker bridge ────────────────────────────────────────────────────────
+//
+// A `NativeConnection` owns no socket. A dedicated worker thread owns the
+// transport plus a current-thread tokio runtime, and all socket I/O runs on
+// that runtime's reactor. The handle forwards work to the worker over a
+// command channel: sync methods block on a `std::sync::mpsc` reply, async
+// methods await a `tokio::sync::oneshot`. Because the socket is created on the
+// worker's reactor and never leaves it, every operation touches one consistent
+// reactor, so the connection works under a current-thread runtime, a
+// multi-thread runtime, or no runtime at all. The old design drove futures
+// with `tokio::task::block_in_place`, which panics on a current-thread runtime.
+
+/// Commands sent from the `NativeConnection` handle to its worker thread.
+///
+/// Each command carries its own reply channel.
+enum Command {
+    /// Run a simple query and return the raw result. The handle interprets the
+    /// status and `is_ok`, so this stays a thin I/O primitive.
+    Query {
+        sql: String,
+        reply: std_mpsc::Sender<Result<NativePgResult>>,
+    },
+    /// Read the next batch of CopyData payloads from the replication stream.
+    GetCopyBatch {
+        token: CancellationToken,
+        reply: oneshot::Sender<Result<VecDeque<Bytes>>>,
+    },
+    /// Send one CopyData message (standby status update or hot standby feedback).
+    PutCopyData {
+        data: Bytes,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    /// Best-effort graceful shutdown, then stop the worker loop.
+    Close {
+        in_copy_mode: bool,
+        reply: std_mpsc::Sender<()>,
+    },
+}
+
+/// Transport-owning state that lives entirely on the worker thread.
+struct Worker {
+    transport: Transport,
+    read_buf: BytesMut,
+    server_ver: i32,
+    alive: Arc<AtomicBool>,
+}
+
+impl Worker {
+    async fn query(&mut self, sql: &str) -> Result<NativePgResult> {
+        query::simple_query(&mut self.transport, &mut self.read_buf, sql).await
     }
+
+    /// Read at least one CopyData payload, returning every message currently
+    /// drained from the buffer as one batch. The handle serves these to the
+    /// caller one at a time, so the cross-thread round trip is amortized across
+    /// the whole batch rather than paid per message.
+    async fn get_copy_batch(&mut self, token: &CancellationToken) -> Result<VecDeque<Bytes>> {
+        let mut batch = VecDeque::new();
+        let first =
+            match copy::get_copy_data(&mut self.transport, &mut self.read_buf, &mut batch, token)
+                .await
+            {
+                Ok(payload) => payload,
+                Err(err) => {
+                    if matches!(err, ReplicationError::TransientConnection(_)) {
+                        self.alive.store(false, Ordering::Relaxed);
+                    }
+                    return Err(err);
+                }
+            };
+        // `get_copy_data` pops and returns the first message, leaving the rest
+        // of this read's drained messages in `batch`; restore their order.
+        batch.push_front(first);
+        Ok(batch)
+    }
+
+    async fn put_copy_data(&mut self, data: &[u8]) -> Result<()> {
+        copy::put_copy_data(&mut self.transport, data).await
+    }
+
+    /// Best-effort graceful shutdown: CopyDone if streaming, then Terminate.
+    async fn close(&mut self, in_copy_mode: bool) {
+        if in_copy_mode {
+            let _ = copy::send_copy_done(&mut self.transport).await;
+        }
+        let terminate = wire::build_terminate();
+        let _ = wire::write_all(&mut self.transport, &terminate).await;
+        let _ = wire::flush(&mut self.transport).await;
+    }
+}
+
+/// How the worker thread obtains its transport before serving commands.
+enum WorkerInit {
+    /// Establish a real connection on the worker's own reactor.
+    Connect {
+        conninfo: String,
+        alive: Arc<AtomicBool>,
+    },
+    /// Test-only: adopt a pre-built loopback socket. The worker calls
+    /// `from_std` on its own reactor, so `null_for_testing` needs no ambient
+    /// runtime.
+    #[cfg(test)]
+    Null {
+        std_tcp: std::net::TcpStream,
+        server_ver: i32,
+        alive: Arc<AtomicBool>,
+    },
+}
+
+impl WorkerInit {
+    async fn build(self) -> Result<Worker> {
+        match self {
+            WorkerInit::Connect { conninfo, alive } => {
+                let info = ConnInfo::parse(&conninfo)?;
+                debug!("worker connect: parsed conninfo, host={}", info.host);
+                let (transport, server_ver, read_buf) = startup::connect(&info).await?;
+                debug!("worker connect: startup complete, version={}", server_ver);
+                Ok(Worker {
+                    transport,
+                    read_buf,
+                    server_ver,
+                    alive,
+                })
+            }
+            #[cfg(test)]
+            WorkerInit::Null {
+                std_tcp,
+                server_ver,
+                alive,
+            } => {
+                let tcp = tokio::net::TcpStream::from_std(std_tcp).map_err(|e| {
+                    ReplicationError::backend(format!("failed to adopt test socket: {e}"))
+                })?;
+                Ok(Worker {
+                    transport: Transport::Plain(tcp),
+                    read_buf: BytesMut::new(),
+                    server_ver,
+                    alive,
+                })
+            }
+        }
+    }
+}
+
+/// Entry point for the dedicated worker thread.
+///
+/// Builds a current-thread runtime, establishes the transport, reports the
+/// outcome over `ready_tx`, then serves commands until `Close` or until the
+/// command channel closes.
+fn run_worker(
+    init: WorkerInit,
+    mut cmd_rx: mpsc::UnboundedReceiver<Command>,
+    ready_tx: std_mpsc::Sender<Result<i32>>,
+) {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            let _ = ready_tx.send(Err(ReplicationError::backend(format!(
+                "failed to build worker runtime: {e}"
+            ))));
+            return;
+        }
+    };
+
+    rt.block_on(async move {
+        let mut worker = match init.build().await {
+            Ok(worker) => worker,
+            Err(e) => {
+                let _ = ready_tx.send(Err(e));
+                return;
+            }
+        };
+        let _ = ready_tx.send(Ok(worker.server_ver));
+        drop(ready_tx);
+
+        while let Some(cmd) = cmd_rx.recv().await {
+            match cmd {
+                Command::Query { sql, reply } => {
+                    let _ = reply.send(worker.query(&sql).await);
+                }
+                Command::GetCopyBatch { token, reply } => {
+                    let _ = reply.send(worker.get_copy_batch(&token).await);
+                }
+                Command::PutCopyData { data, reply } => {
+                    let _ = reply.send(worker.put_copy_data(&data).await);
+                }
+                Command::Close {
+                    in_copy_mode,
+                    reply,
+                } => {
+                    worker.close(in_copy_mode).await;
+                    let _ = reply.send(());
+                    break;
+                }
+            }
+        }
+    });
 }
 
 /// Pure-Rust PostgreSQL connection for replication.
 ///
-/// Provides the same public API as the libpq `PgReplicationConnection`
-/// so that `stream.rs` works unchanged regardless of backend.
+/// Provides the same public API as the libpq `PgReplicationConnection` so that
+/// `stream.rs` works unchanged regardless of backend. All socket I/O runs on a
+/// dedicated worker thread (see the worker bridge note above).
 pub struct NativeConnection {
-    transport: Transport,
-    /// Read buffer — `read_buf()` fills this directly from TLS, then
-    /// `drain_read_buffer()` parses complete messages out of it.
-    read_buf: BytesMut,
-    /// Pre-drained messages waiting to be consumed (drain-loop optimization).
-    pending_messages: VecDeque<Bytes>,
-    /// Server version number (e.g. 160001 for PG 16.1).
+    /// Command channel to the worker. `UnboundedSender::send` is a sync,
+    /// non-blocking call usable from any context (async or not, runtime or not).
+    cmd_tx: mpsc::UnboundedSender<Command>,
+    /// Worker thread handle, joined on `Drop`.
+    worker: Option<std::thread::JoinHandle<()>>,
+    /// Batch buffer for the read hot path: filled one batch at a time from the
+    /// worker, drained to the caller one message at a time.
+    pending: VecDeque<Bytes>,
+    /// Server version number (e.g. 160001 for PG 16.1), cached at connect time.
     server_ver: i32,
-    /// Whether we are in COPY (replication) mode.
+    /// Whether we are in COPY (replication) mode. Gates the streaming methods
+    /// and tells the worker whether to send CopyDone on shutdown.
     in_copy_mode: bool,
-    /// Track whether the connection is alive. Set to false on detected errors.
-    alive: bool,
+    /// Liveness flag shared with the worker, which clears it on a transient
+    /// read error.
+    alive: Arc<AtomicBool>,
 }
 
 impl NativeConnection {
@@ -70,45 +264,86 @@ impl NativeConnection {
 
     /// Create a new PostgreSQL connection for logical replication.
     ///
-    /// Establishes a TCP connection (optionally upgraded to TLS via rustls),
-    /// performs the v3.0 startup handshake and authentication.
+    /// Spawns the worker thread, which establishes the TCP connection
+    /// (optionally upgraded to TLS via rustls) and performs the v3.0 startup
+    /// handshake and authentication on its own runtime. Blocks until the worker
+    /// reports success or failure.
     pub fn connect(conninfo: &str) -> Result<Self> {
-        run_sync(Self::connect_async(conninfo))
-    }
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (ready_tx, ready_rx) = std_mpsc::channel();
+        let alive = Arc::new(AtomicBool::new(false));
+        let worker_alive = alive.clone();
+        let conninfo = conninfo.to_string();
 
-    async fn connect_async(conninfo: &str) -> Result<Self> {
-        let info = ConnInfo::parse(conninfo)?;
-        debug!("connect_async: parsed conninfo, host={}", info.host);
-        let (transport, server_version, buf) = startup::connect(&info).await?;
-        debug!(
-            "connect_async: startup complete, version={}",
-            server_version
-        );
+        let worker = std::thread::Builder::new()
+            .name("pg-walstream-native".to_string())
+            .spawn(move || {
+                run_worker(
+                    WorkerInit::Connect {
+                        conninfo,
+                        alive: worker_alive,
+                    },
+                    cmd_rx,
+                    ready_tx,
+                )
+            })
+            .map_err(|e| {
+                ReplicationError::backend(format!("failed to spawn native worker thread: {e}"))
+            })?;
 
-        debug!(
-            "Connected to PostgreSQL {} via native rustls",
-            server_version
-        );
-
-        Ok(Self {
-            transport,
-            read_buf: buf,
-            pending_messages: VecDeque::with_capacity(256),
-            server_ver: server_version,
-            in_copy_mode: false,
-            alive: true,
-        })
+        match ready_rx.recv() {
+            Ok(Ok(server_ver)) => {
+                alive.store(true, Ordering::Relaxed);
+                debug!("Connected to PostgreSQL {} via native rustls", server_ver);
+                Ok(Self {
+                    cmd_tx,
+                    worker: Some(worker),
+                    pending: VecDeque::with_capacity(256),
+                    server_ver,
+                    in_copy_mode: false,
+                    alive,
+                })
+            }
+            Ok(Err(e)) => {
+                let _ = worker.join();
+                Err(e)
+            }
+            Err(_) => {
+                let _ = worker.join();
+                Err(ReplicationError::backend(
+                    "native worker thread exited before connecting",
+                ))
+            }
+        }
     }
 
     // ── Query execution ─────────────────────────────────────────────────
 
-    /// Execute a replication command (like IDENTIFY_SYSTEM).
-    pub fn exec(&mut self, sql: &str) -> Result<NativePgResult> {
-        run_sync(self.exec_async(sql))
+    /// Send a simple query to the worker and block until it replies.
+    fn run_query(&self, sql: &str) -> Result<NativePgResult> {
+        let (reply_tx, reply_rx) = std_mpsc::channel();
+        self.cmd_tx
+            .send(Command::Query {
+                sql: sql.to_string(),
+                reply: reply_tx,
+            })
+            .map_err(|_| Self::worker_gone())?;
+        reply_rx.recv().map_err(|_| Self::worker_gone())?
     }
 
-    async fn exec_async(&mut self, sql: &str) -> Result<NativePgResult> {
-        let result = query::simple_query(&mut self.transport, &mut self.read_buf, sql).await?;
+    #[cold]
+    fn worker_gone() -> ReplicationError {
+        ReplicationError::backend("native worker thread is gone")
+    }
+
+    #[cold]
+    fn worker_reply_dropped() -> ReplicationError {
+        ReplicationError::backend("native worker thread dropped the reply")
+    }
+
+    /// Execute a replication command (like IDENTIFY_SYSTEM).
+    pub fn exec(&mut self, sql: &str) -> Result<NativePgResult> {
+        let result = self.run_query(sql)?;
 
         let status_str = format!("{:?}", result.status());
         debug!("query : {} pg_result.status() : {}", sql, status_str);
@@ -156,23 +391,17 @@ impl NativeConnection {
         options: &[(&str, &str)],
     ) -> Result<()> {
         let sql = crate::sql_builder::build_start_replication_sql(slot_name, start_lsn, options)?;
-
         debug!("Starting replication: {}", sql);
 
-        run_sync(async {
-            let result = query::simple_query(&mut self.transport, &mut self.read_buf, &sql).await?;
-
-            if result.status() != &NativeResultStatus::CopyBoth {
-                let error_msg = result
-                    .error_message()
-                    .unwrap_or_else(|| "Unknown error".to_string());
-                return Err(ReplicationError::protocol(format!(
-                    "START_REPLICATION did not enter COPY mode: {error_msg}"
-                )));
-            }
-
-            Ok(())
-        })?;
+        let result = self.run_query(&sql)?;
+        if result.status() != &NativeResultStatus::CopyBoth {
+            let error_msg = result
+                .error_message()
+                .unwrap_or_else(|| "Unknown error".to_string());
+            return Err(ReplicationError::protocol(format!(
+                "START_REPLICATION did not enter COPY mode: {error_msg}"
+            )));
+        }
 
         self.in_copy_mode = true;
         debug!("Replication started successfully");
@@ -181,26 +410,44 @@ impl NativeConnection {
 
     /// Get copy data from replication stream (truly async, non-blocking).
     ///
-    /// Implements drain-loop batch queue optimization with zero-copy extraction.
+    /// Serves from the local batch buffer first (no channel traffic), and only
+    /// on empty requests a fresh batch from the worker over a oneshot.
     pub async fn get_copy_data_async(
         &mut self,
         cancellation_token: &CancellationToken,
     ) -> Result<Bytes> {
         self.ensure_replication_mode()?;
 
-        let result = copy::get_copy_data(
-            &mut self.transport,
-            &mut self.read_buf,
-            &mut self.pending_messages,
-            cancellation_token,
-        )
-        .await;
-
-        if let Err(ReplicationError::TransientConnection(_)) = &result {
-            self.alive = false;
+        if let Some(payload) = self.pending.pop_front() {
+            return Ok(payload);
         }
 
-        result
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .cmd_tx
+            .send(Command::GetCopyBatch {
+                token: cancellation_token.clone(),
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            self.alive.store(false, Ordering::Relaxed);
+            return Err(Self::worker_gone());
+        }
+
+        let batch = match reply_rx.await {
+            Ok(result) => result?,
+            Err(_) => {
+                self.alive.store(false, Ordering::Relaxed);
+                return Err(Self::worker_reply_dropped());
+            }
+        };
+
+        self.pending = batch;
+        Ok(self
+            .pending
+            .pop_front()
+            .expect("get_copy_batch returns a non-empty batch on success"))
     }
 
     /// Send feedback to the server (standby status update).
@@ -223,8 +470,7 @@ impl NativeConnection {
         buffer.write_i64(timestamp);
         buffer.write_u8(if reply_requested { 1 } else { 0 });
 
-        let reply_data = buffer.freeze();
-        copy::put_copy_data(&mut self.transport, &reply_data).await?;
+        self.put_copy_data(buffer.freeze()).await?;
 
         info!(
             "Sent standby status update: received={}, flushed={}, applied={}, reply_requested={}",
@@ -250,7 +496,7 @@ impl NativeConnection {
         let feedback_data =
             build_hot_standby_feedback_message(xmin, xmin_epoch, catalog_xmin, catalog_xmin_epoch)?;
 
-        copy::put_copy_data(&mut self.transport, &feedback_data).await?;
+        self.put_copy_data(feedback_data).await?;
 
         debug!(
             "Sent hot standby feedback: xmin={}, catalog_xmin={}",
@@ -259,11 +505,23 @@ impl NativeConnection {
         Ok(())
     }
 
+    /// Send one CopyData message to the worker and await its completion.
+    async fn put_copy_data(&self, data: Bytes) -> Result<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::PutCopyData {
+                data,
+                reply: reply_tx,
+            })
+            .map_err(|_| Self::worker_gone())?;
+        reply_rx.await.map_err(|_| Self::worker_reply_dropped())?
+    }
+
     // ── Connection info ─────────────────────────────────────────────────
 
     /// Check if the connection is still alive.
     pub fn is_alive(&self) -> bool {
-        self.alive
+        self.alive.load(Ordering::Relaxed)
     }
 
     /// Get the server version.
@@ -380,24 +638,20 @@ impl NativeConnection {
             start_lsn,
             timeline_id,
         )?;
-
         debug!("Starting physical replication: {}", sql);
 
-        run_sync(async {
-            let result = query::simple_query(&mut self.transport, &mut self.read_buf, &sql).await?;
-
-            match result.status() {
-                NativeResultStatus::CopyBoth | NativeResultStatus::CopyOut => Ok(()),
-                _ => {
-                    let error_msg = result
-                        .error_message()
-                        .unwrap_or_else(|| "Unknown error".to_string());
-                    Err(ReplicationError::protocol(format!(
-                        "START_REPLICATION did not enter COPY mode: {error_msg}"
-                    )))
-                }
+        let result = self.run_query(&sql)?;
+        match result.status() {
+            NativeResultStatus::CopyBoth | NativeResultStatus::CopyOut => {}
+            _ => {
+                let error_msg = result
+                    .error_message()
+                    .unwrap_or_else(|| "Unknown error".to_string());
+                return Err(ReplicationError::protocol(format!(
+                    "START_REPLICATION did not enter COPY mode: {error_msg}"
+                )));
             }
-        })?;
+        }
 
         self.in_copy_mode = true;
         debug!("Physical replication started successfully");
@@ -430,27 +684,30 @@ impl NativeConnection {
 
     /// Gracefully close the replication connection.
     ///
-    /// This performs a best-effort synchronous shutdown by sending CopyDone
-    /// (if in COPY mode) and Terminate messages. It uses `run_sync` to bridge
-    /// async I/O, which internally uses `block_in_place` when called from a
-    /// multi-threaded runtime. The entire call is wrapped in `catch_unwind` to
-    /// prevent panics from propagating during Drop.
+    /// Sends a `Close` command so the worker performs a best-effort shutdown
+    /// (CopyDone if streaming, then Terminate), waits for it to finish, then
+    /// joins the worker thread. Best-effort I/O errors inside the worker are
+    /// ignored. No panic can occur: there is no `block_in_place` bridge.
     fn close_connection(&mut self) {
-        // Best-effort graceful shutdown.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_sync(async {
-                if self.in_copy_mode {
-                    let _ = copy::send_copy_done(&mut self.transport).await;
-                }
-                let terminate = wire::build_terminate();
-                let _ = wire::write_all(&mut self.transport, &terminate).await;
-                let _ = wire::flush(&mut self.transport).await;
-            });
-        }));
+        if let Some(worker) = self.worker.take() {
+            let (reply_tx, reply_rx) = std_mpsc::channel();
+            if self
+                .cmd_tx
+                .send(Command::Close {
+                    in_copy_mode: self.in_copy_mode,
+                    reply: reply_tx,
+                })
+                .is_ok()
+            {
+                // Wait for the worker to finish its shutdown I/O before joining.
+                let _ = reply_rx.recv();
+            }
+            let _ = worker.join();
+        }
 
-        self.pending_messages.clear();
+        self.pending.clear();
         self.in_copy_mode = false;
-        self.alive = false;
+        self.alive.store(false, Ordering::Relaxed);
     }
 }
 
@@ -464,39 +721,49 @@ impl Drop for NativeConnection {
 impl NativeConnection {
     /// Create a null connection for testing (DO NOT call any methods that touch the DB)
     pub(crate) fn null_for_testing() -> Self {
-        // Create a pair of connected TCP sockets for testing.
+        // Create a pair of connected TCP sockets. The peer end is closed when
+        // this function returns, so any I/O the worker attempts on the socket
+        // fails deterministically rather than blocking.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let std_tcp = std::net::TcpStream::connect(addr).unwrap();
         std_tcp.set_nonblocking(true).unwrap();
-        // Accept the other end so the socket stays connected
         let _peer = listener.accept().unwrap();
 
-        // TcpStream::from_std requires a running reactor. If there's
-        // already one (e.g. #[tokio::test]), use it. Otherwise create a
-        // temporary runtime just for the conversion.
-        let tcp = match tokio::runtime::Handle::try_current() {
-            Ok(_) => tokio::net::TcpStream::from_std(std_tcp).unwrap(),
-            Err(_) => {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_io()
-                    .build()
-                    .unwrap();
-                let _guard = rt.enter();
-                tokio::net::TcpStream::from_std(std_tcp).unwrap()
-                // Note: `rt` is dropped here, but the TcpStream remains
-                // valid as a raw fd wrapper. The tests using null_for_testing
-                // never actually do I/O on it.
-            }
-        };
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (ready_tx, ready_rx) = std_mpsc::channel();
+        let alive = Arc::new(AtomicBool::new(false));
+        let worker_alive = alive.clone();
 
+        let worker = std::thread::Builder::new()
+            .name("pg-walstream-native-null".to_string())
+            .spawn(move || {
+                run_worker(
+                    WorkerInit::Null {
+                        std_tcp,
+                        server_ver: 160000,
+                        alive: worker_alive,
+                    },
+                    cmd_rx,
+                    ready_tx,
+                )
+            })
+            .unwrap();
+
+        // The worker adopts the socket on its own reactor and reports back.
+        let server_ver = ready_rx
+            .recv()
+            .expect("null worker exited before init")
+            .expect("null worker failed to adopt the test socket");
+
+        // A null test connection is intentionally not alive.
         Self {
-            transport: Transport::Plain(tcp),
-            read_buf: BytesMut::new(),
-            pending_messages: VecDeque::new(),
-            server_ver: 160000,
+            cmd_tx,
+            worker: Some(worker),
+            pending: VecDeque::new(),
+            server_ver,
             in_copy_mode: false,
-            alive: false, // null test connection is not alive
+            alive,
         }
     }
 }
@@ -986,7 +1253,7 @@ mod tests {
 
     // === ensure_replication_mode, is_alive, server_version, close_connection, Drop ===
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[tokio::test]
     async fn test_ensure_replication_mode_fails_when_not_replication() {
         let conn = NativeConnection::null_for_testing();
         let err = conn.ensure_replication_mode().unwrap_err();
@@ -996,28 +1263,66 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[tokio::test]
     async fn test_is_alive_returns_false_for_null_conn() {
         let conn = NativeConnection::null_for_testing();
         assert!(!conn.is_alive());
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[tokio::test]
     async fn test_server_version_returns_configured_value() {
         let conn = NativeConnection::null_for_testing();
         assert_eq!(conn.server_version(), 160000);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[tokio::test]
     async fn test_close_connection_null_conn() {
         let mut conn = NativeConnection::null_for_testing();
         conn.close_connection(); // should not panic
         assert!(!conn.is_alive());
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[tokio::test]
     async fn test_drop_null_conn_does_not_panic() {
         let conn = NativeConnection::null_for_testing();
         drop(conn); // should not panic
+    }
+
+    // === Runtime-flavor coverage for the worker-thread bridge ===
+    //
+    // The sync methods (connect, exec, start_replication, ...) used to drive
+    // their futures with tokio::task::block_in_place, which panics on a
+    // current-thread runtime. These tests pin that behavior across all three
+    // runtime contexts plus the Drop path. Test A is the regression anchor: it
+    // panics on the pre-fix code and passes once the worker bridge lands.
+
+    #[tokio::test]
+    async fn test_sync_method_does_not_panic_on_current_thread_runtime() {
+        // Default #[tokio::test] is a current-thread runtime. A sync call here
+        // must return an error from the dead null socket, never panic.
+        let mut conn = NativeConnection::null_for_testing();
+        let result = conn.exec("IDENTIFY_SYSTEM");
+        assert!(
+            result.is_err(),
+            "exec on a null connection should error, not panic"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_sync_method_works_on_multi_thread_runtime() {
+        let mut conn = NativeConnection::null_for_testing();
+        assert!(conn.exec("IDENTIFY_SYSTEM").is_err());
+    }
+
+    #[test]
+    fn test_sync_method_works_without_runtime() {
+        let mut conn = NativeConnection::null_for_testing();
+        assert!(conn.exec("IDENTIFY_SYSTEM").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_drop_does_not_panic_on_current_thread_runtime() {
+        let conn = NativeConnection::null_for_testing();
+        drop(conn); // must not panic on a current-thread runtime
     }
 }

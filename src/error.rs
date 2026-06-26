@@ -51,6 +51,14 @@ pub enum ReplicationError {
 
     /// Deserialization errors (when converting RowData to user types)
     Deserialize(String),
+
+    /// Native backend worker thread failures.
+    ///
+    /// Produced only by the rustls-tls backend when its dedicated worker
+    /// thread cannot be reached: the thread failed to spawn, exited before
+    /// completing the operation, or dropped the reply channel. Treated as
+    /// transient so the stream retry logic can reconnect.
+    Backend(String),
 }
 
 impl core::fmt::Display for ReplicationError {
@@ -72,6 +80,7 @@ impl core::fmt::Display for ReplicationError {
             Self::StringConversion(err) => write!(f, "String conversion error: {err}"),
             Self::Generic(msg) => write!(f, "Replication error: {msg}"),
             Self::Deserialize(msg) => write!(f, "Deserialization error: {msg}"),
+            Self::Backend(msg) => write!(f, "Backend worker error: {msg}"),
         }
     }
 }
@@ -174,6 +183,11 @@ impl ReplicationError {
         ReplicationError::Deserialize(msg.into())
     }
 
+    /// Create a new backend worker error
+    pub fn backend<S: Into<String>>(msg: S) -> Self {
+        ReplicationError::Backend(msg.into())
+    }
+
     /// Check if the error is transient (can be retried)
     pub fn is_transient(&self) -> bool {
         #[cfg(feature = "std")]
@@ -185,6 +199,7 @@ impl ReplicationError {
             ReplicationError::TransientConnection(_)
                 | ReplicationError::Timeout(_)
                 | ReplicationError::ReplicationConnection(_)
+                | ReplicationError::Backend(_)
         )
     }
 
@@ -471,5 +486,26 @@ mod tests {
             ReplicationError::Deserialize(msg) => assert_eq!(msg, "serde custom error"),
             _ => panic!("Expected Deserialize error from serde::de::Error::custom"),
         }
+    }
+
+    #[test]
+    fn test_backend_error() {
+        let err = ReplicationError::backend("worker thread is gone");
+        match err {
+            ReplicationError::Backend(ref msg) => assert_eq!(msg, "worker thread is gone"),
+            _ => panic!("Expected Backend error"),
+        }
+        assert_eq!(
+            err.to_string(),
+            "Backend worker error: worker thread is gone"
+        );
+    }
+
+    #[test]
+    fn test_backend_error_is_transient() {
+        let err = ReplicationError::backend("reply dropped");
+        assert!(err.is_transient());
+        assert!(!err.is_permanent());
+        assert!(!err.is_cancelled());
     }
 }

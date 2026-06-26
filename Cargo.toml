@@ -54,6 +54,7 @@ libpq = ["dep:libpq-sys", "dep:tokio", "dep:tokio-util", "std"]
 # Pure-Rust native backend: uses rustls with aws-lc-rs forhardware-accelerated TLS crypto (AES-NI, AVX2, SHA-NI), requires cmake + C compiler at build time.
 rustls-tls = [
     "dep:tokio",
+    "tokio/sync",
     "dep:tokio-util",
     "dep:tokio-rustls",
     "dep:rustls",
