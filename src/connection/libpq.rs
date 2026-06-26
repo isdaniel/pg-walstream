@@ -897,18 +897,10 @@ impl PgResult {
         unsafe { PQnfields(self.result) }
     }
 
-    /// Get a field value as string
+    /// Get a field value as string. Lossy for non-UTF-8 data — use [`get_bytes`](Self::get_bytes) for lossless access.
     pub fn get_value(&self, row: i32, col: i32) -> Option<String> {
-        if row >= self.ntuples() || col >= self.nfields() {
-            return None;
-        }
-
-        let value_ptr = unsafe { PQgetvalue(self.result, row, col) };
-        if value_ptr.is_null() {
-            None
-        } else {
-            unsafe { Some(CStr::from_ptr(value_ptr).to_string_lossy().into_owned()) }
-        }
+        let bytes = self.get_bytes(row, col)?;
+        Some(String::from_utf8_lossy(bytes).into_owned())
     }
 
     /// Get a field value as raw bytes, borrowed until this `PgResult` drops.
@@ -2397,5 +2389,24 @@ mod tests {
 
         let res_null = make_bytea_result(&[None]);
         assert_eq!(res_null.get_bytes_owned(0, 0), None);
+    }
+
+    #[test]
+    fn get_value_decodes_utf8_and_handles_null() {
+        let res = make_bytea_result(&[Some(b"hello"), None]);
+        // Valid UTF-8 round-trips through the get_bytes delegation.
+        assert_eq!(res.get_value(0, 0), Some("hello".to_string()));
+        // SQL NULL propagates as None.
+        assert_eq!(res.get_value(0, 1), None);
+        // Out-of-bounds is None (covers the negative-index guard get_value inherits).
+        assert_eq!(res.get_value(-1, 0), None);
+    }
+
+    #[test]
+    fn get_value_is_lossy_for_non_utf8() {
+        let res = make_bytea_result(&[Some(&[0xFF, 0x00, 0xFE])]);
+        let s = res.get_value(0, 0).expect("non-null");
+        // Lossy decode replaces the invalid bytes, so it cannot equal the input.
+        assert_ne!(s.as_bytes(), &[0xFF, 0x00, 0xFE][..]);
     }
 }

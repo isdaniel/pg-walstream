@@ -1,0 +1,9 @@
+[package]
+name = "binary-column-access"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Zero-copy access to binary (BYTEA) columns via PgResult::get_bytes"
+
+[dependencies]
+pg_walstream = { path = "../.." }

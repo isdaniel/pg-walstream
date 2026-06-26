@@ -109,6 +109,10 @@ path = "integration-tests/streaming_decode.rs"
 name = "pg_result_get_bytes"
 path = "integration-tests/pg_result_get_bytes.rs"
 
+[[test]]
+name = "binary_columns"
+path = "integration-tests/binary_columns.rs"
+
 [[bench]]
 name = "wal_pipeline"
 harness = false

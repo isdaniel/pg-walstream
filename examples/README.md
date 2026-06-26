@@ -164,6 +164,18 @@ cargo run
 
 **No database required** — this example uses in-memory `RowData` and `ChangeEvent` objects to demonstrate the deserialization API.
 
+### 8. binary-column-access
+
+Demonstrates `PgResult::get_bytes` for lossless, zero-copy access to binary
+(`BYTEA`) columns — contrasting it with the lossy `get_value` and showing how a
+replication extension reads binary payloads without `encode(data, 'hex')`.
+
+**Run:**
+```bash
+cd examples/binary-column-access
+cargo run
+```
+
 ## Prerequisites
 
 ### For Logical Replication Examples (basic_streaming, polling_example, safe_transaction_consumer)

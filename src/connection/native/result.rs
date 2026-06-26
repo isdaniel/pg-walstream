@@ -21,7 +21,7 @@ pub enum NativeResultStatus {
 pub struct NativePgResult {
     pub(crate) status: NativeResultStatus,
     pub(crate) columns: Vec<String>,
-    pub(crate) rows: Vec<Vec<Option<String>>>,
+    pub(crate) rows: Vec<Vec<Option<Vec<u8>>>>,
     pub(crate) error_msg: Option<String>,
 }
 
@@ -64,9 +64,21 @@ impl NativePgResult {
         self.columns.len() as i32
     }
 
-    /// Get a field value as string.
+    /// Get a field value as string. Lossy for non-UTF-8 data — use [`get_bytes`](Self::get_bytes) for lossless access.
     pub fn get_value(&self, row: i32, col: i32) -> Option<String> {
-        self.rows.get(row as usize)?.get(col as usize)?.clone()
+        let bytes = self.get_bytes(row, col)?;
+        Some(String::from_utf8_lossy(bytes).into_owned())
+    }
+
+    /// Get a field value as raw bytes, zero-copy and lossless.
+    ///
+    /// Returns `None` for SQL NULL and for out-of-bounds `row`/`col`.
+    /// Unlike [`get_value`](Self::get_value) this never mangles non-UTF-8 data.
+    pub fn get_bytes(&self, row: i32, col: i32) -> Option<&[u8]> {
+        if row < 0 || col < 0 {
+            return None;
+        }
+        self.rows.get(row as usize)?.get(col as usize)?.as_deref()
     }
 
     /// Get error message if any.
@@ -118,17 +130,22 @@ impl NativePgResult {
             let col_len = i32::from_be_bytes(payload[pos..pos + 4].try_into().unwrap());
             pos += 4;
 
-            if col_len == -1 {
-                row.push(None); // SQL NULL
+            if col_len < 0 {
+                // -1 is SQL NULL; any other negative is malformed wire data, treat it as absent rather than sign-extending into a huge usize.
+                row.push(None);
             } else {
                 let len = col_len as usize;
-                if pos + len <= payload.len() {
-                    let val = String::from_utf8_lossy(&payload[pos..pos + len]).to_string();
-                    row.push(Some(val));
-                } else {
-                    row.push(None);
+                match pos.checked_add(len) {
+                    Some(end) if end <= payload.len() => {
+                        row.push(Some(payload[pos..end].to_vec()));
+                        pos = end;
+                    }
+                    // Truncated or overflowing length: stop parsing this row.
+                    _ => {
+                        row.push(None);
+                        break;
+                    }
                 }
-                pos += len;
             }
         }
 
@@ -261,6 +278,79 @@ mod tests {
         result.parse_data_row(&payload);
         // Should not panic — gracefully handle truncated data
         assert_eq!(result.ntuples(), 1);
+    }
+
+    #[test]
+    fn test_parse_data_row_negative_length_is_not_null() {
+        // A column length of -2 (anything negative but -1) is malformed wire
+        // data. It must NOT sign-extend into a huge usize and panic on overflow.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1i16.to_be_bytes()); // 1 column
+        payload.extend_from_slice(&(-2i32).to_be_bytes()); // malformed length
+
+        let mut result = NativePgResult::new();
+        result.columns = vec!["b".into()];
+        result.parse_data_row(&payload); // must not panic
+        assert_eq!(result.ntuples(), 1);
+        assert_eq!(result.get_bytes(0, 0), None);
+    }
+
+    #[test]
+    fn test_get_bytes_lossless_non_utf8() {
+        // A column holding bytes that are NOT valid UTF-8.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1i16.to_be_bytes()); // 1 column
+        let val = [0xffu8, 0x00, 0xfe];
+        payload.extend_from_slice(&(val.len() as i32).to_be_bytes());
+        payload.extend_from_slice(&val);
+
+        let mut result = NativePgResult::new();
+        result.columns = vec!["b".into()];
+        result.parse_data_row(&payload);
+
+        // get_bytes is exact and lossless.
+        assert_eq!(result.get_bytes(0, 0), Some(&val[..]));
+        // get_value mangles the same bytes through from_utf8_lossy (the win).
+        assert_ne!(
+            result.get_value(0, 0).unwrap().as_bytes(),
+            &val[..],
+            "get_value is expected to be lossy for non-UTF-8 data"
+        );
+    }
+
+    #[test]
+    fn test_get_bytes_null_is_none() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1i16.to_be_bytes()); // 1 column
+        payload.extend_from_slice(&(-1i32).to_be_bytes()); // SQL NULL
+
+        let mut result = NativePgResult::new();
+        result.columns = vec!["b".into()];
+        result.parse_data_row(&payload);
+
+        assert_eq!(result.get_bytes(0, 0), None);
+    }
+
+    #[test]
+    fn test_get_bytes_empty_non_null() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1i16.to_be_bytes()); // 1 column
+        payload.extend_from_slice(&0i32.to_be_bytes()); // zero-length, non-NULL
+
+        let mut result = NativePgResult::new();
+        result.columns = vec!["b".into()];
+        result.parse_data_row(&payload);
+
+        assert_eq!(result.get_bytes(0, 0), Some(&[][..]));
+    }
+
+    #[test]
+    fn test_get_bytes_out_of_bounds() {
+        let result = NativePgResult::new();
+        assert_eq!(result.get_bytes(0, 0), None);
+        assert_eq!(result.get_bytes(99, 0), None);
+        assert_eq!(result.get_bytes(-1, 0), None);
+        assert_eq!(result.get_bytes(0, -1), None);
     }
 
     #[test]
