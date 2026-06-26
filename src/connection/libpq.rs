@@ -864,7 +864,11 @@ impl PgReplicationConnection {
     }
 }
 
-/// Safe wrapper for PostgreSQL result
+/// Safe wrapper for a PostgreSQL result.
+///
+/// [`get_value`](Self::get_value) decodes a cell as a lossy UTF-8 `String`. For
+/// byte-exact access, or to tell a SQL `NULL` apart from an empty value, use
+/// [`get_bytes`](Self::get_bytes).
 pub struct PgResult {
     result: *mut PGresult,
 }
@@ -909,6 +913,50 @@ impl PgResult {
         } else {
             unsafe { Some(CStr::from_ptr(value_ptr).to_string_lossy().into_owned()) }
         }
+    }
+
+    /// Get a field value as raw bytes, borrowed from this `PgResult`.
+    ///
+    /// Returns `None` if the cell is SQL `NULL`, if `row` or `col` is out of
+    /// range, or if either index is negative. Unlike [`Self::get_value`], the
+    /// slice is byte-exact: it preserves embedded NUL bytes and non-UTF8
+    /// sequences, as required for `BYTEA` columns and for any column read in
+    /// binary protocol mode.
+    ///
+    /// The slice borrows from `self` and is valid until this `PgResult` is
+    /// dropped. For an owned copy, see [`Self::get_bytes_owned`].
+    pub fn get_bytes(&self, row: i32, col: i32) -> Option<&[u8]> {
+        if row < 0 || col < 0 || row >= self.ntuples() || col >= self.nfields() {
+            return None;
+        }
+        // PQgetisnull returns 1 for SQL NULL, 0 otherwise (including ''::bytea),
+        // which is how a NULL cell is told apart from an empty value.
+        if unsafe { PQgetisnull(self.result, row, col) } != 0 {
+            return None;
+        }
+        let ptr = unsafe { PQgetvalue(self.result, row, col) };
+        if ptr.is_null() {
+            return None;
+        }
+        let len = unsafe { PQgetlength(self.result, row, col) };
+        // SAFETY:
+        // - `ptr` is non-null (checked above) and points into the buffer owned
+        //   by `self.result`, which libpq keeps alive until `PQclear`.
+        // - `len` is libpq's reported byte length for a valid, non-NULL cell and
+        //   is `>= 0`, so the cast to `usize` is exact.
+        // - That buffer holds `len` contiguous, initialized bytes.
+        // - The slice lifetime is bounded by `&self`, so it cannot outlive the
+        //   `PQclear` in `Drop`, and no mutable aliasing exists because
+        //   `PgResult` is not `Sync` and this takes `&self`.
+        Some(unsafe { core::slice::from_raw_parts(ptr.cast::<u8>(), len as usize) })
+    }
+
+    /// Get a field value as owned bytes.
+    ///
+    /// Equivalent to `self.get_bytes(row, col).map(<[u8]>::to_vec)`, for
+    /// consumers that need to drop this `PgResult` before processing the cell.
+    pub fn get_bytes_owned(&self, row: i32, col: i32) -> Option<Vec<u8>> {
+        self.get_bytes(row, col).map(<[u8]>::to_vec)
     }
 
     /// Get error message if any
@@ -2262,5 +2310,111 @@ mod tests {
         );
         let err = result.err().expect("expected error");
         assert!(err.to_string().contains("null bytes"));
+    }
+
+    // === PgResult::get_bytes / get_bytes_owned ===
+
+    /// Build a single-row `PgResult` with one binary column per `cells` entry,
+    /// using libpq's result-construction API so no server is needed. `None`
+    /// sets a SQL NULL cell, `Some(bytes)` sets a binary value (len may be 0).
+    fn make_bytea_result(cells: &[Option<&[u8]>]) -> PgResult {
+        use libpq_sys::{
+            ExecStatusType, PGresAttDesc, PQmakeEmptyPGresult, PQsetResultAttrs, PQsetvalue,
+        };
+        use std::os::raw::{c_char, c_int};
+
+        let names: Vec<CString> = (0..cells.len())
+            .map(|i| CString::new(format!("c{i}")).unwrap())
+            .collect();
+        let mut attrs: Vec<PGresAttDesc> = names
+            .iter()
+            .map(|name| PGresAttDesc {
+                name: name.as_ptr() as *mut c_char,
+                tableid: 0,
+                columnid: 0,
+                format: 1, // binary
+                typid: 17, // BYTEA
+                typlen: -1,
+                atttypmod: -1,
+            })
+            .collect();
+
+        unsafe {
+            let res = PQmakeEmptyPGresult(std::ptr::null_mut(), ExecStatusType::PGRES_TUPLES_OK);
+            assert!(!res.is_null(), "PQmakeEmptyPGresult returned null");
+            assert_ne!(
+                PQsetResultAttrs(res, cells.len() as c_int, attrs.as_mut_ptr()),
+                0,
+                "PQsetResultAttrs failed"
+            );
+            // libpq deep-copies the descriptors, so `names`/`attrs` can drop after this.
+            for (col, cell) in cells.iter().enumerate() {
+                let rc = match cell {
+                    None => PQsetvalue(res, 0, col as c_int, std::ptr::null_mut(), -1),
+                    Some(bytes) => PQsetvalue(
+                        res,
+                        0,
+                        col as c_int,
+                        bytes.as_ptr() as *mut c_char,
+                        bytes.len() as c_int,
+                    ),
+                };
+                assert_ne!(rc, 0, "PQsetvalue failed for col {col}");
+            }
+            PgResult::new(res)
+        }
+    }
+
+    #[test]
+    fn get_bytes_reads_ascii_payload() {
+        let res = make_bytea_result(&[Some(b"hello")]);
+        assert_eq!(res.get_bytes(0, 0), Some(&b"hello"[..]));
+    }
+
+    #[test]
+    fn get_bytes_preserves_non_utf8() {
+        let res = make_bytea_result(&[Some(&[0xDE, 0xAD, 0xBE, 0xEF])]);
+        assert_eq!(res.get_bytes(0, 0), Some(&[0xDE, 0xAD, 0xBE, 0xEF][..]));
+    }
+
+    #[test]
+    fn get_bytes_preserves_embedded_nul() {
+        let res = make_bytea_result(&[Some(&[0x00, 0x01, 0x00, 0x02])]);
+        // get_value stops at the first NUL via CStr; get_bytes must not.
+        assert_eq!(res.get_bytes(0, 0), Some(&[0x00, 0x01, 0x00, 0x02][..]));
+    }
+
+    #[test]
+    fn get_bytes_distinguishes_null_from_empty() {
+        let res = make_bytea_result(&[None, Some(&[])]);
+        assert_eq!(res.get_bytes(0, 0), None, "SQL NULL must be None");
+        assert_eq!(
+            res.get_bytes(0, 1),
+            Some(&[][..]),
+            "empty bytea must be Some(&[])"
+        );
+    }
+
+    #[test]
+    fn get_bytes_out_of_range_and_negative_return_none() {
+        let res = make_bytea_result(&[Some(b"x")]);
+        assert_eq!(res.ntuples(), 1);
+        assert_eq!(res.nfields(), 1);
+        assert_eq!(res.get_bytes(1, 0), None, "row past end");
+        assert_eq!(res.get_bytes(0, 1), None, "col past end");
+        assert_eq!(res.get_bytes(-1, 0), None, "negative row");
+        assert_eq!(res.get_bytes(0, -1), None, "negative col");
+    }
+
+    #[test]
+    fn get_bytes_owned_matches_borrowed() {
+        let res = make_bytea_result(&[Some(&[0x00, 0xFF, 0x10])]);
+        let borrowed = res.get_bytes(0, 0).map(<[u8]>::to_vec);
+        let owned = res.get_bytes_owned(0, 0);
+        assert_eq!(owned, Some(vec![0x00, 0xFF, 0x10]));
+        assert_eq!(owned, borrowed);
+
+        let res_null = make_bytea_result(&[None]);
+        assert_eq!(res_null.get_bytes_owned(0, 0), None);
     }
 }
