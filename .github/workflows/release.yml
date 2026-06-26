@@ -5,9 +5,15 @@ on:
     tags: ['v*']
 
 jobs:
+  checks:
+    name: Checks
+    uses: ./.github/workflows/ci-checks.yml
+    secrets: inherit
+
   publish:
     name: Publish to crates.io
     runs-on: ubuntu-latest
+    needs: checks
 
     steps:
     - name: Checkout repository
@@ -19,7 +25,7 @@ jobs:
       run: |
         git fetch origin main
         if git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-          echo "Tag commit is on main branch — proceeding with publish."
+          echo "Tag commit is on main branch. Proceeding with publish."
         else
           echo "Error: Tag is NOT on the main branch. Publishing is only allowed from main."
           exit 1
