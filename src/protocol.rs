@@ -646,15 +646,16 @@ impl ReplicationState {
         self.last_sent_applied_lsn = applied_lsn;
     }
 
+    /// Mark feedback as sent and record the LSN values sent.
     #[cfg(feature = "std")]
-    /// Mark feedback as sent and record the LSN values sent
     pub fn mark_feedback_sent_with_lsn(&mut self, flush_lsn: XLogRecPtr, applied_lsn: XLogRecPtr) {
-        self.last_feedback_time = std::time::Instant::now();
+        self.mark_feedback_sent();
         self.record_sent_lsns(flush_lsn, applied_lsn);
     }
 
+    /// Mark feedback as sent without updating recorded LSNs.
     #[cfg(feature = "std")]
-    /// Mark feedback as sent (backward compatibility)
+    #[inline]
     pub fn mark_feedback_sent(&mut self) {
         self.last_feedback_time = std::time::Instant::now();
     }
