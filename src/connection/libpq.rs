@@ -927,8 +927,11 @@ impl PgResult {
             return None;
         }
         let len = unsafe { PQgetlength(self.result, row, col) };
-        // SAFETY: non-null `ptr` to `len >= 0` initialized bytes owned by
-        // `self.result` (freed only in `Drop`); the `&self` slice cannot outlive
+        if len < 0 {
+            return None;
+        }
+        // SAFETY: non-null `ptr` to `len` initialized bytes owned by
+        // `self.result` (freed only in `Drop`). The `&self` slice cannot outlive
         // it and `PgResult` is not `Sync`, so there is no aliasing.
         Some(unsafe { core::slice::from_raw_parts(ptr.cast::<u8>(), len as usize) })
     }
