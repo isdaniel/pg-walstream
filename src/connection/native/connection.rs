@@ -76,6 +76,9 @@ enum Command {
 struct Worker {
     transport: Transport,
     read_buf: BytesMut,
+    /// Batch stashed from a request whose reply receiver was dropped. Returned
+    /// on the next `get_copy_batch` so a cancelled caller never drops consumed WAL.
+    pending: VecDeque<Bytes>,
     server_ver: i32,
     alive: Arc<AtomicBool>,
 }
@@ -90,6 +93,11 @@ impl Worker {
     /// caller one at a time, so the cross-thread round trip is amortized across
     /// the whole batch rather than paid per message.
     async fn get_copy_batch(&mut self, token: &CancellationToken) -> Result<VecDeque<Bytes>> {
+        // Return a batch stashed from a previously cancelled request first, so
+        // its already-consumed WAL messages are not skipped.
+        if !self.pending.is_empty() {
+            return Ok(std::mem::take(&mut self.pending));
+        }
         let mut batch = VecDeque::new();
         let first =
             match copy::get_copy_data(&mut self.transport, &mut self.read_buf, &mut batch, token)
@@ -107,6 +115,27 @@ impl Worker {
         // of this read's drained messages in `batch`; restore their order.
         batch.push_front(first);
         Ok(batch)
+    }
+
+    /// Run a `GetCopyBatch` command, preserving the batch if the caller went
+    /// away. If the oneshot receiver was dropped (the caller cancelled by
+    /// dropping the future), the already-consumed WAL messages are stashed in
+    /// `pending` and returned on the next request instead of being lost.
+    async fn handle_get_copy_batch(
+        &mut self,
+        token: &CancellationToken,
+        reply: oneshot::Sender<Result<VecDeque<Bytes>>>,
+    ) {
+        match self.get_copy_batch(token).await {
+            Ok(batch) => {
+                if let Err(Ok(batch)) = reply.send(Ok(batch)) {
+                    self.pending = batch;
+                }
+            }
+            Err(e) => {
+                let _ = reply.send(Err(e));
+            }
+        }
     }
 
     async fn put_copy_data(&mut self, data: &[u8]) -> Result<()> {
@@ -153,6 +182,7 @@ impl WorkerInit {
                 Ok(Worker {
                     transport,
                     read_buf,
+                    pending: VecDeque::new(),
                     server_ver,
                     alive,
                 })
@@ -169,6 +199,7 @@ impl WorkerInit {
                 Ok(Worker {
                     transport: Transport::Plain(tcp),
                     read_buf: BytesMut::new(),
+                    pending: VecDeque::new(),
                     server_ver,
                     alive,
                 })
@@ -217,7 +248,7 @@ fn run_worker(
                     let _ = reply.send(worker.query(&sql).await);
                 }
                 Command::GetCopyBatch { token, reply } => {
-                    let _ = reply.send(worker.get_copy_batch(&token).await);
+                    worker.handle_get_copy_batch(&token, reply).await;
                 }
                 Command::PutCopyData { data, reply } => {
                     let _ = reply.send(worker.put_copy_data(&data).await);
@@ -412,6 +443,12 @@ impl NativeConnection {
     ///
     /// Serves from the local batch buffer first (no channel traffic), and only
     /// on empty requests a fresh batch from the worker over a oneshot.
+    ///
+    /// Cancel by signalling `cancellation_token`, not by dropping this future.
+    /// If the future is dropped while the worker is delivering a batch, the
+    /// worker stashes that batch and returns it on the next call so no WAL is
+    /// lost. The token is the intended cancellation path and is what the
+    /// streaming loop uses.
     pub async fn get_copy_data_async(
         &mut self,
         cancellation_token: &CancellationToken,
@@ -1324,5 +1361,76 @@ mod tests {
     async fn test_drop_does_not_panic_on_current_thread_runtime() {
         let conn = NativeConnection::null_for_testing();
         drop(conn); // must not panic on a current-thread runtime
+    }
+
+    // === Worker batch stash (cancellation data-loss guard) ===
+
+    fn copy_data_frame(payload: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(5 + payload.len());
+        frame.push(b'd');
+        frame.extend_from_slice(&((4 + payload.len()) as i32).to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    async fn worker_with_loopback() -> (Worker, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let worker = Worker {
+            transport: Transport::Plain(client),
+            read_buf: BytesMut::new(),
+            pending: VecDeque::new(),
+            server_ver: 160000,
+            alive: Arc::new(AtomicBool::new(true)),
+        };
+        (worker, server)
+    }
+
+    #[tokio::test]
+    async fn test_worker_get_copy_batch_returns_pending_first() {
+        let (mut worker, _server) = worker_with_loopback().await;
+        worker.pending.push_back(Bytes::from_static(b"alpha"));
+        worker.pending.push_back(Bytes::from_static(b"beta"));
+
+        // A non-empty stash is returned without touching the socket.
+        let batch = worker
+            .get_copy_batch(&CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(batch.len(), 2);
+        assert_eq!(&batch[0][..], b"alpha");
+        assert_eq!(&batch[1][..], b"beta");
+        assert!(worker.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_worker_stashes_batch_when_reply_receiver_dropped() {
+        use tokio::io::AsyncWriteExt;
+        let (mut worker, mut server) = worker_with_loopback().await;
+        server
+            .write_all(&copy_data_frame(b"wal-message"))
+            .await
+            .unwrap();
+        server.flush().await.unwrap();
+
+        // Caller cancelled by dropping the future: the reply receiver is gone.
+        let (reply_tx, reply_rx) = oneshot::channel();
+        drop(reply_rx);
+        let token = CancellationToken::new();
+        worker.handle_get_copy_batch(&token, reply_tx).await;
+
+        // The consumed message must be stashed, not silently lost.
+        assert_eq!(worker.pending.len(), 1);
+        assert_eq!(&worker.pending[0][..], b"wal-message");
+
+        // The next request with a live receiver returns it.
+        let (reply_tx2, reply_rx2) = oneshot::channel();
+        worker.handle_get_copy_batch(&token, reply_tx2).await;
+        let batch = reply_rx2.await.unwrap().unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(&batch[0][..], b"wal-message");
+        assert!(worker.pending.is_empty());
     }
 }
