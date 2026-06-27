@@ -173,6 +173,10 @@ jobs:
         psql -h localhost -U postgres -d test_walstream -c "ALTER SYSTEM SET wal_level = 'logical';"
         psql -h localhost -U postgres -d test_walstream -c "ALTER SYSTEM SET max_replication_slots = 16;"
         psql -h localhost -U postgres -d test_walstream -c "ALTER SYSTEM SET max_wal_senders = 16;"
+        # Two-phase commit tests (pgoutput_fidelity, streaming_decode) need prepared transactions.
+        psql -h localhost -U postgres -d test_walstream -c "ALTER SYSTEM SET max_prepared_transactions = 16;"
+        # streaming_decode forces protocol-v2 streaming by keeping the reorder buffer tiny.
+        psql -h localhost -U postgres -d test_walstream -c "ALTER SYSTEM SET logical_decoding_work_mem = '64kB';"
         # Restart PostgreSQL container to apply wal_level change (requires restart)
         docker restart ${{ job.services.postgres.id }}
         # Wait for PostgreSQL to be ready after restart
@@ -218,6 +222,26 @@ jobs:
           -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_type = 'logical';" || true
 
         cargo test --test typed_deserialization -- --ignored --nocapture --test-threads=1
+
+        PGPASSWORD=postgres psql -h localhost -U postgres -d test_walstream \
+          -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_type = 'logical';" || true
+
+        cargo test --test pgoutput_fidelity -- --ignored --nocapture --test-threads=1
+
+        PGPASSWORD=postgres psql -h localhost -U postgres -d test_walstream \
+          -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_type = 'logical';" || true
+
+        cargo test --test streaming_decode -- --ignored --nocapture --test-threads=1
+
+        PGPASSWORD=postgres psql -h localhost -U postgres -d test_walstream \
+          -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_type = 'logical';" || true
+
+        cargo test --test binary_columns -- --ignored --nocapture --test-threads=1
+
+        PGPASSWORD=postgres psql -h localhost -U postgres -d test_walstream \
+          -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_type = 'logical';" || true
+
+        cargo test --test pg_result_get_bytes -- --ignored --nocapture --test-threads=1
 
   integration-ssl:
     name: SSL Integration Tests (PG ${{ matrix.pg_version }})
