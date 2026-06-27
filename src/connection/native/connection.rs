@@ -321,25 +321,18 @@ fn run_worker(
     });
 }
 
-/// Drive an async future to completion from a sync context. Used only by the
-/// inline driver, which `connect` selects solely under a multi-thread ambient
-/// runtime — so the `block_in_place` + `Handle::block_on` arm is what runs in
-/// practice, reusing that persistent runtime's reactor across calls.
+/// Drive an async future to completion from a sync context, on a specific
+/// runtime. Used only by the inline driver.
 ///
-/// The fallback arm (build a temporary current-thread runtime) exists only for
-/// the forced test helpers; it must not be relied on across calls, because each
-/// temporary runtime's reactor dies when it returns, orphaning any socket
-/// created on it. Real inline connections never reach it.
-fn run_sync<F: std::future::Future>(fut: F) -> F::Output {
+/// `handle` is the multi-thread runtime the connection's socket was created on (captured at `connect`). We always drive the future on *that* runtime so the socket stays registered on its original reactor — regardless of the caller's context. This matters most on `Drop`: a connection can be dropped after the ambient runtime context is gone (e.g. moved out of the `block_on` scope it was created in), and resolving the runtime via `Handle::try_current()` at that point would build a throwaway runtime whose reactor never owned the socket, orphaning it and risking a silent hang.
+fn run_sync<F: std::future::Future>(handle: &tokio::runtime::Handle, fut: F) -> F::Output {
     match tokio::runtime::Handle::try_current() {
-        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(|| h.block_on(fut))
+        // Nested inside a multi-thread runtime worker: we must not block it directly. `block_in_place` offloads this worker; the inner `block_on` then drives `fut` on the stored handle's reactor. In the common case the stored handle *is* the current runtime (the canonical pattern).
+        Ok(cur) if cur.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| handle.block_on(fut))
         }
-        _ => tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("failed to build fallback runtime for native sync bridge")
-            .block_on(fut),
+        // No ambient runtime (e.g. `Drop` on a plain thread): block on the stored handle directly. The runtime's own worker threads service the reactor.
+        _ => handle.block_on(fut),
     }
 }
 
@@ -352,6 +345,8 @@ enum Driver {
     Inline {
         worker: Worker,
         pending: VecDeque<Bytes>,
+        /// The multi-thread runtime the socket was created on; `run_sync` always drives sync I/O on it so the socket never ends up on a foreign or temporary reactor (see `run_sync`).
+        handle: tokio::runtime::Handle,
     },
     /// Worker lives on its own thread; commands cross `cmd_tx`, batches `batch_rx`.
     Threaded {
@@ -411,8 +406,10 @@ impl NativeConnection {
 
     /// Inline driver: build the worker on the caller's runtime via `run_sync`.
     fn connect_inline(conninfo: &str) -> Result<Self> {
+        let handle = tokio::runtime::Handle::current();
         let alive = Arc::new(AtomicBool::new(false));
         let worker = run_sync(
+            &handle,
             WorkerInit::Connect {
                 conninfo: conninfo.to_string(),
                 alive: alive.clone(),
@@ -429,6 +426,7 @@ impl NativeConnection {
             driver: Driver::Inline {
                 worker,
                 pending: VecDeque::with_capacity(256),
+                handle,
             },
             server_ver,
             in_copy_mode: false,
@@ -494,7 +492,7 @@ impl NativeConnection {
     /// Run a simple query: inline on the worker, or over the command channel.
     fn run_query(&mut self, sql: &str) -> Result<NativePgResult> {
         match &mut self.driver {
-            Driver::Inline { worker, .. } => run_sync(worker.query(sql)),
+            Driver::Inline { worker, handle, .. } => run_sync(handle, worker.query(sql)),
             Driver::Threaded { cmd_tx, .. } => {
                 let (reply_tx, reply_rx) = std_mpsc::channel();
                 cmd_tx
@@ -600,7 +598,9 @@ impl NativeConnection {
         match &mut self.driver {
             // Inline: read directly on the caller's runtime. `copy::get_copy_data`
             // serves from `pending` first, then reads+drains the socket.
-            Driver::Inline { worker, pending } => {
+            Driver::Inline {
+                worker, pending, ..
+            } => {
                 let result = copy::get_copy_data(
                     &mut worker.transport,
                     &mut worker.read_buf,
@@ -918,9 +918,28 @@ impl NativeConnection {
     fn close_connection(&mut self) {
         let in_copy_mode = self.in_copy_mode;
         match &mut self.driver {
-            Driver::Inline { worker, pending } => {
-                // Best-effort graceful shutdown on the caller's runtime.
-                run_sync(worker.close(in_copy_mode));
+            Driver::Inline {
+                worker,
+                pending,
+                handle,
+            } => {
+                // Best-effort graceful shutdown (CopyDone + Terminate) on the
+                // connection's original runtime. `close` only borrows the worker, so we can block to completion in the cases where that is safe:
+                //
+                //   - nested in a multi-thread runtime → `block_in_place` + `block_on`
+                //   - no ambient runtime (plain-thread Drop) → `block_on` directly
+                //
+                // We must NOT block when dropped *inside* a current-thread runtime: `block_in_place` requires a multi-thread runtime and `block_on`
+                // panics ("cannot start a runtime from within a runtime"). There we skip the courtesy close; the socket still closes via TCP FIN when `worker` drops, and PostgreSQL reaps the walsender on disconnect.
+                match tokio::runtime::Handle::try_current() {
+                    Ok(cur)
+                        if cur.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
+                    {
+                        tokio::task::block_in_place(|| handle.block_on(worker.close(in_copy_mode)));
+                    }
+                    Err(_) => handle.block_on(worker.close(in_copy_mode)),
+                    Ok(_) => { /* current-thread runtime: cannot block safely; skip */ }
+                }
                 pending.clear();
             }
             Driver::Threaded {
@@ -1020,7 +1039,8 @@ impl NativeConnection {
     }
 
     /// Create a null **inline-driver** connection for testing. Must be called on
-    /// a multi-thread runtime or with no ambient runtime so `run_sync` is safe.
+    /// a multi-thread runtime so the connect-time `Handle` can be captured and
+    /// `run_sync` is safe.
     pub(crate) fn null_for_testing_inline() -> Self {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1028,8 +1048,10 @@ impl NativeConnection {
         std_tcp.set_nonblocking(true).unwrap();
         let _peer = listener.accept().unwrap();
 
+        let handle = tokio::runtime::Handle::current();
         let alive = Arc::new(AtomicBool::new(false));
         let worker = run_sync(
+            &handle,
             WorkerInit::Null {
                 std_tcp,
                 server_ver: 160000,
@@ -1044,6 +1066,7 @@ impl NativeConnection {
             driver: Driver::Inline {
                 worker,
                 pending: VecDeque::new(),
+                handle,
             },
             server_ver,
             in_copy_mode: false,
@@ -1649,6 +1672,50 @@ mod tests {
         drop(conn); // Drop → run_sync(worker.close) on a multi-thread runtime.
     }
 
+    #[test]
+    fn test_inline_drop_outside_ambient_runtime_does_not_panic() {
+        // Build the inline connection inside a multi-thread runtime (so its socket
+        // is created on that runtime's reactor and the connect-time `Handle` is
+        // captured), then move it out and drop it with NO ambient runtime. The
+        // stored handle must drive the shutdown on the original reactor — without
+        // it, `run_sync` would build a throwaway runtime and orphan the socket, or
+        // (per the reviewer's literal suggestion) call `block_in_place` off-runtime
+        // and panic here.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let conn = rt.block_on(async { NativeConnection::null_for_testing_inline() });
+        assert!(conn.driver_is_inline());
+        drop(conn); // no ambient runtime here → must not panic
+        drop(rt);
+    }
+
+    #[test]
+    fn test_inline_drop_within_current_thread_runtime_does_not_panic() {
+        // Build the inline connection on a multi-thread runtime (handle = mt), then
+        // drop it from *inside* a current-thread runtime. `close_connection` must
+        // not block_on the stored handle there — that panics with "cannot start a
+        // runtime from within a runtime" (issue #76's failure mode). Best-effort
+        // graceful close is skipped; the socket still closes via TCP FIN.
+        let mt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let conn = mt.block_on(async { NativeConnection::null_for_testing_inline() });
+        assert!(conn.driver_is_inline());
+
+        let ct = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        ct.block_on(async move {
+            drop(conn); // must not panic on a current-thread runtime
+        });
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_inline_get_copy_data_drains_pending() {
         use tokio::io::AsyncWriteExt;
@@ -1657,6 +1724,7 @@ mod tests {
             driver: Driver::Inline {
                 worker,
                 pending: VecDeque::new(),
+                handle: tokio::runtime::Handle::current(),
             },
             server_ver: 160000,
             in_copy_mode: true, // skip the replication-mode gate
