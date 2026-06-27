@@ -61,6 +61,16 @@ fn regular_conn_string() -> String {
     })
 }
 
+/// `server_version_num` (e.g. 160000 for PG 16). Returns 0 if it cannot be read.
+fn server_version_num() -> i32 {
+    PgReplicationConnection::connect(&regular_conn_string())
+        .ok()
+        .and_then(|mut c| c.exec("SHOW server_version_num").ok())
+        .and_then(|r| r.get_value(0, 0))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
 fn setup(conn: &mut PgReplicationConnection) {
     let _ = conn.exec(
         "CREATE TABLE IF NOT EXISTS stream_test (id SERIAL PRIMARY KEY, payload TEXT NOT NULL)",
@@ -292,6 +302,12 @@ async fn streams_large_committed_transaction() {
 #[tokio::test]
 #[ignore = "requires live PostgreSQL with wal_level=logical and low logical_decoding_work_mem"]
 async fn streams_large_committed_transaction_parallel_v4() {
+    // `streaming = parallel` (protocol v4) requires PostgreSQL 16+.
+    let ver = server_version_num();
+    if ver < 160000 {
+        eprintln!("skipping parallel-v4 test: requires PG 16+ (server_version_num={ver})");
+        return;
+    }
     let slot = "it_stream_commit_v4";
     drop_slot(slot);
 
@@ -347,6 +363,14 @@ async fn streams_large_committed_transaction_parallel_v4() {
 #[tokio::test]
 #[ignore = "requires live PostgreSQL with wal_level=logical and low logical_decoding_work_mem"]
 async fn streams_large_aborted_transaction_v4() {
+    // `streaming = parallel` (v4) requires PG 16+; PG 18+ detects the rollback and
+    // stops decoding the aborted transaction before it streams, so no StreamAbort
+    // is delivered. This abort-tail coverage therefore only runs on PG 16/17.
+    let ver = server_version_num();
+    if !(160000..180000).contains(&ver) {
+        eprintln!("skipping aborted parallel-v4 test: needs PG 16/17 (server_version_num={ver})");
+        return;
+    }
     let slot = "it_stream_abort_v4";
     drop_slot(slot);
 
@@ -486,6 +510,16 @@ async fn streaming_bytes_reencode_identically() {
 #[tokio::test]
 #[ignore = "requires live PostgreSQL with wal_level=logical and low logical_decoding_work_mem"]
 async fn aborted_stream_bytes_reencode_identically() {
+    // See `streams_large_aborted_transaction_v4`: parallel-v4 abort framing is
+    // only delivered on PG 16/17 (PG 15 lacks parallel streaming; PG 18+ skips
+    // decoding aborted transactions).
+    let ver = server_version_num();
+    if !(160000..180000).contains(&ver) {
+        eprintln!(
+            "skipping aborted raw parallel-v4 test: needs PG 16/17 (server_version_num={ver})"
+        );
+        return;
+    }
     let slot = "it_stream_abort_raw_v4";
     drop_slot(slot);
 

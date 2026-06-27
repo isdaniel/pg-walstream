@@ -42,10 +42,14 @@ enum Command {
         sql: String,
         reply: std_mpsc::Sender<Result<NativePgResult>>,
     },
-    /// Read the next batch of CopyData payloads from the replication stream.
-    GetCopyBatch {
+    /// Enter the streaming push loop: the worker continuously reads CopyData
+    /// batches and pushes them down `batch_tx` until the token is cancelled, the
+    /// receiver is dropped, or a read error occurs. Replaces the old per-event
+    /// `GetCopyBatch` request/reply round-trip, which cost two cross-thread
+    /// wakeups per WAL message.
+    StreamCopy {
         token: CancellationToken,
-        reply: oneshot::Sender<Result<VecDeque<Bytes>>>,
+        batch_tx: mpsc::Sender<Result<VecDeque<Bytes>>>,
     },
     /// Send one CopyData message (standby status update or hot standby feedback).
     PutCopyData {
@@ -59,13 +63,25 @@ enum Command {
     },
 }
 
+/// Bounded batch queue between the worker thread and the consumer. Bounds
+/// memory and applies backpressure when the consumer falls behind; a handful of
+/// batches is enough to let the worker's next read overlap the consumer's parse.
+const BATCH_CHANNEL_CAP: usize = 16;
+
+/// What to do after the streaming loop services an interleaved command.
+enum StreamCmd {
+    /// Keep streaming.
+    Continue,
+    /// `Close` was handled; the worker should stop.
+    Close,
+    /// The command channel is gone; the worker should stop.
+    WorkerGone,
+}
+
 /// Transport-owning state that lives entirely on the worker thread.
 struct Worker {
     transport: Transport,
     read_buf: BytesMut,
-    /// Batch stashed from a request whose reply receiver was dropped. Returned
-    /// on the next `get_copy_batch` so a cancelled caller never drops consumed WAL.
-    pending: VecDeque<Bytes>,
     server_ver: i32,
     alive: Arc<AtomicBool>,
 }
@@ -75,47 +91,89 @@ impl Worker {
         query::simple_query(&mut self.transport, &mut self.read_buf, sql).await
     }
 
-    /// Read at least one CopyData payload, returning all messages drained in one
-    /// batch. The handle serves them one at a time to amortize the round trip.
-    async fn get_copy_batch(&mut self, token: &CancellationToken) -> Result<VecDeque<Bytes>> {
-        // Return a stash left by a cancelled request before reading more.
-        if !self.pending.is_empty() {
-            return Ok(std::mem::take(&mut self.pending));
-        }
-        let mut batch = VecDeque::new();
-        let first =
-            match copy::get_copy_data(&mut self.transport, &mut self.read_buf, &mut batch, token)
-                .await
-            {
-                Ok(payload) => payload,
-                Err(err) => {
-                    if matches!(err, ReplicationError::TransientConnection(_)) {
-                        self.alive.store(false, Ordering::Relaxed);
+    /// Streaming push loop. Continuously reads CopyData batches and pushes them to `batch_tx`, while still servicing interleaved commands (feedback `PutCopyData`, `Close`) on `cmd_rx`. Returns `true` if a `Close` was  handled (the worker should stop), `false` if streaming ended for any other reason (cancel, read error, or the consumer dropped the receiver).
+    ///
+    /// The two threads pipeline: while the consumer parses one batch, the workers already parked on the next socket read. A ready batch is held and sent via `reserve()` inside the same `select!` as command handling, so backpressure on a full channel never blocks an incoming feedback/Close.
+    async fn stream_copy(
+        &mut self,
+        token: CancellationToken,
+        batch_tx: mpsc::Sender<Result<VecDeque<Bytes>>>,
+        cmd_rx: &mut mpsc::UnboundedReceiver<Command>,
+    ) -> bool {
+        let mut held: Option<VecDeque<Bytes>> = None;
+        loop {
+            if let Some(batch) = held.take() {
+                tokio::select! {
+                    biased;
+                    cmd = cmd_rx.recv() => {
+                        held = Some(batch);
+                        match self.handle_stream_cmd(cmd).await {
+                            StreamCmd::Continue => continue,
+                            StreamCmd::Close => return true,
+                            StreamCmd::WorkerGone => return false,
+                        }
                     }
-                    return Err(err);
+                    permit = batch_tx.reserve() => match permit {
+                        Ok(permit) => permit.send(Ok(batch)),
+                        Err(_) => return false, // consumer dropped the receiver
+                    }
                 }
-            };
-        // `get_copy_data` returned the first message; the rest stayed in `batch`.
-        batch.push_front(first);
-        Ok(batch)
+            } else {
+                let mut batch = VecDeque::new();
+                tokio::select! {
+                    biased;
+                    cmd = cmd_rx.recv() => {
+                        match self.handle_stream_cmd(cmd).await {
+                            StreamCmd::Continue => continue,
+                            StreamCmd::Close => return true,
+                            StreamCmd::WorkerGone => return false,
+                        }
+                    }
+                    read = copy::get_copy_data(
+                        &mut self.transport, &mut self.read_buf, &mut batch, &token,
+                    ) => match read {
+                        Ok(first) => {
+                            batch.push_front(first);
+                            held = Some(batch);
+                        }
+                        Err(err) => {
+                            if matches!(err, ReplicationError::TransientConnection(_)) {
+                                self.alive.store(false, Ordering::Relaxed);
+                            }
+                            let _ = batch_tx.send(Err(err)).await;
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    /// If the caller dropped the reply (cancelled), stash the batch so its
-    /// already-consumed WAL is returned next time instead of being lost.
-    async fn handle_get_copy_batch(
-        &mut self,
-        token: &CancellationToken,
-        reply: oneshot::Sender<Result<VecDeque<Bytes>>>,
-    ) {
-        match self.get_copy_batch(token).await {
-            Ok(batch) => {
-                if let Err(Ok(batch)) = reply.send(Ok(batch)) {
-                    self.pending = batch;
-                }
+    /// Service a command that arrived mid-stream.
+    async fn handle_stream_cmd(&mut self, cmd: Option<Command>) -> StreamCmd {
+        match cmd {
+            Some(Command::PutCopyData { data, reply }) => {
+                let _ = reply.send(self.put_copy_data(&data).await);
+                StreamCmd::Continue
             }
-            Err(e) => {
-                let _ = reply.send(Err(e));
+            Some(Command::Query { sql, reply }) => {
+                let _ = reply.send(self.query(&sql).await);
+                StreamCmd::Continue
             }
+            Some(Command::Close {
+                in_copy_mode,
+                reply,
+            }) => {
+                self.close(in_copy_mode).await;
+                let _ = reply.send(());
+                StreamCmd::Close
+            }
+            Some(Command::StreamCopy { batch_tx, .. }) => {
+                // Already streaming; reject a duplicate request rather than nest.
+                let _ = batch_tx.try_send(Err(ReplicationError::backend("already streaming")));
+                StreamCmd::Continue
+            }
+            None => StreamCmd::WorkerGone,
         }
     }
 
@@ -163,7 +221,6 @@ impl WorkerInit {
                 Ok(Worker {
                     transport,
                     read_buf,
-                    pending: VecDeque::new(),
                     server_ver,
                     alive,
                 })
@@ -180,7 +237,6 @@ impl WorkerInit {
                 Ok(Worker {
                     transport: Transport::Plain(tcp),
                     read_buf: BytesMut::new(),
-                    pending: VecDeque::new(),
                     server_ver,
                     alive,
                 })
@@ -241,8 +297,12 @@ fn run_worker(
                 Command::Query { sql, reply } => {
                     let _ = reply.send(worker.query(&sql).await);
                 }
-                Command::GetCopyBatch { token, reply } => {
-                    worker.handle_get_copy_batch(&token, reply).await;
+                Command::StreamCopy { token, batch_tx } => {
+                    // Runs its own loop, servicing interleaved commands, until
+                    // streaming ends. Returns true only if it handled a Close.
+                    if worker.stream_copy(token, batch_tx, &mut cmd_rx).await {
+                        break;
+                    }
                 }
                 Command::PutCopyData { data, reply } => {
                     let _ = reply.send(worker.put_copy_data(&data).await);
@@ -266,21 +326,19 @@ fn run_worker(
 /// `stream.rs` works unchanged regardless of backend. All socket I/O runs on a
 /// dedicated worker thread (see the worker bridge note above).
 pub struct NativeConnection {
-    /// Command channel to the worker. `UnboundedSender::send` is a sync,
-    /// non-blocking call usable from any context (async or not, runtime or not).
+    /// Command channel to the worker. `UnboundedSender::send` is a sync, non-blocking call usable from any context (async or not, runtime or not).
     cmd_tx: mpsc::UnboundedSender<Command>,
     /// Worker thread handle, joined on `Drop`.
     worker: Option<std::thread::JoinHandle<()>>,
-    /// Batch buffer for the read hot path: filled one batch at a time from the
-    /// worker, drained to the caller one message at a time.
+    /// Batch buffer for the read hot path: filled one batch at a time from the worker, drained to the caller one message at a time.
     pending: VecDeque<Bytes>,
+    /// Receiver for the worker's streaming push loop. `None` until the first `get_copy_data_async` call lazily starts streaming; reset to `None` after the stream ends (cancel/error) so a later call can restart it.
+    batch_rx: Option<mpsc::Receiver<Result<VecDeque<Bytes>>>>,
     /// Server version number (e.g. 160001 for PG 16.1), cached at connect time.
     server_ver: i32,
-    /// Whether we are in COPY (replication) mode. Gates the streaming methods
-    /// and tells the worker whether to send CopyDone on shutdown.
+    /// Whether we are in COPY (replication) mode. Gates the streaming methods and tells the worker whether to send CopyDone on shutdown.
     in_copy_mode: bool,
-    /// Liveness flag shared with the worker, which clears it on a transient
-    /// read error.
+    /// Liveness flag shared with the worker, which clears it on a transient read error.
     alive: Arc<AtomicBool>,
 }
 
@@ -289,10 +347,7 @@ impl NativeConnection {
 
     /// Create a new PostgreSQL connection for logical replication.
     ///
-    /// Spawns the worker thread, which establishes the TCP connection
-    /// (optionally upgraded to TLS via rustls) and performs the v3.0 startup
-    /// handshake and authentication on its own runtime. Blocks until the worker
-    /// reports success or failure.
+    /// Spawns the worker thread, which establishes the TCP connection (optionally upgraded to TLS via rustls) and performs the v3.0 startup handshake and authentication on its own runtime. Blocks until the worker reports success or failure.
     pub fn connect(conninfo: &str) -> Result<Self> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = std_mpsc::channel();
@@ -324,6 +379,7 @@ impl NativeConnection {
                     cmd_tx,
                     worker: Some(worker),
                     pending: VecDeque::with_capacity(256),
+                    batch_rx: None,
                     server_ver,
                     in_copy_mode: false,
                     alive,
@@ -435,9 +491,9 @@ impl NativeConnection {
 
     /// Get copy data from the replication stream (truly async, non-blocking).
     ///
-    /// Serves from the local batch buffer first, requesting a fresh batch from
-    /// the worker only when empty. Cancel via `cancellation_token` rather than
-    /// by dropping this future.
+    /// Serves from the local batch buffer first. When empty, pulls the next batch the worker has already pushed down a buffered channel — no per-message request/reply round-trip. The worker streams continuously, so its next socket read overlaps the caller's parse of the current batch.
+    ///
+    /// Cancel via `cancellation_token` rather than by dropping this future.
     pub async fn get_copy_data_async(
         &mut self,
         cancellation_token: &CancellationToken,
@@ -448,24 +504,45 @@ impl NativeConnection {
             return Ok(payload);
         }
 
-        let (reply_tx, reply_rx) = oneshot::channel();
-        if self
-            .cmd_tx
-            .send(Command::GetCopyBatch {
-                token: cancellation_token.clone(),
-                reply: reply_tx,
-            })
-            .is_err()
-        {
-            self.alive.store(false, Ordering::Relaxed);
-            return Err(Self::worker_gone());
+        // Lazily start the worker's streaming push loop on first use (and after a prior stream ended), binding it to this cancellation token.
+        if self.batch_rx.is_none() {
+            let (batch_tx, batch_rx) = mpsc::channel(BATCH_CHANNEL_CAP);
+            if self
+                .cmd_tx
+                .send(Command::StreamCopy {
+                    token: cancellation_token.clone(),
+                    batch_tx,
+                })
+                .is_err()
+            {
+                self.alive.store(false, Ordering::Relaxed);
+                return Err(Self::worker_gone());
+            }
+            self.batch_rx = Some(batch_rx);
         }
 
-        let batch = match reply_rx.await {
-            Ok(result) => result?,
-            Err(_) => {
-                self.alive.store(false, Ordering::Relaxed);
-                return Err(Self::worker_reply_dropped());
+        let batch = {
+            let rx = self.batch_rx.as_mut().unwrap();
+            tokio::select! {
+                biased;
+                _ = cancellation_token.cancelled() => {
+                    // Stream is ending; drop the receiver so a later call restarts it.
+                    self.batch_rx = None;
+                    return Err(ReplicationError::Cancelled("Operation cancelled".to_string()));
+                }
+                recv = rx.recv() => match recv {
+                    Some(Ok(batch)) => batch,
+                    Some(Err(e)) => {
+                        self.batch_rx = None;
+                        return Err(e);
+                    }
+                    None => {
+                        // Worker dropped the sender (stream ended); allow a restart.
+                        self.batch_rx = None;
+                        self.alive.store(false, Ordering::Relaxed);
+                        return Err(Self::worker_gone());
+                    }
+                }
             }
         };
 
@@ -473,7 +550,7 @@ impl NativeConnection {
         Ok(self
             .pending
             .pop_front()
-            .expect("get_copy_batch returns a non-empty batch on success"))
+            .expect("stream_copy pushes only non-empty batches"))
     }
 
     /// Send feedback to the server (standby status update).
@@ -713,6 +790,10 @@ impl NativeConnection {
     /// Sends a `Close` command so the worker does a best-effort shutdown
     /// (CopyDone if streaming, then Terminate), then joins the worker thread.
     fn close_connection(&mut self) {
+        // Drop the streaming receiver first: when the worker is parked on
+        // `batch_tx.reserve()` under backpressure, closing the channel lets that
+        // branch resolve so the worker reaches the `Close` command promptly.
+        self.batch_rx = None;
         if let Some(worker) = self.worker.take() {
             let (reply_tx, reply_rx) = std_mpsc::channel();
             if self
@@ -725,7 +806,9 @@ impl NativeConnection {
             {
                 // Wait for the worker to finish its shutdown I/O before joining.
                 //
-                // Bounded blocking note: the worker serves commands one at a time, so this `Close` queues behind any in-flight `GetCopyBatch` read. If a caller dropped a `get_copy_data_async` future, that read is still parked on the socket, and this `recv()` waits until the next WAL/keepalive frame (or a socket error) lets the worker reach `Close`. The wait is bounded by the server keepalive interval, never unbounded.
+                // The streaming loop's `select!` is biased to handle commands
+                // first, so this `Close` interrupts an in-flight read or a parked
+                // `reserve()` immediately — no waiting for the next keepalive.
                 let _ = reply_rx.recv();
             }
             let _ = worker.join();
@@ -787,6 +870,7 @@ impl NativeConnection {
             cmd_tx,
             worker: Some(worker),
             pending: VecDeque::new(),
+            batch_rx: None,
             server_ver,
             in_copy_mode: false,
             alive,
@@ -1347,7 +1431,7 @@ mod tests {
         drop(conn); // must not panic on a current-thread runtime
     }
 
-    // === Worker batch stash (cancellation data-loss guard) ===
+    // === Worker streaming push loop ===
 
     fn copy_data_frame(payload: &[u8]) -> Vec<u8> {
         let mut frame = Vec::with_capacity(5 + payload.len());
@@ -1365,7 +1449,6 @@ mod tests {
         let worker = Worker {
             transport: Transport::Plain(client),
             read_buf: BytesMut::new(),
-            pending: VecDeque::new(),
             server_ver: 160000,
             alive: Arc::new(AtomicBool::new(true)),
         };
@@ -1373,48 +1456,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_worker_get_copy_batch_returns_pending_first() {
-        let (mut worker, _server) = worker_with_loopback().await;
-        worker.pending.push_back(Bytes::from_static(b"alpha"));
-        worker.pending.push_back(Bytes::from_static(b"beta"));
+    async fn test_stream_copy_pushes_batches_then_close() {
+        use tokio::io::AsyncWriteExt;
+        let (worker, mut server) = worker_with_loopback().await;
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<Command>();
+        let (batch_tx, mut batch_rx) = mpsc::channel(BATCH_CHANNEL_CAP);
+        let token = CancellationToken::new();
 
-        // A non-empty stash is returned without touching the socket.
-        let batch = worker
-            .get_copy_batch(&CancellationToken::new())
-            .await
+        let handle = tokio::spawn(async move {
+            let mut worker = worker;
+            worker.stream_copy(token, batch_tx, &mut cmd_rx).await
+        });
+
+        // Server streams two WAL messages; the worker pushes them down the channel.
+        server.write_all(&copy_data_frame(b"one")).await.unwrap();
+        server.write_all(&copy_data_frame(b"two")).await.unwrap();
+        server.flush().await.unwrap();
+
+        let mut got = Vec::new();
+        while got.len() < 2 {
+            let batch = batch_rx.recv().await.unwrap().unwrap();
+            got.extend(batch);
+        }
+        assert_eq!(&got[0][..], b"one");
+        assert_eq!(&got[1][..], b"two");
+
+        // A Close command interrupts the loop and is reported as `true`.
+        let (reply_tx, reply_rx) = std_mpsc::channel();
+        cmd_tx
+            .send(Command::Close {
+                in_copy_mode: true,
+                reply: reply_tx,
+            })
             .unwrap();
-        assert_eq!(batch.len(), 2);
-        assert_eq!(&batch[0][..], b"alpha");
-        assert_eq!(&batch[1][..], b"beta");
-        assert!(worker.pending.is_empty());
+        assert!(handle.await.unwrap(), "Close should stop the worker");
+        let _ = reply_rx.recv();
     }
 
     #[tokio::test]
-    async fn test_worker_stashes_batch_when_reply_receiver_dropped() {
-        use tokio::io::AsyncWriteExt;
-        let (mut worker, mut server) = worker_with_loopback().await;
-        server
-            .write_all(&copy_data_frame(b"wal-message"))
-            .await
-            .unwrap();
-        server.flush().await.unwrap();
-
-        // Caller cancelled by dropping the future: the reply receiver is gone.
-        let (reply_tx, reply_rx) = oneshot::channel();
-        drop(reply_rx);
+    async fn test_stream_copy_cancel_pushes_error_and_stops() {
+        let (mut worker, _server) = worker_with_loopback().await;
+        let (_cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<Command>();
+        let (batch_tx, mut batch_rx) = mpsc::channel(BATCH_CHANNEL_CAP);
         let token = CancellationToken::new();
-        worker.handle_get_copy_batch(&token, reply_tx).await;
+        token.cancel();
 
-        // The consumed message must be stashed, not silently lost.
-        assert_eq!(worker.pending.len(), 1);
-        assert_eq!(&worker.pending[0][..], b"wal-message");
-
-        // The next request with a live receiver returns it.
-        let (reply_tx2, reply_rx2) = oneshot::channel();
-        worker.handle_get_copy_batch(&token, reply_tx2).await;
-        let batch = reply_rx2.await.unwrap().unwrap();
-        assert_eq!(batch.len(), 1);
-        assert_eq!(&batch[0][..], b"wal-message");
-        assert!(worker.pending.is_empty());
+        // A pre-cancelled token makes the first read return Cancelled, which the
+        // loop forwards down the channel before stopping (not a Close → false).
+        let stopped_via_close = worker.stream_copy(token, batch_tx, &mut cmd_rx).await;
+        assert!(!stopped_via_close);
+        match batch_rx.try_recv() {
+            Ok(Err(ReplicationError::Cancelled(_))) => {}
+            other => panic!("expected a Cancelled error, got {other:?}"),
+        }
     }
 }
