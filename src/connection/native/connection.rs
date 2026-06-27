@@ -26,13 +26,6 @@ use crate::types::{
     SlotType, XLogRecPtr,
 };
 
-/// Initial capacity for the read buffer (256 KiB).
-///
-/// Sized to absorb bursts of WAL frames without reallocating the backing
-/// `BytesMut`. Increased from 64 KiB for bulk WAL throughput.
-#[allow(dead_code)]
-const READ_BUF_INITIAL_CAPACITY: usize = 256 * 1024;
-
 // A `NativeConnection` is a handle. A dedicated worker thread owns the socket on
 // its own current-thread runtime, so all I/O stays on one reactor and the
 // connection works under any runtime flavor (or none), unlike the old
@@ -196,6 +189,25 @@ impl WorkerInit {
     }
 }
 
+/// Build the transport and report the outcome back to the connecting thread.
+///
+/// Consumes `ready_tx`, which is dropped when this returns (on either path), so the worker command loop never has to thread it through or drop it by hand.
+async fn build_and_report(
+    init: WorkerInit,
+    ready_tx: std_mpsc::Sender<Result<i32>>,
+) -> Option<Worker> {
+    match init.build().await {
+        Ok(worker) => {
+            let _ = ready_tx.send(Ok(worker.server_ver));
+            Some(worker)
+        }
+        Err(e) => {
+            let _ = ready_tx.send(Err(e));
+            None
+        }
+    }
+}
+
 /// Entry point for the dedicated worker thread.
 ///
 /// Builds a current-thread runtime, establishes the transport, reports the
@@ -220,15 +232,9 @@ fn run_worker(
     };
 
     rt.block_on(async move {
-        let mut worker = match init.build().await {
-            Ok(worker) => worker,
-            Err(e) => {
-                let _ = ready_tx.send(Err(e));
-                return;
-            }
+        let Some(mut worker) = build_and_report(init, ready_tx).await else {
+            return;
         };
-        let _ = ready_tx.send(Ok(worker.server_ver));
-        drop(ready_tx);
 
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
@@ -718,6 +724,8 @@ impl NativeConnection {
                 .is_ok()
             {
                 // Wait for the worker to finish its shutdown I/O before joining.
+                //
+                // Bounded blocking note: the worker serves commands one at a time, so this `Close` queues behind any in-flight `GetCopyBatch` read. If a caller dropped a `get_copy_data_async` future, that read is still parked on the socket, and this `recv()` waits until the next WAL/keepalive frame (or a socket error) lets the worker reach `Close`. The wait is bounded by the server keepalive interval, never unbounded.
                 let _ = reply_rx.recv();
             }
             let _ = worker.join();

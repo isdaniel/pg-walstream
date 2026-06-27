@@ -36,9 +36,9 @@ fn get_bytes_against_live_result() {
     assert_eq!(res.get_bytes(2, 0), None, "SQL NULL is None");
     assert_eq!(res.get_bytes_owned(0, 0), Some(b"hello".to_vec()));
 
-    // get_value cannot tell NULL from empty: both come back as Some(String::new()).
+    // get_value delegates to get_bytes: empty text is Some(""), SQL NULL is None.
     assert_eq!(res.get_value(1, 0), Some(String::new()));
-    assert_eq!(res.get_value(2, 0), Some(String::new()));
+    assert_eq!(res.get_value(2, 0), None);
 
     conn.exec("DROP TABLE get_bytes_it").unwrap();
 }
