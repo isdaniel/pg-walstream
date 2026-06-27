@@ -56,6 +56,13 @@ pub enum ReplicationError {
     /// be spawned, exited early, or dropped a reply. Transient so the stream
     /// retry logic can reconnect.
     Backend(String),
+
+    /// A parse left input bytes unconsumed.
+    ///
+    /// `consumed` is how many bytes the parser read, `total` is the input
+    /// length. Returned by `parse_wal_message` and `parse_wal_message_bytes`
+    /// when a frame carries bytes beyond one message.
+    TrailingBytes { consumed: usize, total: usize },
 }
 
 impl core::fmt::Display for ReplicationError {
@@ -78,6 +85,10 @@ impl core::fmt::Display for ReplicationError {
             Self::Generic(msg) => write!(f, "Replication error: {msg}"),
             Self::Deserialize(msg) => write!(f, "Deserialization error: {msg}"),
             Self::Backend(msg) => write!(f, "Backend worker error: {msg}"),
+            Self::TrailingBytes { consumed, total } => write!(
+                f,
+                "Trailing bytes after WAL message: consumed {consumed} of {total} bytes"
+            ),
         }
     }
 }
@@ -502,6 +513,21 @@ mod tests {
     fn test_backend_error_is_transient() {
         let err = ReplicationError::backend("reply dropped");
         assert!(err.is_transient());
+        assert!(!err.is_permanent());
+        assert!(!err.is_cancelled());
+    }
+
+    #[test]
+    fn test_trailing_bytes_display() {
+        let err = ReplicationError::TrailingBytes {
+            consumed: 42,
+            total: 44,
+        };
+        assert_eq!(
+            err.to_string(),
+            "Trailing bytes after WAL message: consumed 42 of 44 bytes"
+        );
+        assert!(!err.is_transient());
         assert!(!err.is_permanent());
         assert!(!err.is_cancelled());
     }
