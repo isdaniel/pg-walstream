@@ -321,20 +321,53 @@ fn run_worker(
     });
 }
 
+/// Drive an async future to completion from a sync context. Used only by the
+/// inline driver, which `connect` selects solely under a multi-thread ambient
+/// runtime — so the `block_in_place` + `Handle::block_on` arm is what runs in
+/// practice, reusing that persistent runtime's reactor across calls.
+///
+/// The fallback arm (build a temporary current-thread runtime) exists only for
+/// the forced test helpers; it must not be relied on across calls, because each
+/// temporary runtime's reactor dies when it returns, orphaning any socket
+/// created on it. Real inline connections never reach it.
+fn run_sync<F: std::future::Future>(fut: F) -> F::Output {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| h.block_on(fut))
+        }
+        _ => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build fallback runtime for native sync bridge")
+            .block_on(fut),
+    }
+}
+
+/// How a `NativeConnection` drives its socket I/O.
+///
+/// `Inline` runs the connection's `Worker` directly on the caller's runtime, chosen only on a multi-thread runtime, where this is safe and avoids the cross-thread channel/second-reactor cost. `Threaded` keeps the dedicated worker-thread bridge, used on a current-thread runtime (where the inline `run_sync` `block_in_place` would panic) and with no ambient runtime (where a per-call temporary runtime would orphan the socket). The Inline variant owns a `Worker` (large `Transport`) on the I/O hot path; boxing it would add a pointer indirection to every read, so the size gap with the channel-only Threaded variant is an intentional tradeoff (cf. `Transport`).
+#[allow(clippy::large_enum_variant)]
+enum Driver {
+    /// Worker owned directly; sync methods use `run_sync`, async methods await.
+    Inline {
+        worker: Worker,
+        pending: VecDeque<Bytes>,
+    },
+    /// Worker lives on its own thread; commands cross `cmd_tx`, batches `batch_rx`.
+    Threaded {
+        cmd_tx: mpsc::UnboundedSender<Command>,
+        worker: Option<std::thread::JoinHandle<()>>,
+        pending: VecDeque<Bytes>,
+        batch_rx: Option<mpsc::Receiver<Result<VecDeque<Bytes>>>>,
+    },
+}
+
 /// Pure-Rust PostgreSQL connection for replication.
 ///
-/// Provides the same public API as the libpq `PgReplicationConnection` so that
-/// `stream.rs` works unchanged regardless of backend. All socket I/O runs on a
-/// dedicated worker thread (see the worker bridge note above).
+/// Provides the same public API as the libpq `PgReplicationConnection` so that `stream.rs` works unchanged regardless of backend. Socket I/O runs either inline on the caller's runtime or on a dedicated worker thread, chosen at `connect` by the ambient runtime flavor (see `Driver`).
 pub struct NativeConnection {
-    /// Command channel to the worker. `UnboundedSender::send` is a sync, non-blocking call usable from any context (async or not, runtime or not).
-    cmd_tx: mpsc::UnboundedSender<Command>,
-    /// Worker thread handle, joined on `Drop`.
-    worker: Option<std::thread::JoinHandle<()>>,
-    /// Batch buffer for the read hot path: filled one batch at a time from the worker, drained to the caller one message at a time.
-    pending: VecDeque<Bytes>,
-    /// Receiver for the worker's streaming push loop. `None` until the first `get_copy_data_async` call lazily starts streaming; reset to `None` after the stream ends (cancel/error) so a later call can restart it.
-    batch_rx: Option<mpsc::Receiver<Result<VecDeque<Bytes>>>>,
+    /// How socket I/O is driven (inline vs. worker thread).
+    driver: Driver,
     /// Server version number (e.g. 160001 for PG 16.1), cached at connect time.
     server_ver: i32,
     /// Whether we are in COPY (replication) mode. Gates the streaming methods and tells the worker whether to send CopyDone on shutdown.
@@ -348,8 +381,63 @@ impl NativeConnection {
 
     /// Create a new PostgreSQL connection for logical replication.
     ///
-    /// Spawns the worker thread, which establishes the TCP connection (optionally upgraded to TLS via rustls) and performs the v3.0 startup handshake and authentication on its own runtime. Blocks until the worker reports success or failure.
+    /// On a **multi-thread** runtime the connection runs inline on the caller's
+    /// runtime (cheaper: no worker thread, no cross-thread channel). On a
+    /// current-thread runtime *or with no ambient runtime* it spawns a dedicated
+    /// worker thread. The choice is fixed here for the connection's lifetime.
     pub fn connect(conninfo: &str) -> Result<Self> {
+        if Self::prefer_inline_driver() {
+            Self::connect_inline(conninfo)
+        } else {
+            Self::connect_threaded(conninfo)
+        }
+    }
+
+    /// The inline driver is chosen *only* under a persistent multi-thread ambient
+    /// runtime, where `run_sync` (`block_in_place` + `Handle::block_on`) reuses
+    /// that runtime's reactor across calls — so the connection's socket stays
+    /// registered for the connection's whole lifetime.
+    ///
+    /// A current-thread ambient runtime can't run `block_in_place`, and with no
+    /// ambient runtime each `run_sync` would spin up a *fresh* temporary runtime
+    /// whose reactor dies when it returns, orphaning the long-lived socket. Both
+    /// cases therefore use the worker thread, which owns one persistent runtime.
+    fn prefer_inline_driver() -> bool {
+        matches!(
+            tokio::runtime::Handle::try_current(),
+            Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        )
+    }
+
+    /// Inline driver: build the worker on the caller's runtime via `run_sync`.
+    fn connect_inline(conninfo: &str) -> Result<Self> {
+        let alive = Arc::new(AtomicBool::new(false));
+        let worker = run_sync(
+            WorkerInit::Connect {
+                conninfo: conninfo.to_string(),
+                alive: alive.clone(),
+            }
+            .build(),
+        )?;
+        alive.store(true, Ordering::Relaxed);
+        let server_ver = worker.server_ver;
+        debug!(
+            "Connected to PostgreSQL {} via native rustls (inline)",
+            server_ver
+        );
+        Ok(Self {
+            driver: Driver::Inline {
+                worker,
+                pending: VecDeque::with_capacity(256),
+            },
+            server_ver,
+            in_copy_mode: false,
+            alive,
+        })
+    }
+
+    /// Threaded driver: spawn the worker thread, which establishes the TCP connection (optionally upgraded to TLS via rustls) and performs the v3.0 startup handshake and authentication on its own runtime. Blocks until the worker reports success or failure.
+    fn connect_threaded(conninfo: &str) -> Result<Self> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = std_mpsc::channel();
         let alive = Arc::new(AtomicBool::new(false));
@@ -377,10 +465,12 @@ impl NativeConnection {
                 alive.store(true, Ordering::Relaxed);
                 debug!("Connected to PostgreSQL {} via native rustls", server_ver);
                 Ok(Self {
-                    cmd_tx,
-                    worker: Some(worker),
-                    pending: VecDeque::with_capacity(256),
-                    batch_rx: None,
+                    driver: Driver::Threaded {
+                        cmd_tx,
+                        worker: Some(worker),
+                        pending: VecDeque::with_capacity(256),
+                        batch_rx: None,
+                    },
                     server_ver,
                     in_copy_mode: false,
                     alive,
@@ -401,16 +491,21 @@ impl NativeConnection {
 
     // ── Query execution ─────────────────────────────────────────────────
 
-    /// Send a simple query to the worker and block until it replies.
-    fn run_query(&self, sql: &str) -> Result<NativePgResult> {
-        let (reply_tx, reply_rx) = std_mpsc::channel();
-        self.cmd_tx
-            .send(Command::Query {
-                sql: sql.to_string(),
-                reply: reply_tx,
-            })
-            .map_err(|_| Self::worker_gone())?;
-        reply_rx.recv().map_err(|_| Self::worker_gone())?
+    /// Run a simple query: inline on the worker, or over the command channel.
+    fn run_query(&mut self, sql: &str) -> Result<NativePgResult> {
+        match &mut self.driver {
+            Driver::Inline { worker, .. } => run_sync(worker.query(sql)),
+            Driver::Threaded { cmd_tx, .. } => {
+                let (reply_tx, reply_rx) = std_mpsc::channel();
+                cmd_tx
+                    .send(Command::Query {
+                        sql: sql.to_string(),
+                        reply: reply_tx,
+                    })
+                    .map_err(|_| Self::worker_gone())?;
+                reply_rx.recv().map_err(|_| Self::worker_gone())?
+            }
+        }
     }
 
     #[cold]
@@ -500,58 +595,83 @@ impl NativeConnection {
         cancellation_token: &CancellationToken,
     ) -> Result<Bytes> {
         self.ensure_replication_mode()?;
+        let alive = self.alive.clone();
 
-        if let Some(payload) = self.pending.pop_front() {
-            return Ok(payload);
-        }
-
-        // Lazily start the worker's streaming push loop on first use (and after a prior stream ended), binding it to this cancellation token.
-        if self.batch_rx.is_none() {
-            let (batch_tx, batch_rx) = mpsc::channel(BATCH_CHANNEL_CAP);
-            if self
-                .cmd_tx
-                .send(Command::StreamCopy {
-                    token: cancellation_token.clone(),
-                    batch_tx,
-                })
-                .is_err()
-            {
-                self.alive.store(false, Ordering::Relaxed);
-                return Err(Self::worker_gone());
-            }
-            self.batch_rx = Some(batch_rx);
-        }
-
-        let batch = {
-            let rx = self.batch_rx.as_mut().unwrap();
-            tokio::select! {
-                biased;
-                _ = cancellation_token.cancelled() => {
-                    // Stream is ending; drop the receiver so a later call restarts it.
-                    self.batch_rx = None;
-                    return Err(ReplicationError::Cancelled("Operation cancelled".to_string()));
+        match &mut self.driver {
+            // Inline: read directly on the caller's runtime. `copy::get_copy_data`
+            // serves from `pending` first, then reads+drains the socket.
+            Driver::Inline { worker, pending } => {
+                let result = copy::get_copy_data(
+                    &mut worker.transport,
+                    &mut worker.read_buf,
+                    pending,
+                    cancellation_token,
+                )
+                .await;
+                if let Err(ReplicationError::TransientConnection(_)) = &result {
+                    alive.store(false, Ordering::Relaxed);
                 }
-                recv = rx.recv() => match recv {
-                    Some(Ok(batch)) => batch,
-                    Some(Err(e)) => {
-                        self.batch_rx = None;
-                        return Err(e);
-                    }
-                    None => {
-                        // Worker dropped the sender (stream ended); allow a restart.
-                        self.batch_rx = None;
-                        self.alive.store(false, Ordering::Relaxed);
+                result
+            }
+            // Threaded: serve from the local buffer, else pull the next batch the
+            // worker has already pushed down the channel.
+            Driver::Threaded {
+                cmd_tx,
+                pending,
+                batch_rx,
+                ..
+            } => {
+                if let Some(payload) = pending.pop_front() {
+                    return Ok(payload);
+                }
+
+                // Lazily start the worker's streaming push loop on first use (and after a prior stream ended), binding it to this cancellation token.
+                if batch_rx.is_none() {
+                    let (batch_tx, rx) = mpsc::channel(BATCH_CHANNEL_CAP);
+                    if cmd_tx
+                        .send(Command::StreamCopy {
+                            token: cancellation_token.clone(),
+                            batch_tx,
+                        })
+                        .is_err()
+                    {
+                        alive.store(false, Ordering::Relaxed);
                         return Err(Self::worker_gone());
                     }
+                    *batch_rx = Some(rx);
                 }
-            }
-        };
 
-        self.pending = batch;
-        Ok(self
-            .pending
-            .pop_front()
-            .expect("stream_copy pushes only non-empty batches"))
+                let batch = {
+                    let rx = batch_rx.as_mut().unwrap();
+                    tokio::select! {
+                        biased;
+                        _ = cancellation_token.cancelled() => {
+                            // Stream is ending; drop the receiver so a later call restarts it.
+                            *batch_rx = None;
+                            return Err(ReplicationError::Cancelled("Operation cancelled".to_string()));
+                        }
+                        recv = rx.recv() => match recv {
+                            Some(Ok(batch)) => batch,
+                            Some(Err(e)) => {
+                                *batch_rx = None;
+                                return Err(e);
+                            }
+                            None => {
+                                // Worker dropped the sender (stream ended); allow a restart.
+                                *batch_rx = None;
+                                alive.store(false, Ordering::Relaxed);
+                                return Err(Self::worker_gone());
+                            }
+                        }
+                    }
+                };
+
+                *pending = batch;
+                Ok(pending
+                    .pop_front()
+                    .expect("stream_copy pushes only non-empty batches"))
+            }
+        }
     }
 
     /// Send feedback to the server (standby status update).
@@ -609,16 +729,21 @@ impl NativeConnection {
         Ok(())
     }
 
-    /// Send one CopyData message to the worker and await its completion.
-    async fn put_copy_data(&self, data: Bytes) -> Result<()> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.cmd_tx
-            .send(Command::PutCopyData {
-                data,
-                reply: reply_tx,
-            })
-            .map_err(|_| Self::worker_gone())?;
-        reply_rx.await.map_err(|_| Self::worker_reply_dropped())?
+    /// Send one CopyData message: inline on the worker, or over the channel.
+    async fn put_copy_data(&mut self, data: Bytes) -> Result<()> {
+        match &mut self.driver {
+            Driver::Inline { worker, .. } => worker.put_copy_data(data.as_ref()).await,
+            Driver::Threaded { cmd_tx, .. } => {
+                let (reply_tx, reply_rx) = oneshot::channel();
+                cmd_tx
+                    .send(Command::PutCopyData {
+                        data,
+                        reply: reply_tx,
+                    })
+                    .map_err(|_| Self::worker_gone())?;
+                reply_rx.await.map_err(|_| Self::worker_reply_dropped())?
+            }
+        }
     }
 
     // ── Connection info ─────────────────────────────────────────────────
@@ -791,31 +916,45 @@ impl NativeConnection {
     /// Sends a `Close` command so the worker does a best-effort shutdown
     /// (CopyDone if streaming, then Terminate), then joins the worker thread.
     fn close_connection(&mut self) {
-        // Drop the streaming receiver first: when the worker is parked on
-        // `batch_tx.reserve()` under backpressure, closing the channel lets that
-        // branch resolve so the worker reaches the `Close` command promptly.
-        self.batch_rx = None;
-        if let Some(worker) = self.worker.take() {
-            let (reply_tx, reply_rx) = std_mpsc::channel();
-            if self
-                .cmd_tx
-                .send(Command::Close {
-                    in_copy_mode: self.in_copy_mode,
-                    reply: reply_tx,
-                })
-                .is_ok()
-            {
-                // Wait for the worker to finish its shutdown I/O before joining.
-                //
-                // The streaming loop's `select!` is biased to handle commands
-                // first, so this `Close` interrupts an in-flight read or a parked
-                // `reserve()` immediately — no waiting for the next keepalive.
-                let _ = reply_rx.recv();
+        let in_copy_mode = self.in_copy_mode;
+        match &mut self.driver {
+            Driver::Inline { worker, pending } => {
+                // Best-effort graceful shutdown on the caller's runtime.
+                run_sync(worker.close(in_copy_mode));
+                pending.clear();
             }
-            let _ = worker.join();
+            Driver::Threaded {
+                cmd_tx,
+                worker,
+                pending,
+                batch_rx,
+            } => {
+                // Drop the streaming receiver first: when the worker is parked on
+                // `batch_tx.reserve()` under backpressure, closing the channel lets that
+                // branch resolve so the worker reaches the `Close` command promptly.
+                *batch_rx = None;
+                if let Some(handle) = worker.take() {
+                    let (reply_tx, reply_rx) = std_mpsc::channel();
+                    if cmd_tx
+                        .send(Command::Close {
+                            in_copy_mode,
+                            reply: reply_tx,
+                        })
+                        .is_ok()
+                    {
+                        // Wait for the worker to finish its shutdown I/O before joining.
+                        //
+                        // The streaming loop's `select!` is biased to handle commands
+                        // first, so this `Close` interrupts an in-flight read or a parked
+                        // `reserve()` immediately — no waiting for the next keepalive.
+                        let _ = reply_rx.recv();
+                    }
+                    let _ = handle.join();
+                }
+                pending.clear();
+            }
         }
 
-        self.pending.clear();
         self.in_copy_mode = false;
         self.alive.store(false, Ordering::Relaxed);
     }
@@ -868,14 +1007,53 @@ impl NativeConnection {
 
         // A null test connection is intentionally not alive.
         Self {
-            cmd_tx,
-            worker: Some(worker),
-            pending: VecDeque::new(),
-            batch_rx: None,
+            driver: Driver::Threaded {
+                cmd_tx,
+                worker: Some(worker),
+                pending: VecDeque::new(),
+                batch_rx: None,
+            },
             server_ver,
             in_copy_mode: false,
             alive,
         }
+    }
+
+    /// Create a null **inline-driver** connection for testing. Must be called on
+    /// a multi-thread runtime or with no ambient runtime so `run_sync` is safe.
+    pub(crate) fn null_for_testing_inline() -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let std_tcp = std::net::TcpStream::connect(addr).unwrap();
+        std_tcp.set_nonblocking(true).unwrap();
+        let _peer = listener.accept().unwrap();
+
+        let alive = Arc::new(AtomicBool::new(false));
+        let worker = run_sync(
+            WorkerInit::Null {
+                std_tcp,
+                server_ver: 160000,
+                alive: alive.clone(),
+            }
+            .build(),
+        )
+        .expect("null worker failed to adopt the test socket");
+        let server_ver = worker.server_ver;
+
+        Self {
+            driver: Driver::Inline {
+                worker,
+                pending: VecDeque::new(),
+            },
+            server_ver,
+            in_copy_mode: false,
+            alive,
+        }
+    }
+
+    /// Test-only: whether this connection uses the inline driver.
+    pub(crate) fn driver_is_inline(&self) -> bool {
+        matches!(self.driver, Driver::Inline { .. })
     }
 }
 
@@ -1430,6 +1608,71 @@ mod tests {
     async fn test_drop_does_not_panic_on_current_thread_runtime() {
         let conn = NativeConnection::null_for_testing();
         drop(conn); // must not panic on a current-thread runtime
+    }
+
+    // Inline-driver coverage. The default `#[tokio::test]` is current-thread, so
+    // the tests above exercise the Threaded driver; these pin the Inline driver
+    // (multi-thread / no-runtime), where sync methods go through `run_sync`.
+
+    #[test]
+    fn test_prefer_inline_driver_selection() {
+        // No ambient runtime → threaded (a per-call temp runtime would orphan the socket).
+        assert!(!NativeConnection::prefer_inline_driver());
+
+        // Current-thread runtime → threaded.
+        let ct = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert!(!ct.block_on(async { NativeConnection::prefer_inline_driver() }));
+
+        // Multi-thread runtime → inline.
+        let mt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        assert!(mt.block_on(async { NativeConnection::prefer_inline_driver() }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_inline_sync_method_does_not_panic_on_multi_thread_runtime() {
+        let mut conn = NativeConnection::null_for_testing_inline();
+        assert!(conn.driver_is_inline());
+        // Sync exec drives async I/O via run_sync→block_in_place; dead socket → error, not panic.
+        assert!(conn.exec("IDENTIFY_SYSTEM").is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_inline_drop_does_not_panic() {
+        let conn = NativeConnection::null_for_testing_inline();
+        drop(conn); // Drop → run_sync(worker.close) on a multi-thread runtime.
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_inline_get_copy_data_drains_pending() {
+        use tokio::io::AsyncWriteExt;
+        let (worker, mut server) = worker_with_loopback().await;
+        let mut conn = NativeConnection {
+            driver: Driver::Inline {
+                worker,
+                pending: VecDeque::new(),
+            },
+            server_ver: 160000,
+            in_copy_mode: true, // skip the replication-mode gate
+            alive: Arc::new(AtomicBool::new(true)),
+        };
+
+        // Server streams two WAL messages; the inline read path drains both.
+        server.write_all(&copy_data_frame(b"one")).await.unwrap();
+        server.write_all(&copy_data_frame(b"two")).await.unwrap();
+        server.flush().await.unwrap();
+
+        let token = CancellationToken::new();
+        let first = conn.get_copy_data_async(&token).await.unwrap();
+        let second = conn.get_copy_data_async(&token).await.unwrap();
+        assert_eq!(&first[..], b"one");
+        assert_eq!(&second[..], b"two");
     }
 
     // === Worker streaming push loop ===
