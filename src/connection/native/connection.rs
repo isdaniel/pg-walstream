@@ -140,7 +140,8 @@ impl Worker {
                             if matches!(err, ReplicationError::TransientConnection(_)) {
                                 self.alive.store(false, Ordering::Relaxed);
                             }
-                            let _ = batch_tx.send(Err(err)).await;
+
+                            let _ = batch_tx.try_send(Err(err));
                             return false;
                         }
                     }
