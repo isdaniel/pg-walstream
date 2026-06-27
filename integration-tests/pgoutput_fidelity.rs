@@ -366,9 +366,20 @@ fn encoder_reproduces_two_phase_commit() {
 }
 
 #[test]
-#[ignore = "requires PostgreSQL with wal_level=logical; run with --ignored --test-threads=1"]
+#[ignore = "requires PostgreSQL 16+ with wal_level=logical; run with --ignored --test-threads=1"]
 fn encoder_reproduces_origin() {
     let mut c = connect();
+
+    // The pgoutput `origin` option was added in PostgreSQL 16; skip on older servers.
+    let ver: i32 = c
+        .exec("SHOW server_version_num")
+        .ok()
+        .and_then(|r| r.get_value(0, 0).and_then(|v| v.parse().ok()))
+        .unwrap_or(0);
+    if ver < 160000 {
+        eprintln!("skipping encoder_reproduces_origin: requires PG 16+ (server_version_num={ver})");
+        return;
+    }
 
     // Clean up leftovers from a prior run.
     let _ = c.exec("SELECT pg_replication_origin_session_reset()");
