@@ -1,0 +1,65 @@
+name: Bug Report
+description: Report a problem with pg_walstream
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report! Please fill out the sections below.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug, including what you expected to happen instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps or a code snippet that reproduces the issue.
+      placeholder: |
+        1. Create a replication slot with ...
+        2. Stream changes ...
+        3. See error
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: pg_walstream version
+      placeholder: "0.6.3"
+    validations:
+      required: true
+  - type: input
+    id: pg-version
+    attributes:
+      label: PostgreSQL version
+      placeholder: "15.4"
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Connection backend
+      options:
+        - libpq (default)
+        - rustls-tls (pure-Rust)
+        - not sure
+    validations:
+      required: true
+  - type: input
+    id: rust-version
+    attributes:
+      label: Rust version (rustc --version)
+      placeholder: "1.78.0"
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs / backtrace
+      description: Paste any relevant output. Set `RUST_BACKTRACE=1` for backtraces.
+      render: shell
+    validations:
+      required: false
