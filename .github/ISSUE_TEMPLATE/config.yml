@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions & Discussions
+    url: https://github.com/isdaniel/pg-walstream/discussions
+    about: Ask questions and discuss usage here instead of opening an issue.
+  - name: Security vulnerability
+    url: https://github.com/isdaniel/pg-walstream/security/policy
+    about: Please report security issues privately — see our security policy.
