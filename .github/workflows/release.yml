@@ -2,9 +2,8 @@ name: Release
 
 on:
   push:
-    branches: [ main ]
-  push:
-    tags: ['v*']
+    tags:
+      - 'v*'
 
 jobs:
   checks:
@@ -16,6 +15,9 @@ jobs:
     name: Publish to crates.io
     runs-on: ubuntu-latest
     needs: checks
+    permissions:
+      id-token: write   # required for the OIDC token exchange
+      contents: write   # required by gh release create
 
     steps:
     - name: Checkout repository
@@ -24,13 +26,15 @@ jobs:
         fetch-depth: 0
 
     - name: Verify tag is on main branch
+      id: verify_main
       run: |
         git fetch origin main
         if git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
           echo "Tag commit is on main branch. Proceeding with publish."
+          echo "on_main=true" >> $GITHUB_OUTPUT
         else
-          echo "Error: Tag is NOT on the main branch. Publishing is only allowed from main."
-          exit 1
+          echo "Tag is NOT on the main branch. Skipping publish (not an error)."
+          echo "on_main=false" >> $GITHUB_OUTPUT
         fi
 
     - name: Install Rust toolchain
@@ -60,17 +64,25 @@ jobs:
           exit 1
         fi
 
+    - name: Authenticate to crates.io
+      id: auth
+      if: steps.verify_main.outputs.on_main == 'true'
+      uses: rust-lang/crates-io-auth-action@v1
+
     - name: Dry run publish
+      if: steps.verify_main.outputs.on_main == 'true'
       run: cargo publish --dry-run
       env:
-        CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
     - name: Publish to crates.io
+      if: steps.verify_main.outputs.on_main == 'true'
       run: cargo publish
       env:
-        CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
     - name: Create GitHub Release
+      if: steps.verify_main.outputs.on_main == 'true'
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
