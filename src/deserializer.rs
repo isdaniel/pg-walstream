@@ -148,7 +148,8 @@ impl<'a> RowDataDeserializer<'a> {
     }
 }
 
-impl<'de, 'a> de::Deserializer<'de> for RowDataDeserializer<'a> {
+// The data lifetime IS serde's `'de`: values borrow directly from `&'de RowData`, `deserialize_into<DeserializeOwned>` still compiles because `for<'de>` covers the concrete borrow lifetime; `deserialize_borrowed<'de>` exposes the borrow.
+impl<'de> de::Deserializer<'de> for RowDataDeserializer<'de> {
     type Error = ReplicationError;
 
     #[inline]
@@ -193,7 +194,7 @@ struct RowDataMapAccess<'a> {
     current_value: Option<&'a ColumnValue>,
 }
 
-impl<'de, 'a> MapAccess<'de> for RowDataMapAccess<'a> {
+impl<'de> MapAccess<'de> for RowDataMapAccess<'de> {
     type Error = ReplicationError;
 
     #[inline]
@@ -238,10 +239,10 @@ struct ColumnValueDeserializer<'a> {
     value: &'a ColumnValue,
 }
 
-impl<'a> ColumnValueDeserializer<'a> {
+impl<'de> ColumnValueDeserializer<'de> {
     /// Get the text content or return an error for the given target type.
     #[inline]
-    fn text_or_err(&self, target: &str) -> Result<&'a str, ReplicationError> {
+    fn text_or_err(&self, target: &str) -> Result<&'de str, ReplicationError> {
         match self.value {
             ColumnValue::Text(b) => core::str::from_utf8(b).map_err(|e| {
                 ReplicationError::deserialize(format!("invalid UTF-8 for {target}: {e}"))
@@ -259,7 +260,7 @@ impl<'a> ColumnValueDeserializer<'a> {
     /// Use only for paths where the parser itself rejects non-ASCII bytes
     /// (numeric, bool). String-shaped paths must use `text_or_err`.
     #[inline]
-    fn bytes_or_err(&self, target: &str) -> Result<&'a [u8], ReplicationError> {
+    fn bytes_or_err(&self, target: &str) -> Result<&'de [u8], ReplicationError> {
         match self.value {
             ColumnValue::Text(b) => Ok(b.as_ref()),
             ColumnValue::Null => Err(ReplicationError::deserialize(format!(
@@ -319,7 +320,7 @@ fn numeric_parse_error(b: &[u8], type_name: &str) -> ReplicationError {
     }
 }
 
-impl<'de, 'a> de::Deserializer<'de> for ColumnValueDeserializer<'a> {
+impl<'de> de::Deserializer<'de> for ColumnValueDeserializer<'de> {
     type Error = ReplicationError;
 
     #[inline]
@@ -327,10 +328,10 @@ impl<'de, 'a> de::Deserializer<'de> for ColumnValueDeserializer<'a> {
         match self.value {
             ColumnValue::Null => visitor.visit_none(),
             ColumnValue::Text(b) => match core::str::from_utf8(b) {
-                Ok(s) => visitor.visit_str(s),
-                Err(_) => visitor.visit_bytes(b),
+                Ok(s) => visitor.visit_borrowed_str(s),
+                Err(_) => visitor.visit_borrowed_bytes(b),
             },
-            ColumnValue::Binary(b) => visitor.visit_bytes(b),
+            ColumnValue::Binary(b) => visitor.visit_borrowed_bytes(b),
         }
     }
 
@@ -411,19 +412,19 @@ impl<'de, 'a> de::Deserializer<'de> for ColumnValueDeserializer<'a> {
     #[inline]
     fn deserialize_str<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         let s = self.text_or_err("str")?;
-        visitor.visit_str(s)
+        visitor.visit_borrowed_str(s)
     }
 
     #[inline]
     fn deserialize_string<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         let s = self.text_or_err("String")?;
-        visitor.visit_str(s)
+        visitor.visit_borrowed_str(s)
     }
 
     #[inline]
     fn deserialize_bytes<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self.value {
-            ColumnValue::Binary(b) | ColumnValue::Text(b) => visitor.visit_bytes(b),
+            ColumnValue::Binary(b) | ColumnValue::Text(b) => visitor.visit_borrowed_bytes(b),
             ColumnValue::Null => Err(ReplicationError::deserialize(
                 "cannot deserialize NULL as bytes",
             )),
@@ -1002,6 +1003,8 @@ pub(crate) fn try_deserialize_row<T: serde::de::DeserializeOwned>(
 
 #[cfg(test)]
 mod tests {
+    #![allow(dead_code)]
+
     use crate::column_value::{ColumnValue, RowData};
     use crate::types::{ChangeEvent, Lsn, ReplicaIdentity};
     use bytes::Bytes;
@@ -1106,7 +1109,6 @@ mod tests {
         let row = RowData::from_pairs(vec![("a", ColumnValue::text("maybe"))]);
         #[derive(Debug, Deserialize)]
         struct B {
-            #[allow(dead_code)]
             a: bool,
         }
         let result: crate::error::Result<B> = row.deserialize_into();
@@ -1182,7 +1184,6 @@ mod tests {
         let row = RowData::from_pairs(vec![("id", ColumnValue::Null)]);
         #[derive(Debug, Deserialize)]
         struct S {
-            #[allow(dead_code)]
             id: u32,
         }
         let result: crate::error::Result<S> = row.deserialize_into();
@@ -1196,7 +1197,6 @@ mod tests {
         let row = RowData::from_pairs(vec![("id", ColumnValue::text("not_a_number"))]);
         #[derive(Debug, Deserialize)]
         struct S {
-            #[allow(dead_code)]
             id: u32,
         }
         let result: crate::error::Result<S> = row.deserialize_into();
@@ -1210,7 +1210,6 @@ mod tests {
         let row = RowData::from_pairs(vec![("val", ColumnValue::text("99999"))]);
         #[derive(Debug, Deserialize)]
         struct S {
-            #[allow(dead_code)]
             val: i8,
         }
         let result: crate::error::Result<S> = row.deserialize_into();
@@ -1291,7 +1290,6 @@ mod tests {
     fn test_char_too_long() {
         #[derive(Debug, Deserialize)]
         struct S {
-            #[allow(dead_code)]
             c: char,
         }
         let row = RowData::from_pairs(vec![("c", ColumnValue::text("AB"))]);
@@ -1585,7 +1583,6 @@ mod tests {
         #[derive(Debug, Deserialize)]
         struct S {
             #[serde(with = "serde_bytes")]
-            #[allow(dead_code)]
             data: Vec<u8>,
         }
         let row = RowData::from_pairs(vec![("data", ColumnValue::Null)]);
@@ -1643,7 +1640,6 @@ mod tests {
     fn test_unit_from_non_null_errors() {
         #[derive(Debug, Deserialize)]
         struct S {
-            #[allow(dead_code)]
             val: (),
         }
         let row = RowData::from_pairs(vec![("val", ColumnValue::text("something"))]);
@@ -1659,7 +1655,6 @@ mod tests {
     fn test_seq_not_supported() {
         #[derive(Debug, Deserialize)]
         struct S {
-            #[allow(dead_code)]
             vals: Vec<u32>,
         }
         let row = RowData::from_pairs(vec![("vals", ColumnValue::text("[1,2,3]"))]);
@@ -1673,12 +1668,10 @@ mod tests {
     fn test_nested_struct_not_supported() {
         #[derive(Debug, Deserialize)]
         struct Inner {
-            #[allow(dead_code)]
             x: u32,
         }
         #[derive(Debug, Deserialize)]
         struct Outer {
-            #[allow(dead_code)]
             inner: Inner,
         }
         let row = RowData::from_pairs(vec![("inner", ColumnValue::text("{\"x\":1}"))]);
@@ -1694,7 +1687,6 @@ mod tests {
     fn test_null_bool_errors() {
         #[derive(Debug, Deserialize)]
         struct S {
-            #[allow(dead_code)]
             flag: bool,
         }
         let row = RowData::from_pairs(vec![("flag", ColumnValue::Null)]);
@@ -1708,7 +1700,6 @@ mod tests {
     fn test_binary_numeric_errors() {
         #[derive(Debug, Deserialize)]
         struct S {
-            #[allow(dead_code)]
             val: i32,
         }
         let row = RowData::from_pairs(vec![(
@@ -1725,7 +1716,6 @@ mod tests {
     fn test_binary_bool_errors() {
         #[derive(Debug, Deserialize)]
         struct S {
-            #[allow(dead_code)]
             flag: bool,
         }
         let row = RowData::from_pairs(vec![(
@@ -1746,7 +1736,6 @@ mod tests {
         )]);
         #[derive(Debug, Deserialize)]
         struct S {
-            #[allow(dead_code)]
             username: String,
         }
         let result: crate::error::Result<S> = row.deserialize_into();
@@ -1760,7 +1749,6 @@ mod tests {
         let row = RowData::from_pairs(vec![("name", ColumnValue::Null)]);
         #[derive(Debug, Deserialize)]
         struct S {
-            #[allow(dead_code)]
             name: String,
         }
         let result: crate::error::Result<S> = row.deserialize_into();
@@ -1775,7 +1763,6 @@ mod tests {
     fn test_char_empty_string_errors() {
         #[derive(Debug, Deserialize)]
         struct S {
-            #[allow(dead_code)]
             c: char,
         }
         let row = RowData::from_pairs(vec![("c", ColumnValue::text(""))]);
@@ -1787,7 +1774,6 @@ mod tests {
     fn test_char_null_errors() {
         #[derive(Debug, Deserialize)]
         struct S {
-            #[allow(dead_code)]
             c: char,
         }
         let row = RowData::from_pairs(vec![("c", ColumnValue::Null)]);
@@ -1984,7 +1970,6 @@ mod tests {
         #[derive(Debug, Deserialize)]
         struct S {
             #[serde(with = "serde_bytes")]
-            #[allow(dead_code)]
             data: Vec<u8>,
         }
         let row = RowData::from_pairs(vec![("data", ColumnValue::Null)]);
@@ -1998,7 +1983,6 @@ mod tests {
     fn test_tuple_not_supported() {
         #[derive(Debug, Deserialize)]
         struct S {
-            #[allow(dead_code)]
             pair: (u32, u32),
         }
         let row = RowData::from_pairs(vec![("pair", ColumnValue::text("1,2"))]);
@@ -2011,10 +1995,9 @@ mod tests {
     #[test]
     fn test_tuple_struct_not_supported() {
         #[derive(Debug, Deserialize)]
-        struct Pair(#[allow(dead_code)] u32, #[allow(dead_code)] u32);
+        struct Pair(u32, u32);
         #[derive(Debug, Deserialize)]
         struct S {
-            #[allow(dead_code)]
             p: Pair,
         }
         let row = RowData::from_pairs(vec![("p", ColumnValue::text("1,2"))]);
@@ -2029,7 +2012,6 @@ mod tests {
         use std::collections::HashMap;
         #[derive(Debug, Deserialize)]
         struct S {
-            #[allow(dead_code)]
             m: HashMap<String, String>,
         }
         let row = RowData::from_pairs(vec![("m", ColumnValue::text("{}"))]);
@@ -2084,7 +2066,6 @@ mod tests {
     fn test_boolean_invalid_single_char() {
         #[derive(Debug, Deserialize)]
         struct S {
-            #[allow(dead_code)]
             a: bool,
         }
         let row = RowData::from_pairs(vec![("a", ColumnValue::text("x"))]);
@@ -2149,7 +2130,6 @@ mod tests {
         )]);
         #[derive(Debug, Deserialize)]
         struct S {
-            #[allow(dead_code)]
             val: u32,
         }
         let result: crate::error::Result<S> = row.deserialize_into();
@@ -2205,12 +2185,10 @@ mod tests {
     fn test_enum_newtype_variant_not_supported() {
         #[derive(Debug, Deserialize)]
         enum E {
-            #[allow(dead_code)]
             V(u32),
         }
         #[derive(Debug, Deserialize)]
         struct S {
-            #[allow(dead_code)]
             e: E,
         }
         let row = RowData::from_pairs(vec![("e", ColumnValue::text("V"))]);
@@ -2224,12 +2202,10 @@ mod tests {
     fn test_enum_tuple_variant_not_supported() {
         #[derive(Debug, Deserialize)]
         enum E {
-            #[allow(dead_code)]
             V(u32, u32),
         }
         #[derive(Debug, Deserialize)]
         struct S {
-            #[allow(dead_code)]
             e: E,
         }
         let row = RowData::from_pairs(vec![("e", ColumnValue::text("V"))]);
@@ -2243,12 +2219,10 @@ mod tests {
     fn test_enum_struct_variant_not_supported() {
         #[derive(Debug, Deserialize)]
         enum E {
-            #[allow(dead_code)]
             V { x: u32 },
         }
         #[derive(Debug, Deserialize)]
         struct S {
-            #[allow(dead_code)]
             e: E,
         }
         let row = RowData::from_pairs(vec![("e", ColumnValue::text("V"))]);
@@ -2509,7 +2483,6 @@ mod tests {
     #[test]
     fn test_try_into_result_err() {
         #[derive(Debug, Deserialize)]
-        #[allow(dead_code)]
         struct S {
             id: u32,
         }
@@ -2524,7 +2497,6 @@ mod tests {
     fn test_try_unit_on_non_null_reports_but_succeeds() {
         #[derive(Debug, Deserialize)]
         struct S {
-            #[allow(dead_code)]
             marker: (),
         }
         let row = RowData::from_pairs(vec![("marker", ColumnValue::text("x"))]);
@@ -2568,12 +2540,10 @@ mod tests {
     fn test_try_nested_struct_errors_structural() {
         #[derive(Debug, Deserialize)]
         struct Inner {
-            #[allow(dead_code)]
             x: u32,
         }
         #[derive(Debug, Deserialize)]
         struct Outer {
-            #[allow(dead_code)]
             inner: Inner,
         }
         let row = RowData::from_pairs(vec![("inner", ColumnValue::text("{}"))]);
@@ -2596,7 +2566,6 @@ mod tests {
     #[test]
     fn test_try_is_clean_false_when_errors_recorded() {
         #[derive(Debug, Deserialize)]
-        #[allow(dead_code)]
         struct S {
             v: u32,
         }
@@ -2645,11 +2614,9 @@ mod tests {
     #[test]
     fn test_try_lenient_tuple_struct_errors() {
         #[derive(Debug, Deserialize)]
-        #[allow(dead_code)]
         struct TS(u32, u32);
         #[derive(Debug, Deserialize)]
         struct S {
-            #[allow(dead_code)]
             t: TS,
         }
         let row = RowData::from_pairs(vec![("t", ColumnValue::text("1,2"))]);
@@ -2661,7 +2628,6 @@ mod tests {
     fn test_try_lenient_seq_errors() {
         #[derive(Debug, Deserialize)]
         struct S {
-            #[allow(dead_code)]
             xs: Vec<u32>,
         }
         let row = RowData::from_pairs(vec![("xs", ColumnValue::text("1"))]);
@@ -2674,7 +2640,6 @@ mod tests {
         use std::collections::HashMap;
         #[derive(Debug, Deserialize)]
         struct S {
-            #[allow(dead_code)]
             m: HashMap<String, String>,
         }
         let row = RowData::from_pairs(vec![("m", ColumnValue::text("{}"))]);
@@ -2730,7 +2695,6 @@ mod tests {
         struct Marker;
         #[derive(Debug, Deserialize)]
         struct S {
-            #[allow(dead_code)]
             m: Marker,
         }
         let row = RowData::from_pairs(vec![("m", ColumnValue::Null)]);
@@ -2783,13 +2747,11 @@ mod tests {
     fn test_strict_unit_variant_newtype_errors() {
         // Exercise UnitVariantAccess::newtype_variant_seed error path.
         #[derive(Debug, Deserialize)]
-        #[allow(dead_code)]
         enum E {
             A(u32),
         }
         #[derive(Debug, Deserialize)]
         struct S {
-            #[allow(dead_code)]
             e: E,
         }
         let row = RowData::from_pairs(vec![("e", ColumnValue::text("A"))]);
@@ -3164,7 +3126,6 @@ mod tests {
         struct Marker;
         #[derive(Debug, Deserialize)]
         struct S {
-            #[allow(dead_code)]
             m: Marker,
         }
         let row = RowData::from_pairs(vec![("m", ColumnValue::text("x"))]);
@@ -3413,7 +3374,6 @@ mod tests {
     fn test_strict_float_parse_error() {
         #[derive(Debug, Deserialize)]
         struct S {
-            #[allow(dead_code)]
             v: f64,
         }
         let row = RowData::from_pairs(vec![("v", ColumnValue::text("not_float"))]);
@@ -3429,7 +3389,6 @@ mod tests {
     fn test_strict_binary_char_errors() {
         #[derive(Debug, Deserialize)]
         struct S {
-            #[allow(dead_code)]
             c: char,
         }
         let row = RowData::from_pairs(vec![(
@@ -3446,7 +3405,6 @@ mod tests {
     fn test_strict_null_char_errors() {
         #[derive(Debug, Deserialize)]
         struct S {
-            #[allow(dead_code)]
             c: char,
         }
         let row = RowData::from_pairs(vec![("c", ColumnValue::Null)]);
@@ -3569,12 +3527,10 @@ mod tests {
     fn test_try_lenient_enum_binary_structural_error() {
         #[derive(Debug, Deserialize)]
         enum E {
-            #[allow(dead_code)]
             A,
         }
         #[derive(Debug, Deserialize)]
         struct S {
-            #[allow(dead_code)]
             e: E,
         }
         let row = RowData::from_pairs(vec![(
@@ -3592,7 +3548,6 @@ mod tests {
         #[derive(Debug, Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Strict {
-            #[allow(dead_code)]
             id: u32,
         }
         let row = RowData::from_pairs(vec![
@@ -3623,5 +3578,123 @@ mod tests {
         assert_eq!(v.id, 42);
         assert_eq!(v.score, 0.0);
         assert_eq!(v.name, None);
+    }
+
+    // -- Borrowed (zero-copy) deserialization --------------------------------
+
+    #[test]
+    fn test_deserialize_borrowed_str() {
+        // &'de str borrows straight from the row's Bytes — no allocation.
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Row<'a> {
+            id: u32,
+            name: &'a str,
+        }
+        let row = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("42")),
+            ("name", ColumnValue::text("alice")),
+        ]);
+        let r: Row = row.deserialize_borrowed().unwrap();
+        assert_eq!(r.id, 42);
+        assert_eq!(r.name, "alice");
+        // Prove it actually points into the row's buffer, not a copy.
+        let backing = row.get("name").unwrap().as_bytes().as_ptr();
+        assert_eq!(r.name.as_ptr(), backing);
+    }
+
+    #[test]
+    fn test_deserialize_borrowed_bytes() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Row<'a> {
+            #[serde(with = "serde_bytes")]
+            payload: &'a [u8],
+        }
+        let row = RowData::from_pairs(vec![(
+            "payload",
+            ColumnValue::binary_bytes(Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef])),
+        )]);
+        let r: Row = row.deserialize_borrowed().unwrap();
+        assert_eq!(r.payload, &[0xde, 0xad, 0xbe, 0xef]);
+        let backing = row.get("payload").unwrap().as_bytes().as_ptr();
+        assert_eq!(r.payload.as_ptr(), backing);
+    }
+
+    #[test]
+    fn test_deserialize_borrowed_cow_clean_borrows() {
+        // Clean data → Cow::Borrowed, no allocation.
+        use std::borrow::Cow;
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Row<'a> {
+            #[serde(borrow)]
+            note: Cow<'a, str>,
+        }
+        let row = RowData::from_pairs(vec![("note", ColumnValue::text("clean"))]);
+        let r: Row = row.deserialize_borrowed().unwrap();
+        assert!(matches!(r.note, Cow::Borrowed(_)), "expected borrowed");
+        assert_eq!(r.note, "clean");
+    }
+
+    #[test]
+    fn test_deserialize_borrowed_option_some_and_null() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Row<'a> {
+            #[serde(borrow)]
+            a: Option<&'a str>,
+            #[serde(borrow)]
+            b: Option<&'a str>,
+        }
+        let row = RowData::from_pairs(vec![
+            ("a", ColumnValue::text("here")),
+            ("b", ColumnValue::Null),
+        ]);
+        let r: Row = row.deserialize_borrowed().unwrap();
+        assert_eq!(r.a, Some("here"));
+        assert_eq!(r.b, None);
+    }
+
+    #[test]
+    fn test_deserialize_borrowed_owned_string_still_works() {
+        // Owned String field via the borrowing entry point: copies, as expected.
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Row {
+            name: String,
+        }
+        let row = RowData::from_pairs(vec![("name", ColumnValue::text("owned"))]);
+        let r: Row = row.deserialize_borrowed().unwrap();
+        assert_eq!(r.name, "owned");
+    }
+
+    #[test]
+    fn test_deserialize_borrowed_via_change_event() {
+        use crate::types::{ChangeEvent, Lsn};
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Row<'a> {
+            id: u32,
+            name: &'a str,
+        }
+        let data = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("7")),
+            ("name", ColumnValue::text("zed")),
+        ]);
+        let event = ChangeEvent::insert("public", "users", 1, data, Lsn::new(1));
+        let r: Row = event.deserialize_data_borrowed().unwrap();
+        assert_eq!(r.id, 7);
+        assert_eq!(r.name, "zed");
+    }
+
+    #[test]
+    fn test_deserialize_borrowed_invalid_utf8_text_as_bytes() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Row<'a> {
+            #[serde(with = "serde_bytes")]
+            raw: &'a [u8],
+        }
+        let bad = Bytes::from_static(&[0xff, 0xfe, 0x00, 0xfd]);
+        let row = RowData::from_pairs(vec![("raw", ColumnValue::text_bytes(bad))]);
+        let r: Row = row.deserialize_borrowed().unwrap();
+        assert_eq!(r.raw, &[0xff, 0xfe, 0x00, 0xfd]);
+        // Borrowed straight from the column buffer, not copied.
+        let backing = row.get("raw").unwrap().as_bytes().as_ptr();
+        assert_eq!(r.raw.as_ptr(), backing);
     }
 }

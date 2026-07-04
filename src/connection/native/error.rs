@@ -67,36 +67,31 @@ pub fn parse_error_fields(payload: &[u8]) -> PgErrorFields {
     fields
 }
 
-/// Parse an ErrorResponse message (including the 5-byte header) into
-/// a `ReplicationError`.
-#[allow(dead_code)]
-pub fn error_response_to_replication_error(msg: &[u8]) -> crate::error::ReplicationError {
-    let fields = parse_error_fields(&msg[5..]); // skip tag + length
-    let error_lower = fields.message.to_lowercase();
-
-    if error_lower.contains("authentication")
-        || error_lower.contains("password")
-        || fields.code.starts_with("28")
-    // Class 28 — Invalid Authorization
-    {
-        crate::error::ReplicationError::authentication(format!(
-            "PostgreSQL authentication failed: {}",
-            fields
-        ))
-    } else if fields.severity == "FATAL" || fields.severity == "PANIC" {
-        crate::error::ReplicationError::permanent_connection(format!(
-            "PostgreSQL fatal error: {}",
-            fields
-        ))
-    } else {
-        crate::error::ReplicationError::protocol(format!("PostgreSQL error: {}", fields))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn error_response_to_replication_error(msg: &[u8]) -> crate::error::ReplicationError {
+        let fields = parse_error_fields(&msg[5..]); // skip tag + length
+        let error_lower = fields.message.to_lowercase();
+
+        if error_lower.contains("authentication")
+            || error_lower.contains("password")
+            || fields.code.starts_with("28")
+        {
+            crate::error::ReplicationError::authentication(format!(
+                "PostgreSQL authentication failed: {}",
+                fields
+            ))
+        } else if fields.severity == "FATAL" || fields.severity == "PANIC" {
+            crate::error::ReplicationError::permanent_connection(format!(
+                "PostgreSQL fatal error: {}",
+                fields
+            ))
+        } else {
+            crate::error::ReplicationError::protocol(format!("PostgreSQL error: {}", fields))
+        }
+    }
     #[test]
     fn test_parse_error_fields() {
         let mut payload = Vec::new();

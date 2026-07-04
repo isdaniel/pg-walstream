@@ -2076,10 +2076,6 @@ mod tests {
     use crate::protocol::TupleData;
     use crate::types::{parse_lsn, ReplicaIdentity};
 
-    // ========================================
-    // Compile-time Send/Sync assertions
-    // ========================================
-    // These ensure that key types can be used inside tokio::spawn.
     #[allow(dead_code)]
     const _: () = {
         fn assert_send<T: Send>() {}
@@ -6742,11 +6738,6 @@ mod tests {
         assert_eq!(stream.current_lsn(), high_lsn);
     }
 
-    // ========================================
-    // futures::Stream trait tests
-    // ========================================
-
-    /// Compile-time assertion that EventStream implements key traits
     #[allow(dead_code)]
     const _: () = {
         fn assert_stream<T: futures_core::Stream>() {}
