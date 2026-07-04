@@ -445,6 +445,44 @@ impl RowData {
         T::deserialize(crate::deserializer::RowDataDeserializer::new(self))
     }
 
+    /// Zero-copy deserialize: borrow column data directly from this row.
+    ///
+    /// Unlike [`deserialize_into`](Self::deserialize_into), the target `T` may
+    /// borrow from the row (`&'de str`, `&'de [u8]`, `Cow<'de, str>`), so a
+    /// string-heavy row deserializes with zero per-field allocation. The row
+    /// (and the underlying protocol buffer it slices) must outlive `T`.
+    ///
+    /// `String`/owned fields still work — they copy, exactly as with
+    /// `deserialize_into`.
+    ///
+    /// # Caveat: borrowed bytes are raw pgoutput text
+    ///
+    /// A `&'de [u8]` / `&'de str` borrows the column's *raw* pgoutput bytes. For a `bytea` column (delivered as text like `\x00ff`) that means the escaped text, **not** the decoded binary — decode it yourself, or use an owned type with a deserializer that unescapes. This matches the existing `deserialize_into` semantics; borrowing only removes the copy.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use pg_walstream::{RowData, ColumnValue};
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(Deserialize)]
+    /// struct Row<'a> {
+    ///     id: u32,
+    ///     name: &'a str,
+    /// }
+    ///
+    /// let row = RowData::from_pairs(vec![
+    ///     ("id", ColumnValue::text("42")),
+    ///     ("name", ColumnValue::text("Alice")),
+    /// ]);
+    /// let r: Row = row.deserialize_borrowed().unwrap();
+    /// assert_eq!(r.id, 42);
+    /// assert_eq!(r.name, "Alice");
+    /// ```
+    pub fn deserialize_borrowed<'de, T: Deserialize<'de>>(&'de self) -> crate::error::Result<T> {
+        T::deserialize(crate::deserializer::RowDataDeserializer::new(self))
+    }
+
     /// Lenient deserialization: returns a [`TryDeserializeResult`] whose `value`
     /// always contains a populated `T` (with per-type defaults substituted for
     /// columns that fail to parse) and whose `errors` lists every failing field.

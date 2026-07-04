@@ -117,3 +117,7 @@ path = "integration-tests/binary_columns.rs"
 [[bench]]
 name = "wal_pipeline"
 harness = false
+
+[[bench]]
+name = "deserialize"
+harness = false

@@ -422,7 +422,7 @@ dependencies = [
 
 [[package]]
 name = "pg_walstream"
-version = "0.6.3"
+version = "0.7.0"
 dependencies = [
  "bytes",
  "chrono",

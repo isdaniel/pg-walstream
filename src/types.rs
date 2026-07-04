@@ -1239,6 +1239,20 @@ impl ChangeEvent {
         }
     }
 
+    /// Zero-copy variant of [`deserialize_data`](Self::deserialize_data): the
+    /// target `T` may borrow (`&'de str`, `Cow<'de, str>`, `&'de [u8]`) directly from the event's row data, so a string-heavy row costs no per-field allocation. The event must outlive `T`.
+    pub fn deserialize_data_borrowed<'de, T: serde::Deserialize<'de>>(&'de self) -> Result<T> {
+        match &self.event_type {
+            EventType::Insert { data, .. } => data.deserialize_borrowed(),
+            EventType::Update { new_data, .. } => new_data.deserialize_borrowed(),
+            EventType::Delete { old_data, .. } => old_data.deserialize_borrowed(),
+            _ => Err(ReplicationError::deserialize(format!(
+                "event type '{}' does not contain row data",
+                self.event_type_str()
+            ))),
+        }
+    }
+
     pub fn event_type_str(&self) -> &str {
         match self.event_type {
             EventType::Insert { .. } => "insert",

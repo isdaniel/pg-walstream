@@ -22,6 +22,13 @@ const HEADER_LEN: usize = 5;
 /// Maximum allowed message body length (128 MiB), matching wire.rs.
 const MAX_MESSAGE_LEN: usize = 128 * 1024 * 1024;
 
+/// Headroom reserved on `read_buf` before each socket read.
+///
+/// `read_buf` on a full `BytesMut` reserves only 64 bytes at a time, capping each `read()` to a tiny slice and multiplying syscalls under load. Reserving a large chunk lets one syscall pull far more TLS-decrypted data, so the drain loop slices more messages per read.
+///
+/// ponytail: 256 KiB is a common sweet spot; the win is syscall-count, which this repo has no IO benchmark to measure — tune here if a real workload shows read/syscall dominating a flamegraph.
+const READ_CHUNK: usize = 256 * 1024;
+
 /// Read the next CopyData payload from the replication stream.
 ///
 /// This implements a **drain-loop batch queue** optimization:
@@ -47,7 +54,10 @@ pub async fn get_copy_data<R: AsyncRead + Unpin>(
             return Ok(payload);
         }
 
-        // ── Slow path: read from transport, drain all complete messages ──
+        // Ensure a large contiguous headroom BEFORE the read so one read() pulls as much as possible. `pending` is empty here (fast path returned above) and the buffer is typically drained, so this reserve is cheap — no realloc of live data. See READ_CHUNK.
+        if read_buf.capacity() - read_buf.len() < READ_CHUNK {
+            read_buf.reserve(READ_CHUNK);
+        }
         tokio::select! {
             biased;
             _ = cancellation_token.cancelled() => {

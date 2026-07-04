@@ -350,6 +350,7 @@ async fn negotiate_tls_standard(
             })?;
 
             tracing::debug!("TLS connection established");
+            log_negotiated_suite(&tls_stream);
             Ok(Transport::Tls(BufReader::with_capacity(
                 TLS_BUF_SIZE,
                 tls_stream,
@@ -405,10 +406,19 @@ async fn negotiate_tls_direct(
     })?;
 
     tracing::debug!("Direct TLS connection established (ALPN postgresql)");
+    log_negotiated_suite(&tls_stream);
     Ok(Transport::Tls(BufReader::with_capacity(
         TLS_BUF_SIZE,
         tls_stream,
     )))
+}
+
+/// Log the negotiated TLS cipher suite for verification that hardware-accelerated
+/// AES-GCM (via aws-lc-rs) was selected rather than an unexpected fallback.
+fn log_negotiated_suite(tls_stream: &tokio_rustls::client::TlsStream<TcpStream>) {
+    if let Some(suite) = tls_stream.get_ref().1.negotiated_cipher_suite() {
+        tracing::info!("TLS negotiated cipher suite: {:?}", suite.suite());
+    }
 }
 
 /// Build a rustls `ClientConfig` based on the sslmode.
