@@ -1241,6 +1241,10 @@ impl ChangeEvent {
 
     /// Zero-copy variant of [`deserialize_data`](Self::deserialize_data): the
     /// target `T` may borrow (`&'de str`, `Cow<'de, str>`, `&'de [u8]`) directly from the event's row data, so a string-heavy row costs no per-field allocation. The event must outlive `T`.
+    ///
+    /// Borrowed values alias the underlying protocol buffer and are raw pgoutput
+    /// text (see [`RowData::deserialize_borrowed`](RowData::deserialize_borrowed)
+    /// for the escaping caveat).
     pub fn deserialize_data_borrowed<'de, T: serde::Deserialize<'de>>(&'de self) -> Result<T> {
         match &self.event_type {
             EventType::Insert { data, .. } => data.deserialize_borrowed(),
@@ -3950,5 +3954,77 @@ mod tests {
             let event = ChangeEvent::relation(1, "s", "t", ri, cols, Lsn::new(50000));
             assert_encode_decode_round_trip(&event);
         }
+    }
+
+    // ---- deserialize_data_borrowed across event types ----
+
+    #[test]
+    fn test_deserialize_data_borrowed_update_and_delete() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Row<'a> {
+            id: u32,
+            name: &'a str,
+        }
+
+        // Update → borrows from new_data.
+        let new_data = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("9")),
+            ("name", ColumnValue::text("updated")),
+        ]);
+        let upd = ChangeEvent::update(
+            "public",
+            "users",
+            1,
+            None,
+            new_data,
+            ReplicaIdentity::Default,
+            vec![Arc::from("id")],
+            Lsn::new(1),
+        );
+        let r: Row = upd.deserialize_data_borrowed().unwrap();
+        assert_eq!(
+            r,
+            Row {
+                id: 9,
+                name: "updated"
+            }
+        );
+
+        // Delete → borrows from old_data.
+        let old_data = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("3")),
+            ("name", ColumnValue::text("gone")),
+        ]);
+        let del = ChangeEvent::delete(
+            "public",
+            "users",
+            1,
+            old_data,
+            ReplicaIdentity::Full,
+            vec![Arc::from("id")],
+            Lsn::new(2),
+        );
+        let r: Row = del.deserialize_data_borrowed().unwrap();
+        assert_eq!(
+            r,
+            Row {
+                id: 3,
+                name: "gone"
+            }
+        );
+    }
+
+    #[test]
+    fn test_deserialize_data_borrowed_non_dml_errors() {
+        #[derive(Debug, Deserialize)]
+        struct Row<'a> {
+            #[allow(dead_code)]
+            name: &'a str,
+        }
+        // Begin carries no row data → error, not panic.
+        let ts = Utc.with_ymd_and_hms(2024, 7, 1, 12, 0, 0).unwrap();
+        let begin = ChangeEvent::begin(7, Lsn::new(10), ts, Lsn::new(11));
+        let r: Result<Row> = begin.deserialize_data_borrowed();
+        assert!(r.is_err(), "Begin has no row data");
     }
 }

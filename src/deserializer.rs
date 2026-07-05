@@ -205,7 +205,8 @@ impl<'de> MapAccess<'de> for RowDataMapAccess<'de> {
         match self.iter.next() {
             Some((key, value)) => {
                 self.current_value = Some(value);
-                let key_de = serde::de::value::StrDeserializer::new(key.as_ref());
+                // Struct fields already match names without allocating.
+                let key_de = serde::de::value::BorrowedStrDeserializer::new(key.as_ref());
                 seed.deserialize(key_de).map(Some)
             }
             None => Ok(None),
@@ -3696,5 +3697,104 @@ mod tests {
         // Borrowed straight from the column buffer, not copied.
         let backing = row.get("raw").unwrap().as_bytes().as_ptr();
         assert_eq!(r.raw.as_ptr(), backing);
+    }
+
+    #[test]
+    fn test_deserialize_borrowed_map_keys_are_borrowed() {
+        // A HashMap<&'de str, &'de str> borrows BOTH keys and values straight
+        // from the row — the map key aliases the column's Arc<str> name buffer.
+        use std::collections::HashMap;
+        let row = RowData::from_pairs(vec![
+            ("alpha", ColumnValue::text("one")),
+            ("beta", ColumnValue::text("two")),
+        ]);
+        let m: HashMap<&str, &str> = row.deserialize_borrowed().unwrap();
+        assert_eq!(m.get("alpha"), Some(&"one"));
+        assert_eq!(m.get("beta"), Some(&"two"));
+
+        // Prove the key is borrowed, not copied: its pointer must equal the
+        // Arc<str> name backing the corresponding column.
+        let (name_arc, _) = row
+            .iter()
+            .find(|(k, _)| k.as_ref() == "alpha")
+            .expect("column present");
+        let borrowed_key: &&str = m.keys().find(|k| ***k == *"alpha").expect("key present");
+        let name_ptr = name_arc.as_bytes().as_ptr();
+        let key_ptr = borrowed_key.as_bytes().as_ptr();
+        assert_eq!(key_ptr, name_ptr);
+    }
+
+    #[test]
+    fn test_column_value_deserialize_any_borrowed_branches() {
+        // Directly exercise ColumnValueDeserializer::deserialize_any for all four
+        // variants — the borrowed-str / borrowed-bytes / none arms. Reached by
+        // self-describing targets (serde_json::Value, IgnoredAny, flatten).
+        use serde::de::{Deserializer as _, Visitor};
+        use std::fmt;
+
+        #[derive(Debug, PartialEq)]
+        enum Got {
+            Str(String),
+            Bytes(Vec<u8>),
+            None,
+        }
+        struct Rec;
+        impl<'de> Visitor<'de> for Rec {
+            type Value = Got;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(f, "anything")
+            }
+            fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Got, E> {
+                Ok(Got::Str(v.to_string()))
+            }
+            fn visit_str<E>(self, v: &str) -> Result<Got, E> {
+                Ok(Got::Str(v.to_string()))
+            }
+            fn visit_borrowed_bytes<E>(self, v: &'de [u8]) -> Result<Got, E> {
+                Ok(Got::Bytes(v.to_vec()))
+            }
+            fn visit_bytes<E>(self, v: &[u8]) -> Result<Got, E> {
+                Ok(Got::Bytes(v.to_vec()))
+            }
+            fn visit_none<E>(self) -> Result<Got, E> {
+                Ok(Got::None)
+            }
+        }
+
+        // Text (valid UTF-8) → visit_borrowed_str
+        let cv = ColumnValue::text("hello");
+        let d = super::ColumnValueDeserializer { value: &cv };
+        assert_eq!(d.deserialize_any(Rec).unwrap(), Got::Str("hello".into()));
+
+        // Text (invalid UTF-8) → visit_borrowed_bytes
+        let cv = ColumnValue::text_bytes(Bytes::from_static(&[0xff, 0xfe]));
+        let d = super::ColumnValueDeserializer { value: &cv };
+        assert_eq!(
+            d.deserialize_any(Rec).unwrap(),
+            Got::Bytes(vec![0xff, 0xfe])
+        );
+
+        // Binary → visit_borrowed_bytes
+        let cv = ColumnValue::binary_bytes(Bytes::from_static(&[1, 2, 3]));
+        let d = super::ColumnValueDeserializer { value: &cv };
+        assert_eq!(d.deserialize_any(Rec).unwrap(), Got::Bytes(vec![1, 2, 3]));
+
+        // Null → visit_none
+        let cv = ColumnValue::Null;
+        let d = super::ColumnValueDeserializer { value: &cv };
+        assert_eq!(d.deserialize_any(Rec).unwrap(), Got::None);
+    }
+
+    #[test]
+    fn test_deserialize_borrowed_null_as_bytes_errors() {
+        // NULL through the borrowed deserialize_bytes path must error, not panic.
+        #[derive(Debug, Deserialize)]
+        struct Row<'a> {
+            #[serde(with = "serde_bytes")]
+            data: &'a [u8],
+        }
+        let row = RowData::from_pairs(vec![("data", ColumnValue::Null)]);
+        let r: crate::error::Result<Row> = row.deserialize_borrowed();
+        assert!(r.is_err(), "NULL as borrowed bytes should error");
     }
 }
