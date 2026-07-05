@@ -12,6 +12,9 @@ cargo build --no-default-features --features rustls-tls
 # Run unit tests (no PostgreSQL required)
 cargo test --lib
 
+# Run unit tests including the derive-macro layer
+cargo test --lib --features derive
+
 # Run benchmarks
 cargo bench --bench wal_pipeline
 
@@ -33,6 +36,9 @@ src/
 ├── buffer.rs        # Zero-copy BufferReader/BufferWriter (bytes crate)
 ├── protocol.rs      # WAL message parser (hot path)
 ├── stream.rs        # High-level LogicalReplicationStream + EventStream
+│                    #   + ReplicationStreamConfig builder, EventStream::for_each_event
+├── router.rs        # WalRouter: typed async by-table event router (convenience layer)
+├── handler.rs       # WalTable trait (bound to #[derive(WalTable)])
 ├── column_value.rs  # ColumnValue/RowData types
 ├── deserializer.rs  # serde Deserializer for RowData → user structs
 ├── types.rs         # Type aliases, CachePadded, ChangeEvent, Lsn
@@ -44,7 +50,25 @@ src/
     ├── mod.rs
     ├── libpq.rs     # libpq FFI backend (default)
     └── native/      # Pure-Rust rustls-tls backend
+
+macros/              # pg-walstream-macros proc-macro crate (opt-in `derive` feature)
+└── src/lib.rs       #   #[derive(WalTable)] → impl WalTable { const TABLE }
 ```
+
+## Client Ergonomics Layer (not hot path)
+
+Convenience API on top of the core streaming primitives, all `Send + 'static`:
+
+- `ReplicationStreamConfig::builder(slot, publication).with_*(...)` — avoids the
+  8-arg `new()` (which is retained, non-breaking).
+- `EventStream::for_each_event(|ev| async {...})` — consume loop that auto-advances
+  the applied LSN after each `Ok` handler; `Cancelled` → graceful exit.
+- `WalRouter` — routes by `(table, kind)` to typed async handlers
+  (`on_insert/on_update/on_delete/on_default`, `dispatch`, `run`). Heap-allocates one
+  boxed future per event; perf-critical consumers use `next_event`/`for_each_event`.
+- `#[derive(WalTable)] #[wal(table = "...")]` (opt-in `derive` feature) + the
+  `on_insert_of::<T>/on_update_of::<T>/on_delete_of::<T>` router methods infer the
+  table from `T::TABLE`. Derive-using tests are `#[cfg(all(test, feature = "derive"))]`.
 
 ## Hot Path
 

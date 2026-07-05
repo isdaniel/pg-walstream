@@ -264,6 +264,78 @@ impl ReplicationStreamConfig {
     }
 }
 
+impl Default for ReplicationStreamConfig {
+    fn default() -> Self {
+        Self {
+            slot_name: String::new(),
+            publication_name: String::new(),
+            protocol_version: 2,
+            streaming_mode: StreamingMode::Off,
+            messages: false,
+            binary: false,
+            two_phase: false,
+            origin: None,
+            feedback_interval: Duration::from_secs(10),
+            connection_timeout: Duration::from_secs(30),
+            health_check_interval: Duration::from_secs(60),
+            retry_config: RetryConfig::default(),
+            slot_options: ReplicationSlotOptions {
+                snapshot: Some("nothing".to_string()),
+                ..Default::default()
+            },
+            slot_type: SlotType::Logical,
+        }
+    }
+}
+
+impl ReplicationStreamConfig {
+    /// Start a config from the two required fields; everything else defaults.
+    /// Non-breaking alternative to the 8-arg [`new`](Self::new).
+    #[inline]
+    pub fn builder(slot: impl Into<String>, publication: impl Into<String>) -> Self {
+        Self {
+            slot_name: slot.into(),
+            publication_name: publication.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Set the logical replication protocol version (1-4).
+    #[inline]
+    pub fn with_protocol_version(mut self, v: u32) -> Self {
+        self.protocol_version = v;
+        self
+    }
+
+    /// Set how often status feedback is sent to PostgreSQL.
+    #[inline]
+    pub fn with_feedback_interval(mut self, d: Duration) -> Self {
+        self.feedback_interval = d;
+        self
+    }
+
+    /// Set the connection establishment timeout.
+    #[inline]
+    pub fn with_connection_timeout(mut self, d: Duration) -> Self {
+        self.connection_timeout = d;
+        self
+    }
+
+    /// Set how often connection health is checked.
+    #[inline]
+    pub fn with_health_check_interval(mut self, d: Duration) -> Self {
+        self.health_check_interval = d;
+        self
+    }
+
+    /// Set the connection retry configuration.
+    #[inline]
+    pub fn with_retry_config(mut self, r: RetryConfig) -> Self {
+        self.retry_config = r;
+        self
+    }
+}
+
 impl LogicalReplicationStream {
     /// Create a new logical replication stream
     ///
@@ -1804,6 +1876,45 @@ pub struct EventStream {
     terminated: bool,
 }
 
+/// Crate-internal seam so the consume loop is unit-testable without a live
+/// PostgreSQL connection. Implemented by [`EventStream`]; mocked in tests.
+pub(crate) trait EventSource {
+    async fn recv(&mut self) -> Result<ChangeEvent>;
+    fn ack(&self, lsn: XLogRecPtr);
+}
+
+impl EventSource for EventStream {
+    #[inline]
+    async fn recv(&mut self) -> Result<ChangeEvent> {
+        self.next_event().await
+    }
+    #[inline]
+    fn ack(&self, lsn: XLogRecPtr) {
+        self.update_applied_lsn(lsn);
+    }
+}
+
+/// Drive `source`, running `handler` per event and advancing the applied LSN
+/// only after the handler resolves `Ok`. `Cancelled` recv → graceful `Ok(())`.
+pub(crate) async fn for_each_event_impl<S, F, Fut>(source: &mut S, mut handler: F) -> Result<()>
+where
+    S: EventSource,
+    F: FnMut(ChangeEvent) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    loop {
+        match source.recv().await {
+            Ok(ev) => {
+                let lsn = ev.lsn.value();
+                handler(ev).await?;
+                source.ack(lsn);
+            }
+            Err(ReplicationError::Cancelled(_)) => return Ok(()),
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 impl EventStream {
     /// Get a reference to the underlying LogicalReplicationStream
     ///
@@ -1889,6 +2000,23 @@ impl EventStream {
             .as_mut()
             .expect("inner stream is temporarily taken during poll");
         inner.next_event_with_retry(&self.cancellation_token).await
+    }
+
+    /// Consume the stream to completion, running `handler` on each event and
+    /// automatically advancing the applied LSN after each successful handler.
+    ///
+    /// - `handler` returning `Ok(())` acks that event (advances applied LSN).
+    /// - `handler` returning `Err(e)` stops the loop and returns `e` (no ack).
+    /// - A cancelled stream returns `Ok(())` for graceful shutdown.
+    ///
+    /// The handler future must be self-contained (own its captures or clone an
+    /// `Arc`); it may not borrow the handler's environment across `.await`.
+    pub async fn for_each_event<F, Fut>(&mut self, handler: F) -> Result<()>
+    where
+        F: FnMut(ChangeEvent) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        for_each_event_impl(self, handler).await
     }
 
     /// Gracefully shut down the replication stream.
@@ -8130,5 +8258,135 @@ mod tests {
         } else {
             panic!("Expected Relation event");
         }
+    }
+}
+
+#[cfg(test)]
+mod ergonomics_config_tests {
+    use super::*;
+    use std::time::Duration;
+
+    // builder() must match the exact defaults new() produces.
+    #[test]
+    fn builder_matches_new_defaults() {
+        let built = ReplicationStreamConfig::builder("slot_a", "pub_a")
+            .with_protocol_version(2)
+            .with_streaming_mode(StreamingMode::On)
+            .with_feedback_interval(Duration::from_secs(10))
+            .with_connection_timeout(Duration::from_secs(30))
+            .with_health_check_interval(Duration::from_secs(60));
+
+        let made = ReplicationStreamConfig::new(
+            "slot_a".to_string(),
+            "pub_a".to_string(),
+            2,
+            StreamingMode::On,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        );
+
+        assert_eq!(built.slot_name, made.slot_name);
+        assert_eq!(built.publication_name, made.publication_name);
+        assert_eq!(built.protocol_version, made.protocol_version);
+        assert_eq!(built.streaming_mode, made.streaming_mode);
+        assert_eq!(built.feedback_interval, made.feedback_interval);
+        assert_eq!(built.connection_timeout, made.connection_timeout);
+        assert_eq!(built.health_check_interval, made.health_check_interval);
+        // Critical: snapshot default must be Some("nothing").
+        assert_eq!(built.slot_options.snapshot, Some("nothing".to_string()));
+        assert_eq!(built.slot_options.snapshot, made.slot_options.snapshot);
+    }
+
+    #[test]
+    fn default_has_nothing_snapshot() {
+        let d = ReplicationStreamConfig::default();
+        assert_eq!(d.slot_options.snapshot, Some("nothing".to_string()));
+        assert_eq!(d.protocol_version, 2);
+    }
+}
+
+#[cfg(test)]
+mod for_each_event_tests {
+    use super::*;
+    use crate::{ChangeEvent, ColumnValue, Lsn, RowData};
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct MockSource {
+        events: VecDeque<Result<ChangeEvent>>,
+        last_ack: AtomicU64,
+    }
+    impl MockSource {
+        fn new(events: Vec<Result<ChangeEvent>>) -> Self {
+            Self {
+                events: events.into(),
+                last_ack: AtomicU64::new(0),
+            }
+        }
+    }
+    impl EventSource for MockSource {
+        async fn recv(&mut self) -> Result<ChangeEvent> {
+            self.events
+                .pop_front()
+                .unwrap_or_else(|| Err(ReplicationError::Cancelled("drained".into())))
+        }
+        fn ack(&self, lsn: XLogRecPtr) {
+            self.last_ack.store(lsn, Ordering::SeqCst);
+        }
+    }
+
+    fn ins(lsn: u64) -> ChangeEvent {
+        let data = RowData::from_pairs(vec![("id", ColumnValue::text("1"))]);
+        ChangeEvent::insert("public", "t", 1, data, Lsn::new(lsn))
+    }
+
+    #[tokio::test]
+    async fn acks_after_each_ok_handler() {
+        let mut src = MockSource::new(vec![Ok(ins(10)), Ok(ins(20))]);
+        let mut seen = Vec::new();
+        let out = for_each_event_impl(&mut src, |ev| {
+            seen.push(ev.lsn.value());
+            async { Ok(()) }
+        })
+        .await;
+        assert!(out.is_ok());
+        assert_eq!(seen, vec![10, 20]);
+        assert_eq!(src.last_ack.load(Ordering::SeqCst), 20);
+    }
+
+    #[tokio::test]
+    async fn handler_err_stops_without_acking_that_event() {
+        let mut src = MockSource::new(vec![Ok(ins(10)), Ok(ins(20))]);
+        let mut n = 0;
+        let out = for_each_event_impl(&mut src, |_ev| {
+            n += 1;
+            async move {
+                if n == 2 {
+                    Err(ReplicationError::deserialize("boom"))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        assert!(out.is_err());
+        // First event (10) acked, second (20) failed before ack.
+        assert_eq!(src.last_ack.load(Ordering::SeqCst), 10);
+    }
+
+    #[tokio::test]
+    async fn cancelled_recv_exits_ok() {
+        let mut src = MockSource::new(vec![Err(ReplicationError::Cancelled("stop".into()))]);
+        let out = for_each_event_impl(&mut src, |_ev| async { Ok(()) }).await;
+        assert!(out.is_ok());
+    }
+
+    #[tokio::test]
+    async fn non_cancelled_recv_err_propagates() {
+        let mut src = MockSource::new(vec![Err(ReplicationError::deserialize("io"))]);
+        let out = for_each_event_impl(&mut src, |_ev| async { Ok(()) }).await;
+        assert!(out.is_err());
     }
 }

@@ -55,12 +55,22 @@ jobs:
 
     - name: Verify tag matches Cargo.toml version
       run: |
+        # Both crates inherit [workspace.package] version, so this literal is the
+        # single source of truth for the whole release.
         CARGO_VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/.*= "//' | sed 's/".*//')
         TAG_VERSION="${{ steps.get_version.outputs.version }}"
-        echo "Cargo.toml version: $CARGO_VERSION"
+        echo "workspace.package version: $CARGO_VERSION"
         echo "Git tag version: $TAG_VERSION"
         if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
           echo "Error: Version mismatch between Cargo.toml ($CARGO_VERSION) and git tag ($TAG_VERSION)"
+          exit 1
+        fi
+        # The exact dep pin in [workspace.dependencies] is the one field NOT covered
+        # by inheritance — it must be bumped alongside the version.
+        PIN=$(grep 'pg-walstream-macros' Cargo.toml | grep -o 'version = "=[^"]*"' | grep -o '[0-9][^"]*')
+        echo "pg-walstream-macros dep pin: =$PIN"
+        if [ "$PIN" != "$TAG_VERSION" ]; then
+          echo "Error: pg-walstream-macros pin (=$PIN) must equal the release tag ($TAG_VERSION)"
           exit 1
         fi
 
@@ -69,15 +79,44 @@ jobs:
       if: steps.verify_main.outputs.on_main == 'true'
       uses: rust-lang/crates-io-auth-action@v1
 
-    - name: Dry run publish
+    - name: Dry run publish (pg-walstream-macros)
       if: steps.verify_main.outputs.on_main == 'true'
-      run: cargo publish --dry-run
+      run: cargo publish -p pg-walstream-macros --dry-run
       env:
         CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
-    - name: Publish to crates.io
+    # The lib depends on the macro crate (=version), so the macro crate must be
+    # published and indexed FIRST or the lib publish fails to resolve it.
+    - name: Publish pg-walstream-macros to crates.io
       if: steps.verify_main.outputs.on_main == 'true'
-      run: cargo publish
+      run: cargo publish -p pg-walstream-macros
+      env:
+        CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+    - name: Wait for pg-walstream-macros to appear on the crates.io index
+      if: steps.verify_main.outputs.on_main == 'true'
+      run: |
+        VER="${{ steps.get_version.outputs.version }}"
+        for i in $(seq 1 30); do
+          if curl -sf "https://index.crates.io/pg/-w/pg-walstream-macros" | grep -q "\"vers\":\"$VER\""; then
+            echo "pg-walstream-macros $VER is indexed."
+            exit 0
+          fi
+          echo "Waiting for crates.io to index pg-walstream-macros $VER ($i/30)..."
+          sleep 10
+        done
+        echo "Timed out waiting for pg-walstream-macros $VER on the crates.io index."
+        exit 1
+
+    - name: Dry run publish (pg_walstream)
+      if: steps.verify_main.outputs.on_main == 'true'
+      run: cargo publish -p pg_walstream --dry-run
+      env:
+        CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+    - name: Publish pg_walstream to crates.io
+      if: steps.verify_main.outputs.on_main == 'true'
+      run: cargo publish -p pg_walstream
       env:
         CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 

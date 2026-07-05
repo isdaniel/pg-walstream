@@ -1,0 +1,21 @@
+[package]
+name = "derive-router"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Demonstrates #[derive(WalTable)] + WalRouter::on_*_of on live PostgreSQL WAL events"
+
+[features]
+default = ["libpq"]
+libpq = ["pg_walstream/libpq"]
+rustls-tls = ["pg_walstream/rustls-tls", "dep:rustls"]
+
+[dependencies]
+pg_walstream = { path = "../..", features = ["derive"] }
+rustls = { version = "0.23.38", default-features = false, features = ["aws_lc_rs"], optional = true }
+serde = { version = "1.0.228", features = ["derive"] }
+tokio = { version = "1.52.1", features = ["full"] }
+tokio-postgres = "0.7.17"
+postgres-openssl = "0.5.3"
+openssl = "0.10.76"
+chrono = "0.4.44"
