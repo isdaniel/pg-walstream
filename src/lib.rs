@@ -125,6 +125,11 @@
 
 extern crate alloc;
 
+// Lets `#[derive(WalTable)]` expansions inside this crate's own tests resolve
+// `::pg_walstream::WalTable`. Downstream crates don't need this.
+#[cfg(feature = "derive")]
+extern crate self as pg_walstream;
+
 /// Common `alloc` re-exports so each module can `use crate::prelude::*` and work
 /// in both `std` and `no_std + alloc` builds. Glob-imported, so unused entries
 /// never warn, and under `std` they shadow the identical prelude items harmlessly.
@@ -148,6 +153,8 @@ pub mod error;
 pub mod sql_builder;
 pub mod types;
 
+pub mod handler;
+
 // Protocol implementation
 pub mod lsn;
 pub mod pgoutput_encode;
@@ -156,6 +163,9 @@ pub mod protocol;
 // High-level stream management
 #[cfg(any(feature = "libpq", feature = "rustls-tls"))]
 pub mod stream;
+
+#[cfg(any(feature = "libpq", feature = "rustls-tls"))]
+pub mod router;
 
 #[cfg(any(feature = "libpq", feature = "rustls-tls"))]
 pub mod connection;
@@ -169,6 +179,8 @@ pub use lsn::SharedLsnFeedback;
 
 // Re-export column value types
 pub use column_value::{ColumnValue, RowData};
+
+pub use handler::WalTable;
 
 // Re-export deserializer
 pub use deserializer::{FieldError, RowDataDeserializer, TryDeserializeResult};
@@ -222,6 +234,12 @@ pub use stream::{
     EventStream, EventStreamRef, LogicalReplicationStream, OriginFilter, ReplicationStreamConfig,
     StreamingMode,
 };
+
+#[cfg(any(feature = "libpq", feature = "rustls-tls"))]
+pub use router::WalRouter;
+
+#[cfg(feature = "derive")]
+pub use pg_walstream_macros::{wal_table, WalTable};
 
 // Re-export tokio_util for CancellationToken
 #[cfg(any(feature = "libpq", feature = "rustls-tls"))]

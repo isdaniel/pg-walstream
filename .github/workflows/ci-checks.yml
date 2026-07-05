@@ -53,11 +53,19 @@ jobs:
     - name: Check formatting
       run: cargo fmt --all -- --check
 
+    - name: Clippy (workspace, derive feature)
+      # Gate lints on stable only; beta may add lints that would fail -D warnings.
+      if: matrix.rust == 'stable'
+      run: cargo clippy --workspace --all-targets --features derive -- -D warnings
+
     - name: Build
-      run: cargo build --verbose
+      run: cargo build --workspace --verbose
 
     - name: Run unit tests
       run: cargo test --lib --verbose
+
+    - name: Run unit tests (derive feature)
+      run: cargo test --lib --features derive --verbose
 
   coverage:
     name: Code Coverage
@@ -90,10 +98,10 @@ jobs:
           ${{ runner.os }}-cargo-coverage-
 
     - name: Generate coverage report (lcov for Codecov)
-      run: cargo llvm-cov --lib --lcov --output-path lcov.info
+      run: cargo llvm-cov --lib --features derive --lcov --output-path lcov.info
 
     - name: Generate coverage report (json for threshold check)
-      run: cargo llvm-cov --lib --json --output-path coverage.json
+      run: cargo llvm-cov --lib --features derive --json --output-path coverage.json
 
     - name: Check coverage threshold (minimum ${{ env.MIN_COVERAGE }}%)
       run: |
@@ -221,7 +229,7 @@ jobs:
         PGPASSWORD=postgres psql -h localhost -U postgres -d test_walstream \
           -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_type = 'logical';" || true
 
-        cargo test --test typed_deserialization -- --ignored --nocapture --test-threads=1
+        cargo test --test typed_deserialization --features derive -- --ignored --nocapture --test-threads=1
 
         PGPASSWORD=postgres psql -h localhost -U postgres -d test_walstream \
           -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_type = 'logical';" || true
@@ -242,6 +250,13 @@ jobs:
           -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_type = 'logical';" || true
 
         cargo test --test pg_result_get_bytes -- --ignored --nocapture --test-threads=1
+
+        PGPASSWORD=postgres psql -h localhost -U postgres -d test_walstream \
+          -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_type = 'logical';" || true
+
+        # Ergonomics layer (WalRouter, for_each_event) + derive layer (WalTable /
+        # on_*_of) — the derive module is #[cfg(feature = "derive")].
+        cargo test --test ergonomics --features derive -- --ignored --nocapture --test-threads=1
 
   integration-ssl:
     name: SSL Integration Tests (PG ${{ matrix.pg_version }})

@@ -24,6 +24,7 @@ A high-performance Rust library for PostgreSQL logical and physical replication 
 - **Connection Management**: Built-in connection handling with exponential backoff retry logic
 - **Type-Safe API**: Strongly typed message parsing with comprehensive error handling
 - **Typed Row Deserialization**: Built-in `serde` deserializer maps WAL rows directly into user-defined Rust structs (numerics, `bool`, `String`, `Option<T>`, enums, bytes)
+- **High-Level Consumption Ergonomics**: `ReplicationStreamConfig::builder()`, an auto-acking `EventStream::for_each_event`, and a typed by-table `WalRouter` with an optional `#[derive(WalTable)]` layer (opt-in `derive` feature)
 - **Replication Slot Management**: Create, alter, read, and drop slots with full option support
 - **Hot Standby Feedback**: Send hot standby feedback messages for physical replication
 
@@ -61,6 +62,7 @@ pg-walstream provides two connection backends plus a `std` toggle, all selected 
 | `std` | Yes | None | Standard library support. Disable with `default-features = false` for a `no_std` plus `alloc` parser-only build (no connection layer) that compiles for `wasm32-unknown-unknown` and embedded targets. |
 | `libpq` | Yes | `libpq-dev`, `libclang-dev` | Uses PostgreSQL's C client library via FFI. Battle-tested, supports all auth methods natively. Implies `std`. |
 | `rustls-tls` | No | `cmake`, `gcc` (build-time only) | Pure-Rust implementation using `rustls` with `aws-lc-rs` crypto backend for hardware-accelerated TLS. No runtime C dependencies. Takes priority when both backends are enabled. Implies `std`. |
+| `derive` | No | None | Opt-in proc-macros (pull `syn`/`quote`) that bind a struct to a table — `#[derive(WalTable)] #[wal(table = "...")]` or the one-line attribute form `#[wal_table("...")]` — enabling the `WalRouter::on_insert_of::<T>` / `on_update_of::<T>` / `on_delete_of::<T>` table-inference methods. |
 
 > **Note:** The protocol parser, encoder, and types need no backend. Building with `default-features = false` gives a `no_std` plus `alloc` build of just those, suitable for wasm and embedded. A connection backend (`libpq` or `rustls-tls`) is required only for the live streaming and connection APIs, and pulls in `std`.
 
@@ -123,6 +125,7 @@ The [`examples/`](examples/) directory contains runnable examples demonstrating 
 | [`rate-limited-streaming`](examples/rate-limited-streaming) | Rate-limited consumption using `tokio_stream::StreamExt::throttle` |
 | [`tokio-spawn-streaming`](examples/tokio-spawn-streaming) | Producer/consumer pattern via `tokio::spawn` with `mpsc` channel (demonstrates `Send` safety) |
 | [`typed-deserialization`](examples/typed-deserialization) | Map INSERT/UPDATE/DELETE events directly into user-defined Rust structs via `serde` |
+| [`derive-router`](examples/derive-router) | `#[derive(WalTable)]` + `WalRouter` table-inference (`on_*_of::<T>`) — the `derive` feature |
 | [`pg-basebackup`](examples/pg-basebackup) | Full physical backup tool using `BASE_BACKUP` with tar extraction and progress reporting |
 | [`arbitrary-fuzzing`](examples/arbitrary-fuzzing) | Property-based fuzzing of all protocol types using the `arbitrary` crate |
 
@@ -177,6 +180,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+```
+
+## Mapping Columns to Struct Fields
+
+Rows are keyed by their real PostgreSQL column names. When a struct field name
+differs from its column, use serde's `#[serde(rename = "...")]` — no extra
+attribute is needed:
+
+```rust
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+struct User {
+    id: i64,
+    #[serde(rename = "user_name")] // field `username` ← column `user_name`
+    username: String,
+    #[serde(rename = "mail")]      // field `email`    ← column `mail`
+    email: Option<String>,         // nullable column → Option
+}
+
+// let user: User = event.deserialize_insert()?;   // or row.deserialize_into()?
+```
+
+With the `derive` feature, add `#[wal_table("...")]` (outermost attribute) to bind the type to its table for `WalRouter`; it composes with the renames above:
+
+```rust,ignore
+#[wal_table("typed_deser_users")]
+#[derive(Debug, Deserialize)]
+struct User { /* fields as above */ }
 ```
 
 ## LSN Tracking

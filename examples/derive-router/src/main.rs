@@ -1,8 +1,8 @@
-//! Typed Deserialization Example (Live Database)
+//! Derive Router Example (Live Database)
 //!
-//! Demonstrates how to connect to a real PostgreSQL database, stream WAL events
-//! via `next_event()`, and deserialize them into user-defined Rust structs using
-//! `ChangeEvent::deserialize_insert()`, `deserialize_update()`, etc.
+//! Demonstrates how to connect to a real PostgreSQL database, stream WAL events,
+//! and route them into typed handlers using `#[derive(WalTable)]` and the
+//! `WalRouter::on_*_of` Level-A closures.
 //!
 //! ## Prerequisites
 //!
@@ -12,7 +12,7 @@
 //! ## Running
 //!
 //! ```bash
-//! cd examples/typed-deserialization
+//! cd examples/derive-router
 //! DATABASE_URL='postgresql://postgres:pass@host:5432/db?replication=database&sslmode=require' cargo run
 //! ```
 //!
@@ -26,21 +26,20 @@
 use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 use pg_walstream::{
     CancellationToken, LogicalReplicationStream, ReplicationSlotOptions, ReplicationStreamConfig,
-    RetryConfig, StreamingMode, WalRouter,
+    RetryConfig, StreamingMode, WalRouter, wal_table
 };
 use postgres_openssl::MakeTlsConnector;
 use serde::Deserialize;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
-// 1. Define your model structs — just derive Deserialize
+// 1. Define your model struct — derive Deserialize + WalTable
 // ---------------------------------------------------------------------------
 
-/// Matches the `users` table we create below:
+/// Matches the `typed_deser_users` table we create below:
 /// ```sql
-/// CREATE TABLE users (
+/// CREATE TABLE typed_deser_users (
 ///     id         BIGSERIAL PRIMARY KEY,
 ///     username   VARCHAR(50) NOT NULL,
 ///     email      TEXT,
@@ -48,6 +47,9 @@ use std::time::Duration;
 ///     active     BOOLEAN NOT NULL DEFAULT true
 /// );
 /// ```
+// #[derive(Debug, Deserialize, pg_walstream::WalTable)]
+// #[wal(table = "typed_deser_users")]
+#[wal_table("typed_deser_users")]
 #[derive(Debug, Deserialize)]
 struct User {
     id: i64,
@@ -308,7 +310,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     }
 
-    println!("=== pg-walstream Typed Deserialization (Live DB) ===\n");
+    println!("=== pg-walstream Derive Router (Live DB) ===\n");
 
     let cfg = parse_db_config();
     println!(
@@ -359,54 +361,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Listening for WAL events... (Press Ctrl+C to stop)\n");
     println!("{:-<70}", "");
 
-    // 5. Route events through a WalRouter with typed, per-table handlers.
+    // 5. Route events through a WalRouter using the derived table + Level-A closures.
+    use std::sync::atomic::{AtomicU64, Ordering};
     let count = Arc::new(AtomicU64::new(0));
-
     let mut router = WalRouter::new();
     {
         let c = count.clone();
-        router.on_insert::<User, _, _>(TABLE_NAME, move |u| {
+        router.on_insert_of::<User, _>(move |u| {
+            let c = c.clone();
+            async move { c.fetch_add(1, Ordering::SeqCst); println!("[INSERT] {}", fmt_user(&u)); Ok(()) }
+        });
+    }
+    {
+        let c = count.clone();
+        router.on_update_of::<User, _>(move |old, new| {
             let c = c.clone();
             async move {
                 c.fetch_add(1, Ordering::SeqCst);
-                println!("[INSERT] {}", fmt_user(&u));
+                println!("[UPDATE] {} => {}", old.as_ref().map(fmt_user).unwrap_or_else(|| "<none>".into()), fmt_user(&new));
                 Ok(())
             }
         });
     }
     {
         let c = count.clone();
-        router.on_update::<User, _, _>(TABLE_NAME, move |old, new| {
+        router.on_delete_of::<User, _>(move |u| {
             let c = c.clone();
-            async move {
-                c.fetch_add(1, Ordering::SeqCst);
-                match &old {
-                    Some(o) => println!("[UPDATE] old={} => new={}", fmt_user(o), fmt_user(&new)),
-                    None => println!("[UPDATE] old=<unavailable> => new={}", fmt_user(&new)),
-                }
-                Ok(())
-            }
+            async move { c.fetch_add(1, Ordering::SeqCst); println!("[DELETE] {}", fmt_user(&u)); Ok(()) }
         });
     }
-    {
-        let c = count.clone();
-        router.on_delete::<User, _, _>(TABLE_NAME, move |u| {
-            let c = c.clone();
-            async move {
-                c.fetch_add(1, Ordering::SeqCst);
-                println!("[DELETE] {}", fmt_user(&u));
-                Ok(())
-            }
-        });
-    }
-
     router.run(&mut event_stream).await?;
-
     let _ = event_stream.shutdown().await;
-    println!(
-        "\nTotal DML events deserialized: {}",
-        count.load(Ordering::SeqCst)
-    );
+    println!("\nTotal DML events handled: {}", count.load(Ordering::SeqCst));
 
     // 6. Cleanup
     cleanup_database(&cfg).await;

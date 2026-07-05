@@ -501,3 +501,102 @@ async fn test_row_try_deserialize_into_lenient() {
         good.value, bad.value, bad.errors
     );
 }
+
+// ─── 6) #[wal_table] + #[serde(rename)] column mapping — typed_deser_users ────
+//
+// End-to-end proof that `#[wal_table("typed_deser_users")]` composes with
+// `#[serde(rename)]`: fields `username`/`email` map to real columns
+// `user_name`/`mail`, while `WalTable::TABLE` is bound for router dispatch.
+// Gated on the `derive` feature (same pattern as ergonomics.rs).
+
+#[cfg(feature = "derive")]
+mod wal_table_mapping {
+    use super::*;
+    use pg_walstream::{wal_table, WalTable};
+
+    /// Mirrors the `typed_deser_users` table from the design request.
+    #[wal_table("typed_deser_users")]
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct User {
+        id: i64,
+        #[serde(rename = "user_name")]
+        username: String,
+        #[serde(rename = "mail")]
+        email: Option<String>, // nullable column → Option
+        score: f64,
+        active: bool,
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live PostgreSQL with wal_level=logical"]
+    async fn test_wal_table_column_mapping() {
+        // Table binding comes from the attribute macro, not a hardcoded literal.
+        assert_eq!(<User as WalTable>::TABLE, "typed_deser_users");
+
+        let slot = "it_typed_col_map";
+        let pub_name = "typed_col_map_pub";
+        drop_slot(slot);
+
+        let mut regular =
+            PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
+
+        let ddl = format!(
+            "CREATE TABLE IF NOT EXISTS {} (\
+             id BIGSERIAL PRIMARY KEY, \
+             user_name VARCHAR(50) NOT NULL, \
+             mail TEXT, \
+             score DOUBLE PRECISION NOT NULL DEFAULT 0.0, \
+             active BOOLEAN NOT NULL DEFAULT true\
+             )",
+            <User as WalTable>::TABLE
+        );
+        let _ = regular.exec(&ddl);
+        let _ = regular.exec("TRUNCATE typed_deser_users RESTART IDENTITY");
+        let _ = regular.exec(&format!("DROP PUBLICATION IF EXISTS {pub_name}"));
+        let _ = regular.exec(&format!(
+            "CREATE PUBLICATION {pub_name} FOR TABLE typed_deser_users"
+        ));
+
+        let mut stream =
+            LogicalReplicationStream::new(&replication_conn_string(), typed_config(slot, pub_name))
+                .await
+                .expect("replication stream");
+        stream.start(None).await.expect("start");
+
+        // Row 1: mail present. Row 2: mail NULL → None, active false.
+        regular
+            .exec(
+                "INSERT INTO typed_deser_users (user_name, mail, score, active) VALUES \
+                 ('alice', 'alice@example.com', 3.5, true), \
+                 ('bob', NULL, 0.0, false)",
+            )
+            .expect("INSERT users");
+
+        let events = collect_change_events(&mut stream, 10, 2, 0).await;
+        let inserts: Vec<&ChangeEvent> = events
+            .iter()
+            .filter(|e| matches!(e.event_type, EventType::Insert { .. }))
+            .collect();
+        assert_eq!(inserts.len(), 2, "expected 2 Insert events");
+
+        let alice: User = inserts[0].deserialize_insert().expect("deserialize alice");
+        assert_eq!(
+            alice,
+            User {
+                id: 1,
+                username: "alice".into(),
+                email: Some("alice@example.com".into()),
+                score: 3.5,
+                active: true,
+            }
+        );
+
+        let bob: User = inserts[1].deserialize_insert().expect("deserialize bob");
+        assert_eq!(bob.id, 2);
+        assert_eq!(bob.username, "bob");
+        assert_eq!(bob.email, None);
+        assert!(!bob.active);
+
+        println!("wal_table column mapping OK: alice={alice:?} bob={bob:?}");
+    }
+}

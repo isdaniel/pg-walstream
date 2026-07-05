@@ -1,0 +1,20 @@
+[package]
+name = "pg-walstream-macros"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Derive macros for pg-walstream (WalTable)."
+keywords = ["postgresql", "replication", "derive", "wal"]
+categories = ["database"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2.0.118", features = ["full"] }
+quote = "1.0.46"
+proc-macro2 = "1.0.106"

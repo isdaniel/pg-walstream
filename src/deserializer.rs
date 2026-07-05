@@ -25,6 +25,65 @@
 //! assert_eq!(user.id, 42);
 //! assert_eq!(user.username, "alice");
 //! ```
+//!
+//! # Mapping struct fields to different column names
+//!
+//! [`RowData`] is keyed by the *real* PostgreSQL column names that pgoutput
+//! delivers, so field→column mapping needs only serde's
+//! `#[serde(rename = "...")]` — there is no bespoke `#[column(...)]` attribute:
+//!
+//! ```
+//! use pg_walstream::{RowData, ColumnValue};
+//! use serde::Deserialize;
+//!
+//! #[derive(Debug, Deserialize, PartialEq)]
+//! struct User {
+//!     id: i64,
+//!     #[serde(rename = "user_name")] // struct field `username` ← column `user_name`
+//!     username: String,
+//!     #[serde(rename = "mail")]      // struct field `email`    ← column `mail`
+//!     email: Option<String>,         // nullable column → Option
+//!     score: f64,
+//!     active: bool,
+//! }
+//!
+//! let row = RowData::from_pairs(vec![
+//!     ("id", ColumnValue::text("1")),
+//!     ("user_name", ColumnValue::text("alice")),
+//!     ("mail", ColumnValue::Null),
+//!     ("score", ColumnValue::text("9.5")),
+//!     ("active", ColumnValue::text("t")),
+//! ]);
+//! let user: User = row.deserialize_into().unwrap();
+//! assert_eq!(user, User { id: 1, username: "alice".into(), email: None, score: 9.5, active: true });
+//! ```
+//!
+//! ## Binding the type to its table with `#[wal_table]`
+//!
+//! The `#[wal_table("...")]` attribute (opt-in `derive` feature) composes with
+//! the `#[serde(rename)]` mapping above — it only adds a `WalTable::TABLE`
+//! binding for router dispatch and leaves the field attributes untouched.
+//! Place it as the outer (top) attribute, above `#[derive(Deserialize)]`:
+//!
+//! ```ignore
+//! # // requires: pg-walstream = { features = ["derive"] }
+//! use pg_walstream::{wal_table, WalTable, RowData, ColumnValue};
+//! use serde::Deserialize;
+//!
+//! #[wal_table("typed_deser_users")]
+//! #[derive(Debug, Deserialize, PartialEq)]
+//! struct User {
+//!     id: i64,
+//!     #[serde(rename = "user_name")]
+//!     username: String,
+//!     #[serde(rename = "mail")]
+//!     email: Option<String>,
+//!     score: f64,
+//!     active: bool,
+//! }
+//!
+//! assert_eq!(<User as WalTable>::TABLE, "typed_deser_users");
+//! ```
 
 use crate::column_value::{ColumnValue, RowData};
 use crate::error::ReplicationError;
@@ -1250,6 +1309,65 @@ mod tests {
         let v: Renamed = row.deserialize_into().unwrap();
         assert_eq!(v.id, 10);
         assert_eq!(v.name, "charlie");
+    }
+
+    // -- Column-name mapping + #[wal_table]: the exact typed_deser_users case --
+    // Runnable proof that `#[wal_table("...")]` composes with `#[serde(rename)]`:
+    // the attribute macro binds `WalTable::TABLE` while leaving the field rename
+    // attrs intact for the derive. Mirrors the `column_mapping` integration test.
+    #[cfg(feature = "derive")]
+    #[test]
+    fn test_wal_table_with_column_rename() {
+        use crate::{wal_table, WalTable};
+
+        #[wal_table("typed_deser_users")]
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct User {
+            id: i64,
+            #[serde(rename = "user_name")]
+            username: String,
+            #[serde(rename = "mail")]
+            email: Option<String>, // nullable column → Option
+            score: f64,
+            active: bool,
+        }
+
+        // Table binding populated by the attribute macro.
+        assert_eq!(<User as WalTable>::TABLE, "typed_deser_users");
+
+        // Rename attrs survived the macro round-trip: user_name→username, mail→email.
+        let row = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("7")),
+            ("user_name", ColumnValue::text("alice")),
+            ("mail", ColumnValue::text("alice@example.com")),
+            ("score", ColumnValue::text("3.5")),
+            ("active", ColumnValue::text("t")),
+        ]);
+        let user: User = row.deserialize_into().unwrap();
+        assert_eq!(
+            user,
+            User {
+                id: 7,
+                username: "alice".into(),
+                email: Some("alice@example.com".into()),
+                score: 3.5,
+                active: true,
+            }
+        );
+
+        // mail NULL → None; active 'f' → false.
+        let row = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("8")),
+            ("user_name", ColumnValue::text("bob")),
+            ("mail", ColumnValue::Null),
+            ("score", ColumnValue::text("0")),
+            ("active", ColumnValue::text("f")),
+        ]);
+        let user: User = row.deserialize_into().unwrap();
+        assert_eq!(user.id, 8);
+        assert_eq!(user.username, "bob");
+        assert_eq!(user.email, None);
+        assert!(!user.active);
     }
 
     #[derive(Debug, Deserialize, PartialEq)]
