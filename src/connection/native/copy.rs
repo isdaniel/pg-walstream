@@ -26,8 +26,15 @@ const MAX_MESSAGE_LEN: usize = 128 * 1024 * 1024;
 ///
 /// `read_buf` on a full `BytesMut` reserves only 64 bytes at a time, capping each `read()` to a tiny slice and multiplying syscalls under load. Reserving a large chunk lets one syscall pull far more TLS-decrypted data, so the drain loop slices more messages per read.
 ///
-/// ponytail: 256 KiB is a common sweet spot; the win is syscall-count, which this repo has no IO benchmark to measure — tune here if a real workload shows read/syscall dominating a flamegraph.
+/// Note: 256 KiB is a common sweet spot; the win is syscall-count, which this repo has no IO benchmark to measure — tune here if a real workload shows read/syscall dominating a flamegraph.
 const READ_CHUNK: usize = 256 * 1024;
+
+/// Minimum free headroom that triggers a `reserve(READ_CHUNK)` top-up.
+///
+/// Using `READ_CHUNK` itself as the threshold would realloc on almost every
+/// read: after each drain, frozen slices pin the buffer so `reserve` can't
+/// reclaim, and the remaining headroom sits just below `READ_CHUNK` → reserve fires and reallocs every iteration. Checking against this smaller threshold lets one 256 KiB reservation serve many reads before the next top-up.
+const MIN_HEADROOM: usize = 64 * 1024;
 
 /// Read the next CopyData payload from the replication stream.
 ///
@@ -54,8 +61,8 @@ pub async fn get_copy_data<R: AsyncRead + Unpin>(
             return Ok(payload);
         }
 
-        // Ensure a large contiguous headroom BEFORE the read so one read() pulls as much as possible. `pending` is empty here (fast path returned above) and the buffer is typically drained, so this reserve is cheap — no realloc of live data. See READ_CHUNK.
-        if read_buf.capacity() - read_buf.len() < READ_CHUNK {
+        // Ensure a large contiguous headroom BEFORE the read so one read() pulls as much as possible. Reserve only when free headroom drops below MIN_HEADROOM (not READ_CHUNK), so one 256 KiB reservation serves many reads instead of reallocating every iteration. `pending` is empty here (fast path returned above).
+        if read_buf.capacity() - read_buf.len() < MIN_HEADROOM {
             read_buf.reserve(READ_CHUNK);
         }
         tokio::select! {
@@ -545,6 +552,88 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, ReplicationError::Cancelled(_)));
+    }
+
+    #[tokio::test]
+    async fn test_get_copy_data_cancelled_with_buffered_data() {
+        // Cancelled, but a complete message is already sitting in read_buf → it
+        // must be drained and returned rather than dropped.
+        let (mut client, _server) = tokio::io::duplex(8192);
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let payload = b"buffered";
+        let body_len = (4 + payload.len()) as i32;
+        let mut read_buf = BytesMut::new();
+        read_buf.extend_from_slice(b"d");
+        read_buf.extend_from_slice(&body_len.to_be_bytes());
+        read_buf.extend_from_slice(payload);
+
+        let mut pending = VecDeque::new();
+        let result = get_copy_data(&mut client, &mut read_buf, &mut pending, &token).await;
+        assert_eq!(&result.unwrap()[..], b"buffered");
+    }
+
+    #[tokio::test]
+    async fn test_get_copy_data_connection_closed() {
+        // Server hangs up → read returns 0 → transient "connection closed" error.
+        let (mut client, server) = tokio::io::duplex(8192);
+        drop(server);
+        let token = CancellationToken::new();
+        let mut read_buf = BytesMut::new();
+        let mut pending = VecDeque::new();
+        let result = get_copy_data(&mut client, &mut read_buf, &mut pending, &token).await;
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err}").contains("closed"),
+            "expected connection-closed error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_copy_data_server_error_response() {
+        // An ErrorResponse ('E') during COPY surfaces as a protocol error.
+        use tokio::io::AsyncWriteExt;
+        let (mut client, mut server) = tokio::io::duplex(8192);
+        let token = CancellationToken::new();
+        tokio::spawn(async move {
+            let fields = b"SERROR\0C28000\0Mnope\0\0";
+            let body_len = (4 + fields.len()) as i32;
+            let mut msg = vec![b'E'];
+            msg.extend_from_slice(&body_len.to_be_bytes());
+            msg.extend_from_slice(fields);
+            server.write_all(&msg).await.unwrap();
+            server.flush().await.unwrap();
+        });
+        let mut read_buf = BytesMut::new();
+        let mut pending = VecDeque::new();
+        let result = get_copy_data(&mut client, &mut read_buf, &mut pending, &token).await;
+        assert!(result.is_err(), "server ErrorResponse should error");
+    }
+
+    #[tokio::test]
+    async fn test_get_copy_data_partial_then_complete() {
+        // First read delivers only part of a message → the loop must `continue`
+        // and read again before returning the assembled payload.
+        use tokio::io::AsyncWriteExt;
+        let (mut client, mut server) = tokio::io::duplex(8192);
+        let token = CancellationToken::new();
+        tokio::spawn(async move {
+            let payload = b"split payload";
+            let body_len = (4 + payload.len()) as i32;
+            let mut msg = vec![b'd'];
+            msg.extend_from_slice(&body_len.to_be_bytes());
+            msg.extend_from_slice(payload);
+            server.write_all(&msg[..7]).await.unwrap();
+            server.flush().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            server.write_all(&msg[7..]).await.unwrap();
+            server.flush().await.unwrap();
+        });
+        let mut read_buf = BytesMut::new();
+        let mut pending = VecDeque::new();
+        let result = get_copy_data(&mut client, &mut read_buf, &mut pending, &token).await;
+        assert_eq!(&result.unwrap()[..], b"split payload");
     }
 
     #[tokio::test]

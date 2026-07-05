@@ -185,5 +185,28 @@ fn bench_mixed(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_narrow, bench_wide, bench_mixed);
+// Map consumer: `HashMap<String,String>` (owned keys+values) vs `HashMap<&str,&str>` (fully borrowed). The borrowed-key half only works after switching the map-key deserializer to `visit_borrowed_str` — before that a `&str` key errored. Isolates the field-name / value alloc a map consumer pays.
+fn bench_map(c: &mut Criterion) {
+    use std::collections::HashMap;
+    let row = cols_row(12, 24);
+    let mut group = c.benchmark_group("hashmap12");
+
+    group.bench_function("owned", |b| {
+        b.iter(|| {
+            let m: HashMap<String, String> = black_box(&row).deserialize_into().unwrap();
+            black_box(m);
+        });
+    });
+
+    group.bench_function("borrowed", |b| {
+        b.iter(|| {
+            let m: HashMap<&str, &str> = black_box(&row).deserialize_borrowed().unwrap();
+            black_box(m);
+        });
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_narrow, bench_wide, bench_mixed, bench_map);
 criterion_main!(benches);
