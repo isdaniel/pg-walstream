@@ -30,7 +30,9 @@ jobs:
       if: matrix.os == 'ubuntu-latest'
       run: |
         sudo apt-get update
-        sudo apt-get install -y libpq-dev pkg-config libssl-dev
+        # Default backend is rustls-tls (aws-lc-rs) — needs only cmake + a C
+        # compiler (preinstalled). No libpq / OpenSSL / pkg-config on this path.
+        sudo apt-get install -y cmake
 
     - name: Cache cargo registry
       uses: actions/cache@v4
@@ -67,6 +69,45 @@ jobs:
     - name: Run unit tests (derive feature)
       run: cargo test --lib --features derive --verbose
 
+  libpq-backend:
+    name: libpq backend (pq-sys, clean env)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy
+
+    # Clean, minimal environment for the opt-in libpq backend: only libpq +
+    # OpenSSL + pkg-config. Deliberately NO clang/libclang (pq-sys ships
+    # pre-generated bindings — no bindgen) and NO cmake (no aws-lc-rs on this
+    # path). If this job builds, the libpq/pq-sys backend needs nothing more.
+    - name: Install dependencies (libpq only)
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libpq-dev libssl-dev pkg-config
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+        key: ${{ runner.os }}-cargo-libpq-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-libpq-
+
+    - name: Build (libpq / pq-sys)
+      run: cargo build --no-default-features --features libpq --verbose
+
+    - name: Clippy (libpq / pq-sys)
+      run: cargo clippy --no-default-features --features libpq --all-targets -- -D warnings
+
+    - name: Unit tests (libpq / pq-sys)
+      run: cargo test --lib --no-default-features --features libpq --verbose
+
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
@@ -82,7 +123,8 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y libpq-dev pkg-config libssl-dev
+        # Coverage runs on the default rustls-tls backend (aws-lc-rs): cmake only.
+        sudo apt-get install -y cmake
 
     - name: Install cargo-llvm-cov
       uses: taiki-e/install-action@cargo-llvm-cov
@@ -162,7 +204,7 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y libpq-dev pkg-config libssl-dev
+        sudo apt-get install -y libpq-dev pkg-config libssl-dev cmake
 
     - name: Cache cargo registry
       uses: actions/cache@v4
@@ -249,7 +291,7 @@ jobs:
         PGPASSWORD=postgres psql -h localhost -U postgres -d test_walstream \
           -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_type = 'logical';" || true
 
-        cargo test --test pg_result_get_bytes -- --ignored --nocapture --test-threads=1
+        cargo test --test pg_result_get_bytes --no-default-features --features libpq -- --ignored --nocapture --test-threads=1
 
         PGPASSWORD=postgres psql -h localhost -U postgres -d test_walstream \
           -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_type = 'logical';" || true
