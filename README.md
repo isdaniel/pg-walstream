@@ -13,13 +13,13 @@ A high-performance Rust library for PostgreSQL logical and physical replication 
 - **Full Logical Replication Support**: Implements PostgreSQL logical replication protocol versions 1-4
 - **Physical Replication Support**: Stream raw WAL data for standby servers and PITR
 - **Base Backup Support**: Full `BASE_BACKUP` command with progress, compression, and manifest options
-- **Pure-Rust Backend**: Optional `rustls-tls` feature eliminates all C dependencies (no libpq, no libclang), using `aws-lc-rs` for hardware-accelerated TLS (AES-NI, AVX2, SHA-NI)
+- **Pure-Rust Backend (default)**: The default `rustls-tls` backend needs no libpq and no OpenSSL, using `aws-lc-rs` for hardware-accelerated TLS (AES-NI, AVX2, SHA-NI) — ~2× more CPU-efficient than the optional C libpq backend
 - **TLS/SSL Support**: All PostgreSQL SSL modes (`disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`)
 - **Authentication**: Cleartext, MD5, and SCRAM-SHA-256 authentication methods
 - **Streaming Transactions**: Support for streaming large transactions (protocol v2+)
 - **Two-Phase Commit**: Prepared transaction support (protocol v3+)
 - **Parallel Streaming**: Multi-stream parallel replication (protocol v4+)
-- **Zero-Copy Operations**: Efficient buffer management using the `bytes` crate with drain-loop batch queue optimization
+- **Zero-Copy Operations**: Efficient buffer management using the `bytes` crate with drain-loop batch queue optimization. The libpq backend copies each COPY message into a reusable `BytesMut` buffer, then reference-counts it downstream as `Bytes` (no per-message heap allocation after warmup)
 - **Thread-Safe LSN Tracking**: Atomic LSN feedback for producer-consumer patterns
 - **Connection Management**: Built-in connection handling with exponential backoff retry logic
 - **Type-Safe API**: Strongly typed message parsing with comprehensive error handling
@@ -34,47 +34,42 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-pg_walstream = "0.6.3"
+pg_walstream = "0.7"
 ```
 
-By default, this uses the `libpq` backend (C FFI). To switch to a **pure-Rust** build:
+By default, this uses the pure-Rust `rustls-tls` backend — no libpq and no OpenSSL, only `cmake` + a C compiler at build time (for `aws-lc-rs`).
+
+To use the C **libpq** backend instead (bound by `pq-sys`; requires system libpq):
 
 ```toml
 [dependencies]
-pg_walstream = { version = "0.6.3", features = ["rustls-tls"] }
+pg_walstream = { version = "0.7", default-features = false, features = ["libpq"] }
 ```
 
-When `rustls-tls` is enabled alongside the default `libpq`, `rustls-tls` takes priority automatically — no need to set `default-features = false`.
-
-For a fully pure-Rust build with **no system dependencies** (avoids building `libpq-sys` entirely):
-
-```toml
-[dependencies]
-pg_walstream = { version = "0.6.3", default-features = false, features = ["rustls-tls"] }
-```
+If both backends are enabled, `rustls-tls` takes priority automatically.
 
 ## Feature Flags
 
-pg-walstream provides two connection backends plus a `std` toggle, all selected at compile time. When both backends are enabled, `rustls-tls` takes priority:
+pg-walstream provides two connection backends plus a `std` toggle, all selected at compile time. `rustls-tls` is the default; `libpq` is opt-in. When both are enabled, `rustls-tls` takes priority:
 
 | Feature | Default | C Dependencies | Description |
 |---------|---------|----------------|-------------|
 | `std` | Yes | None | Standard library support. Disable with `default-features = false` for a `no_std` plus `alloc` parser-only build (no connection layer) that compiles for `wasm32-unknown-unknown` and embedded targets. |
-| `libpq` | Yes | `libpq-dev`, `libclang-dev` | Uses PostgreSQL's C client library via FFI. Battle-tested, supports all auth methods natively. Implies `std`. |
-| `rustls-tls` | No | `cmake`, `gcc` (build-time only) | Pure-Rust implementation using `rustls` with `aws-lc-rs` crypto backend for hardware-accelerated TLS. No runtime C dependencies. Takes priority when both backends are enabled. Implies `std`. |
+| `libpq` | No | `libpq-dev` + OpenSSL | Opt-in. PostgreSQL's C client library via FFI, bound by `pq-sys` (pre-generated bindings — no libclang). Battle-tested. Enable with `--no-default-features --features libpq`. Implies `std`. |
+| `rustls-tls` | Yes | `cmake`, `gcc` (build-time only) | Default. Pure-Rust implementation using `rustls` with `aws-lc-rs` crypto backend for hardware-accelerated TLS. No libpq, no OpenSSL, no runtime C dependencies. Takes priority when both backends are enabled. Implies `std`. |
 | `derive` | No | None | Opt-in proc-macros (pull `syn`/`quote`) that bind a struct to a table — `#[derive(WalTable)] #[wal(table = "...")]` or the one-line attribute form `#[wal_table("...")]` — enabling the `WalRouter::on_insert_of::<T>` / `on_update_of::<T>` / `on_delete_of::<T>` table-inference methods. |
 
 > **Note:** The protocol parser, encoder, and types need no backend. Building with `default-features = false` gives a `no_std` plus `alloc` build of just those, suitable for wasm and embedded. A connection backend (`libpq` or `rustls-tls`) is required only for the live streaming and connection APIs, and pulls in `std`.
 
 ## System Dependencies
 
-System dependencies are **only required** when using the default `libpq` feature. The `rustls-tls` feature requires only `cmake` and a C compiler at build time (for the `aws-lc-rs` crypto library), with no runtime dependencies.
+System dependencies are **only required** for the opt-in `libpq` feature. The default `rustls-tls` backend requires only `cmake` and a C compiler at build time (for the `aws-lc-rs` crypto library), with no runtime dependencies.
 
-### For `libpq` feature (default)
+### For `libpq` feature (opt-in)
 
 **Ubuntu/Debian:**
 ```bash
-sudo apt-get install libpq-dev clang libclang-dev
+sudo apt-get install libpq-dev libssl-dev
 ```
 
 **CentOS/RHEL/Fedora:**
@@ -97,7 +92,7 @@ sudo apt-get install cmake gcc
 Then add to `Cargo.toml`:
 
 ```toml
-pg_walstream = { version = "0.6.3", features = ["rustls-tls"] }
+pg_walstream = { version = "0.7", features = ["rustls-tls"] }
 ```
 
 #### TLS trust store
@@ -341,8 +336,8 @@ The library supports all PostgreSQL logical replication message types:
 │  │  libpq backend  │ rustls-tls       │  │
 │  │  (C FFI)        │ (pure Rust)      │  │
 │  │                 │                  │  │
-│  │  libpq-sys      │ rustls +         │  │
-│  │  + libclang     │ aws-lc-rs +      │  │
+│  │  pq-sys         │ rustls +         │  │
+│  │                 │ aws-lc-rs +      │  │
 │  │                 │ postgres-protocol│  │
 │  └─────────────────┴──────────────────┘  │
 │  Compile-time feature flag selection     │

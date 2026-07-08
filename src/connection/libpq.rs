@@ -1,4 +1,4 @@
-//! Low-level PostgreSQL connection using libpq-sys
+//! Low-level PostgreSQL connection using pq-sys (raw FFI bindings to libpq)
 //!
 //! This module provides safe wrappers around libpq functions for logical replication.
 //! It relies on libpq and requires the libpq development libraries at build time.
@@ -37,7 +37,7 @@ use crate::types::{
     SlotType, XLogRecPtr,
 };
 use bytes::{BufMut, Bytes, BytesMut};
-use libpq_sys::*;
+use pq_sys::*;
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
@@ -1666,6 +1666,16 @@ mod tests {
         }
     }
 
+    /// The libpq wire ABI fixes these status-enum discriminants; the `pq-sys` binding must agree with them. Guards against a future bindgen/libpq drift.
+    #[test]
+    fn status_enum_abi_values_match_libpq() {
+        assert_eq!(ConnStatusType::CONNECTION_OK as i32, 0);
+        assert_eq!(ExecStatusType::PGRES_COMMAND_OK as i32, 1);
+        assert_eq!(ExecStatusType::PGRES_TUPLES_OK as i32, 2);
+        assert_eq!(ExecStatusType::PGRES_COPY_OUT as i32, 3);
+        assert_eq!(ExecStatusType::PGRES_COPY_BOTH as i32, 8);
+    }
+
     // ========================================
     // build_drop_slot_sql tests
     // ========================================
@@ -2291,7 +2301,7 @@ mod tests {
     /// One-row `PgResult` built via libpq's result API (no server). `None` is a
     /// SQL NULL cell, `Some(bytes)` a binary value (len may be 0).
     fn make_bytea_result(cells: &[Option<&[u8]>]) -> PgResult {
-        use libpq_sys::{
+        use pq_sys::{
             ExecStatusType, PGresAttDesc, PQmakeEmptyPGresult, PQsetResultAttrs, PQsetvalue,
         };
         use std::os::raw::{c_char, c_int};

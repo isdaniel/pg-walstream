@@ -43,7 +43,10 @@ fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
 /// - A single TLS record payload is at most 16,384 bytes (2^14, per RFC 8446).
 /// - `postgres-openssl` and `postgres-native-tls` use 8,192 (one typical record).
 /// - For **replication streaming**, we use 65,536 so one `read()` can pull several maximum-size TLS records at once. The CopyData drain loop (`copy::drain_read_buffer`) then parses more WAL messages per wakeup,  cutting syscalls and — on the worker-thread driver — cross-thread batch handoffs during sustained high-throughput WAL consumption.
-const TLS_BUF_SIZE: usize = 65_536;
+///
+/// Exposed `pub(crate)` so `copy.rs` can pin its read-headroom invariant
+/// (`MIN_HEADROOM > TLS_BUF_SIZE`) to this value at compile time, guaranteeing tokio's `BufReader` always bypasses its buffer on the CopyData hot path.
+pub(crate) const TLS_BUF_SIZE: usize = 65_536;
 
 /// The transport layer — either plain TCP or TLS-wrapped TCP.
 ///

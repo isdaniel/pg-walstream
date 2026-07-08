@@ -43,8 +43,8 @@ body:
     attributes:
       label: Connection backend
       options:
-        - libpq (default)
-        - rustls-tls (pure-Rust)
+        - rustls-tls (default, pure-Rust)
+        - libpq (opt-in)
         - not sure
     validations:
       required: true

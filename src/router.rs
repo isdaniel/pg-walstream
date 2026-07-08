@@ -39,7 +39,7 @@ enum Kind {
 /// `next_event()` and match event types by hand), returning `Ok(())` to skip.
 pub struct WalRouter {
     handlers: HashMap<(Arc<str>, Kind), Handler>,
-    default: Handler,
+    default: Option<Handler>,
 }
 
 impl Default for WalRouter {
@@ -53,7 +53,7 @@ impl WalRouter {
     pub fn new() -> Self {
         Self {
             handlers: HashMap::new(),
-            default: Box::new(|_ev| Box::pin(async { Ok(()) })),
+            default: None,
         }
     }
 
@@ -122,7 +122,7 @@ impl WalRouter {
         F: FnMut(&ChangeEvent) -> Fut + Send + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
     {
-        self.default = Box::new(move |ev| Box::pin(f(ev)) as BoxFut);
+        self.default = Some(Box::new(move |ev| Box::pin(f(ev)) as BoxFut));
         self
     }
 
@@ -138,11 +138,13 @@ impl WalRouter {
             EventType::Delete { table, .. } => Some((table.clone(), Kind::Delete)),
             _ => None,
         };
-        let fut = match key.as_ref().and_then(|k| self.handlers.get_mut(k)) {
-            Some(h) => h(ev),
-            None => (self.default)(ev),
-        };
-        fut.await
+        match key.as_ref().and_then(|k| self.handlers.get_mut(k)) {
+            Some(h) => h(ev).await,
+            None => match self.default.as_mut() {
+                Some(d) => d(ev).await,
+                None => Ok(()),
+            },
+        }
     }
 
     /// Drive an [`EventStream`]: dispatch each event, auto-advance applied LSN

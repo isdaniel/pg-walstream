@@ -107,7 +107,7 @@ impl SharedLsnFeedback {
             return;
         }
 
-        let mut current = self.flushed_lsn.load(Ordering::Acquire);
+        let mut current = self.flushed_lsn.load(Ordering::Relaxed);
         loop {
             if lsn <= current {
                 return;
@@ -141,7 +141,7 @@ impl SharedLsnFeedback {
             return;
         }
 
-        let mut current = self.applied_lsn.load(Ordering::Acquire);
+        let mut current = self.applied_lsn.load(Ordering::Relaxed);
         let mut advanced = false;
         loop {
             if lsn <= current {
@@ -165,9 +165,10 @@ impl SharedLsnFeedback {
             }
         }
 
-        // Applied data is implicitly flushed. Only chase the flushed CAS when we actually moved applied forward; otherwise flushed cannot be behind.
+        // Applied data is implicitly flushed. Only chase flushed when we actually moved applied forward; otherwise flushed cannot be behind.
+        // A single `fetch_max` RMW replaces a second load+CAS loop: `lsn` is guaranteed non-zero (early return above) and, since we just advanced applied past `current`, `lsn` also exceeds any legitimate flushed value, so the max is monotonic and correct. `Release` publishes it for the `Acquire` reader in `get_feedback_lsn`.
         if advanced {
-            self.update_flushed_lsn(lsn);
+            self.flushed_lsn.fetch_max(lsn, Ordering::Release);
         }
     }
 

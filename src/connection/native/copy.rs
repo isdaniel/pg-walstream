@@ -34,7 +34,12 @@ const READ_CHUNK: usize = 256 * 1024;
 /// Using `READ_CHUNK` itself as the threshold would realloc on almost every
 /// read: after each drain, frozen slices pin the buffer so `reserve` can't
 /// reclaim, and the remaining headroom sits just below `READ_CHUNK` → reserve fires and reallocs every iteration. Checking against this smaller threshold lets one 256 KiB reservation serve many reads before the next top-up.
-const MIN_HEADROOM: usize = 64 * 1024;
+///
+/// Pinned strictly greater than [`startup::TLS_BUF_SIZE`](super::startup::TLS_BUF_SIZE): at read time `read_buf` always has more free space than the TLS `BufReader`'s internal buffer, so tokio's `BufReader` bypasses its own buffer and decrypts
+/// straight into `read_buf` — no intermediate copy on the streaming hot path.
+/// The `const` assert below enforces the coupling at compile time (previously the two happened to be equal, which held only by coincidence).
+const MIN_HEADROOM: usize = super::startup::TLS_BUF_SIZE + 4 * 1024;
+const _: () = assert!(MIN_HEADROOM > super::startup::TLS_BUF_SIZE);
 
 /// Read the next CopyData payload from the replication stream.
 ///

@@ -27,22 +27,22 @@ homepage = "https://github.com/isdaniel/pg-walstream"
 rust-version = "1.87"
 
 [workspace.dependencies]
-pg-walstream-macros = { path = "macros", version = "=0.7.0" }
+pg-walstream-macros = { path = "macros", version = "0.7" }
 
 [dependencies]
 tokio = { version = "1.52.3", features = ["io-util", "net", "time", "macros", "rt", "rt-multi-thread"], optional = true }
 tokio-util = { version = "0.7.18", optional = true }
 serde = { version = "1.0.228", default-features = false, features = ["derive", "rc", "alloc"] }
 chrono = { version = "0.4.45", default-features = false, features = ["serde", "alloc"] }
-bytes = { version = "1.12.0", default-features = false, features = ["serde"] }
+bytes = { version = "1.12.1", default-features = false, features = ["serde"] }
 tracing = { version = "0.1.44", default-features = false }
 futures-core = { version = "0.3.32", default-features = false }
-memchr = { version = "2.8.2", default-features = false }
+memchr = { version = "2.8.3", default-features = false }
 smallvec = { version = "1.15.2", features = ["serde"] }
 pg-walstream-macros = { workspace = true, optional = true }
 
-# libpq backend (default)
-libpq-sys = { version = "0.8", optional = true }
+# libpq backend (opt-in) — pq-sys: raw FFI to the system libpq via pkg-config, with pre-generated bindings (no libclang/bindgen at build time).
+pq-sys = { version = "0.7.5", optional = true }
 
 # rustls-tls
 tokio-rustls = { version = "0.26.4", optional = true }
@@ -53,7 +53,7 @@ aws-lc-rs = { version = "1.17.1", optional = true }
 socket2 = { version = "0.6.4", features = ["all"], optional = true }
 
 [features]
-default = ["std", "libpq"]
+default = ["std", "rustls-tls"]
 derive = ["dep:pg-walstream-macros"]
 
 # Standard library support, on by default. Disable with `--no-default-features` for a no_std + alloc parser-only build (targets wasm and embedded).
@@ -67,7 +67,7 @@ std = [
     "memchr/std",
 ]
 
-libpq = ["dep:libpq-sys", "dep:tokio", "dep:tokio-util", "std"]
+libpq = ["dep:pq-sys", "dep:tokio", "dep:tokio-util", "std"]
 
 # Pure-Rust native backend: uses rustls with aws-lc-rs forhardware-accelerated TLS crypto (AES-NI, AVX2, SHA-NI), requires cmake + C compiler at build time.
 rustls-tls = [
