@@ -573,6 +573,68 @@ impl PgReplicationConnection {
         }
     }
 
+    /// Send a client CopyDone (`PQputCopyEnd`) to end the COPY stream cleanly.
+    ///
+    /// Idempotent: a no-op when not in replication mode. The non-blocking flush loop mirrors `put_copy_data_and_flush`. Trailing results are reclaimed by `PQfinish` on drop (matching `close_replication_connection`), so we do not drain `PQgetResult` here.
+    pub(crate) async fn end_copy(&mut self) -> Result<()> {
+        if !self.is_replication_conn {
+            return Ok(());
+        }
+        // Mark the copy ended up front: even if a flush below errors out, this keeps `close_replication_connection` on drop from redundantly re-sending CopyEnd on an already-half-closed connection.
+        self.is_replication_conn = false;
+        // PQputCopyEnd: 1 = queued, 0 = would block (nonblocking mode), -1 = err.
+        loop {
+            let r = unsafe { PQputCopyEnd(self.conn, ptr::null()) };
+            match r {
+                1 => break,
+                0 => {
+                    // Would block: drain libpq's output buffer with PQflush before retrying. Just waiting for writability without flushing would spin — the socket stays writable while the buffer is never emptied, and PQputCopyEnd keeps returning 0.
+                    let flush = unsafe { PQflush(self.conn) };
+                    if flush < 0 {
+                        let msg = self.last_error_message();
+                        return Err(ReplicationError::protocol(format!("PQflush failed: {msg}")));
+                    }
+                    if flush == 1 {
+                        let async_fd = self.async_fd.as_ref().ok_or_else(|| {
+                            ReplicationError::protocol("AsyncFd not initialized".to_string())
+                        })?;
+                        let mut guard = async_fd.writable().await.map_err(|e| {
+                            ReplicationError::protocol(format!("wait writable failed: {e}"))
+                        })?;
+                        guard.clear_ready();
+                    }
+                }
+                _ => {
+                    let msg = self.last_error_message();
+                    return Err(ReplicationError::protocol(format!(
+                        "PQputCopyEnd failed: {msg}"
+                    )));
+                }
+            }
+        }
+        // Flush the CopyDone to the socket (same non-blocking loop as feedback).
+        loop {
+            let flush = unsafe { PQflush(self.conn) };
+            match flush {
+                0 => break,
+                1 => {
+                    let async_fd = self.async_fd.as_ref().ok_or_else(|| {
+                        ReplicationError::protocol("AsyncFd not initialized".to_string())
+                    })?;
+                    let mut guard = async_fd.writable().await.map_err(|e| {
+                        ReplicationError::protocol(format!("wait writable failed: {e}"))
+                    })?;
+                    guard.clear_ready();
+                }
+                _ => {
+                    let msg = self.last_error_message();
+                    return Err(ReplicationError::protocol(format!("PQflush failed: {msg}")));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Check if the connection is still alive
     pub fn is_alive(&self) -> bool {
         if self.conn.is_null() {
@@ -1237,6 +1299,13 @@ mod tests {
         let mut conn = PgReplicationConnection::null_for_testing();
         conn.close_replication_connection(); // should not panic
         assert!(conn.conn.is_null());
+    }
+
+    #[tokio::test]
+    async fn end_copy_noop_when_not_replication_conn() {
+        // A conn that is not in replication mode must no-op without touching FFI.
+        let mut conn = PgReplicationConnection::null_for_testing();
+        assert!(conn.end_copy().await.is_ok());
     }
 
     #[test]
