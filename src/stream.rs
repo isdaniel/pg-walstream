@@ -872,6 +872,15 @@ impl LogicalReplicationStream {
         &mut self,
         cancellation_token: &CancellationToken,
     ) -> Result<ChangeEvent> {
+        // Bounded-replay terminal is authoritative: once a stop boundary has been
+        // reached, delegate straight to `next_event` (which sends CopyDone once and
+        // returns StreamStopped) and skip the health check below. Otherwise a dead
+        // connection could be reconnected by `recover_connection` and the COPY
+        // stream resurrected past `stop_at_lsn`.
+        if self.stop_at_reached.is_some() {
+            return self.next_event(cancellation_token).await;
+        }
+
         // Perform periodic health check.
         //
         // The check itself is cheap when nothing is wrong (it just compares `Instant::now()` against `last_health_check`), but `Instant::now()` is a vDSO syscall on Linux. At 100k+ rps that adds up, so we gate the health check on the per-event feedback counter and let it amortize across `HEALTH_CHECK_EVENT_INTERVAL` events. The actual time-based interval inside `check_connection_health()` still applies, this just skips the syscall on the inner-loop hot path.
