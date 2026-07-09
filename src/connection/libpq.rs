@@ -587,20 +587,29 @@ impl PgReplicationConnection {
             match r {
                 1 => break,
                 0 => {
-                    // Would block: drain libpq's output buffer with PQflush before retrying. Just waiting for writability without flushing would spin — the socket stays writable while the buffer is never emptied, and PQputCopyEnd keeps returning 0.
-                    let flush = unsafe { PQflush(self.conn) };
-                    if flush < 0 {
-                        let msg = self.last_error_message();
-                        return Err(ReplicationError::protocol(format!("PQflush failed: {msg}")));
-                    }
-                    if flush == 1 {
-                        let async_fd = self.async_fd.as_ref().ok_or_else(|| {
-                            ReplicationError::protocol("AsyncFd not initialized".to_string())
-                        })?;
-                        let mut guard = async_fd.writable().await.map_err(|e| {
-                            ReplicationError::protocol(format!("wait writable failed: {e}"))
-                        })?;
-                        guard.clear_ready();
+                    // Would block: fully drain libpq's output buffer (loop PQflush until it returns 0) before retrying PQputCopyEnd — matching the flush loop in `put_copy_data_and_flush`. Flushing only once then retrying PQputCopyEnd wastes an FFI round-trip per partial flush; not flushing at all would spin (the socket stays writable while the buffer is never emptied).
+                    loop {
+                        let flush = unsafe { PQflush(self.conn) };
+                        match flush {
+                            0 => break,
+                            1 => {
+                                let async_fd = self.async_fd.as_ref().ok_or_else(|| {
+                                    ReplicationError::protocol(
+                                        "AsyncFd not initialized".to_string(),
+                                    )
+                                })?;
+                                let mut guard = async_fd.writable().await.map_err(|e| {
+                                    ReplicationError::protocol(format!("wait writable failed: {e}"))
+                                })?;
+                                guard.clear_ready();
+                            }
+                            _ => {
+                                let msg = self.last_error_message();
+                                return Err(ReplicationError::protocol(format!(
+                                    "PQflush failed: {msg}"
+                                )));
+                            }
+                        }
                     }
                 }
                 _ => {
