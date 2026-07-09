@@ -719,15 +719,21 @@ impl NativeConnection {
         if !self.in_copy_mode {
             return Ok(());
         }
-        // Mark the copy ended up front: if the Inline `send_copy_done` below errors out, this keeps `close_connection` on drop from redundantly re-sending CopyDone on an already-half-closed connection.
-        self.in_copy_mode = false;
         match &mut self.driver {
             Driver::Inline { worker, .. } => {
-                copy::send_copy_done(&mut worker.transport).await?;
+                // Write the CopyDone, then mark the copy ended ONLY after it is fully flushed. If this errors or the future is cancelled mid-write, `in_copy_mode` stays true so Drop's `close(true)` resends a well-formed CopyDone rather than leaving a torn frame.
+                if let Err(e) = copy::send_copy_done(&mut worker.transport).await {
+                    self.alive.store(false, Ordering::Relaxed);
+                    return Err(e);
+                }
+                self.in_copy_mode = false;
             }
             Driver::Threaded {
                 cmd_tx, batch_rx, ..
             } => {
+                // The worker (not this task) writes the frame, so clearing the
+                // flag up front is safe and keeps Drop from re-sending CopyDone.
+                self.in_copy_mode = false;
                 // Dropping the batch receiver lets a back-pressured worker
                 // (parked on `reserve()`) resolve and service the command.
                 *batch_rx = None;

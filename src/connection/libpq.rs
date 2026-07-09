@@ -318,10 +318,9 @@ impl PgReplicationConnection {
         debug!("Starting replication: {}", sql);
         let _result = self.exec(&sql)?;
 
-        self.is_replication_conn = true;
-
-        // Initialize async socket for non-blocking operations
+        // Initialize the async socket first; mark the connection as being in replication mode only AFTER it succeeds, preserving the invariant `is_replication_conn == true ⇒ async_fd is Some`. Otherwise a failed socket setup would leave the flag true with no async_fd, and a later `end_copy`/Drop would reach the writable-wait path with `async_fd == None`.
         self.initialize_async_socket()?;
+        self.is_replication_conn = true;
 
         debug!("Replication started successfully");
         Ok(())
@@ -810,8 +809,8 @@ impl PgReplicationConnection {
         debug!("Starting physical replication: {}", sql);
         let _result = self.exec(&sql)?;
 
-        self.is_replication_conn = true;
         self.initialize_async_socket()?;
+        self.is_replication_conn = true;
 
         debug!("Physical replication started successfully");
         Ok(())
@@ -851,8 +850,8 @@ impl PgReplicationConnection {
         debug!("Starting base backup: {}", base_backup_sql);
         let result = self.exec(&base_backup_sql)?;
 
-        self.is_replication_conn = true;
         self.initialize_async_socket()?;
+        self.is_replication_conn = true;
 
         debug!("Base backup started successfully");
         Ok(result)
