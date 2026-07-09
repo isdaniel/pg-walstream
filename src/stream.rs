@@ -46,6 +46,10 @@ pub struct LogicalReplicationStream {
     exported_snapshot_name: Option<String>,
     /// Counter that throttles per-event time checks inside `next_event`. We only consult `Instant::now()` once every `FEEDBACK_CHECK_EVENT_INTERVAL` events so the hot path avoids a syscall on every message.
     feedback_check_counter: u32,
+    /// Bounded replay: set to the crossing commit's `end_lsn` once that event has been delivered; the next `next_event` sends CopyDone and returns `StreamStopped`. `None` when bounded replay is off or not yet reached.
+    stop_at_reached: Option<Lsn>,
+    /// One-shot guard so the bounded-replay CopyDone is sent at most once.
+    copy_done_sent: bool,
 }
 
 /// How often `next_event` consults `Instant::now()` to decide whether to send
@@ -75,6 +79,8 @@ pub struct ReplicationStreamConfig {
     pub retry_config: RetryConfig,
     pub slot_options: ReplicationSlotOptions,
     pub slot_type: SlotType,
+    /// Bounded replay: stop after the transaction whose commit `end_lsn` reaches this LSN. `None` (the default) streams unbounded.
+    pub stop_at_lsn: Option<Lsn>,
 }
 
 /// Streaming mode for logical replication (pgoutput)
@@ -181,6 +187,7 @@ impl ReplicationStreamConfig {
                 ..Default::default()
             },
             slot_type: SlotType::Logical,
+            stop_at_lsn: None,
         }
     }
 
@@ -284,6 +291,7 @@ impl Default for ReplicationStreamConfig {
                 ..Default::default()
             },
             slot_type: SlotType::Logical,
+            stop_at_lsn: None,
         }
     }
 }
@@ -334,6 +342,32 @@ impl ReplicationStreamConfig {
         self.retry_config = r;
         self
     }
+
+    /// Stop replication after the first committed transaction whose commit `end_lsn` reaches `lsn`. That transaction is delivered in full, then the stream ends cleanly (client CopyDone) and `next_event` returns [`crate::ReplicationError::StreamStopped`]. `None` (default) is unbounded.
+    #[inline]
+    pub fn with_stop_at_lsn(mut self, lsn: impl Into<Lsn>) -> Self {
+        self.stop_at_lsn = Some(lsn.into());
+        self
+    }
+}
+
+/// Bounded replay: given the configured `stop_at`, return `Some(end_lsn)` when
+/// `event` is a committed-transaction boundary (`Commit` / `StreamCommit` /
+/// `CommitPrepared`) whose `end_lsn` reaches the target, else `None`.
+///
+/// Pure and allocation-free. The `stop_at?` short-circuits with zero cost when
+/// bounded replay is off, and the match only ever fires on commit boundaries,
+/// so the DML hot path is untouched.
+#[inline]
+fn reached_stop_lsn(stop_at: Option<Lsn>, event: &ChangeEvent) -> Option<Lsn> {
+    let target = stop_at?;
+    let end_lsn = match &event.event_type {
+        EventType::Commit { end_lsn, .. }
+        | EventType::StreamCommit { end_lsn, .. }
+        | EventType::CommitPrepared { end_lsn, .. } => *end_lsn,
+        _ => return None,
+    };
+    (end_lsn >= target).then_some(end_lsn)
 }
 
 impl LogicalReplicationStream {
@@ -424,6 +458,8 @@ impl LogicalReplicationStream {
             shared_lsn_feedback,
             exported_snapshot_name: None,
             feedback_check_counter: 0,
+            stop_at_reached: None,
+            copy_done_sent: false,
         })
     }
 
@@ -652,6 +688,20 @@ impl LogicalReplicationStream {
                 ));
             }
 
+            // Bounded replay terminal: once a stop boundary has been delivered,
+            // end the COPY stream cleanly (once) and report StreamStopped on
+            // this and every subsequent call. Runs before any socket read so no
+            // further WAL is consumed past the target.
+            if let Some(reached) = self.stop_at_reached {
+                if !self.copy_done_sent {
+                    self.copy_done_sent = true;
+                    if let Err(e) = self.connection.end_copy().await {
+                        warn!("Failed to send CopyDone at stop_at_lsn: {e}");
+                    }
+                }
+                return Err(ReplicationError::stream_stopped(reached));
+            }
+
             // Throttle feedback checks: only consult `Instant::now()` and the shared atomic once every FEEDBACK_CHECK_EVENT_INTERVAL iterations, feedback is time-based (10s default), so skipping up to ~511 checks does not delay it perceptibly while removing a per-event syscall.
             self.feedback_check_counter = self.feedback_check_counter.wrapping_add(1);
             if self.feedback_check_counter & (FEEDBACK_CHECK_EVENT_INTERVAL - 1) == 0 {
@@ -672,6 +722,13 @@ impl LogicalReplicationStream {
                 b'w' => {
                     // WAL data message (zero-copy: Bytes slicing avoids copies)
                     if let Some(event) = self.process_wal_message(data)? {
+                        // Bounded replay: if this event is a commit boundary that
+                        // reaches stop_at_lsn, remember it — the full crossing
+                        // transaction is still delivered now; the NEXT call
+                        // terminates.
+                        if let Some(reached) = reached_stop_lsn(self.config.stop_at_lsn, &event) {
+                            self.stop_at_reached = Some(reached);
+                        }
                         return Ok(event);
                     }
                 }
@@ -835,9 +892,12 @@ impl LogicalReplicationStream {
             match self.next_event(cancellation_token).await {
                 Ok(event) => return Ok(event),
                 Err(e) => {
-                    // Check if it's a cancellation error - these should not be retried
-                    if matches!(e, ReplicationError::Cancelled(_)) {
-                        error!("Operation cancelled: {}", e);
+                    // Cancellation and bounded-replay stop are terminal — never retry.
+                    if matches!(
+                        e,
+                        ReplicationError::Cancelled(_) | ReplicationError::StreamStopped(_)
+                    ) {
+                        debug!("Terminal signal, ending stream: {}", e);
                         return Err(e);
                     }
 
@@ -1909,7 +1969,9 @@ where
                 handler(ev).await?;
                 source.ack(lsn);
             }
-            Err(ReplicationError::Cancelled(_)) => return Ok(()),
+            Err(ReplicationError::Cancelled(_)) | Err(ReplicationError::StreamStopped(_)) => {
+                return Ok(())
+            }
             Err(e) => return Err(e),
         }
     }
@@ -2076,7 +2138,7 @@ impl futures_core::Stream for EventStream {
 
                 match result {
                     Ok(event) => std::task::Poll::Ready(Some(Ok(event))),
-                    Err(ref e) if e.is_cancelled() => {
+                    Err(ref e) if e.is_cancelled() || e.is_stream_stopped() => {
                         self.terminated = true;
                         std::task::Poll::Ready(None)
                     }
@@ -2194,6 +2256,96 @@ async fn timeout_or_error<T>(
         Err(_) => Err(ReplicationError::timeout(format!(
             "Connection attempt exceeded timeout of {duration:?}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod reached_stop_lsn_tests {
+    use super::*;
+    use crate::column_value::{ColumnValue, RowData};
+
+    fn ts() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap()
+    }
+    fn commit(end: u64) -> ChangeEvent {
+        ChangeEvent {
+            event_type: EventType::Commit {
+                commit_timestamp: ts(),
+                commit_lsn: Lsn::new(end),
+                end_lsn: Lsn::new(end),
+            },
+            lsn: Lsn::new(end),
+            metadata: None,
+        }
+    }
+    fn stream_commit(end: u64) -> ChangeEvent {
+        ChangeEvent {
+            event_type: EventType::StreamCommit {
+                transaction_id: 7,
+                commit_lsn: Lsn::new(end),
+                end_lsn: Lsn::new(end),
+                commit_timestamp: ts(),
+            },
+            lsn: Lsn::new(end),
+            metadata: None,
+        }
+    }
+    fn commit_prepared(end: u64) -> ChangeEvent {
+        ChangeEvent {
+            event_type: EventType::CommitPrepared {
+                flags: 0,
+                transaction_id: 7,
+                commit_lsn: Lsn::new(end),
+                end_lsn: Lsn::new(end),
+                commit_timestamp: ts(),
+                gid: std::sync::Arc::from("g"),
+            },
+            lsn: Lsn::new(end),
+            metadata: None,
+        }
+    }
+    fn insert(lsn: u64) -> ChangeEvent {
+        let data = RowData::from_pairs(vec![("id", ColumnValue::text("1"))]);
+        ChangeEvent::insert("public", "t", 1, data, Lsn::new(lsn))
+    }
+
+    #[test]
+    fn none_when_feature_off() {
+        assert_eq!(reached_stop_lsn(None, &commit(9999)), None);
+    }
+
+    #[test]
+    fn stops_at_or_after_target_on_commit() {
+        assert_eq!(reached_stop_lsn(Some(Lsn::new(100)), &commit(99)), None);
+        assert_eq!(
+            reached_stop_lsn(Some(Lsn::new(100)), &commit(100)),
+            Some(Lsn::new(100))
+        );
+        assert_eq!(
+            reached_stop_lsn(Some(Lsn::new(100)), &commit(101)),
+            Some(Lsn::new(101))
+        );
+    }
+
+    #[test]
+    fn handles_stream_commit_and_commit_prepared() {
+        assert_eq!(
+            reached_stop_lsn(Some(Lsn::new(50)), &stream_commit(50)),
+            Some(Lsn::new(50))
+        );
+        assert_eq!(
+            reached_stop_lsn(Some(Lsn::new(50)), &commit_prepared(60)),
+            Some(Lsn::new(60))
+        );
+        assert_eq!(
+            reached_stop_lsn(Some(Lsn::new(50)), &stream_commit(49)),
+            None
+        );
+    }
+
+    #[test]
+    fn never_stops_on_non_commit_events() {
+        assert_eq!(reached_stop_lsn(Some(Lsn::new(1)), &insert(9999)), None);
     }
 }
 
@@ -4079,7 +4231,63 @@ mod tests {
             shared_lsn_feedback: SharedLsnFeedback::new_shared(),
             exported_snapshot_name: None,
             feedback_check_counter: 0,
+            stop_at_reached: None,
+            copy_done_sent: false,
         }
+    }
+
+    #[tokio::test]
+    async fn next_event_terminates_after_stop_boundary_reached() {
+        // Simulate a crossing commit already delivered: the terminal guard must
+        // send CopyDone once (a no-op on the null test connection) and return
+        // StreamStopped on this and every subsequent call, without reading WAL.
+        let cfg = ReplicationStreamConfig::builder("slot", "pub").with_stop_at_lsn(0x100u64);
+        let mut stream = create_test_stream(cfg);
+        stream.stop_at_reached = Some(Lsn::new(0x100));
+        let token = CancellationToken::new();
+
+        let err = stream.next_event(&token).await.unwrap_err();
+        assert!(
+            matches!(err, ReplicationError::StreamStopped(l) if l == Lsn::new(0x100)),
+            "expected StreamStopped(0x100), got {err:?}"
+        );
+        assert!(
+            stream.copy_done_sent,
+            "CopyDone must be sent once on termination"
+        );
+
+        // Idempotent: a second call still reports StreamStopped without resending.
+        let err2 = stream.next_event(&token).await.unwrap_err();
+        assert!(matches!(err2, ReplicationError::StreamStopped(_)));
+    }
+
+    #[tokio::test]
+    async fn next_event_with_retry_passes_through_stream_stopped() {
+        // StreamStopped is terminal — returned immediately, never retried.
+        let cfg = ReplicationStreamConfig::builder("slot", "pub").with_stop_at_lsn(0x200u64);
+        let mut stream = create_test_stream(cfg);
+        stream.stop_at_reached = Some(Lsn::new(0x200));
+        let token = CancellationToken::new();
+
+        let err = stream.next_event_with_retry(&token).await.unwrap_err();
+        assert!(
+            matches!(err, ReplicationError::StreamStopped(l) if l == Lsn::new(0x200)),
+            "retry wrapper must pass StreamStopped through unretried, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn event_stream_terminates_none_on_stream_stopped() {
+        use futures::StreamExt;
+        // poll_next maps StreamStopped to a graceful end-of-stream (None + terminated).
+        let cfg = ReplicationStreamConfig::builder("slot", "pub").with_stop_at_lsn(0x300u64);
+        let mut stream = create_test_stream(cfg);
+        stream.stop_at_reached = Some(Lsn::new(0x300));
+        let token = CancellationToken::new();
+        let mut es = stream.into_stream(token);
+
+        assert!(es.next().await.is_none(), "StreamStopped should yield None");
+        assert!(es.is_terminated(), "stream should mark itself terminated");
     }
 
     #[test]
@@ -8388,5 +8596,42 @@ mod for_each_event_tests {
         let mut src = MockSource::new(vec![Err(ReplicationError::deserialize("io"))]);
         let out = for_each_event_impl(&mut src, |_ev| async { Ok(()) }).await;
         assert!(out.is_err());
+    }
+
+    #[tokio::test]
+    async fn for_each_event_stops_gracefully_on_stream_stopped() {
+        let mut src = MockSource::new(vec![
+            Ok(ins(10)),
+            Ok(ins(20)),
+            Err(ReplicationError::stream_stopped(Lsn::new(25))),
+        ]);
+        let mut count = 0u32;
+        let res = for_each_event_impl(&mut src, |_ev| {
+            count += 1;
+            async { Ok(()) }
+        })
+        .await;
+        assert!(res.is_ok(), "StreamStopped must end the loop gracefully");
+        assert_eq!(count, 2, "both events before the stop are handled");
+        assert_eq!(src.last_ack.load(std::sync::atomic::Ordering::SeqCst), 20);
+    }
+}
+
+#[cfg(test)]
+mod stop_at_lsn_config_tests {
+    use super::*;
+
+    #[test]
+    fn default_config_has_no_stop_lsn() {
+        let cfg = ReplicationStreamConfig::default();
+        assert_eq!(cfg.stop_at_lsn, None);
+        let cfg2 = ReplicationStreamConfig::builder("slot", "pub");
+        assert_eq!(cfg2.stop_at_lsn, None);
+    }
+
+    #[test]
+    fn with_stop_at_lsn_sets_target() {
+        let cfg = ReplicationStreamConfig::builder("slot", "pub").with_stop_at_lsn(0x2000u64);
+        assert_eq!(cfg.stop_at_lsn, Some(Lsn::new(0x2000)));
     }
 }

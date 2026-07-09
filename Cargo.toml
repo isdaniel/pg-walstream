@@ -136,6 +136,10 @@ path = "integration-tests/binary_columns.rs"
 name = "ergonomics"
 path = "integration-tests/ergonomics.rs"
 
+[[test]]
+name = "bounded_replay"
+path = "integration-tests/bounded_replay.rs"
+
 [[bench]]
 name = "wal_pipeline"
 harness = false

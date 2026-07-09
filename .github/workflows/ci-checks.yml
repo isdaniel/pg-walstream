@@ -300,6 +300,12 @@ jobs:
         # on_*_of) — the derive module is #[cfg(feature = "derive")].
         cargo test --test ergonomics --features derive -- --ignored --nocapture --test-threads=1
 
+        PGPASSWORD=postgres psql -h localhost -U postgres -d test_walstream \
+          -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_type = 'logical';" || true
+
+        # Bounded replay: stream to a target LSN, stop cleanly at the commit boundary.
+        cargo test --test bounded_replay -- --ignored --nocapture --test-threads=1
+
   integration-ssl:
     name: SSL Integration Tests (PG ${{ matrix.pg_version }})
     runs-on: ubuntu-latest

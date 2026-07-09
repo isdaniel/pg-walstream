@@ -707,6 +707,47 @@ impl NativeConnection {
         Ok(())
     }
 
+    /// Send a client CopyDone to end the COPY stream cleanly.
+    ///
+    /// Idempotent: a no-op when not in COPY mode. On the Inline driver we write
+    /// the CopyDone frame directly on the transport. On the Threaded driver we
+    /// hand the existing graceful `Close` command to the worker (which sends
+    /// CopyDone + Terminate) without blocking the async task on its reply —
+    /// `Drop`'s `close_connection` still joins the worker, guaranteeing the
+    /// frames flush before teardown completes.
+    pub(crate) async fn end_copy(&mut self) -> Result<()> {
+        if !self.in_copy_mode {
+            return Ok(());
+        }
+        // Mark the copy ended up front: if the Inline `send_copy_done` below errors out, this keeps `close_connection` on drop from redundantly re-sending CopyDone on an already-half-closed connection.
+        self.in_copy_mode = false;
+        match &mut self.driver {
+            Driver::Inline { worker, .. } => {
+                copy::send_copy_done(&mut worker.transport).await?;
+            }
+            Driver::Threaded {
+                cmd_tx, batch_rx, ..
+            } => {
+                // Dropping the batch receiver lets a back-pressured worker
+                // (parked on `reserve()`) resolve and service the command.
+                *batch_rx = None;
+                let (reply_tx, reply_rx) = std_mpsc::channel();
+                if cmd_tx
+                    .send(Command::Close {
+                        in_copy_mode: true,
+                        reply: reply_tx,
+                    })
+                    .is_ok()
+                {
+                    // The blocking `recv()` runs on a blocking thread so the async executor is not parked. `.is_ok()` above already handled a dead worker (channel closed), so this cannot hang on one.
+                    let _ = tokio::task::spawn_blocking(move || reply_rx.recv()).await;
+                }
+                self.alive.store(false, Ordering::Relaxed);
+            }
+        }
+        Ok(())
+    }
+
     /// Send hot standby feedback message to the server.
     pub async fn send_hot_standby_feedback(
         &mut self,
@@ -1821,5 +1862,25 @@ mod tests {
             Ok(Err(ReplicationError::Cancelled(_))) => {}
             other => panic!("expected a Cancelled error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn end_copy_noop_when_not_in_copy_mode() {
+        // A null connection is not in COPY mode; end_copy must be a safe no-op.
+        let mut conn = NativeConnection::null_for_testing();
+        assert!(conn.end_copy().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn end_copy_in_copy_mode_fires_close() {
+        // Force COPY mode so end_copy takes the live Threaded branch (drop
+        // batch_rx + fire Command::Close), not just the no-op guard. The null
+        // worker's socket is closed, so the CopyDone/Terminate best-effort I/O
+        // fails silently and the worker exits — end_copy still returns Ok.
+        let mut conn = NativeConnection::null_for_testing();
+        conn.in_copy_mode = true;
+        assert!(conn.end_copy().await.is_ok());
+        // Flag cleared → a second call takes the no-op guard path.
+        assert!(conn.end_copy().await.is_ok());
     }
 }

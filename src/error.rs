@@ -4,6 +4,7 @@
 //! operations, connection handling, and message parsing.
 
 use crate::prelude::*;
+use crate::types::Lsn;
 
 /// Comprehensive error types for replication operations
 #[derive(Debug)]
@@ -56,6 +57,9 @@ pub enum ReplicationError {
     /// be spawned, exited early, or dropped a reply. Transient so the stream
     /// retry logic can reconnect.
     Backend(String),
+
+    /// Bounded replay reached its configured `stop_at_lsn`. Carries the commit end LSN at which streaming stopped. This is a clean, expected terminal signal (treated like a graceful end of stream), never retried.
+    StreamStopped(Lsn),
 }
 
 impl core::fmt::Display for ReplicationError {
@@ -78,6 +82,9 @@ impl core::fmt::Display for ReplicationError {
             Self::Generic(msg) => write!(f, "Replication error: {msg}"),
             Self::Deserialize(msg) => write!(f, "Deserialization error: {msg}"),
             Self::Backend(msg) => write!(f, "Backend worker error: {msg}"),
+            Self::StreamStopped(lsn) => {
+                write!(f, "Replication stopped at stop_at_lsn (reached {lsn})")
+            }
         }
     }
 }
@@ -185,6 +192,16 @@ impl ReplicationError {
         ReplicationError::Backend(msg.into())
     }
 
+    /// Create a bounded-replay terminal stop signal at the given LSN.
+    ///
+    /// Crate-internal: the library emits this; external consumers match the [`ReplicationError::StreamStopped`] variant rather than constructing it.
+    ///
+    /// Gated on a connection backend: the streaming layer that emits it  (`crate::stream`) is compiled only with `libpq`/`rustls-tls`, so this helper is dead code in the parser-only `no_std` build without the gate.
+    #[cfg(feature = "std")]
+    pub(crate) fn stream_stopped(lsn: Lsn) -> Self {
+        ReplicationError::StreamStopped(lsn)
+    }
+
     /// Check if the error is transient (can be retried)
     pub fn is_transient(&self) -> bool {
         #[cfg(feature = "std")]
@@ -213,6 +230,14 @@ impl ReplicationError {
     /// Check if the error is due to cancellation
     pub fn is_cancelled(&self) -> bool {
         matches!(self, ReplicationError::Cancelled(_))
+    }
+
+    /// Check if the error is the terminal bounded-replay stop signal.
+    ///
+    /// Gated on a connection backend for the same reason as [`Self::stream_stopped`]: its only caller lives in the backend-gated `crate::stream`.
+    #[cfg(feature = "std")]
+    pub(crate) fn is_stream_stopped(&self) -> bool {
+        matches!(self, ReplicationError::StreamStopped(_))
     }
 }
 
@@ -504,5 +529,36 @@ mod tests {
         assert!(err.is_transient());
         assert!(!err.is_permanent());
         assert!(!err.is_cancelled());
+    }
+}
+
+#[cfg(all(test, any(feature = "libpq", feature = "rustls-tls")))]
+mod stop_signal_tests {
+    use super::*;
+    use crate::types::Lsn;
+
+    #[test]
+    fn stream_stopped_is_terminal_not_retryable() {
+        let e = ReplicationError::stream_stopped(Lsn::new(0x1A2B));
+        assert!(e.is_stream_stopped(), "should report as stream-stopped");
+        assert!(!e.is_transient(), "stop signal must never be retried");
+        assert!(
+            !e.is_permanent(),
+            "stop signal is a graceful terminal, not a permanent error"
+        );
+        assert!(
+            !e.is_cancelled(),
+            "stop signal is distinct from cancellation"
+        );
+    }
+
+    #[test]
+    fn stream_stopped_displays_reached_lsn() {
+        let e = ReplicationError::StreamStopped(Lsn::new(0x100));
+        let s = format!("{e}");
+        assert!(
+            s.contains("stop"),
+            "message should mention stopping, got: {s}"
+        );
     }
 }
