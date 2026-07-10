@@ -176,6 +176,22 @@ cd examples/binary-column-access
 cargo run
 ```
 
+### 9. raw-xlogdata
+
+Streams the **undecoded** pgoutput payload via `next_raw_event()` — bring your
+own decoder — with manual auto-ack.
+
+**Features:**
+- Raw `RawXLogData` (WAL positions + undecoded bytes), no pgoutput parsing
+- Advance the applied LSN with `raw.wal_end` after durable processing
+- Graceful exit on `Cancelled` / `StreamStopped`
+
+**Run:**
+```bash
+cd examples/raw-xlogdata
+cargo run
+```
+
 ## Prerequisites
 
 ### For Logical Replication Examples (basic_streaming, polling_example, safe_transaction_consumer)
