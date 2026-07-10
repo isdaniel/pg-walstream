@@ -1121,6 +1121,20 @@ impl NativeConnection {
         }
     }
 
+    /// Test-only: a null (Threaded-driver) connection pre-seeded with COPY-data
+    /// frames that `get_copy_data_async` serves in order from `pending` before
+    /// any socket I/O. `in_copy_mode` is set so the replication-mode gate passes.
+    /// Once the seeded frames are exhausted the next read hits the dead test
+    /// socket and errors — a test consumes exactly what it seeds.
+    pub(crate) fn null_for_testing_with_frames(frames: Vec<Bytes>) -> Self {
+        let mut conn = Self::null_for_testing();
+        conn.in_copy_mode = true;
+        if let Driver::Threaded { pending, .. } = &mut conn.driver {
+            pending.extend(frames);
+        }
+        conn
+    }
+
     /// Test-only: whether this connection uses the inline driver.
     pub(crate) fn driver_is_inline(&self) -> bool {
         matches!(self.driver, Driver::Inline { .. })

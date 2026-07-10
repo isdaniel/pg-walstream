@@ -16,6 +16,8 @@
 //! - **`futures::Stream` trait implementation** - Works with all stream combinators
 //! - **Graceful cancellation** - All operations support cancellation tokens
 //! - Protocol parsing is portable; the connection module uses libpq
+//! - Raw XLogData access via `next_raw_event` — undecoded pgoutput bytes plus
+//!   WAL positions, for consumers that bring their own decoder
 //!
 //! ## Async Stream API
 //!
@@ -231,8 +233,8 @@ pub use pgoutput_encode::{
 // Re-export stream types
 #[cfg(any(feature = "libpq", feature = "rustls-tls"))]
 pub use stream::{
-    EventStream, EventStreamRef, LogicalReplicationStream, OriginFilter, ReplicationStreamConfig,
-    StreamingMode,
+    EventStream, EventStreamRef, LogicalReplicationStream, OriginFilter, RawXLogData,
+    ReplicationStreamConfig, StreamingMode,
 };
 
 #[cfg(any(feature = "libpq", feature = "rustls-tls"))]
