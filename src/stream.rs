@@ -57,7 +57,7 @@ pub struct LogicalReplicationStream {
 /// positions. Bring your own decoder.
 ///
 /// Returned by [`LogicalReplicationStream::next_raw_event`]. `data` is a zero-copy slice of the connection read buffer and is valid until the next call to `next_raw_event` or `next_event`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RawXLogData {
     /// Server WAL start position for this message (`start_lsn`).
     pub wal_start: Lsn,
@@ -644,7 +644,6 @@ impl LogicalReplicationStream {
     ///
     /// Handles cancellation, the bounded-replay terminal (CopyDone-once + `StreamStopped`), throttled feedback, and keepalives internally. Returns the full `'w'` CopyData buffer (1-byte tag + 24-byte header + payload).
     /// Shared by [`next_event`](Self::next_event) and [`next_raw_event`](Self::next_raw_event).
-    #[inline]
     async fn next_wal_frame(&mut self, cancellation_token: &CancellationToken) -> Result<Bytes> {
         loop {
             // Check cancellation before processing.
@@ -823,7 +822,7 @@ impl LogicalReplicationStream {
 
         // Transport-level bounded replay: arm the terminal when this message's wal_end reaches the configured stop LSN. The next `next_wal_frame` call sends CopyDone once and returns StreamStopped. Armed here (not in the decoder) so the decoder stays policy-free and the typed path can reuse it; mirrors how `next_event` arms the commit-boundary stop.
         if let Some(stop) = self.config.stop_at_lsn {
-            if raw.wal_end.value() >= stop.value() {
+            if raw.wal_end >= stop {
                 self.stop_at_reached = Some(raw.wal_end);
             }
         }
@@ -7711,6 +7710,41 @@ mod tests {
         let err = stream.next_raw_event(&token).await.unwrap_err();
         assert!(matches!(err, ReplicationError::StreamStopped(l) if l == Lsn::new(0x2000)));
         assert!(stream.copy_done_sent);
+    }
+
+    #[cfg(feature = "rustls-tls")]
+    #[tokio::test]
+    async fn next_event_returns_decoded_event() {
+        // Drive the TYPED path end-to-end through the seeded pump: a Begin frame
+        // pumps → process_wal_message → convert → a ChangeEvent.
+        let payload = build_begin_payload(0x2000, 42);
+        let frame = bytes::Bytes::from(build_wal_message(0x1000, 0x2000, &payload));
+        let mut stream = create_test_stream_with_frames(create_test_config(), vec![frame]);
+        let token = CancellationToken::new();
+
+        let event = stream.next_event(&token).await.unwrap();
+        match event.event_type {
+            EventType::Begin { transaction_id, .. } => assert_eq!(transaction_id, 42),
+            other => panic!("expected Begin, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "rustls-tls")]
+    #[tokio::test]
+    async fn next_event_arms_commit_boundary_stop() {
+        // A Commit whose end_lsn reaches stop_at_lsn is delivered AND arms the
+        // commit-boundary terminal (the typed path's bounded-replay mechanism,
+        // distinct from the raw transport stop).
+        let cfg = ReplicationStreamConfig::builder("slot", "pub").with_stop_at_lsn(0x2000u64);
+        let payload = build_commit_payload(0x2000, 0x2100); // commit_lsn, end_lsn
+        let frame = bytes::Bytes::from(build_wal_message(0x1000, 0x2100, &payload));
+        let mut stream = create_test_stream_with_frames(cfg, vec![frame]);
+        let token = CancellationToken::new();
+
+        let event = stream.next_event(&token).await.unwrap();
+        assert!(matches!(event.event_type, EventType::Commit { .. }));
+        // reached_stop_lsn returns the commit's end_lsn (0x2100 >= 0x2000).
+        assert_eq!(stream.stop_at_reached, Some(Lsn::new(0x2100)));
     }
     // into_stream() and EventStream construction coverage
     // ========================================

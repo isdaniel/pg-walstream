@@ -32,6 +32,7 @@ src/
 ├── buffer.rs        # zero-copy BufferReader/BufferWriter (bytes crate)
 ├── protocol.rs      # WAL message parser (hot path); RelationInfo, ReplicationState
 ├── stream.rs        # LogicalReplicationStream + EventStream + config builder
+│                    #   next_raw_event → RawXLogData (undecoded pgoutput, BYO decoder)
 ├── router.rs        # WalRouter: typed async by-table event router (convenience)
 ├── deserializer.rs  # serde Deserializer: RowData → user structs
 ├── column_value.rs  # ColumnValue / RowData
