@@ -140,6 +140,10 @@ path = "integration-tests/ergonomics.rs"
 name = "bounded_replay"
 path = "integration-tests/bounded_replay.rs"
 
+[[test]]
+name = "raw_xlogdata"
+path = "integration-tests/raw_xlogdata.rs"
+
 [[bench]]
 name = "wal_pipeline"
 harness = false

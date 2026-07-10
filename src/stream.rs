@@ -17,6 +17,7 @@ use crate::error::{ReplicationError, Result};
 use crate::lsn::SharedLsnFeedback;
 use crate::types::{
     ChangeEvent, EventType, Lsn, RelationColumn, ReplicaIdentity, ReplicationSlotOptions, SlotType,
+    TimestampTz,
 };
 use crate::{
     format_lsn, parse_keepalive_message, postgres_timestamp_to_chrono, LogicalReplicationMessage,
@@ -50,6 +51,22 @@ pub struct LogicalReplicationStream {
     stop_at_reached: Option<Lsn>,
     /// One-shot guard so the bounded-replay CopyDone is sent at most once.
     copy_done_sent: bool,
+}
+
+/// A raw XLogData (`'w'`) message: the undecoded pgoutput payload plus its WAL
+/// positions. Bring your own decoder.
+///
+/// Returned by [`LogicalReplicationStream::next_raw_event`]. `data` is a zero-copy slice of the connection read buffer and is valid until the next call to `next_raw_event` or `next_event`.
+#[derive(Clone, Debug)]
+pub struct RawXLogData {
+    /// Server WAL start position for this message (`start_lsn`).
+    pub wal_start: Lsn,
+    /// WAL end position — the next byte after this message. Ack with this.
+    pub wal_end: Lsn,
+    /// Server send time (Postgres-epoch microseconds).
+    pub server_time: TimestampTz,
+    /// Undecoded pgoutput message bytes (everything after the 25-byte header).
+    pub data: Bytes,
 }
 
 /// How often `next_event` consults `Instant::now()` to decide whether to send
@@ -623,6 +640,61 @@ impl LogicalReplicationStream {
         Ok(())
     }
 
+    /// Pump the COPY stream until the next XLogData (`'w'`) frame arrives.
+    ///
+    /// Handles cancellation, the bounded-replay terminal (CopyDone-once + `StreamStopped`), throttled feedback, and keepalives internally. Returns the full `'w'` CopyData buffer (1-byte tag + 24-byte header + payload).
+    /// Shared by [`next_event`](Self::next_event) and [`next_raw_event`](Self::next_raw_event).
+    #[inline]
+    async fn next_wal_frame(&mut self, cancellation_token: &CancellationToken) -> Result<Bytes> {
+        loop {
+            // Check cancellation before processing.
+            if cancellation_token.is_cancelled() {
+                return Err(ReplicationError::Cancelled(
+                    "Operation cancelled".to_string(),
+                ));
+            }
+
+            // Bounded replay terminal: once a stop boundary has been delivered, end the COPY stream cleanly (once) and report StreamStopped on this and every subsequent call. Runs before any socket read so no further WAL is consumed past the target.
+            if let Some(reached) = self.stop_at_reached {
+                if !self.copy_done_sent {
+                    self.copy_done_sent = true;
+                    if let Err(e) = self.connection.end_copy().await {
+                        warn!("Failed to send CopyDone at stop_at_lsn: {e}");
+                    }
+                }
+                return Err(ReplicationError::stream_stopped(reached));
+            }
+
+            // Throttle feedback checks: only consult `Instant::now()` and the
+            // shared atomic once every FEEDBACK_CHECK_EVENT_INTERVAL iterations.
+            self.feedback_check_counter = self.feedback_check_counter.wrapping_add(1);
+            if self.feedback_check_counter & (FEEDBACK_CHECK_EVENT_INTERVAL - 1) == 0 {
+                self.maybe_send_feedback().await;
+            }
+
+            // Get data from replication stream (returns Bytes for zero-copy).
+            let data = self
+                .connection
+                .get_copy_data_async(cancellation_token)
+                .await?;
+
+            if data.is_empty() {
+                continue;
+            }
+
+            match data[0] {
+                b'w' => return Ok(data),
+                b'k' => {
+                    // Keepalive message — handled internally.
+                    self.process_keepalive_message(&data).await?;
+                }
+                other => {
+                    warn!("Received unknown message type: {}", other as char);
+                }
+            }
+        }
+    }
+
     /// Process the next single replication event with cancellation support
     ///
     /// This is the core method for retrieving individual change events from PostgreSQL.
@@ -681,66 +753,82 @@ impl LogicalReplicationStream {
     ) -> Result<ChangeEvent> {
         // Loop until we get a valid event or encounter an error/cancellation
         loop {
-            // Check cancellation before processing
-            if cancellation_token.is_cancelled() {
-                return Err(ReplicationError::Cancelled(
-                    "Operation cancelled".to_string(),
-                ));
-            }
-
-            // Bounded replay terminal: once a stop boundary has been delivered,
-            // end the COPY stream cleanly (once) and report StreamStopped on
-            // this and every subsequent call. Runs before any socket read so no
-            // further WAL is consumed past the target.
-            if let Some(reached) = self.stop_at_reached {
-                if !self.copy_done_sent {
-                    self.copy_done_sent = true;
-                    if let Err(e) = self.connection.end_copy().await {
-                        warn!("Failed to send CopyDone at stop_at_lsn: {e}");
-                    }
+            let data = self.next_wal_frame(cancellation_token).await?;
+            // 'w' WAL data message (zero-copy: Bytes slicing avoids copies).
+            if let Some(event) = self.process_wal_message(data)? {
+                // Bounded replay: if this event is a commit boundary that reaches
+                // stop_at_lsn, remember it — the full crossing transaction is
+                // still delivered now; the NEXT call terminates.
+                if let Some(reached) = reached_stop_lsn(self.config.stop_at_lsn, &event) {
+                    self.stop_at_reached = Some(reached);
                 }
-                return Err(ReplicationError::stream_stopped(reached));
+                return Ok(event);
             }
+            // Control message with no ChangeEvent (e.g. Relation) → next frame.
+        }
+    }
 
-            // Throttle feedback checks: only consult `Instant::now()` and the shared atomic once every FEEDBACK_CHECK_EVENT_INTERVAL iterations, feedback is time-based (10s default), so skipping up to ~511 checks does not delay it perceptibly while removing a per-event syscall.
-            self.feedback_check_counter = self.feedback_check_counter.wrapping_add(1);
-            if self.feedback_check_counter & (FEEDBACK_CHECK_EVENT_INTERVAL - 1) == 0 {
-                self.maybe_send_feedback().await;
-            }
+    /// Like [`next_event`](Self::next_event), but returns the **undecoded** XLogData payload instead of a parsed `ChangeEvent`. Keepalives, feedback throttling, cancellation, and the bounded-replay terminal are handled identically; only pgoutput decoding is skipped — bring your own decoder.
+    ///
+    /// Ack progress after durable processing by advancing the applied LSN: `stream.shared_lsn_feedback.update_applied_lsn(raw.wal_end.value())`. There is no auto-ack and no retry/recovery on this path (that is the point — you own restart semantics), so wrap reconnection yourself if you need it.
+    ///
+    /// In raw mode `config.stop_at_lsn` is a **transport-level** cutoff: the stream stops after the first message whose `wal_end >= stop_at_lsn`, which may fall mid-transaction. Terminates with [`ReplicationError::StreamStopped`].
+    ///
+    /// **Do not interleave** `next_raw_event` with `next_event` on the same  stream: raw mode bypasses the parser's relation cache.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig, StreamingMode};
+    /// use tokio_util::sync::CancellationToken;
+    /// use std::time::Duration;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let config = ReplicationStreamConfig::new(
+    ///     "my_slot".to_string(),
+    ///     "my_publication".to_string(),
+    ///     2, StreamingMode::On,
+    ///     Duration::from_secs(10),
+    ///     Duration::from_secs(30),
+    ///     Duration::from_secs(60),
+    ///     RetryConfig::default(),
+    /// );
+    /// let mut stream = LogicalReplicationStream::new("connection_string", config).await?;
+    /// stream.start(None).await?;
+    /// let cancel = CancellationToken::new();
+    ///
+    /// loop {
+    ///     match stream.next_raw_event(&cancel).await {
+    ///         Ok(raw) => {
+    ///             // Decode `raw.data` (pgoutput bytes) yourself, then ack:
+    ///             stream.shared_lsn_feedback.update_applied_lsn(raw.wal_end.value());
+    ///         }
+    ///         Err(e) if matches!(
+    ///             e,
+    ///             pg_walstream::ReplicationError::Cancelled(_)
+    ///                 | pg_walstream::ReplicationError::StreamStopped(_)
+    ///         ) => break,
+    ///         Err(e) => return Err(e.into()),
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn next_raw_event(
+        &mut self,
+        cancellation_token: &CancellationToken,
+    ) -> Result<RawXLogData> {
+        let data = self.next_wal_frame(cancellation_token).await?;
+        let raw = self.decode_raw_frame(data)?;
 
-            // Get data from replication stream (returns Bytes for zero-copy)
-            let data = self
-                .connection
-                .get_copy_data_async(cancellation_token)
-                .await?;
-
-            if data.is_empty() {
-                continue;
-            }
-
-            match data[0] {
-                b'w' => {
-                    // WAL data message (zero-copy: Bytes slicing avoids copies)
-                    if let Some(event) = self.process_wal_message(data)? {
-                        // Bounded replay: if this event is a commit boundary that
-                        // reaches stop_at_lsn, remember it — the full crossing
-                        // transaction is still delivered now; the NEXT call
-                        // terminates.
-                        if let Some(reached) = reached_stop_lsn(self.config.stop_at_lsn, &event) {
-                            self.stop_at_reached = Some(reached);
-                        }
-                        return Ok(event);
-                    }
-                }
-                b'k' => {
-                    // Keepalive message
-                    self.process_keepalive_message(&data).await?;
-                }
-                other => {
-                    warn!("Received unknown message type: {}", other as char);
-                }
+        // Transport-level bounded replay: arm the terminal when this message's wal_end reaches the configured stop LSN. The next `next_wal_frame` call sends CopyDone once and returns StreamStopped. Armed here (not in the decoder) so the decoder stays policy-free and the typed path can reuse it; mirrors how `next_event` arms the commit-boundary stop.
+        if let Some(stop) = self.config.stop_at_lsn {
+            if raw.wal_end.value() >= stop.value() {
+                self.stop_at_reached = Some(raw.wal_end);
             }
         }
+
+        Ok(raw)
     }
 
     /// Check connection health and attempt recovery if needed
@@ -957,6 +1045,37 @@ impl LogicalReplicationStream {
         }
     }
 
+    /// Parse and validate the fixed 25-byte XLogData (`'w'`) header, advancing
+    /// the received LSN. Returns `(wal_start, wal_end, send_time)`.
+    ///
+    /// Shared by [`process_wal_message`](Self::process_wal_message) (typed path)
+    /// and [`decode_raw_frame`](Self::decode_raw_frame) (raw path); each caller
+    /// then handles the message body (or its absence) its own way. Layout:
+    /// `'w'` (1) + start_lsn (8) + end_lsn (8) + send_time (8) = 25 bytes.
+    /// `#[inline]`, so callers keep identical codegen to a hand-inlined header
+    /// decode.
+    #[inline]
+    fn parse_xlogdata_header(&mut self, data: &Bytes) -> Result<(u64, u64, i64)> {
+        // 'w' (1) + start_lsn (8) + end_lsn (8) + send_time (8) = 25 bytes.
+        if data.len() < 25 {
+            return Err(ReplicationError::protocol(
+                "WAL message too short".to_string(),
+            ));
+        }
+
+        let mut header = &data[1..25];
+        let wal_start = header.get_u64();
+        let wal_end = header.get_u64();
+        let send_time = header.get_i64();
+
+        // Update LSN tracking using the server's WAL end position for this message.
+        if wal_end > 0 {
+            self.state.update_received_lsn(wal_end);
+        }
+
+        Ok((wal_start, wal_end, send_time))
+    }
+
     /// Process a WAL data message (zero-copy: uses Bytes slicing)
     ///
     /// The XLogData header is fixed-layout (25 bytes), so we decode it directly
@@ -965,35 +1084,40 @@ impl LogicalReplicationStream {
     /// extra `Bytes` slice for the header region.
     #[inline]
     fn process_wal_message(&mut self, data: impl Into<Bytes>) -> Result<Option<ChangeEvent>> {
-        let data: Bytes = data.into();
-
-        // 'w' (1) + start_lsn (8) + end_lsn (8) + send_time (8) = 25 bytes
-        if data.len() < 25 {
-            return Err(ReplicationError::protocol(
-                "WAL message too short".to_string(),
-            ));
-        }
-
-        // Parse WAL message header: Format: 'w' + start_lsn (8) + end_lsn (8) + send_time (8) + message_data
-        let mut header = &data[1..25];
-        let start_lsn = header.get_u64();
-        let end_lsn = header.get_u64();
-        let _send_time = header.get_i64();
-
-        // Update LSN tracking using the server's WAL end position for this message
-        if end_lsn > 0 {
-            self.state.update_received_lsn(end_lsn);
-        }
-
-        // No payload after the header → nothing to convert.
-        if data.len() == 25 {
+        // Decode the XLogData envelope with the shared, policy-free decoder, then decode its pgoutput body. A header-only frame has an empty body → no event; the raw path surfaces that same frame instead (each caller owns the skip-vs-surface choice).
+        let raw = self.decode_raw_frame(data.into())?;
+        if raw.data.is_empty() {
             return Ok(None);
         }
 
-        // Zero-copy slice for the message body — refcount-only, no memcpy.
-        let message_data = data.slice(25..);
-        let replication_message = self.parser.parse_wal_message_bytes(message_data)?;
-        self.convert_to_change_event(replication_message, start_lsn)
+        let replication_message = self.parser.parse_wal_message_bytes(raw.data)?;
+        self.convert_to_change_event(replication_message, raw.wal_start.value())
+    }
+
+    /// Decode a `'w'` CopyData frame into a [`RawXLogData`] without touching the
+    /// pgoutput parser.
+    ///
+    /// Policy-free: it parses the fixed 25-byte header (advancing the received
+    /// LSN, in `parse_xlogdata_header`) and returns the zero-copy body slice — it
+    /// arms NO stop. Callers own that: [`next_raw_event`](Self::next_raw_event)
+    /// arms the transport-level stop, `next_event` arms the commit-boundary stop.
+    /// That separation is what lets the typed `process_wal_message` reuse this
+    /// decoder without inheriting the raw path's stop semantics.
+    ///
+    /// A header-only frame (len == 25) yields a `RawXLogData` with an empty
+    /// `data` payload — a conformant server never sends one (it sends a keepalive
+    /// when idle), so this is only reached by a malformed/edge frame.
+    #[inline]
+    fn decode_raw_frame(&mut self, data: Bytes) -> Result<RawXLogData> {
+        let (wal_start, wal_end, server_time) = self.parse_xlogdata_header(&data)?;
+
+        // Zero-copy slice of the message body — refcount only, no memcpy, `slice(25..)` is an empty `Bytes` for a header-only frame.
+        Ok(RawXLogData {
+            wal_start: Lsn::new(wal_start),
+            wal_end: Lsn::new(wal_end),
+            server_time,
+            data: data.slice(25..),
+        })
     }
 
     /// Process a keepalive message
@@ -7245,6 +7369,22 @@ mod tests {
     }
 
     #[test]
+    fn raw_xlogdata_struct_fields() {
+        use bytes::Bytes;
+
+        let raw = RawXLogData {
+            wal_start: Lsn::new(0x1000),
+            wal_end: Lsn::new(0x2000),
+            server_time: 42,
+            data: Bytes::from_static(b"payload"),
+        };
+        assert_eq!(raw.wal_start, Lsn::new(0x1000));
+        assert_eq!(raw.wal_end, Lsn::new(0x2000));
+        assert_eq!(raw.server_time, 42);
+        assert_eq!(&raw.data[..], b"payload");
+    }
+
+    #[test]
     fn test_process_wal_message_bytes_commit() {
         use bytes::Bytes;
 
@@ -7352,7 +7492,226 @@ mod tests {
         }
     }
 
-    // ========================================
+    #[test]
+    fn decode_raw_frame_returns_payload_and_positions() {
+        let mut stream = create_test_stream(create_test_config());
+        // Build a 'w' frame with an explicit non-zero send_time to prove the
+        // header offsets are read correctly.
+        let mut frame = vec![b'w'];
+        frame.extend_from_slice(&0x1000u64.to_be_bytes()); // wal_start
+        frame.extend_from_slice(&0x2000u64.to_be_bytes()); // wal_end
+        frame.extend_from_slice(&0x0102_0304_0506_0708i64.to_be_bytes()); // send_time
+        frame.extend_from_slice(b"pgoutput-bytes"); // payload
+
+        let raw = stream.decode_raw_frame(bytes::Bytes::from(frame)).unwrap();
+        assert_eq!(raw.wal_start, Lsn::new(0x1000));
+        assert_eq!(raw.wal_end, Lsn::new(0x2000));
+        assert_eq!(raw.server_time, 0x0102_0304_0506_0708i64);
+        assert_eq!(&raw.data[..], b"pgoutput-bytes");
+    }
+
+    #[test]
+    fn decode_raw_frame_data_is_zero_copy_slice() {
+        let mut stream = create_test_stream(create_test_config());
+        let orig = bytes::Bytes::from(build_wal_message(1, 2, b"abcdef"));
+        let raw = stream.decode_raw_frame(orig.clone()).unwrap();
+        // slice(25..) must point into the same allocation (no memcpy).
+        assert_eq!(raw.data.as_ptr(), orig[25..].as_ptr());
+    }
+
+    #[test]
+    fn decode_raw_frame_header_only_has_empty_payload() {
+        let mut stream = create_test_stream(create_test_config());
+        // Empty payload → frame is exactly 25 bytes (header only). Decodes to a
+        // RawXLogData carrying the header positions and an empty `data` slice.
+        let frame = bytes::Bytes::from(build_wal_message(0x10, 0x20, &[]));
+        assert_eq!(frame.len(), 25);
+        let raw = stream.decode_raw_frame(frame).unwrap();
+        assert_eq!(raw.wal_start, Lsn::new(0x10));
+        assert_eq!(raw.wal_end, Lsn::new(0x20));
+        assert!(raw.data.is_empty());
+    }
+
+    #[test]
+    fn decode_raw_frame_too_short_errors() {
+        let mut stream = create_test_stream(create_test_config());
+        let data = bytes::Bytes::from(vec![b'w'; 10]);
+        let err = stream.decode_raw_frame(data).unwrap_err();
+        assert!(err.to_string().contains("too short"));
+    }
+
+    #[test]
+    fn decode_raw_frame_advances_received_lsn() {
+        let mut stream = create_test_stream(create_test_config());
+        assert_eq!(stream.state.last_received_lsn, 0);
+        let frame = bytes::Bytes::from(build_wal_message(0x1000, 0xABCD, b"x"));
+        stream.decode_raw_frame(frame).unwrap();
+        assert_eq!(stream.state.last_received_lsn, 0xABCD);
+    }
+
+    #[cfg(feature = "rustls-tls")]
+    #[tokio::test]
+    async fn next_raw_event_arms_transport_stop_at_or_past_lsn() {
+        // Arming now lives in next_raw_event (decode_raw_frame is policy-free), so
+        // drive it through the pump with a seeded frame.
+        let token = CancellationToken::new();
+
+        // Below the stop LSN: terminal not armed.
+        let cfg = ReplicationStreamConfig::builder("slot", "pub").with_stop_at_lsn(0x2000u64);
+        let below = bytes::Bytes::from(build_wal_message(0x1000, 0x1FFF, b"x"));
+        let mut stream = create_test_stream_with_frames(cfg, vec![below]);
+        stream.next_raw_event(&token).await.unwrap();
+        assert!(stream.stop_at_reached.is_none());
+
+        // At/past the stop LSN: armed with this message's wal_end.
+        let cfg2 = ReplicationStreamConfig::builder("slot", "pub").with_stop_at_lsn(0x2000u64);
+        let at = bytes::Bytes::from(build_wal_message(0x1000, 0x2000, b"x"));
+        let mut stream2 = create_test_stream_with_frames(cfg2, vec![at]);
+        stream2.next_raw_event(&token).await.unwrap();
+        assert_eq!(stream2.stop_at_reached, Some(Lsn::new(0x2000)));
+    }
+
+    // ---- next_raw_event / next_wal_frame (connection-driven) ----
+    //
+    // These drive the raw pump through a null connection pre-seeded with
+    // CopyData frames. Native-backend only: the frame-seeding seam reaches into
+    // the native driver's `pending` queue. The coverage job runs default
+    // features (rustls-tls), so these count toward the coverage gate.
+
+    /// Build a test stream whose connection serves `frames` in order from its
+    /// `pending` queue, so the connection-driven raw path is unit-testable.
+    #[cfg(feature = "rustls-tls")]
+    fn create_test_stream_with_frames(
+        config: ReplicationStreamConfig,
+        frames: Vec<bytes::Bytes>,
+    ) -> LogicalReplicationStream {
+        let mut stream = create_test_stream(config);
+        stream.connection = PgReplicationConnection::null_for_testing_with_frames(frames);
+        stream
+    }
+
+    #[cfg(feature = "rustls-tls")]
+    #[tokio::test]
+    async fn next_raw_event_returns_seeded_wal_payload() {
+        let payload = build_begin_payload(0x2000, 7);
+        let frame = bytes::Bytes::from(build_wal_message(0x1000, 0x2000, &payload));
+        let mut stream = create_test_stream_with_frames(create_test_config(), vec![frame]);
+        let token = CancellationToken::new();
+
+        let raw = stream.next_raw_event(&token).await.unwrap();
+        assert_eq!(raw.wal_start, Lsn::new(0x1000));
+        assert_eq!(raw.wal_end, Lsn::new(0x2000));
+        assert_eq!(&raw.data[..], payload.as_slice());
+        // The 'w' header's end_lsn advanced the received LSN.
+        assert_eq!(stream.state.last_received_lsn, 0x2000);
+    }
+
+    #[cfg(feature = "rustls-tls")]
+    #[tokio::test]
+    async fn next_raw_event_returns_header_only_frame() {
+        // A header-only 'w' frame (len == 25) is returned directly with an empty
+        // payload — the pump does not skip it (a conformant server never sends
+        // one; a malformed frame surfaces as an empty-`data` event).
+        let header_only = bytes::Bytes::from(build_wal_message(0x1000, 0x1500, &[]));
+        let mut stream = create_test_stream_with_frames(create_test_config(), vec![header_only]);
+        let token = CancellationToken::new();
+
+        let raw = stream.next_raw_event(&token).await.unwrap();
+        assert_eq!(raw.wal_end, Lsn::new(0x1500));
+        assert!(raw.data.is_empty());
+    }
+
+    #[cfg(feature = "rustls-tls")]
+    #[tokio::test]
+    async fn next_raw_event_handles_keepalive_then_wal() {
+        // A keepalive ('k', no reply requested) is consumed internally and
+        // advances the received LSN; the following 'w' frame is returned.
+        let mut ka = vec![b'k'];
+        ka.extend_from_slice(&0x1500u64.to_be_bytes()); // wal_end
+        ka.extend_from_slice(&0i64.to_be_bytes()); // timestamp
+        ka.push(0u8); // reply_requested = false
+        let payload = build_begin_payload(0x2000, 1);
+        let wal = bytes::Bytes::from(build_wal_message(0x1000, 0x2000, &payload));
+        let mut stream =
+            create_test_stream_with_frames(create_test_config(), vec![bytes::Bytes::from(ka), wal]);
+        let token = CancellationToken::new();
+
+        let raw = stream.next_raw_event(&token).await.unwrap();
+        assert_eq!(raw.wal_end, Lsn::new(0x2000));
+        assert_eq!(stream.state.last_received_lsn, 0x2000);
+    }
+
+    #[cfg(feature = "rustls-tls")]
+    #[tokio::test]
+    async fn next_raw_event_skips_empty_and_unknown_frames() {
+        // An empty CopyData payload is skipped; an unknown message type is logged
+        // and skipped; the following 'w' frame is returned.
+        let payload = build_begin_payload(0x2000, 1);
+        let wal = bytes::Bytes::from(build_wal_message(0x1000, 0x2000, &payload));
+        let mut stream = create_test_stream_with_frames(
+            create_test_config(),
+            vec![
+                bytes::Bytes::new(),
+                bytes::Bytes::from(vec![b'z', 1, 2, 3]),
+                wal,
+            ],
+        );
+        let token = CancellationToken::new();
+
+        let raw = stream.next_raw_event(&token).await.unwrap();
+        assert_eq!(raw.wal_end, Lsn::new(0x2000));
+    }
+
+    #[cfg(feature = "rustls-tls")]
+    #[tokio::test]
+    async fn next_raw_event_cancelled_returns_error() {
+        // A pre-cancelled token short-circuits the pump before any read.
+        let mut stream = create_test_stream_with_frames(create_test_config(), vec![]);
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let err = stream.next_raw_event(&token).await.unwrap_err();
+        assert!(matches!(err, ReplicationError::Cancelled(_)));
+    }
+
+    #[cfg(feature = "rustls-tls")]
+    #[tokio::test]
+    async fn next_raw_event_runs_periodic_feedback_check() {
+        // Pre-arm the throttle counter so the next pumped frame lands on the
+        // feedback-check tick, exercising the maybe_send_feedback branch.
+        let payload = build_begin_payload(0x2000, 1);
+        let wal = bytes::Bytes::from(build_wal_message(0x1000, 0x2000, &payload));
+        let mut stream = create_test_stream_with_frames(create_test_config(), vec![wal]);
+        stream.feedback_check_counter = FEEDBACK_CHECK_EVENT_INTERVAL - 1;
+        let token = CancellationToken::new();
+
+        let raw = stream.next_raw_event(&token).await.unwrap();
+        assert_eq!(raw.wal_end, Lsn::new(0x2000));
+    }
+
+    #[cfg(feature = "rustls-tls")]
+    #[tokio::test]
+    async fn next_raw_event_terminates_after_transport_stop() {
+        // A frame whose wal_end reaches stop_at_lsn is delivered and arms the
+        // transport terminal; the next call sends CopyDone once (a no-op on the
+        // null connection) and reports StreamStopped — end-to-end through the
+        // raw entry point, not just the shared pump.
+        let cfg = ReplicationStreamConfig::builder("slot", "pub").with_stop_at_lsn(0x2000u64);
+        let payload = build_begin_payload(0x2000, 1);
+        let frame = bytes::Bytes::from(build_wal_message(0x1000, 0x2000, &payload));
+        let mut stream = create_test_stream_with_frames(cfg, vec![frame]);
+        let token = CancellationToken::new();
+
+        // First call delivers the crossing frame and arms the terminal.
+        let raw = stream.next_raw_event(&token).await.unwrap();
+        assert_eq!(raw.wal_end, Lsn::new(0x2000));
+        assert_eq!(stream.stop_at_reached, Some(Lsn::new(0x2000)));
+
+        // Second call terminates cleanly (CopyDone sent once, StreamStopped).
+        let err = stream.next_raw_event(&token).await.unwrap_err();
+        assert!(matches!(err, ReplicationError::StreamStopped(l) if l == Lsn::new(0x2000)));
+        assert!(stream.copy_done_sent);
+    }
     // into_stream() and EventStream construction coverage
     // ========================================
 
