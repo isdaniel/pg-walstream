@@ -55,6 +55,28 @@ message parsing/streaming pipeline — changes there should be benchmarked:
 cargo bench --bench wal_pipeline
 ```
 
+## Performance regression CI
+
+Every PR runs the `Benchmarks` workflow (`.github/workflows/benchmarks.yml`),
+which executes the `wal_pipeline` and `deserialize` criterion benches under
+[CodSpeed](https://codspeed.io) in `simulation` mode. Simulation mode measures
+instruction/cache behavior on a simulated CPU, so results are deterministic —
+there is no CI-runner noise and no need to re-run for accuracy.
+
+CodSpeed compares the PR against the base branch's last recorded run (baselines
+come from the push-to-`main` trigger) and posts a per-benchmark diff as a PR
+comment plus a status check. The regression **threshold is configured in the
+CodSpeed dashboard**, not in the workflow YAML. To make a regression block
+merge, add the CodSpeed status check to the `main` branch-protection rules.
+
+Locally, `cargo bench` is unaffected — `codspeed-criterion-compat` is a
+passthrough to criterion when not run under `cargo codspeed`.
+
+**One-time setup (maintainers):** sign in to codspeed.io with the GitHub org and
+enable this repository (installs the CodSpeed GitHub App). `CODSPEED_TOKEN` is
+optional for this public repo (OIDC via `id-token: write`); add it as a repo
+secret only if tokenless auth is insufficient.
+
 ## Coding conventions
 
 - Prefer zero-copy `Bytes` over `Vec<u8>` for data flowing through the pipeline.

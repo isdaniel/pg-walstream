@@ -86,7 +86,7 @@ rustls-tls = [
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["full"] }
-criterion = { version = "0.8.2", features = ["html_reports"] }
+criterion = { package = "codspeed-criterion-compat", version = "5.0.1", features = ["html_reports"] }
 futures = "0.3.32"
 serde_bytes = "0.11.19"
 proptest = "1.11"
