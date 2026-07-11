@@ -95,6 +95,70 @@ fn generate_column_values(n: usize) -> Vec<String> {
     (0..n).map(|i| format!("value_{i}_data")).collect()
 }
 
+/// A column value covering the four `parse_tuple_data` wire variants.
+enum Col<'a> {
+    Text(&'a str),
+    Binary(&'a [u8]),
+    Null,
+    Unchanged,
+}
+
+/// Build a TupleData block: `n_columns(u16)` then per column a type byte and,
+/// for `Text`/`Binary`, a `u32` length + data. Mirrors what `parse_tuple_data` reads.
+fn build_tuple(cols: &[Col]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(cols.len() as u16).to_be_bytes());
+    for c in cols {
+        match c {
+            Col::Text(s) => {
+                buf.push(b't');
+                buf.extend_from_slice(&(s.len() as u32).to_be_bytes());
+                buf.extend_from_slice(s.as_bytes());
+            }
+            Col::Binary(data) => {
+                buf.push(b'b');
+                buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
+                buf.extend_from_slice(data);
+            }
+            Col::Null => buf.push(b'n'),
+            Col::Unchanged => buf.push(b'u'),
+        }
+    }
+    buf
+}
+
+/// Build an Insert payload from arbitrary column types: `'I'` + relation_id + `'N'` + tuple.
+fn build_insert_cols(relation_id: u32, cols: &[Col]) -> Vec<u8> {
+    let mut buf = vec![b'I'];
+    buf.extend_from_slice(&relation_id.to_be_bytes());
+    buf.push(b'N');
+    buf.extend_from_slice(&build_tuple(cols));
+    buf
+}
+
+/// Build an Update payload: `'U'` + relation_id + optional (`'O'` old tuple) + `'N'` new tuple.
+/// `old = Some(..)` models REPLICA IDENTITY FULL (the full old row is present).
+fn build_update_payload(relation_id: u32, old: Option<&[Col]>, new: &[Col]) -> Vec<u8> {
+    let mut buf = vec![b'U'];
+    buf.extend_from_slice(&relation_id.to_be_bytes());
+    if let Some(old_cols) = old {
+        buf.push(b'O');
+        buf.extend_from_slice(&build_tuple(old_cols));
+    }
+    buf.push(b'N');
+    buf.extend_from_slice(&build_tuple(new));
+    buf
+}
+
+/// Build a Delete payload: `'D'` + relation_id + `'O'` old/key tuple.
+fn build_delete_payload(relation_id: u32, key: &[Col]) -> Vec<u8> {
+    let mut buf = vec![b'D'];
+    buf.extend_from_slice(&relation_id.to_be_bytes());
+    buf.push(b'O');
+    buf.extend_from_slice(&build_tuple(key));
+    buf
+}
+
 // ---------------------------------------------------------------------------
 // 1. BufferReader creation: copy vs zero-copy
 // ---------------------------------------------------------------------------
@@ -394,6 +458,171 @@ fn bench_parse_commit(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// 8. Update message parse — REPLICA IDENTITY DEFAULT (new only) vs FULL (old+new)
+// ---------------------------------------------------------------------------
+
+fn bench_parse_update(c: &mut Criterion) {
+    let mut group = c.benchmark_group("parse_update");
+
+    let new_vals = generate_column_values(10);
+    let new_cols: Vec<Col> = new_vals.iter().map(|s| Col::Text(s.as_str())).collect();
+
+    // REPLICA IDENTITY DEFAULT: only the new tuple is sent.
+    let default_payload = Bytes::from(build_update_payload(100, None, &new_cols));
+    group.bench_function("replica_default", |b| {
+        let mut parser = LogicalReplicationParser::with_protocol_version(2);
+        b.iter(|| {
+            let result = parser
+                .parse_wal_message_bytes(black_box(default_payload.clone()))
+                .unwrap();
+            black_box(result);
+        });
+    });
+
+    // REPLICA IDENTITY FULL: old tuple + new tuple (two tuples parsed per message).
+    let old_vals = generate_column_values(10);
+    let old_cols: Vec<Col> = old_vals.iter().map(|s| Col::Text(s.as_str())).collect();
+    let full_payload = Bytes::from(build_update_payload(100, Some(&old_cols), &new_cols));
+    group.bench_function("replica_full", |b| {
+        let mut parser = LogicalReplicationParser::with_protocol_version(2);
+        b.iter(|| {
+            let result = parser
+                .parse_wal_message_bytes(black_box(full_payload.clone()))
+                .unwrap();
+            black_box(result);
+        });
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// 9. Delete message parse
+// ---------------------------------------------------------------------------
+
+fn bench_parse_delete(c: &mut Criterion) {
+    let mut group = c.benchmark_group("parse_delete");
+
+    let key_vals = generate_column_values(10);
+    let key_cols: Vec<Col> = key_vals.iter().map(|s| Col::Text(s.as_str())).collect();
+    let payload = Bytes::from(build_delete_payload(100, &key_cols));
+
+    group.bench_function("zero_copy_path", |b| {
+        let mut parser = LogicalReplicationParser::with_protocol_version(2);
+        b.iter(|| {
+            let result = parser
+                .parse_wal_message_bytes(black_box(payload.clone()))
+                .unwrap();
+            black_box(result);
+        });
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// 10. Tuple with mixed column types: text / null / unchanged (TOAST) / binary
+// ---------------------------------------------------------------------------
+
+fn bench_parse_tuple_types(c: &mut Criterion) {
+    let mut group = c.benchmark_group("parse_tuple_types");
+
+    // 12 columns cycling through all four `parse_tuple_data` arms (t/n/u/b).
+    let bin = [0xDEu8, 0xAD, 0xBE, 0xEF];
+    let cols = vec![
+        Col::Text("alpha"),
+        Col::Null,
+        Col::Unchanged,
+        Col::Binary(&bin),
+        Col::Text("bravo"),
+        Col::Null,
+        Col::Unchanged,
+        Col::Binary(&bin),
+        Col::Text("charlie"),
+        Col::Null,
+        Col::Unchanged,
+        Col::Binary(&bin),
+    ];
+    let payload = Bytes::from(build_insert_cols(100, &cols));
+
+    group.bench_function("mixed_t_n_u_b", |b| {
+        let mut parser = LogicalReplicationParser::with_protocol_version(2);
+        b.iter(|| {
+            let result = parser
+                .parse_wal_message_bytes(black_box(payload.clone()))
+                .unwrap();
+            black_box(result);
+        });
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// 11. Large column values — guards the zero-copy invariant (time must stay ~flat
+// across sizes; a stray copy would make this scale with payload size).
+// ---------------------------------------------------------------------------
+
+fn bench_parse_large_values(c: &mut Criterion) {
+    let mut group = c.benchmark_group("parse_large_values");
+
+    for size in [64usize, 1024, 65536] {
+        let big = vec![b'x'; size];
+        let big_str = core::str::from_utf8(&big).unwrap();
+        // Two large text columns + one large binary column.
+        let cols = vec![Col::Text(big_str), Col::Binary(&big), Col::Text(big_str)];
+        let payload = Bytes::from(build_insert_cols(100, &cols));
+
+        group.throughput(criterion::Throughput::Bytes((size * 3) as u64));
+        group.bench_with_input(
+            BenchmarkId::new("zero_copy_path", size),
+            &payload,
+            |b, payload| {
+                let mut parser = LogicalReplicationParser::with_protocol_version(2);
+                b.iter(|| {
+                    let result = parser
+                        .parse_wal_message_bytes(black_box(payload.clone()))
+                        .unwrap();
+                    black_box(result);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// 12. Realistic transaction stream: BEGIN → INSERT×N → COMMIT parsed in sequence
+// on one reused parser (steady-state / state-transition cost).
+// ---------------------------------------------------------------------------
+
+fn bench_parse_transaction(c: &mut Criterion) {
+    let mut group = c.benchmark_group("parse_transaction");
+
+    const N_INSERTS: usize = 64;
+    let vals = generate_column_values(10);
+    let cols: Vec<Col> = vals.iter().map(|s| Col::Text(s.as_str())).collect();
+
+    let begin = Bytes::from(build_begin_payload(0x2000, 42));
+    let insert = Bytes::from(build_insert_cols(100, &cols));
+    let commit = Bytes::from(build_commit_payload(0x2000, 0x2100));
+
+    group.bench_function("begin_inserts_commit", |b| {
+        let mut parser = LogicalReplicationParser::with_protocol_version(2);
+        b.iter(|| {
+            black_box(parser.parse_wal_message_bytes(begin.clone()).unwrap());
+            for _ in 0..N_INSERTS {
+                black_box(parser.parse_wal_message_bytes(insert.clone()).unwrap());
+            }
+            black_box(parser.parse_wal_message_bytes(commit.clone()).unwrap());
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_buffer_reader_create,
@@ -403,5 +632,10 @@ criterion_group!(
     bench_parse_insert_pipeline,
     bench_parse_multi_column,
     bench_parse_commit,
+    bench_parse_update,
+    bench_parse_delete,
+    bench_parse_tuple_types,
+    bench_parse_large_values,
+    bench_parse_transaction,
 );
 criterion_main!(benches);
