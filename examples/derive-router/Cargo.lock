@@ -563,7 +563,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pg-walstream-macros"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -572,7 +572,7 @@ dependencies = [
 
 [[package]]
 name = "pg_walstream"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "aws-lc-rs",
  "bytes",
