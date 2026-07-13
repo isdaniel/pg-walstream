@@ -1,0 +1,51 @@
+name: Auto Tag
+
+# Runs AFTER the CI workflow finishes successfully on main. Gating on CI (rather
+# than on the raw push) means the tagged commit is already proven green, so
+# release.yml can publish without re-running the whole test matrix. The tag is
+# pushed via RELEASE_PAT (not GITHUB_TOKEN) — a GITHUB_TOKEN push would NOT fire
+# release.yml.
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types:
+      - completed
+    branches:
+      - main
+
+jobs:
+  auto-tag:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the commit CI just passed
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PAT }}
+
+      - name: Tag if version is new
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/.*= "//' | sed 's/".*//')
+          TAG="v${VERSION}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists. Nothing to do."
+            exit 0
+          fi
+
+          # Pre-tag consistency check (same rule as release.yml), run BEFORE
+          # tagging so a mismatched version never produces a tag or a failed
+          # publish run. The macros pin is the one field not covered by workspace
+          # inheritance, so it must equal the release version.
+          PIN=$(grep 'pg-walstream-macros' Cargo.toml | grep -o 'version = "=[^"]*"' | grep -o '[0-9][^"]*')
+          echo "workspace.package version: $VERSION"
+          echo "pg-walstream-macros dep pin: =$PIN"
+          if [ "$PIN" != "$VERSION" ]; then
+            echo "Error: pg-walstream-macros pin (=$PIN) must equal the version ($VERSION). Not tagging."
+            exit 1
+          fi
+
+          echo "Creating and pushing ${TAG}."
+          git tag "${TAG}"
+          git push origin "${TAG}"

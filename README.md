@@ -14,7 +14,7 @@ A high-performance Rust library for PostgreSQL logical and physical replication 
 - **Full Logical Replication Support**: Implements PostgreSQL logical replication protocol versions 1-4
 - **Physical Replication Support**: Stream raw WAL data for standby servers and PITR
 - **Base Backup Support**: Full `BASE_BACKUP` command with progress, compression, and manifest options
-- **Pure-Rust Backend (default)**: The default `rustls-tls` backend needs no libpq and no OpenSSL, using `aws-lc-rs` for hardware-accelerated TLS (AES-NI, AVX2, SHA-NI) — ~2× more CPU-efficient than the optional C libpq backend
+- **Pure-Rust Backend (default)**: The default `rustls-tls` backend needs no libpq and no OpenSSL, using `aws-lc-rs` for hardware-accelerated TLS (AES-NI, AVX2, SHA-NI). 
 - **TLS/SSL Support**: All PostgreSQL SSL modes (`disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`)
 - **Authentication**: Cleartext, MD5, and SCRAM-SHA-256 authentication methods
 - **Streaming Transactions**: Support for streaming large transactions (protocol v2+)
@@ -37,7 +37,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-pg_walstream = "0.7"
+pg_walstream = "0.8"
 ```
 
 By default, this uses the pure-Rust `rustls-tls` backend — no libpq and no OpenSSL, only `cmake` + a C compiler at build time (for `aws-lc-rs`).
@@ -46,7 +46,7 @@ To use the C **libpq** backend instead (bound by `pq-sys`; requires system libpq
 
 ```toml
 [dependencies]
-pg_walstream = { version = "0.7", default-features = false, features = ["libpq"] }
+pg_walstream = { version = "0.8", default-features = false, features = ["libpq"] }
 ```
 
 If both backends are enabled, `rustls-tls` takes priority automatically.
@@ -95,7 +95,7 @@ sudo apt-get install cmake gcc
 Then add to `Cargo.toml`:
 
 ```toml
-pg_walstream = { version = "0.7", features = ["rustls-tls"] }
+pg_walstream = { version = "0.8", features = ["rustls-tls"] }
 ```
 
 #### TLS trust store
@@ -359,33 +359,41 @@ The library supports all PostgreSQL logical replication message types:
 Progressive writer concurrency ramp (16 - 192 writers) to find the library's CPU saturation point and throughput ceiling.
 
 - **Backend A**: rustls-tls
-- **Backend B**: libpq 
+- **Backend B**: libpq
+
+**Test environment:** an 8-vCPU Linux VM (TCP-tuned per [Linux VM TCP Tuning](#linux-vm-tcp-tuning-for-production): 64 MB buffers, BBR) streaming from a **remote Azure PostgreSQL Flexible Server 18.4** over TLS (`sslmode=require`). Each scenario ran 10 s warmup + 30 s measure; every configuration was measured **3 times per backend** and the **median** is reported (cross-run CoV ≤ ~6%). Process CPU/RSS reflect **only the pg-walstream consumer** — the write generator runs as a separate OS process.
+
+> **Reading these numbers:** Over a real network link the consumer spends most of its time parked in `epoll`/TLS I/O rather than parsing, so both backends are **network-I/O-bound and converge to within run-to-run noise** on CPU efficiency, CPU%, RSS, and latency. rustls-tls keeps a small (~8%) throughput edge on saturated single-stream ingest. If you are benchmarking over loopback/localhost you may see larger CPU gaps; those do not represent a realistic remote-DB deployment.
 
 ## 1. CPU Efficiency (DML events/sec per 1% CPU)
 
-This is the primary efficiency metric: how many DML events can each backend process for every 1% of CPU it consumes. Higher is better.
+This is the primary efficiency metric: how many DML events each backend processes for every 1% of CPU it consumes. Higher is better.
 
 | Scenario | rustls-tls | libpq | Delta | Winner |
 |----------|----------:|----------:|--------:|--------|
-| Baseline | 4,252 | 1,628 | +161.2% | **rustls-tls** |
-| Batch-100 | 1,053 | 672 | +56.7% | **rustls-tls** |
-| Batch-5000 | 4,764 | 1,621 | +193.9% | **rustls-tls** |
-| 4-Writers | 4,891 | 1,615 | +202.8% | **rustls-tls** |
-| Wide-20col | 1,090 | 777 | +40.3% | **rustls-tls** |
-| Payload-2KB | 973 | 776 | +25.3% | **rustls-tls** |
-| Mixed-DML | 1,832 | 1,066 | +71.9% | **rustls-tls** |
+| Baseline | 4,338 | 4,250 | +2.1% | ~tie |
+| Batch-100 | 2,459 | 2,575 | -4.5% | ~tie |
+| Batch-5000 | 4,105 | 4,122 | -0.4% | ~tie |
+| 4-Writers | 3,621 | 3,626 | -0.1% | ~tie |
+| Wide-20col | 1,856 | 1,960 | -5.3% | ~tie |
+| Payload-2KB | 1,212 | 1,218 | -0.5% | ~tie |
+| Mixed-DML | 3,293 | 3,301 | -0.2% | ~tie |
+
+Both backends land within ±5% across every scenario — a statistical tie.
 
 ## 2. Throughput Comparison
 
 | Scenario | rustls-tls ev/s | libpq ev/s | Delta | rustls-tls DML/s | libpq DML/s | Delta | Winner |
 |----------|----------:|----------:|--------:|----------:|----------:|--------:|--------|
-| Baseline | 22,939 | 22,672 | +1.2% | 22,933 | 22,667 | +1.2% | ~tie |
-| Batch-100 | 327 | 324 | +1.1% | 321 | 317 | +1.1% | ~tie |
-| Batch-5000 | 15,173 | 14,359 | +5.7% | 15,167 | 14,353 | +5.7% | **rustls-tls** |
-| 4-Writers | 80,287 | 78,755 | +1.9% | 80,267 | 78,736 | +1.9% | ~tie |
-| Wide-20col | 1,523 | 1,556 | -2.2% | 1,517 | 1,550 | -2.2% | **libpq** |
-| Payload-2KB | 1,422 | 1,473 | -3.4% | 1,417 | 1,467 | -3.4% | **libpq** |
-| Mixed-DML | 811 | 799 | +1.5% | 804 | 793 | +1.5% | ~tie |
+| Baseline | 178,812 | 164,585 | +8.6% | 177,414 | 163,299 | +8.6% | **rustls-tls** |
+| Batch-100 | 30,909 | 31,069 | -0.5% | 30,303 | 30,460 | -0.5% | ~tie |
+| Batch-5000 | 167,095 | 153,424 | +8.9% | 165,801 | 152,236 | +8.9% | **rustls-tls** |
+| 4-Writers | 147,377 | 146,476 | +0.6% | 145,273 | 144,404 | +0.6% | ~tie |
+| Wide-20col | 27,126 | 27,434 | -1.1% | 26,133 | 26,429 | -1.1% | ~tie |
+| Payload-2KB | 23,069 | 21,297 | +8.3% | 21,400 | 19,756 | +8.3% | **rustls-tls** |
+| Mixed-DML | 55,180 | 57,506 | -4.0% | 54,526 | 56,824 | -4.0% | **libpq** |
+
+rustls-tls is ~8–9% faster on saturated single-stream ingest (Baseline, Batch-5000, Payload-2KB); everything else is within noise.
 
 ## 3. Resource Utilization Comparison
 
@@ -393,25 +401,29 @@ Process CPU and RSS reflect **only the pg-walstream consumer** (generator runs a
 
 | Scenario | rustls-tls CPU% | libpq CPU% | Delta | rustls-tls RSS MB | libpq RSS MB | Delta | Winner |
 |----------|----------:|----------:|--------:|----------:|----------:|--------:|--------|
-| Baseline | 5.4 | 13.9 | -61.3% | 15.9 | 17.3 | -8.1% | **rustls-tls** |
-| Batch-100 | 0.3 | 0.5 | -35.5% | 17.0 | 18.4 | -7.5% | **rustls-tls** |
-| Batch-5000 | 3.2 | 8.9 | -64.0% | 17.2 | 18.5 | -7.4% | **rustls-tls** |
-| 4-Writers | 16.4 | 48.7 | -66.3% | 17.4 | 18.7 | -6.8% | **rustls-tls** |
-| Wide-20col | 1.4 | 2.0 | -30.3% | 17.5 | 18.7 | -6.5% | **rustls-tls** |
-| Payload-2KB | 1.5 | 1.9 | -22.9% | 17.5 | 18.7 | -6.5% | **rustls-tls** |
-| Mixed-DML | 0.4 | 0.7 | -41.0% | 17.5 | 18.8 | -6.8% | **rustls-tls** |
+| Baseline | 38.4 | 38.4 | -0.0% | 14.8 | 14.8 | -0.1% | ~tie |
+| Batch-100 | 12.3 | 12.1 | +1.7% | 16.1 | 15.9 | +1.3% | ~tie |
+| Batch-5000 | 38.9 | 37.2 | +4.6% | 16.3 | 16.3 | -0.2% | ~tie |
+| 4-Writers | 39.6 | 39.7 | -0.3% | 16.5 | 16.5 | +0.4% | ~tie |
+| Wide-20col | 14.1 | 14.4 | -2.4% | 16.6 | 16.6 | +0.2% | ~tie |
+| Payload-2KB | 17.9 | 16.2 | +10.5% | 16.5 | 16.7 | -0.9% | **libpq** |
+| Mixed-DML | 16.5 | 17.7 | -6.4% | 16.7 | 17.6 | -5.1% | **rustls-tls** |
+
+CPU% and RSS are effectively equal; the largest single-scenario deltas (~10%) sit inside the 3-run variance.
 
 ## 4. Latency Comparison (inter-event, microseconds)
 
 | Scenario | rustls-tls P50 | libpq P50 | rustls-tls P99 | libpq P99 | Winner |
 |----------|----------:|----------:|----------:|----------:|--------|
-| Baseline | 1 | 5 | 33 | 17 | **rustls-tls** |
-| Batch-100 | 1 | 6 | 7635 | 7411 | **rustls-tls** |
-| Batch-5000 | 1 | 5 | 111 | 17 | **rustls-tls** |
-| 4-Writers | 1 | 5 | 56 | 22 | **rustls-tls** |
-| Wide-20col | 2 | 7 | 873 | 820 | **rustls-tls** |
-| Payload-2KB | 5 | 6 | 882 | 812 | **rustls-tls** |
-| Mixed-DML | 1 | 5 | 1819 | 1804 | **rustls-tls** |
+| Baseline | 1 | 1 | 72 | 66 | ~tie |
+| Batch-100 | 1 | 1 | 645 | 599 | ~tie |
+| Batch-5000 | 1 | 1 | 64 | 64 | ~tie |
+| 4-Writers | 1 | 1 | 150 | 149 | ~tie |
+| Wide-20col | 1 | 1 | 227 | 223 | ~tie |
+| Payload-2KB | 5 | 5 | 390 | 365 | ~tie |
+| Mixed-DML | 1 | 1 | 107 | 109 | ~tie |
+
+P50 is 1 µs for both; P99 tracks within ±10 µs — no backend advantage.
 
 ## 5. Stress Ramp Comparison
 
@@ -419,23 +431,25 @@ Progressive writer concurrency ramp — comparing throughput and CPU scaling.
 
 | Writers | rustls-tls DML/s | libpq DML/s | Delta | rustls-tls CPU% | libpq CPU% | rustls-tls eff | libpq eff |
 |--------:|----------:|----------:|--------:|----------:|----------:|----------:|----------:|
-| 16 | 134,280 | 128,718 | +4.3% | 28.3 | 83.4 | 4,749 | 1,544 |
-| 32 | 100,387 | 122,192 | -17.8% | 21.8 | 76.0 | 4,613 | 1,608 |
-| 48 | 98,240 | 112,826 | -12.9% | 21.6 | 71.5 | 4,553 | 1,578 |
-| 64 | 107,748 | 104,107 | +3.5% | 22.9 | 67.6 | 4,712 | 1,541 |
-| 96 | 100,869 | 106,684 | -5.5% | 22.4 | 70.1 | 4,501 | 1,522 |
-| 128 | 105,333 | 100,601 | +4.7% | 23.7 | 66.4 | 4,449 | 1,514 |
-| 192 | 94,963 | 99,571 | -4.6% | 24.0 | 64.8 | 3,961 | 1,536 |
+| 16 | 127,226 | 125,729 | +1.2% | 42.9 | 43.4 | 2,975 | 2,969 |
+| 32 | 115,728 | 117,595 | -1.6% | 42.4 | 42.1 | 2,764 | 2,770 |
+| 48 | 103,432 | 105,136 | -1.6% | 40.6 | 40.0 | 2,591 | 2,671 |
+| 64 | 98,473 | 99,038 | -0.6% | 37.8 | 37.3 | 2,616 | 2,586 |
+| 96 | 87,361 | 87,592 | -0.3% | 34.0 | 35.5 | 2,550 | 2,468 |
+| 128 | 79,709 | 76,466 | +4.2% | 32.9 | 34.0 | 2,425 | 2,306 |
+| 192 | 72,291 | 72,186 | +0.1% | 33.1 | 32.9 | 2,193 | 2,194 |
+
+Throughput and efficiency scale essentially identically for both backends across the ramp.
 
 ### Peak Numbers
 
 | Metric | rustls-tls | libpq |
 |--------|------:|------:|
-| Peak DML events/sec | 134,280 | 128,718 |
-| Peak total events/sec | 134,307 | 128,744 |
-| Peak CPU efficiency (DML/s per 1% CPU) | 4,749 | 1,544 |
-| Peak process CPU% | 30.9 | 96.4 |
-| Peak RSS (MB) | 17.8 | 18.8 |
+| Peak DML events/sec | 177,414 | 163,299 |
+| Peak total events/sec | 178,812 | 164,585 |
+| Peak CPU efficiency (DML/s per 1% CPU) | 4,338 | 4,250 |
+| Peak process CPU% | 51 | 50 |
+| Peak RSS (MB) | 18 | 18 |
 
 For a detailed comparison across PostgreSQL 16 and 18 with different optimizations (binary mode, direct TLS, COPY protocol), see the [Load Test Comparison Report](LOAD_TEST_COMPARISON.md).
 

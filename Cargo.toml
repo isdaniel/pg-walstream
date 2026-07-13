@@ -18,7 +18,7 @@ members = ["macros"]
 exclude = ["examples", "fuzz", "load-tests"]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 authors = ["danielshih <dog830228@gmail.com>"]
 license = "BSD-3-Clause"
@@ -27,7 +27,7 @@ homepage = "https://github.com/isdaniel/pg-walstream"
 rust-version = "1.87"
 
 [workspace.dependencies]
-pg-walstream-macros = { path = "macros", version = "0.7" }
+pg-walstream-macros = { path = "macros", version = "=0.8.0" }
 
 [dependencies]
 tokio = { version = "1.52.3", features = ["io-util", "net", "time", "macros", "rt", "rt-multi-thread"], optional = true }
