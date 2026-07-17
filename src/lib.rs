@@ -220,8 +220,8 @@ pub use types::system_time_to_postgres_timestamp;
 // Re-export protocol types
 pub use protocol::{
     message_types, parse_keepalive_message, ColumnData, ColumnInfo, KeepaliveMessage,
-    LogicalReplicationMessage, LogicalReplicationParser, MessageType, RelationInfo,
-    ReplicationState, StreamingReplicationMessage, TupleData,
+    LogicalReplicationMessage, LogicalReplicationParser, MessageType, PgOutputDecoder,
+    RelationInfo, ReplicationState, StreamingReplicationMessage, TupleData,
 };
 
 // pgoutput encoder. `encode_message` emits pgoutput, unlike `ChangeEvent::encode`.
