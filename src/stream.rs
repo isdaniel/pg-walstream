@@ -15,15 +15,14 @@
 
 use crate::error::{ReplicationError, Result};
 use crate::lsn::SharedLsnFeedback;
-use crate::types::{
-    ChangeEvent, EventType, Lsn, RelationColumn, ReplicaIdentity, ReplicationSlotOptions, SlotType,
-    TimestampTz,
-};
+use crate::types::{ChangeEvent, EventType, Lsn, ReplicationSlotOptions, SlotType, TimestampTz};
 use crate::{
-    format_lsn, parse_keepalive_message, postgres_timestamp_to_chrono, LogicalReplicationMessage,
-    LogicalReplicationParser, PgReplicationConnection, RelationInfo, ReplicationConnectionRetry,
-    ReplicationState, RetryConfig, StreamingReplicationMessage, XLogRecPtr, INVALID_XLOG_REC_PTR,
+    format_lsn, parse_keepalive_message, LogicalReplicationParser, PgReplicationConnection,
+    ReplicationConnectionRetry, ReplicationState, RetryConfig, XLogRecPtr, INVALID_XLOG_REC_PTR,
 };
+// `RelationInfo` is referenced only by the unit tests in this file, via `super::*`.
+#[cfg(test)]
+use crate::RelationInfo;
 use bytes::{Buf, Bytes};
 use std::sync::Arc;
 
@@ -1090,7 +1089,11 @@ impl LogicalReplicationStream {
         }
 
         let replication_message = self.parser.parse_wal_message_bytes(raw.data)?;
-        self.convert_to_change_event(replication_message, raw.wal_start.value())
+        crate::protocol::message_to_change_event(
+            &mut self.state,
+            replication_message,
+            raw.wal_start.value(),
+        )
     }
 
     /// Decode a `'w'` CopyData frame into a [`RawXLogData`] without touching the
@@ -1136,473 +1139,6 @@ impl LogicalReplicationStream {
         }
 
         Ok(())
-    }
-
-    /// Convert a logical replication message to a ChangeEvent
-    fn convert_to_change_event(
-        &mut self,
-        message: StreamingReplicationMessage,
-        lsn: XLogRecPtr,
-    ) -> Result<Option<ChangeEvent>> {
-        let event = match message.message {
-            LogicalReplicationMessage::Relation {
-                relation_id,
-                namespace,
-                relation_name,
-                replica_identity,
-                columns,
-            } => {
-                // Detect schema changes: if we already have this relation cached
-                // and the schema differs, emit a Relation event before updating.
-                let schema_changed = if let Some(existing) = self.state.get_relation(relation_id) {
-                    existing.namespace.as_ref() != namespace.as_ref()
-                        || existing.relation_name.as_ref() != relation_name.as_ref()
-                        || existing.replica_identity != replica_identity
-                        || existing.columns.len() != columns.len()
-                        || existing.columns.iter().zip(columns.iter()).any(|(a, b)| {
-                            a.name.as_ref() != b.name.as_ref()
-                                || a.type_id != b.type_id
-                                || a.type_modifier != b.type_modifier
-                                || a.is_key() != b.is_key()
-                        })
-                } else {
-                    false
-                };
-
-                if schema_changed {
-                    let ri = ReplicaIdentity::from_byte(replica_identity)
-                        .unwrap_or(ReplicaIdentity::Default);
-                    let relation_columns = columns
-                        .iter()
-                        .map(|c| RelationColumn {
-                            name: Arc::clone(&c.name),
-                            type_id: c.type_id,
-                            type_modifier: c.type_modifier,
-                            is_key: c.is_key(),
-                        })
-                        .collect();
-                    let relation_info = RelationInfo::new(
-                        relation_id,
-                        namespace.clone(),
-                        relation_name.clone(),
-                        replica_identity,
-                        columns,
-                    );
-                    self.state.add_relation(relation_info);
-                    ChangeEvent::relation(
-                        relation_id,
-                        namespace,
-                        relation_name,
-                        ri,
-                        relation_columns,
-                        Lsn::new(lsn),
-                    )
-                } else {
-                    let relation_info = RelationInfo::new(
-                        relation_id,
-                        namespace,
-                        relation_name,
-                        replica_identity,
-                        columns,
-                    );
-                    self.state.add_relation(relation_info);
-                    return Ok(None);
-                }
-            }
-
-            LogicalReplicationMessage::Insert { relation_id, tuple } => {
-                if let Some(relation) = self.state.get_relation(relation_id) {
-                    let schema_name = Arc::clone(&relation.namespace);
-                    let table_name = Arc::clone(&relation.relation_name);
-                    let data = tuple.into_row_data(relation);
-
-                    ChangeEvent {
-                        event_type: EventType::Insert {
-                            schema: schema_name,
-                            table: table_name,
-                            relation_oid: relation_id,
-                            data,
-                        },
-                        lsn: Lsn::new(lsn),
-                        metadata: None,
-                    }
-                } else {
-                    warn!("Received INSERT for unknown relation: {}", relation_id);
-                    return Ok(None);
-                }
-            }
-
-            LogicalReplicationMessage::Update {
-                relation_id,
-                old_tuple,
-                new_tuple,
-                key_type,
-            } => {
-                if let Some((schema_name, table_name, replica_identity, key_columns, relation)) =
-                    self.relation_metadata(relation_id, key_type)
-                {
-                    let old_data = old_tuple.map(|t| t.into_row_data(relation));
-                    let new_data = new_tuple.into_row_data(relation);
-
-                    ChangeEvent {
-                        event_type: EventType::Update {
-                            schema: schema_name,
-                            table: table_name,
-                            relation_oid: relation_id,
-                            old_data,
-                            new_data,
-                            replica_identity,
-                            key_columns,
-                        },
-                        lsn: Lsn::new(lsn),
-                        metadata: None,
-                    }
-                } else {
-                    warn!("Received UPDATE for unknown relation: {}", relation_id);
-                    return Ok(None);
-                }
-            }
-
-            LogicalReplicationMessage::Delete {
-                relation_id,
-                old_tuple,
-                key_type,
-            } => {
-                if let Some((schema_name, table_name, replica_identity, key_columns, relation)) =
-                    self.relation_metadata(relation_id, Some(key_type))
-                {
-                    let old_data = old_tuple.into_row_data(relation);
-
-                    ChangeEvent {
-                        event_type: EventType::Delete {
-                            schema: schema_name,
-                            table: table_name,
-                            relation_oid: relation_id,
-                            old_data,
-                            replica_identity,
-                            key_columns,
-                        },
-                        lsn: Lsn::new(lsn),
-                        metadata: None,
-                    }
-                } else {
-                    warn!("Received DELETE for unknown relation: {}", relation_id);
-                    return Ok(None);
-                }
-            }
-
-            LogicalReplicationMessage::Begin {
-                final_lsn,
-                xid,
-                timestamp,
-            } => {
-                debug!(
-                    "Transaction begin: xid={}, final_lsn={}",
-                    xid,
-                    format_lsn(final_lsn)
-                );
-                ChangeEvent {
-                    event_type: EventType::Begin {
-                        transaction_id: xid,
-                        final_lsn: Lsn::new(final_lsn),
-                        commit_timestamp: postgres_timestamp_to_chrono(timestamp),
-                    },
-                    lsn: Lsn::new(lsn),
-                    metadata: None,
-                }
-            }
-
-            LogicalReplicationMessage::Commit {
-                flags,
-                timestamp,
-                commit_lsn,
-                end_lsn,
-            } => {
-                debug!(
-                    "Transaction commit, flags={}, commit_lsn:{}, end_lsn:{}",
-                    flags,
-                    format_lsn(commit_lsn),
-                    format_lsn(end_lsn)
-                );
-                ChangeEvent {
-                    event_type: EventType::Commit {
-                        commit_timestamp: postgres_timestamp_to_chrono(timestamp),
-                        commit_lsn: Lsn::new(commit_lsn),
-                        end_lsn: Lsn::new(end_lsn),
-                    },
-                    lsn: Lsn::new(lsn),
-                    metadata: None,
-                }
-            }
-
-            LogicalReplicationMessage::Truncate {
-                relation_ids,
-                flags,
-            } => {
-                let mut truncate_tables = Vec::with_capacity(relation_ids.len());
-                for relation_id in relation_ids {
-                    if let Some(relation) = self.state.get_relation(relation_id) {
-                        info!(
-                            "Table truncated: {} (flags={})",
-                            relation.full_name(),
-                            flags
-                        );
-                        truncate_tables.push(Arc::<str>::from(relation.full_name()));
-                    }
-                }
-
-                ChangeEvent {
-                    event_type: EventType::Truncate(truncate_tables),
-                    lsn: Lsn::new(lsn),
-                    metadata: None,
-                }
-            }
-
-            // Streaming transaction messages (protocol v2+)
-            LogicalReplicationMessage::StreamStart { xid, first_segment } => {
-                debug!("Stream start: xid={}, first_segment={}", xid, first_segment);
-                ChangeEvent {
-                    event_type: EventType::StreamStart {
-                        transaction_id: xid,
-                        first_segment,
-                    },
-                    lsn: Lsn::new(lsn),
-                    metadata: None,
-                }
-            }
-
-            LogicalReplicationMessage::StreamStop => {
-                debug!("Stream stop");
-                ChangeEvent {
-                    event_type: EventType::StreamStop,
-                    lsn: Lsn::new(lsn),
-                    metadata: None,
-                }
-            }
-
-            LogicalReplicationMessage::StreamCommit {
-                xid,
-                flags,
-                timestamp,
-                commit_lsn,
-                end_lsn,
-            } => {
-                debug!(
-                    "Stream commit: xid={}, flags={}, commit_lsn={}, end_lsn={}",
-                    xid,
-                    flags,
-                    format_lsn(commit_lsn),
-                    format_lsn(end_lsn)
-                );
-                ChangeEvent {
-                    event_type: EventType::StreamCommit {
-                        transaction_id: xid,
-                        commit_lsn: Lsn::new(commit_lsn),
-                        end_lsn: Lsn::new(end_lsn),
-                        commit_timestamp: postgres_timestamp_to_chrono(timestamp),
-                    },
-                    lsn: Lsn::new(lsn),
-                    metadata: None,
-                }
-            }
-
-            LogicalReplicationMessage::StreamAbort {
-                xid,
-                subtransaction_xid,
-                abort_lsn,
-                abort_timestamp,
-            } => {
-                debug!(
-                    "Stream abort: xid={}, subtransaction_xid={}, abort_lsn={:?}, abort_timestamp={:?}",
-                    xid,
-                    subtransaction_xid,
-                    abort_lsn.map(format_lsn),
-                    abort_timestamp
-                );
-                ChangeEvent {
-                    event_type: EventType::StreamAbort {
-                        transaction_id: xid,
-                        subtransaction_xid,
-                        abort_lsn: abort_lsn.map(Lsn::new),
-                        abort_timestamp: abort_timestamp.map(postgres_timestamp_to_chrono),
-                    },
-                    lsn: Lsn::new(lsn),
-                    metadata: None,
-                }
-            }
-
-            // Origin, Type, and Message events (previously dropped)
-            LogicalReplicationMessage::Origin {
-                origin_lsn,
-                origin_name,
-            } => {
-                debug!(
-                    "Origin: lsn={}, name={}",
-                    format_lsn(origin_lsn),
-                    origin_name
-                );
-                ChangeEvent::origin(Lsn::new(origin_lsn), origin_name, Lsn::new(lsn))
-            }
-
-            LogicalReplicationMessage::Type {
-                type_id,
-                namespace,
-                type_name,
-            } => {
-                debug!("Type: id={}, {}.{}", type_id, namespace, type_name);
-                ChangeEvent::type_event(type_id, namespace, type_name, Lsn::new(lsn))
-            }
-
-            LogicalReplicationMessage::Message {
-                flags,
-                lsn: msg_lsn,
-                prefix,
-                content,
-            } => {
-                debug!(
-                    "Message: flags={}, lsn={}, prefix={}, content_len={}",
-                    flags,
-                    format_lsn(msg_lsn),
-                    prefix,
-                    content.len()
-                );
-                ChangeEvent::message(
-                    flags,
-                    Lsn::new(msg_lsn),
-                    Arc::<str>::from(prefix.as_str()),
-                    content,
-                    Lsn::new(lsn),
-                )
-            }
-
-            // Two-phase commit events (protocol v3+)
-            LogicalReplicationMessage::BeginPrepare {
-                prepare_lsn,
-                end_lsn: end,
-                timestamp,
-                xid,
-                gid,
-            } => {
-                debug!(
-                    "Begin prepare: xid={}, gid={}, prepare_lsn={}",
-                    xid,
-                    gid,
-                    format_lsn(prepare_lsn)
-                );
-                ChangeEvent::begin_prepare(
-                    xid,
-                    Lsn::new(prepare_lsn),
-                    Lsn::new(end),
-                    postgres_timestamp_to_chrono(timestamp),
-                    Arc::<str>::from(gid.as_str()),
-                    Lsn::new(lsn),
-                )
-            }
-
-            LogicalReplicationMessage::Prepare {
-                flags,
-                prepare_lsn,
-                end_lsn: end,
-                timestamp,
-                xid,
-                gid,
-            } => {
-                debug!(
-                    "Prepare: xid={}, gid={}, prepare_lsn={}",
-                    xid,
-                    gid,
-                    format_lsn(prepare_lsn)
-                );
-                ChangeEvent::prepare(
-                    flags,
-                    xid,
-                    Lsn::new(prepare_lsn),
-                    Lsn::new(end),
-                    postgres_timestamp_to_chrono(timestamp),
-                    Arc::<str>::from(gid.as_str()),
-                    Lsn::new(lsn),
-                )
-            }
-
-            LogicalReplicationMessage::CommitPrepared {
-                flags,
-                commit_lsn,
-                end_lsn: end,
-                timestamp,
-                xid,
-                gid,
-            } => {
-                debug!(
-                    "Commit prepared: xid={}, gid={}, commit_lsn={}",
-                    xid,
-                    gid,
-                    format_lsn(commit_lsn)
-                );
-                ChangeEvent::commit_prepared(
-                    flags,
-                    xid,
-                    Lsn::new(commit_lsn),
-                    Lsn::new(end),
-                    postgres_timestamp_to_chrono(timestamp),
-                    Arc::<str>::from(gid.as_str()),
-                    Lsn::new(lsn),
-                )
-            }
-
-            LogicalReplicationMessage::RollbackPrepared {
-                flags,
-                prepare_end_lsn,
-                rollback_end_lsn,
-                prepare_timestamp,
-                rollback_timestamp,
-                xid,
-                gid,
-            } => {
-                debug!(
-                    "Rollback prepared: xid={}, gid={}, rollback_lsn={}",
-                    xid,
-                    gid,
-                    format_lsn(rollback_end_lsn)
-                );
-                ChangeEvent::rollback_prepared(
-                    flags,
-                    xid,
-                    Lsn::new(prepare_end_lsn),
-                    Lsn::new(rollback_end_lsn),
-                    postgres_timestamp_to_chrono(prepare_timestamp),
-                    postgres_timestamp_to_chrono(rollback_timestamp),
-                    Arc::<str>::from(gid.as_str()),
-                    Lsn::new(lsn),
-                )
-            }
-
-            LogicalReplicationMessage::StreamPrepare {
-                flags,
-                prepare_lsn,
-                end_lsn: end,
-                timestamp,
-                xid,
-                gid,
-            } => {
-                debug!(
-                    "Stream prepare: xid={}, gid={}, prepare_lsn={}",
-                    xid,
-                    gid,
-                    format_lsn(prepare_lsn)
-                );
-                ChangeEvent::stream_prepare(
-                    flags,
-                    xid,
-                    Lsn::new(prepare_lsn),
-                    Lsn::new(end),
-                    postgres_timestamp_to_chrono(timestamp),
-                    Arc::<str>::from(gid.as_str()),
-                    Lsn::new(lsn),
-                )
-            }
-        };
-
-        Ok(Some(event))
     }
 
     /// Check if feedback should be sent and send it
@@ -1701,70 +1237,6 @@ impl LogicalReplicationStream {
             format_lsn(applied_lsn)
         );
         Ok(())
-    }
-
-    /// Extract key columns from relation info based on key_type from the protocol
-    fn get_key_columns_for_relation(
-        &self,
-        relation: &RelationInfo,
-        key_type: Option<char>,
-    ) -> Vec<Arc<str>> {
-        // Get key columns based on the relation's replica identity and key_type from protocol
-        match key_type {
-            Some('K') => {
-                // Key tuple - replica-identity/primary-key columns.
-                relation.key_column_names().collect()
-            }
-            Some('O') => {
-                // Old tuple - means REPLICA IDENTITY FULL, use all columns
-                relation
-                    .columns
-                    .iter()
-                    .map(|col| Arc::clone(&col.name))
-                    .collect()
-            }
-            None => {
-                // No old tuple data - means REPLICA IDENTITY NOTHING or DEFAULT
-                // without changes to key columns. Fall back to key columns.
-                relation.key_column_names().collect()
-            }
-            _ => {
-                // Unknown key type, fall back to key columns.
-                relation.key_column_names().collect()
-            }
-        }
-    }
-
-    /// Extract schema/table name, replica identity, and key columns for a relation
-    #[allow(clippy::type_complexity)]
-    fn relation_metadata(
-        &self,
-        relation_id: u32,
-        key_type: Option<char>,
-    ) -> Option<(
-        Arc<str>,
-        Arc<str>,
-        ReplicaIdentity,
-        Vec<Arc<str>>,
-        &RelationInfo,
-    )> {
-        let relation = self.state.get_relation(relation_id)?;
-
-        let schema_name = Arc::clone(&relation.namespace);
-        let table_name = Arc::clone(&relation.relation_name);
-
-        let replica_identity = ReplicaIdentity::from_byte(relation.replica_identity)
-            .unwrap_or(ReplicaIdentity::Default);
-
-        let key_columns = self.get_key_columns_for_relation(relation, key_type);
-
-        Some((
-            schema_name,
-            table_name,
-            replica_identity,
-            key_columns,
-            relation,
-        ))
     }
 
     /// Stop the replication stream
@@ -4655,8 +4127,7 @@ mod tests {
         ];
         let relation = RelationInfo::new(1, "public", "users", b'd', columns);
 
-        let stream = create_test_stream(create_test_config());
-        let keys = stream.get_key_columns_for_relation(&relation, Some('K'));
+        let keys = crate::protocol::key_columns_for_relation(&relation, Some('K'));
         assert_eq!(keys, vec![Arc::from("id"), Arc::from("email")]);
     }
 
@@ -4669,8 +4140,7 @@ mod tests {
         ];
         let relation = RelationInfo::new(1, "public", "users", b'f', columns);
 
-        let stream = create_test_stream(create_test_config());
-        let keys = stream.get_key_columns_for_relation(&relation, Some('O'));
+        let keys = crate::protocol::key_columns_for_relation(&relation, Some('O'));
         // 'O' means full old row, return ALL column names
         assert_eq!(keys, vec![Arc::from("id"), Arc::from("name")]);
     }
@@ -4684,8 +4154,7 @@ mod tests {
         ];
         let relation = RelationInfo::new(1, "public", "users", b'd', columns);
 
-        let stream = create_test_stream(create_test_config());
-        let keys = stream.get_key_columns_for_relation(&relation, None);
+        let keys = crate::protocol::key_columns_for_relation(&relation, None);
         // Falls back to key columns from relation
         assert_eq!(keys, vec![Arc::from("id")]);
     }
@@ -4699,8 +4168,7 @@ mod tests {
         ];
         let relation = RelationInfo::new(1, "public", "t", b'n', columns);
 
-        let stream = create_test_stream(create_test_config());
-        let keys = stream.get_key_columns_for_relation(&relation, None);
+        let keys = crate::protocol::key_columns_for_relation(&relation, None);
         // No key columns, and no flagged key columns, should return empty
         assert!(keys.is_empty());
     }
@@ -4714,8 +4182,7 @@ mod tests {
         ];
         let relation = RelationInfo::new(1, "public", "users", b'd', columns);
 
-        let stream = create_test_stream(create_test_config());
-        let keys = stream.get_key_columns_for_relation(&relation, Some('X'));
+        let keys = crate::protocol::key_columns_for_relation(&relation, Some('X'));
         assert_eq!(keys, vec![Arc::from("id")]);
     }
 
@@ -4739,7 +4206,7 @@ mod tests {
         stream.state.add_relation(relation);
 
         let (schema, table, replica_id, key_cols, _rel) =
-            stream.relation_metadata(100, Some('K')).unwrap();
+            crate::protocol::relation_metadata(&stream.state, 100, Some('K')).unwrap();
         assert_eq!(&*schema, "myschema");
         assert_eq!(&*table, "mytable");
         assert_eq!(replica_id, ReplicaIdentity::Default);
@@ -4749,7 +4216,7 @@ mod tests {
     #[test]
     fn test_relation_metadata_missing() {
         let stream = create_test_stream(create_test_config());
-        assert!(stream.relation_metadata(999, None).is_none());
+        assert!(crate::protocol::relation_metadata(&stream.state, 999, None).is_none());
     }
 
     #[test]
@@ -4765,7 +4232,8 @@ mod tests {
             xid: 42,
         });
 
-        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        let result =
+            crate::protocol::message_to_change_event(&mut stream.state, msg, 0x500).unwrap();
         assert!(result.is_some());
         let event = result.unwrap();
         match event.event_type {
@@ -4790,7 +4258,8 @@ mod tests {
             timestamp: 0,
         });
 
-        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        let result =
+            crate::protocol::message_to_change_event(&mut stream.state, msg, 0x500).unwrap();
         assert!(result.is_some());
         let event = result.unwrap();
         match event.event_type {
@@ -4822,7 +4291,8 @@ mod tests {
             columns: vec![ColumnInfo::new(1, "id".to_string(), 23, -1)],
         });
 
-        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        let result =
+            crate::protocol::message_to_change_event(&mut stream.state, msg, 0x500).unwrap();
         // Relation messages return None (they update internal state)
         assert!(result.is_none());
         // But the relation should be stored in state
@@ -4858,7 +4328,8 @@ mod tests {
             ]),
         });
 
-        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        let result =
+            crate::protocol::message_to_change_event(&mut stream.state, msg, 0x500).unwrap();
         assert!(result.is_some());
         let event = result.unwrap();
         match event.event_type {
@@ -4890,7 +4361,8 @@ mod tests {
             tuple: TupleData::new(vec![ColumnData::text(b"1".to_vec())]),
         });
 
-        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        let result =
+            crate::protocol::message_to_change_event(&mut stream.state, msg, 0x500).unwrap();
         assert!(result.is_none());
     }
 
@@ -4927,7 +4399,8 @@ mod tests {
             key_type: Some('O'),
         });
 
-        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        let result =
+            crate::protocol::message_to_change_event(&mut stream.state, msg, 0x500).unwrap();
         assert!(result.is_some());
         let event = result.unwrap();
         match event.event_type {
@@ -4964,7 +4437,8 @@ mod tests {
             key_type: None,
         });
 
-        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        let result =
+            crate::protocol::message_to_change_event(&mut stream.state, msg, 0x500).unwrap();
         assert!(result.is_none());
     }
 
@@ -4997,7 +4471,8 @@ mod tests {
             key_type: 'K',
         });
 
-        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        let result =
+            crate::protocol::message_to_change_event(&mut stream.state, msg, 0x500).unwrap();
         assert!(result.is_some());
         let event = result.unwrap();
         match event.event_type {
@@ -5027,7 +4502,8 @@ mod tests {
             key_type: 'K',
         });
 
-        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        let result =
+            crate::protocol::message_to_change_event(&mut stream.state, msg, 0x500).unwrap();
         assert!(result.is_none());
     }
 
@@ -5053,7 +4529,8 @@ mod tests {
             flags: 0,
         });
 
-        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        let result =
+            crate::protocol::message_to_change_event(&mut stream.state, msg, 0x500).unwrap();
         assert!(result.is_some());
         let event = result.unwrap();
         match event.event_type {
@@ -5077,7 +4554,8 @@ mod tests {
             first_segment: true,
         });
 
-        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        let result =
+            crate::protocol::message_to_change_event(&mut stream.state, msg, 0x500).unwrap();
         assert!(result.is_some());
         match result.unwrap().event_type {
             EventType::StreamStart {
@@ -5100,7 +4578,8 @@ mod tests {
 
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::StreamStop);
 
-        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        let result =
+            crate::protocol::message_to_change_event(&mut stream.state, msg, 0x500).unwrap();
         assert!(result.is_some());
         match result.unwrap().event_type {
             EventType::StreamStop => {}
@@ -5123,7 +4602,8 @@ mod tests {
             end_lsn: 0x3100,
         });
 
-        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        let result =
+            crate::protocol::message_to_change_event(&mut stream.state, msg, 0x500).unwrap();
         assert!(result.is_some());
         match result.unwrap().event_type {
             EventType::StreamCommit { transaction_id, .. } => {
@@ -5147,7 +4627,8 @@ mod tests {
             abort_timestamp: Some(123456),
         });
 
-        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        let result =
+            crate::protocol::message_to_change_event(&mut stream.state, msg, 0x500).unwrap();
         assert!(result.is_some());
         match result.unwrap().event_type {
             EventType::StreamAbort {
@@ -5176,7 +4657,8 @@ mod tests {
             origin_name: "test_origin".to_string(),
         });
 
-        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        let result =
+            crate::protocol::message_to_change_event(&mut stream.state, msg, 0x500).unwrap();
         // Origin messages are now surfaced as events
         assert!(result.is_some());
         let event = result.unwrap();
@@ -5238,7 +4720,8 @@ mod tests {
         );
         stream.state.add_relation(relation);
 
-        let (schema, table, _ri, _keys, _rel) = stream.relation_metadata(100, None).unwrap();
+        let (schema, table, _ri, _keys, _rel) =
+            crate::protocol::relation_metadata(&stream.state, 100, None).unwrap();
         // With empty namespace, full_name is ".just_table", split gives ["", "just_table"]
         assert_eq!(&*table, "just_table");
         // Schema should still work
@@ -5732,7 +5215,8 @@ mod tests {
             content: Bytes::from_static(b"hello world"),
         });
 
-        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        let result =
+            crate::protocol::message_to_change_event(&mut stream.state, msg, 0x500).unwrap();
         // Message events are now surfaced with full content
         assert!(result.is_some());
         let event = result.unwrap();
@@ -5765,7 +5249,8 @@ mod tests {
             type_name: "int4".to_string(),
         });
 
-        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        let result =
+            crate::protocol::message_to_change_event(&mut stream.state, msg, 0x500).unwrap();
         // Type messages are now surfaced as events
         assert!(result.is_some());
         let event = result.unwrap();
@@ -5802,7 +5287,8 @@ mod tests {
             key_type: None,
         });
 
-        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        let result =
+            crate::protocol::message_to_change_event(&mut stream.state, msg, 0x500).unwrap();
         assert!(result.is_some());
         let event = result.unwrap();
         match event.event_type {
@@ -5828,7 +5314,8 @@ mod tests {
             flags: 0,
         });
 
-        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        let result =
+            crate::protocol::message_to_change_event(&mut stream.state, msg, 0x500).unwrap();
         assert!(result.is_some());
         match result.unwrap().event_type {
             EventType::Truncate(tables) => {
@@ -5993,7 +5480,8 @@ mod tests {
             abort_timestamp: None,
         });
 
-        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        let result =
+            crate::protocol::message_to_change_event(&mut stream.state, msg, 0x500).unwrap();
         assert!(result.is_some());
         match result.unwrap().event_type {
             EventType::StreamAbort {
@@ -6042,7 +5530,8 @@ mod tests {
             key_type: Some('K'),
         });
 
-        let result = stream.convert_to_change_event(msg, 0x500).unwrap();
+        let result =
+            crate::protocol::message_to_change_event(&mut stream.state, msg, 0x500).unwrap();
         assert!(result.is_some());
         let event = result.unwrap();
         match event.event_type {
@@ -8306,7 +7795,8 @@ mod tests {
             gid: "gid_test_bp".to_string(),
         });
 
-        let result = stream.convert_to_change_event(msg, 0x4900).unwrap();
+        let result =
+            crate::protocol::message_to_change_event(&mut stream.state, msg, 0x4900).unwrap();
         assert!(result.is_some());
         let event = result.unwrap();
         assert_eq!(event.event_type_str(), "begin_prepare");
@@ -8344,7 +7834,8 @@ mod tests {
             gid: "gid_test_p".to_string(),
         });
 
-        let result = stream.convert_to_change_event(msg, 0x6000).unwrap();
+        let result =
+            crate::protocol::message_to_change_event(&mut stream.state, msg, 0x6000).unwrap();
         assert!(result.is_some());
         let event = result.unwrap();
         assert_eq!(event.event_type_str(), "prepare");
@@ -8384,7 +7875,8 @@ mod tests {
             gid: "gid_test_cp".to_string(),
         });
 
-        let result = stream.convert_to_change_event(msg, 0x7000).unwrap();
+        let result =
+            crate::protocol::message_to_change_event(&mut stream.state, msg, 0x7000).unwrap();
         assert!(result.is_some());
         let event = result.unwrap();
         assert_eq!(event.event_type_str(), "commit_prepared");
@@ -8425,7 +7917,8 @@ mod tests {
             gid: "gid_test_rp".to_string(),
         });
 
-        let result = stream.convert_to_change_event(msg, 0x8000).unwrap();
+        let result =
+            crate::protocol::message_to_change_event(&mut stream.state, msg, 0x8000).unwrap();
         assert!(result.is_some());
         let event = result.unwrap();
         assert_eq!(event.event_type_str(), "rollback_prepared");
@@ -8465,7 +7958,8 @@ mod tests {
             gid: "gid_test_sp".to_string(),
         });
 
-        let result = stream.convert_to_change_event(msg, 0x9000).unwrap();
+        let result =
+            crate::protocol::message_to_change_event(&mut stream.state, msg, 0x9000).unwrap();
         assert!(result.is_some());
         let event = result.unwrap();
         assert_eq!(event.event_type_str(), "stream_prepare");
@@ -8505,7 +7999,8 @@ mod tests {
             origin_name: "upstream_dc".to_string(),
         });
 
-        let result = stream.convert_to_change_event(msg, 0xA100).unwrap();
+        let result =
+            crate::protocol::message_to_change_event(&mut stream.state, msg, 0xA100).unwrap();
         assert!(result.is_some());
         let event = result.unwrap();
         assert_eq!(event.event_type_str(), "origin");
@@ -8546,7 +8041,8 @@ mod tests {
             ],
         });
 
-        let result = stream.convert_to_change_event(msg, 0xB000).unwrap();
+        let result =
+            crate::protocol::message_to_change_event(&mut stream.state, msg, 0xB000).unwrap();
         assert!(result.is_none(), "First-time relation should return None");
 
         // Verify it was cached
@@ -8586,7 +8082,8 @@ mod tests {
             ],
         });
 
-        let result = stream.convert_to_change_event(msg, 0xC000).unwrap();
+        let result =
+            crate::protocol::message_to_change_event(&mut stream.state, msg, 0xC000).unwrap();
         assert!(
             result.is_none(),
             "Same schema should not emit a Relation event"
@@ -8627,7 +8124,8 @@ mod tests {
             ],
         });
 
-        let result = stream.convert_to_change_event(msg, 0xD000).unwrap();
+        let result =
+            crate::protocol::message_to_change_event(&mut stream.state, msg, 0xD000).unwrap();
         assert!(
             result.is_some(),
             "Schema change should emit a Relation event"
@@ -8686,7 +8184,8 @@ mod tests {
             ],
         });
 
-        let result = stream.convert_to_change_event(msg, 0xE000).unwrap();
+        let result =
+            crate::protocol::message_to_change_event(&mut stream.state, msg, 0xE000).unwrap();
         assert!(
             result.is_some(),
             "Column type change should emit a Relation event"
@@ -8722,7 +8221,8 @@ mod tests {
             columns: vec![ColumnInfo::new(1, "id".to_string(), 23, -1)],
         });
 
-        let result = stream.convert_to_change_event(msg, 0xF000).unwrap();
+        let result =
+            crate::protocol::message_to_change_event(&mut stream.state, msg, 0xF000).unwrap();
         assert!(
             result.is_some(),
             "Replica identity change should emit a Relation event"
@@ -8771,7 +8271,8 @@ mod tests {
             ],
         });
 
-        let result = stream.convert_to_change_event(msg, 0xF100).unwrap();
+        let result =
+            crate::protocol::message_to_change_event(&mut stream.state, msg, 0xF100).unwrap();
         assert!(
             result.is_some(),
             "Column rename should emit a Relation event"
@@ -8811,7 +8312,8 @@ mod tests {
             columns: vec![ColumnInfo::new(1, "id".to_string(), 23, -1)],
         });
 
-        let result = stream.convert_to_change_event(msg, 0xF200).unwrap();
+        let result =
+            crate::protocol::message_to_change_event(&mut stream.state, msg, 0xF200).unwrap();
         assert!(
             result.is_some(),
             "Namespace change should emit a Relation event"
@@ -8857,7 +8359,8 @@ mod tests {
             ],
         });
 
-        let result = stream.convert_to_change_event(msg, 0xF300).unwrap();
+        let result =
+            crate::protocol::message_to_change_event(&mut stream.state, msg, 0xF300).unwrap();
         assert!(
             result.is_some(),
             "Key flag change should emit a Relation event"
