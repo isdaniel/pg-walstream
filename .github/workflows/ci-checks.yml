@@ -312,6 +312,12 @@ jobs:
         # Raw XLogData bytes API: round-trip raw pgoutput through the parser, stop at target LSN.
         cargo test --test raw_xlogdata -- --ignored --nocapture --test-threads=1
 
+        PGPASSWORD=postgres psql -h localhost -U postgres -d test_walstream \
+          -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_type = 'logical';" || true
+
+        # FAILOVER slot creation (issue #103): parenthesized option grammar, skips gracefully on PG<17; verifies pg_replication_slots.failover on 17/18.
+        cargo test --test failover_slot -- --ignored --nocapture --test-threads=1
+
   integration-ssl:
     name: SSL Integration Tests (PG ${{ matrix.pg_version }})
     runs-on: ubuntu-latest

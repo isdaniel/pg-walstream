@@ -30,13 +30,13 @@ rust-version = "1.87"
 pg-walstream-macros = { path = "macros", version = "=0.8.0" }
 
 [dependencies]
-tokio = { version = "1.52.3", features = ["io-util", "net", "time", "macros", "rt", "rt-multi-thread"], optional = true }
+tokio = { version = "1.53.0", features = ["io-util", "net", "time", "macros", "rt", "rt-multi-thread"], optional = true }
 tokio-util = { version = "0.7.18", optional = true }
-serde = { version = "1.0.228", default-features = false, features = ["derive", "rc", "alloc"] }
+serde = { version = "1.0.229", default-features = false, features = ["derive", "rc", "alloc"] }
 chrono = { version = "0.4.45", default-features = false, features = ["serde", "alloc"] }
 bytes = { version = "1.12.1", default-features = false, features = ["serde"] }
 tracing = { version = "0.1.44", default-features = false }
-futures-core = { version = "0.3.32", default-features = false }
+futures-core = { version = "0.3.33", default-features = false }
 memchr = { version = "2.8.3", default-features = false }
 smallvec = { version = "1.15.2", features = ["serde"] }
 pg-walstream-macros = { workspace = true, optional = true }
@@ -46,11 +46,11 @@ pq-sys = { version = "0.7.5", optional = true }
 
 # rustls-tls
 tokio-rustls = { version = "0.26.4", optional = true }
-rustls = { version = "0.23.41", default-features = false, features = ["std", "tls12"], optional = true }
-webpki-roots = { version = "1.0.8", optional = true }
+rustls = { version = "0.23.42", default-features = false, features = ["std", "tls12"], optional = true }
+webpki-roots = { version = "1.0.9", optional = true }
 postgres-protocol = { version = "0.6.12", optional = true }
-aws-lc-rs = { version = "1.17.1", optional = true }
-socket2 = { version = "0.6.4", features = ["all"], optional = true }
+aws-lc-rs = { version = "1.17.3", optional = true }
+socket2 = { version = "0.6.5", features = ["all"], optional = true }
 
 [features]
 default = ["std", "rustls-tls"]
@@ -85,12 +85,13 @@ rustls-tls = [
 ]
 
 [dev-dependencies]
-tokio = { version = "1.52.3", features = ["full"] }
+tokio = { version = "1.53.0", features = ["full"] }
 criterion = { package = "codspeed-criterion-compat", version = "5.0.1", features = ["html_reports"] }
-futures = "0.3.32"
+futures = "0.3.33"
 serde_bytes = "0.11.19"
 proptest = "1.11"
 serde_json = "1.0.150"
+tracing-subscriber = "0.3.23"
 
 [[test]]
 name = "snapshot_export"
@@ -143,6 +144,10 @@ path = "integration-tests/bounded_replay.rs"
 [[test]]
 name = "raw_xlogdata"
 path = "integration-tests/raw_xlogdata.rs"
+
+[[test]]
+name = "failover_slot"
+path = "integration-tests/failover_slot.rs"
 
 [[bench]]
 name = "wal_pipeline"

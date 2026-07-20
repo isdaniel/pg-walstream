@@ -1453,7 +1453,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             sql,
-            "CREATE_REPLICATION_SLOT \"slot\" LOGICAL \"pgoutput\" FAILOVER;"
+            "CREATE_REPLICATION_SLOT \"slot\" LOGICAL \"pgoutput\" (FAILOVER);"
         );
     }
 
@@ -1473,7 +1473,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             sql,
-            "CREATE_REPLICATION_SLOT \"slot\" LOGICAL \"pgoutput\" EXPORT_SNAPSHOT FAILOVER;"
+            "CREATE_REPLICATION_SLOT \"slot\" LOGICAL \"pgoutput\" (SNAPSHOT 'export', FAILOVER);"
         );
     }
 
