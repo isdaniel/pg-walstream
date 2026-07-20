@@ -673,8 +673,7 @@ impl PgReplicationConnection {
     /// - `"nothing"` → `NOEXPORT_SNAPSHOT`
     /// - `"use"` → `USE_SNAPSHOT`
     ///
-    /// **Limitations:** Only one of the snapshot/two-phase keywords is allowed
-    /// per command for LOGICAL slots. If both `two_phase` and `snapshot` are set `two_phase` takes priority.
+    /// **Note:** When both `two_phase` and `snapshot` are set, both options are emitted for LOGICAL slots — PostgreSQL accepts them together.
     ///
     /// See: <https://www.postgresql.org/docs/current/protocol-replication.html>
     pub fn create_replication_slot_with_options(
@@ -1122,7 +1121,7 @@ fn drain_buffered_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql_builder::{quote_ident, quote_literal};
+    use crate::sql_builder::quote_literal;
     use crate::INVALID_XLOG_REC_PTR;
 
     fn sanitize_sql_string_value(value: &str) -> String {
@@ -1132,10 +1131,6 @@ mod tests {
 
     fn quote_sql_string_value(value: &str) -> String {
         quote_literal(value).unwrap()
-    }
-
-    fn quote_sql_identifier(identifier: &str) -> String {
-        quote_ident(identifier).unwrap()
     }
 
     #[test]
@@ -1324,121 +1319,8 @@ mod tests {
     }
 
     #[test]
-    fn test_slot_sql_logical_default_options() {
-        let opts = ReplicationSlotOptions::default();
-        let sql = PgReplicationConnection::build_create_slot_sql(
-            "my_slot",
-            SlotType::Logical,
-            Some("pgoutput"),
-            &opts,
-        )
-        .unwrap();
-        assert_eq!(
-            sql,
-            "CREATE_REPLICATION_SLOT \"my_slot\" LOGICAL \"pgoutput\";"
-        );
-    }
-
-    #[test]
-    fn test_slot_sql_logical_temporary_export_snapshot() {
-        let opts = ReplicationSlotOptions {
-            temporary: true,
-            snapshot: Some("export".to_string()),
-            ..Default::default()
-        };
-        let sql = PgReplicationConnection::build_create_slot_sql(
-            "tmp_slot",
-            SlotType::Logical,
-            Some("pgoutput"),
-            &opts,
-        )
-        .unwrap();
-        assert_eq!(
-            sql,
-            "CREATE_REPLICATION_SLOT \"tmp_slot\" TEMPORARY LOGICAL \"pgoutput\" EXPORT_SNAPSHOT;"
-        );
-    }
-
-    #[test]
-    fn test_slot_sql_logical_noexport_snapshot() {
-        let opts = ReplicationSlotOptions {
-            snapshot: Some("nothing".to_string()),
-            ..Default::default()
-        };
-        let sql = PgReplicationConnection::build_create_slot_sql(
-            "slot",
-            SlotType::Logical,
-            Some("pgoutput"),
-            &opts,
-        )
-        .unwrap();
-        assert_eq!(
-            sql,
-            "CREATE_REPLICATION_SLOT \"slot\" LOGICAL \"pgoutput\" NOEXPORT_SNAPSHOT;"
-        );
-    }
-
-    #[test]
-    fn test_slot_sql_logical_use_snapshot() {
-        let opts = ReplicationSlotOptions {
-            snapshot: Some("use".to_string()),
-            ..Default::default()
-        };
-        let sql = PgReplicationConnection::build_create_slot_sql(
-            "slot",
-            SlotType::Logical,
-            Some("pgoutput"),
-            &opts,
-        )
-        .unwrap();
-        assert_eq!(
-            sql,
-            "CREATE_REPLICATION_SLOT \"slot\" LOGICAL \"pgoutput\" USE_SNAPSHOT;"
-        );
-    }
-
-    #[test]
-    fn test_slot_sql_logical_two_phase() {
-        let opts = ReplicationSlotOptions {
-            two_phase: true,
-            ..Default::default()
-        };
-        let sql = PgReplicationConnection::build_create_slot_sql(
-            "slot",
-            SlotType::Logical,
-            Some("pgoutput"),
-            &opts,
-        )
-        .unwrap();
-        assert_eq!(
-            sql,
-            "CREATE_REPLICATION_SLOT \"slot\" LOGICAL \"pgoutput\" TWO_PHASE;"
-        );
-    }
-
-    #[test]
-    fn test_slot_sql_logical_two_phase_overrides_snapshot() {
-        // Only one of TWO_PHASE / snapshot keyword is allowed; TWO_PHASE wins
-        let opts = ReplicationSlotOptions {
-            two_phase: true,
-            snapshot: Some("export".to_string()),
-            ..Default::default()
-        };
-        let sql = PgReplicationConnection::build_create_slot_sql(
-            "slot",
-            SlotType::Logical,
-            Some("pgoutput"),
-            &opts,
-        )
-        .unwrap();
-        assert_eq!(
-            sql,
-            "CREATE_REPLICATION_SLOT \"slot\" LOGICAL \"pgoutput\" TWO_PHASE;"
-        );
-    }
-
-    #[test]
-    fn test_slot_sql_logical_failover() {
+    fn test_slot_sql_delegates_to_builder() {
+        // Delegates to sql_builder::build_create_slot_sql (exhaustively covered by create_slot_sql_cases there).
         let opts = ReplicationSlotOptions {
             failover: true,
             ..Default::default()
@@ -1452,154 +1334,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             sql,
-            "CREATE_REPLICATION_SLOT \"slot\" LOGICAL \"pgoutput\" (FAILOVER);"
-        );
-    }
-
-    #[test]
-    fn test_slot_sql_logical_export_snapshot_with_failover() {
-        let opts = ReplicationSlotOptions {
-            snapshot: Some("export".to_string()),
-            failover: true,
-            ..Default::default()
-        };
-        let sql = PgReplicationConnection::build_create_slot_sql(
-            "slot",
-            SlotType::Logical,
-            Some("pgoutput"),
-            &opts,
-        )
-        .unwrap();
-        assert_eq!(
-            sql,
-            "CREATE_REPLICATION_SLOT \"slot\" LOGICAL \"pgoutput\" (SNAPSHOT 'export', FAILOVER);"
-        );
-    }
-
-    #[test]
-    fn test_slot_sql_physical_reserve_wal() {
-        let opts = ReplicationSlotOptions {
-            reserve_wal: true,
-            ..Default::default()
-        };
-        let sql =
-            PgReplicationConnection::build_create_slot_sql("phys", SlotType::Physical, None, &opts)
-                .unwrap();
-        assert_eq!(
-            sql,
-            "CREATE_REPLICATION_SLOT \"phys\" PHYSICAL RESERVE_WAL;"
-        );
-    }
-
-    #[test]
-    fn test_slot_sql_physical_default() {
-        let opts = ReplicationSlotOptions::default();
-        let sql =
-            PgReplicationConnection::build_create_slot_sql("phys", SlotType::Physical, None, &opts)
-                .unwrap();
-        assert_eq!(sql, "CREATE_REPLICATION_SLOT \"phys\" PHYSICAL;");
-    }
-
-    #[test]
-    fn test_slot_sql_physical_temporary() {
-        let opts = ReplicationSlotOptions {
-            temporary: true,
-            ..Default::default()
-        };
-        let sql =
-            PgReplicationConnection::build_create_slot_sql("phys", SlotType::Physical, None, &opts)
-                .unwrap();
-        assert_eq!(sql, "CREATE_REPLICATION_SLOT \"phys\" TEMPORARY PHYSICAL;");
-    }
-
-    #[test]
-    fn test_slot_sql_invalid_snapshot_value() {
-        let opts = ReplicationSlotOptions {
-            snapshot: Some("invalid".to_string()),
-            ..Default::default()
-        };
-        let err = PgReplicationConnection::build_create_slot_sql(
-            "slot",
-            SlotType::Logical,
-            Some("pgoutput"),
-            &opts,
-        )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("Invalid snapshot option"),
-            "Expected invalid snapshot error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn test_slot_sql_logical_missing_plugin() {
-        let opts = ReplicationSlotOptions::default();
-        let err =
-            PgReplicationConnection::build_create_slot_sql("slot", SlotType::Logical, None, &opts)
-                .unwrap_err();
-        assert!(
-            err.to_string().contains("Output plugin required"),
-            "Expected plugin error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn test_quote_sql_identifier_simple() {
-        assert_eq!(quote_sql_identifier("my_slot"), r#""my_slot""#);
-    }
-
-    #[test]
-    fn test_quote_sql_identifier_with_double_quote() {
-        assert_eq!(quote_sql_identifier(r#"a"b"#), r#""a""b""#);
-    }
-
-    #[test]
-    fn test_quote_sql_identifier_multiple_quotes() {
-        assert_eq!(quote_sql_identifier(r#"a""b"#), r#""a""""b""#);
-    }
-
-    #[test]
-    fn test_quote_sql_identifier_empty() {
-        assert_eq!(quote_sql_identifier(""), r#""""#);
-    }
-
-    #[test]
-    fn test_quote_sql_identifier_special_chars() {
-        assert_eq!(
-            quote_sql_identifier("slot; DROP TABLE users; --"),
-            r#""slot; DROP TABLE users; --""#
-        );
-    }
-
-    #[test]
-    fn test_slot_sql_slot_name_injection() {
-        let opts = ReplicationSlotOptions::default();
-        let sql = PgReplicationConnection::build_create_slot_sql(
-            r#"evil"PHYSICAL"#,
-            SlotType::Logical,
-            Some("test_decoding"),
-            &opts,
-        )
-        .unwrap();
-        assert_eq!(
-            sql,
-            r#"CREATE_REPLICATION_SLOT "evil""PHYSICAL" LOGICAL "test_decoding";"#
-        );
-    }
-
-    #[test]
-    fn test_slot_sql_plugin_name_injection() {
-        let opts = ReplicationSlotOptions::default();
-        let sql = PgReplicationConnection::build_create_slot_sql(
-            "safe_slot",
-            SlotType::Logical,
-            Some(r#"bad"plugin"#),
-            &opts,
-        )
-        .unwrap();
-        assert_eq!(
-            sql,
-            r#"CREATE_REPLICATION_SLOT "safe_slot" LOGICAL "bad""plugin";"#
+            r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" (FAILOVER);"#
         );
     }
 

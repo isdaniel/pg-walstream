@@ -149,6 +149,14 @@ path = "integration-tests/raw_xlogdata.rs"
 name = "failover_slot"
 path = "integration-tests/failover_slot.rs"
 
+[[test]]
+name = "slot_matrix"
+path = "integration-tests/slot_matrix.rs"
+
+[[test]]
+name = "base_backup_options"
+path = "integration-tests/base_backup_options.rs"
+
 [[bench]]
 name = "wal_pipeline"
 harness = false
