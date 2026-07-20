@@ -92,6 +92,10 @@ pub fn quote_literal(value: &str) -> Result<String> {
 
 /// Build the SQL for `CREATE_REPLICATION_SLOT`.
 ///
+/// # Compatibility
+///
+/// The `failover` option emits the PostgreSQL 17+ parenthesized option-list form and is rejected by older servers (`unrecognized option: failover` on 15–16; a syntax error before 15). `two_phase` requires PostgreSQL 15+. The generated SQL is otherwise valid on all supported versions; matching an option to the server version is the caller's responsibility.
+///
 /// # Example
 ///
 /// ```
@@ -108,16 +112,14 @@ pub fn build_create_slot_sql(
     output_plugin: Option<&str>,
     options: &ReplicationSlotOptions,
 ) -> Result<String> {
-    let mut parts: Vec<String> = Vec::with_capacity(6);
-
-    parts.push("CREATE_REPLICATION_SLOT".to_string());
-    parts.push(quote_ident(slot_name)?);
-
+    let mut sql = String::with_capacity(64);
+    sql.push_str("CREATE_REPLICATION_SLOT ");
+    sql.push_str(&quote_ident(slot_name)?);
     if options.temporary {
-        parts.push("TEMPORARY".to_string());
+        sql.push_str(" TEMPORARY");
     }
-
-    parts.push(slot_type.as_str().to_string());
+    sql.push(' ');
+    sql.push_str(slot_type.as_str());
 
     match slot_type {
         SlotType::Physical => {
@@ -127,49 +129,74 @@ pub fn build_create_slot_sql(
                 ));
             }
             if options.reserve_wal {
-                parts.push("RESERVE_WAL".to_string());
+                sql.push_str(" RESERVE_WAL");
             }
         }
         SlotType::Logical => {
             let plugin = output_plugin.ok_or_else(|| {
                 ReplicationError::protocol("Output plugin required for LOGICAL slots".to_string())
             })?;
-            parts.push(quote_ident(plugin)?);
-
-            if options.failover {
-                // FAILOVER exists only in the PostgreSQL 17+ parenthesized option grammar.
-                if options.temporary {
-                    return Err(ReplicationError::config(
-                        "failover replication slots cannot be temporary".to_string(),
-                    ));
-                }
-                // PG17's parenthesized option list treats TWO_PHASE and SNAPSHOT as independent options, so emit both when set (unlike the legacy positional path, where they conflict).
-                let mut opts: Vec<String> = Vec::with_capacity(3);
-                if options.two_phase {
-                    opts.push("TWO_PHASE".to_string());
-                }
-                if let Some(ref snapshot) = options.snapshot {
-                    opts.push(format!("SNAPSHOT '{}'", validated_snapshot(snapshot)?));
-                }
-                opts.push("FAILOVER".to_string());
-                parts.push(format!("({})", opts.join(", ")));
-            } else if options.two_phase {
-                parts.push("TWO_PHASE".to_string());
-            } else if let Some(ref snapshot) = options.snapshot {
-                parts.push(
-                    match validated_snapshot(snapshot)? {
-                        "export" => "EXPORT_SNAPSHOT",
-                        "nothing" => "NOEXPORT_SNAPSHOT",
-                        "use" => "USE_SNAPSHOT",
-                        _ => unreachable!("validated_snapshot rejects other values"),
-                    }
-                    .to_string(),
-                );
-            }
+            sql.push(' ');
+            sql.push_str(&quote_ident(plugin)?);
+            append_logical_options(&mut sql, options)?;
         }
     }
 
-    Ok(format!("{};", parts.join(" ")))
+    sql.push(';');
+    Ok(sql)
+}
+
+/// Append the LOGICAL-slot option clause, choosing the grammar by `failover`.
+///
+/// Two server grammars carry these options; `failover` forces the choice:
+///
+/// - **Legacy positional** (`TWO_PHASE EXPORT_SNAPSHOT`) — the default, and the only form PostgreSQL 14 accepts (the parenthesized list arrived in PG15). PG14 does not understand `TWO_PHASE` at all (that keyword is PG15+), so emitting `two_phase` still requires a PG15+ server even on this path.
+/// - **Parenthesized list** (`(TWO_PHASE, SNAPSHOT 'export', FAILOVER)`) — used only when `failover` is set, because `FAILOVER` is a generic option that exists solely in the PostgreSQL 17+ parenthesized grammar.
+fn append_logical_options(sql: &mut String, options: &ReplicationSlotOptions) -> Result<()> {
+    let snapshot = options
+        .snapshot
+        .as_deref()
+        .map(validated_snapshot)
+        .transpose()?;
+
+    if !options.failover {
+        // Legacy positional form (PG14+). Both TWO_PHASE and the snapshot keyword are emitted when set. The docs synopsis lists them as `… | TWO_PHASE` (seemingly exclusive), but the server grammar accepts them as a list — verified against PG15/16/17/18 and guarded by the `two_phase + snapshot nothing` case in  integration-tests/slot_matrix.rs. Do NOT collapse this to `else if`: it would silently drop the caller's snapshot choice and re-enable the default export.
+        if options.two_phase {
+            sql.push_str(" TWO_PHASE");
+        }
+        if let Some(snapshot) = snapshot {
+            sql.push(' ');
+            sql.push_str(legacy_snapshot_keyword(snapshot));
+        }
+        return Ok(());
+    }
+
+    // Parenthesized form — the only grammar that accepts FAILOVER (PG17+).
+    if options.temporary {
+        return Err(ReplicationError::config(
+            "failover replication slots cannot be temporary".to_string(),
+        ));
+    }
+    let mut opts: Vec<String> = Vec::with_capacity(3);
+    if options.two_phase {
+        opts.push("TWO_PHASE".to_string());
+    }
+    if let Some(snapshot) = snapshot {
+        opts.push(format!("SNAPSHOT '{snapshot}'"));
+    }
+    opts.push("FAILOVER".to_string());
+    sql.push_str(&build_sql_options(&opts));
+    Ok(())
+}
+
+/// Map a validated snapshot value to its legacy positional keyword.
+fn legacy_snapshot_keyword(snapshot: &str) -> &'static str {
+    match snapshot {
+        "export" => "EXPORT_SNAPSHOT",
+        "nothing" => "NOEXPORT_SNAPSHOT",
+        "use" => "USE_SNAPSHOT",
+        _ => unreachable!("validated_snapshot rejects other values"),
+    }
 }
 
 /// Validate a snapshot option value, returning it unchanged if valid.
@@ -256,6 +283,12 @@ pub fn build_drop_slot_sql(slot_name: &str, wait: bool) -> Result<String> {
 }
 
 /// Build the SQL for `READ_REPLICATION_SLOT`.
+///
+/// # Compatibility
+///
+/// `READ_REPLICATION_SLOT` requires PostgreSQL 15+ — the command does not exist on
+/// PostgreSQL 14. Per the replication protocol it is only meaningful for
+/// **physical** slots; for a logical slot the server returns NULL fields. The generated SQL shape is valid on every PG15+ version; matching the command to the server version is the caller's responsibility.
 ///
 /// # Example
 ///
@@ -359,6 +392,11 @@ pub fn build_start_physical_replication_sql(
 
 /// Build the SQL for `BASE_BACKUP`.
 ///
+/// # Compatibility
+///
+/// This emits the PostgreSQL 15+ parenthesized generic-option form
+/// (`BASE_BACKUP (LABEL '…', …)`). PostgreSQL 14 used a different positional  grammar with different keywords (`FAST`, `NOWAIT`, `NOVERIFY_CHECKSUMS`, …), so this builder is **not** compatible with PostgreSQL 14. The `incremental` option additionally requires PostgreSQL 17+. Matching options to the server version is the caller's responsibility.
+///
 /// # Example
 ///
 /// ```
@@ -437,11 +475,7 @@ pub fn build_base_backup_sql(options: &BaseBackupOptions) -> Result<String> {
         opts.push("INCREMENTAL".to_string());
     }
 
-    if opts.is_empty() {
-        Ok("BASE_BACKUP".to_string())
-    } else {
-        Ok(format!("BASE_BACKUP ({})", opts.join(", ")))
-    }
+    Ok(format!("BASE_BACKUP{}", build_sql_options(&opts)))
 }
 
 /// Options for building a `CREATE SUBSCRIPTION` SQL statement.
@@ -695,314 +729,304 @@ mod tests {
 
     // ── build_create_slot_sql ────────────────────────────────────────────
 
+    /// Every option combination `build_create_slot_sql` can emit, plus the
+    /// client-side guard errors, in one table. `Ok` holds the exact SQL; `Err`
+    /// holds a substring the returned error message must contain.
     #[test]
-    fn create_slot_logical_default() {
-        let opts = ReplicationSlotOptions::default();
-        let sql =
-            build_create_slot_sql("my_slot", SlotType::Logical, Some("pgoutput"), &opts).unwrap();
-        assert_eq!(
-            sql,
-            r#"CREATE_REPLICATION_SLOT "my_slot" LOGICAL "pgoutput";"#
-        );
-    }
+    fn create_slot_sql_cases() {
+        use SlotType::{Logical, Physical};
 
-    #[test]
-    fn create_slot_logical_temporary_export_snapshot() {
-        let opts = ReplicationSlotOptions {
-            temporary: true,
-            snapshot: Some("export".to_string()),
-            ..Default::default()
-        };
-        let sql =
-            build_create_slot_sql("tmp_slot", SlotType::Logical, Some("pgoutput"), &opts).unwrap();
-        assert_eq!(
-            sql,
-            r#"CREATE_REPLICATION_SLOT "tmp_slot" TEMPORARY LOGICAL "pgoutput" EXPORT_SNAPSHOT;"#
-        );
-    }
+        struct Case {
+            name: &'static str,
+            slot: &'static str,
+            slot_type: SlotType,
+            plugin: Option<&'static str>,
+            opts: ReplicationSlotOptions,
+            want: std::result::Result<&'static str, &'static str>,
+        }
 
-    #[test]
-    fn create_slot_logical_noexport_snapshot() {
-        let opts = ReplicationSlotOptions {
-            snapshot: Some("nothing".to_string()),
-            ..Default::default()
-        };
-        let sql =
-            build_create_slot_sql("slot", SlotType::Logical, Some("pgoutput"), &opts).unwrap();
-        assert_eq!(
-            sql,
-            r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" NOEXPORT_SNAPSHOT;"#
-        );
-    }
+        let cases = [
+            Case {
+                name: "logical default",
+                slot: "my_slot",
+                slot_type: Logical,
+                plugin: Some("pgoutput"),
+                opts: ReplicationSlotOptions::default(),
+                want: Ok(r#"CREATE_REPLICATION_SLOT "my_slot" LOGICAL "pgoutput";"#),
+            },
+            Case {
+                name: "temporary + export",
+                slot: "tmp_slot",
+                slot_type: Logical,
+                plugin: Some("pgoutput"),
+                opts: ReplicationSlotOptions {
+                    temporary: true,
+                    snapshot: Some("export".to_string()),
+                    ..Default::default()
+                },
+                want: Ok(
+                    r#"CREATE_REPLICATION_SLOT "tmp_slot" TEMPORARY LOGICAL "pgoutput" EXPORT_SNAPSHOT;"#,
+                ),
+            },
+            Case {
+                name: "noexport snapshot",
+                slot: "slot",
+                slot_type: Logical,
+                plugin: Some("pgoutput"),
+                opts: ReplicationSlotOptions {
+                    snapshot: Some("nothing".to_string()),
+                    ..Default::default()
+                },
+                want: Ok(r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" NOEXPORT_SNAPSHOT;"#),
+            },
+            Case {
+                name: "use snapshot",
+                slot: "slot",
+                slot_type: Logical,
+                plugin: Some("pgoutput"),
+                opts: ReplicationSlotOptions {
+                    snapshot: Some("use".to_string()),
+                    ..Default::default()
+                },
+                want: Ok(r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" USE_SNAPSHOT;"#),
+            },
+            Case {
+                name: "two_phase",
+                slot: "slot",
+                slot_type: Logical,
+                plugin: Some("pgoutput"),
+                opts: ReplicationSlotOptions {
+                    two_phase: true,
+                    ..Default::default()
+                },
+                want: Ok(r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" TWO_PHASE;"#),
+            },
+            Case {
+                name: "two_phase + snapshot (both emitted)",
+                slot: "slot",
+                slot_type: Logical,
+                plugin: Some("pgoutput"),
+                opts: ReplicationSlotOptions {
+                    two_phase: true,
+                    snapshot: Some("export".to_string()),
+                    ..Default::default()
+                },
+                want: Ok(
+                    r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" TWO_PHASE EXPORT_SNAPSHOT;"#,
+                ),
+            },
+            Case {
+                name: "temporary + two_phase",
+                slot: "slot",
+                slot_type: Logical,
+                plugin: Some("pgoutput"),
+                opts: ReplicationSlotOptions {
+                    temporary: true,
+                    two_phase: true,
+                    ..Default::default()
+                },
+                want: Ok(
+                    r#"CREATE_REPLICATION_SLOT "slot" TEMPORARY LOGICAL "pgoutput" TWO_PHASE;"#,
+                ),
+            },
+            Case {
+                name: "failover only",
+                slot: "slot",
+                slot_type: Logical,
+                plugin: Some("pgoutput"),
+                opts: ReplicationSlotOptions {
+                    failover: true,
+                    ..Default::default()
+                },
+                want: Ok(r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" (FAILOVER);"#),
+            },
+            Case {
+                name: "failover + export",
+                slot: "slot",
+                slot_type: Logical,
+                plugin: Some("pgoutput"),
+                opts: ReplicationSlotOptions {
+                    failover: true,
+                    snapshot: Some("export".to_string()),
+                    ..Default::default()
+                },
+                want: Ok(
+                    r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" (SNAPSHOT 'export', FAILOVER);"#,
+                ),
+            },
+            Case {
+                name: "failover + nothing",
+                slot: "slot",
+                slot_type: Logical,
+                plugin: Some("pgoutput"),
+                opts: ReplicationSlotOptions {
+                    failover: true,
+                    snapshot: Some("nothing".to_string()),
+                    ..Default::default()
+                },
+                want: Ok(
+                    r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" (SNAPSHOT 'nothing', FAILOVER);"#,
+                ),
+            },
+            Case {
+                name: "failover + use",
+                slot: "slot",
+                slot_type: Logical,
+                plugin: Some("pgoutput"),
+                opts: ReplicationSlotOptions {
+                    failover: true,
+                    snapshot: Some("use".to_string()),
+                    ..Default::default()
+                },
+                want: Ok(
+                    r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" (SNAPSHOT 'use', FAILOVER);"#,
+                ),
+            },
+            Case {
+                name: "failover + two_phase",
+                slot: "slot",
+                slot_type: Logical,
+                plugin: Some("pgoutput"),
+                opts: ReplicationSlotOptions {
+                    failover: true,
+                    two_phase: true,
+                    ..Default::default()
+                },
+                want: Ok(
+                    r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" (TWO_PHASE, FAILOVER);"#,
+                ),
+            },
+            Case {
+                name: "failover + two_phase + snapshot",
+                slot: "slot",
+                slot_type: Logical,
+                plugin: Some("pgoutput"),
+                opts: ReplicationSlotOptions {
+                    failover: true,
+                    two_phase: true,
+                    snapshot: Some("export".to_string()),
+                    ..Default::default()
+                },
+                want: Ok(
+                    r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" (TWO_PHASE, SNAPSHOT 'export', FAILOVER);"#,
+                ),
+            },
+            Case {
+                name: "physical default",
+                slot: "phys",
+                slot_type: Physical,
+                plugin: None,
+                opts: ReplicationSlotOptions::default(),
+                want: Ok(r#"CREATE_REPLICATION_SLOT "phys" PHYSICAL;"#),
+            },
+            Case {
+                name: "physical temporary",
+                slot: "phys",
+                slot_type: Physical,
+                plugin: None,
+                opts: ReplicationSlotOptions {
+                    temporary: true,
+                    ..Default::default()
+                },
+                want: Ok(r#"CREATE_REPLICATION_SLOT "phys" TEMPORARY PHYSICAL;"#),
+            },
+            Case {
+                name: "physical reserve_wal",
+                slot: "phys",
+                slot_type: Physical,
+                plugin: None,
+                opts: ReplicationSlotOptions {
+                    reserve_wal: true,
+                    ..Default::default()
+                },
+                want: Ok(r#"CREATE_REPLICATION_SLOT "phys" PHYSICAL RESERVE_WAL;"#),
+            },
+            Case {
+                name: "slot-name quoting",
+                slot: r#"evil"PHYSICAL"#,
+                slot_type: Logical,
+                plugin: Some("test_decoding"),
+                opts: ReplicationSlotOptions::default(),
+                want: Ok(r#"CREATE_REPLICATION_SLOT "evil""PHYSICAL" LOGICAL "test_decoding";"#),
+            },
+            Case {
+                name: "plugin-name quoting",
+                slot: "safe_slot",
+                slot_type: Logical,
+                plugin: Some(r#"bad"plugin"#),
+                opts: ReplicationSlotOptions::default(),
+                want: Ok(r#"CREATE_REPLICATION_SLOT "safe_slot" LOGICAL "bad""plugin";"#),
+            },
+            Case {
+                name: "guard: physical + failover",
+                slot: "phys",
+                slot_type: Physical,
+                plugin: None,
+                opts: ReplicationSlotOptions {
+                    failover: true,
+                    ..Default::default()
+                },
+                want: Err("only supported for logical"),
+            },
+            Case {
+                name: "guard: temporary + failover",
+                slot: "slot",
+                slot_type: Logical,
+                plugin: Some("pgoutput"),
+                opts: ReplicationSlotOptions {
+                    temporary: true,
+                    failover: true,
+                    ..Default::default()
+                },
+                want: Err("failover replication slots cannot be temporary"),
+            },
+            Case {
+                name: "guard: missing plugin",
+                slot: "slot",
+                slot_type: Logical,
+                plugin: None,
+                opts: ReplicationSlotOptions::default(),
+                want: Err("Output plugin required"),
+            },
+            Case {
+                name: "guard: invalid snapshot (legacy)",
+                slot: "slot",
+                slot_type: Logical,
+                plugin: Some("pgoutput"),
+                opts: ReplicationSlotOptions {
+                    snapshot: Some("bogus".to_string()),
+                    ..Default::default()
+                },
+                want: Err("Invalid snapshot option"),
+            },
+            Case {
+                name: "guard: invalid snapshot (failover)",
+                slot: "slot",
+                slot_type: Logical,
+                plugin: Some("pgoutput"),
+                opts: ReplicationSlotOptions {
+                    snapshot: Some("bogus".to_string()),
+                    failover: true,
+                    ..Default::default()
+                },
+                want: Err("Invalid snapshot option"),
+            },
+        ];
 
-    #[test]
-    fn create_slot_logical_use_snapshot() {
-        let opts = ReplicationSlotOptions {
-            snapshot: Some("use".to_string()),
-            ..Default::default()
-        };
-        let sql =
-            build_create_slot_sql("slot", SlotType::Logical, Some("pgoutput"), &opts).unwrap();
-        assert_eq!(
-            sql,
-            r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" USE_SNAPSHOT;"#
-        );
-    }
-
-    #[test]
-    fn create_slot_logical_two_phase() {
-        let opts = ReplicationSlotOptions {
-            two_phase: true,
-            ..Default::default()
-        };
-        let sql =
-            build_create_slot_sql("slot", SlotType::Logical, Some("pgoutput"), &opts).unwrap();
-        assert_eq!(
-            sql,
-            r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" TWO_PHASE;"#
-        );
-    }
-
-    #[test]
-    fn create_slot_logical_two_phase_overrides_snapshot() {
-        let opts = ReplicationSlotOptions {
-            two_phase: true,
-            snapshot: Some("export".to_string()),
-            ..Default::default()
-        };
-        let sql =
-            build_create_slot_sql("slot", SlotType::Logical, Some("pgoutput"), &opts).unwrap();
-        assert_eq!(
-            sql,
-            r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" TWO_PHASE;"#
-        );
-    }
-
-    #[test]
-    fn create_slot_logical_failover() {
-        let opts = ReplicationSlotOptions {
-            failover: true,
-            ..Default::default()
-        };
-        let sql =
-            build_create_slot_sql("slot", SlotType::Logical, Some("pgoutput"), &opts).unwrap();
-        assert_eq!(
-            sql,
-            r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" (FAILOVER);"#
-        );
-    }
-
-    #[test]
-    fn create_slot_logical_export_with_failover() {
-        let opts = ReplicationSlotOptions {
-            snapshot: Some("export".to_string()),
-            failover: true,
-            ..Default::default()
-        };
-        let sql =
-            build_create_slot_sql("slot", SlotType::Logical, Some("pgoutput"), &opts).unwrap();
-        assert_eq!(
-            sql,
-            r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" (SNAPSHOT 'export', FAILOVER);"#
-        );
-    }
-
-    #[test]
-    fn create_slot_logical_nothing_with_failover() {
-        let opts = ReplicationSlotOptions {
-            snapshot: Some("nothing".to_string()),
-            failover: true,
-            ..Default::default()
-        };
-        let sql =
-            build_create_slot_sql("slot", SlotType::Logical, Some("pgoutput"), &opts).unwrap();
-        assert_eq!(
-            sql,
-            r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" (SNAPSHOT 'nothing', FAILOVER);"#
-        );
-    }
-
-    #[test]
-    fn create_slot_logical_two_phase_with_failover() {
-        let opts = ReplicationSlotOptions {
-            two_phase: true,
-            failover: true,
-            ..Default::default()
-        };
-        let sql =
-            build_create_slot_sql("slot", SlotType::Logical, Some("pgoutput"), &opts).unwrap();
-        assert_eq!(
-            sql,
-            r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" (TWO_PHASE, FAILOVER);"#
-        );
-    }
-
-    #[test]
-    fn create_slot_temporary_failover_errors() {
-        let opts = ReplicationSlotOptions {
-            temporary: true,
-            failover: true,
-            ..Default::default()
-        };
-        let err =
-            build_create_slot_sql("slot", SlotType::Logical, Some("pgoutput"), &opts).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("failover replication slots cannot be temporary"),
-            "expected the temporary+failover guard error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn create_slot_physical_failover_errors() {
-        let opts = ReplicationSlotOptions {
-            failover: true,
-            ..Default::default()
-        };
-        let err = build_create_slot_sql("phys", SlotType::Physical, None, &opts).unwrap_err();
-        assert!(
-            err.to_string().contains("only supported for logical"),
-            "expected the physical+failover guard error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn create_slot_invalid_snapshot_with_failover_errors() {
-        let opts = ReplicationSlotOptions {
-            snapshot: Some("bogus".to_string()),
-            failover: true,
-            ..Default::default()
-        };
-        let err =
-            build_create_slot_sql("slot", SlotType::Logical, Some("pgoutput"), &opts).unwrap_err();
-        assert!(
-            err.to_string().contains("Invalid snapshot option"),
-            "expected the snapshot-validation error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn create_slot_logical_use_with_failover() {
-        let opts = ReplicationSlotOptions {
-            snapshot: Some("use".to_string()),
-            failover: true,
-            ..Default::default()
-        };
-        let sql =
-            build_create_slot_sql("slot", SlotType::Logical, Some("pgoutput"), &opts).unwrap();
-        assert_eq!(
-            sql,
-            r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" (SNAPSHOT 'use', FAILOVER);"#
-        );
-    }
-
-    #[test]
-    fn create_slot_logical_two_phase_and_snapshot_with_failover() {
-        // PG17's parenthesized grammar accepts TWO_PHASE and SNAPSHOT together;
-        // both must be emitted rather than two_phase overriding snapshot.
-        let opts = ReplicationSlotOptions {
-            two_phase: true,
-            snapshot: Some("export".to_string()),
-            failover: true,
-            ..Default::default()
-        };
-        let sql =
-            build_create_slot_sql("slot", SlotType::Logical, Some("pgoutput"), &opts).unwrap();
-        assert_eq!(
-            sql,
-            r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" (TWO_PHASE, SNAPSHOT 'export', FAILOVER);"#
-        );
-    }
-
-    #[test]
-    fn create_slot_logical_temporary_two_phase() {
-        let opts = ReplicationSlotOptions {
-            temporary: true,
-            two_phase: true,
-            ..Default::default()
-        };
-        let sql =
-            build_create_slot_sql("slot", SlotType::Logical, Some("pgoutput"), &opts).unwrap();
-        assert_eq!(
-            sql,
-            r#"CREATE_REPLICATION_SLOT "slot" TEMPORARY LOGICAL "pgoutput" TWO_PHASE;"#
-        );
-    }
-
-    #[test]
-    fn create_slot_physical_reserve_wal() {
-        let opts = ReplicationSlotOptions {
-            reserve_wal: true,
-            ..Default::default()
-        };
-        let sql = build_create_slot_sql("phys", SlotType::Physical, None, &opts).unwrap();
-        assert_eq!(
-            sql,
-            r#"CREATE_REPLICATION_SLOT "phys" PHYSICAL RESERVE_WAL;"#
-        );
-    }
-
-    #[test]
-    fn create_slot_physical_default() {
-        let opts = ReplicationSlotOptions::default();
-        let sql = build_create_slot_sql("phys", SlotType::Physical, None, &opts).unwrap();
-        assert_eq!(sql, r#"CREATE_REPLICATION_SLOT "phys" PHYSICAL;"#);
-    }
-
-    #[test]
-    fn create_slot_physical_temporary() {
-        let opts = ReplicationSlotOptions {
-            temporary: true,
-            ..Default::default()
-        };
-        let sql = build_create_slot_sql("phys", SlotType::Physical, None, &opts).unwrap();
-        assert_eq!(sql, r#"CREATE_REPLICATION_SLOT "phys" TEMPORARY PHYSICAL;"#);
-    }
-
-    #[test]
-    fn create_slot_invalid_snapshot_value() {
-        let opts = ReplicationSlotOptions {
-            snapshot: Some("invalid".to_string()),
-            ..Default::default()
-        };
-        let err =
-            build_create_slot_sql("slot", SlotType::Logical, Some("pgoutput"), &opts).unwrap_err();
-        assert!(err.to_string().contains("Invalid snapshot option"));
-    }
-
-    #[test]
-    fn create_slot_logical_missing_plugin() {
-        let opts = ReplicationSlotOptions::default();
-        let err = build_create_slot_sql("slot", SlotType::Logical, None, &opts).unwrap_err();
-        assert!(err.to_string().contains("Output plugin required"));
-    }
-
-    #[test]
-    fn create_slot_name_injection() {
-        let opts = ReplicationSlotOptions::default();
-        let sql = build_create_slot_sql(
-            r#"evil"PHYSICAL"#,
-            SlotType::Logical,
-            Some("test_decoding"),
-            &opts,
-        )
-        .unwrap();
-        assert_eq!(
-            sql,
-            r#"CREATE_REPLICATION_SLOT "evil""PHYSICAL" LOGICAL "test_decoding";"#
-        );
-    }
-
-    #[test]
-    fn create_slot_plugin_name_injection() {
-        let opts = ReplicationSlotOptions::default();
-        let sql =
-            build_create_slot_sql("safe_slot", SlotType::Logical, Some(r#"bad"plugin"#), &opts)
-                .unwrap();
-        assert_eq!(
-            sql,
-            r#"CREATE_REPLICATION_SLOT "safe_slot" LOGICAL "bad""plugin";"#
-        );
+        for case in cases {
+            let got = build_create_slot_sql(case.slot, case.slot_type, case.plugin, &case.opts);
+            match case.want {
+                Ok(sql) => assert_eq!(got.as_deref().unwrap(), sql, "case: {}", case.name),
+                Err(needle) => {
+                    let err = got.expect_err(case.name).to_string();
+                    assert!(
+                        err.contains(needle),
+                        "case: {} — error {err:?} lacks {needle:?}",
+                        case.name
+                    );
+                }
+            }
+        }
     }
 
     // ── build_alter_slot_sql ─────────────────────────────────────────────
@@ -1025,6 +1049,16 @@ mod tests {
         assert_eq!(
             sql,
             r#"ALTER_REPLICATION_SLOT "my_slot" (TWO_PHASE false, FAILOVER true);"#
+        );
+    }
+
+    #[test]
+    fn alter_slot_both_false() {
+        // Locks the both-false rendering (each option carries its explicit bool).
+        let sql = build_alter_slot_sql("my_slot", Some(false), Some(false)).unwrap();
+        assert_eq!(
+            sql,
+            r#"ALTER_REPLICATION_SLOT "my_slot" (TWO_PHASE false, FAILOVER false);"#
         );
     }
 
@@ -1404,6 +1438,36 @@ mod tests {
         assert_eq!(
             build_base_backup_sql(&opts).unwrap(),
             "BASE_BACKUP (LABEL 'backup', PROGRESS true, WAL true, VERIFY_CHECKSUMS true)"
+        );
+    }
+
+    #[test]
+    fn base_backup_all_options_golden() {
+        // Locks emission order and every option's exact spelling (guards against a
+        // FAILOVER-class option-name regression on the base-backup path).
+        let opts = BaseBackupOptions {
+            label: Some("lbl".to_string()),
+            target: Some("server".to_string()),
+            target_detail: Some("/backups".to_string()),
+            progress: true,
+            checkpoint: Some("fast".to_string()),
+            wal: true,
+            wait: true,
+            compression: Some("zstd".to_string()),
+            compression_detail: Some("level=3".to_string()),
+            max_rate: Some(2048),
+            tablespace_map: true,
+            verify_checksums: true,
+            manifest: Some("yes".to_string()),
+            manifest_checksums: Some("SHA256".to_string()),
+            incremental: true,
+        };
+        assert_eq!(
+            build_base_backup_sql(&opts).unwrap(),
+            "BASE_BACKUP (LABEL 'lbl', TARGET 'server', TARGET_DETAIL '/backups', \
+             PROGRESS true, CHECKPOINT 'fast', WAL true, WAIT true, COMPRESSION 'zstd', \
+             COMPRESSION_DETAIL 'level=3', MAX_RATE 2048, TABLESPACE_MAP true, \
+             VERIFY_CHECKSUMS true, MANIFEST 'yes', MANIFEST_CHECKSUMS 'SHA256', INCREMENTAL)"
         );
     }
 

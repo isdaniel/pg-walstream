@@ -2619,6 +2619,60 @@ mod tests {
     }
 
     #[test]
+    fn decode_rejects_unknown_replica_identity_byte() {
+        fn corrupt_ri_and_decode(mut a: BytesMut, b: BytesMut) {
+            assert_eq!(a.len(), b.len(), "events should differ only in the RI byte");
+            let pos = (0..a.len())
+                .find(|&i| a[i] != b[i])
+                .expect("exactly one differing byte: the replica identity");
+            a[pos] = 0xFF; // not one of d/n/f/i
+            let err = ChangeEvent::decode(&a).expect_err("unknown RI byte must be rejected");
+            assert!(
+                err.to_string().contains("Unknown replica identity byte"),
+                "got: {err}"
+            );
+        }
+        let enc = |ev: &ChangeEvent| {
+            let mut buf = BytesMut::new();
+            ev.encode(&mut buf);
+            buf
+        };
+
+        let mk_delete = |ri| {
+            ChangeEvent::delete(
+                "public",
+                "users",
+                1,
+                RowData::from_pairs(vec![("id", ColumnValue::text("1"))]),
+                ri,
+                vec![Arc::from("id")],
+                Lsn::new(1),
+            )
+        };
+        corrupt_ri_and_decode(
+            enc(&mk_delete(ReplicaIdentity::Default)),
+            enc(&mk_delete(ReplicaIdentity::Full)),
+        );
+
+        let mk_update = |ri| {
+            ChangeEvent::update(
+                "public",
+                "items",
+                2,
+                Some(RowData::from_pairs(vec![("id", ColumnValue::text("1"))])),
+                RowData::from_pairs(vec![("id", ColumnValue::text("2"))]),
+                ri,
+                vec![Arc::from("id")],
+                Lsn::new(1),
+            )
+        };
+        corrupt_ri_and_decode(
+            enc(&mk_update(ReplicaIdentity::Default)),
+            enc(&mk_update(ReplicaIdentity::Full)),
+        );
+    }
+
+    #[test]
     fn test_encode_decode_truncate() {
         let tables = vec![Arc::from("public.a"), Arc::from("public.b")];
         let event = ChangeEvent::truncate(tables, Lsn::new(4000));

@@ -318,6 +318,18 @@ jobs:
         # FAILOVER slot creation (issue #103): parenthesized option grammar, skips gracefully on PG<17; verifies pg_replication_slots.failover on 17/18.
         cargo test --test failover_slot -- --ignored --nocapture --test-threads=1
 
+        PGPASSWORD=postgres psql -h localhost -U postgres -d test_walstream \
+          -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_type = 'logical';" || true
+
+        # CREATE_REPLICATION_SLOT option matrix: every emitted option combination executed against the live server, version-gated (issue #103).
+        cargo test --test slot_matrix -- --ignored --nocapture --test-threads=1
+
+        PGPASSWORD=postgres psql -h localhost -U postgres -d test_walstream \
+          -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots;" || true
+
+        # BASE_BACKUP option combination: asserts the server accepts every generated option name (PG15+), then aborts the backup without draining.
+        cargo test --test base_backup_options -- --ignored --nocapture --test-threads=1
+
   integration-ssl:
     name: SSL Integration Tests (PG ${{ matrix.pg_version }})
     runs-on: ubuntu-latest
