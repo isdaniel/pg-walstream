@@ -330,6 +330,12 @@ jobs:
         # BASE_BACKUP option combination: asserts the server accepts every generated option name (PG15+), then aborts the backup without draining.
         cargo test --test base_backup_options -- --ignored --nocapture --test-threads=1
 
+        PGPASSWORD=postgres psql -h localhost -U postgres -d test_walstream \
+          -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_type = 'logical';" || true
+
+        # Server-version preflight: end-to-end core CDC path (create slot -> stream -> decode INSERT) plus PG17+ gated slot ops (FAILOVER create + ALTER) that must pass the client-side version gate and execute; the gated portion skips gracefully on PG<17.
+        cargo test --test version_preflight -- --ignored --nocapture --test-threads=1
+
   integration-ssl:
     name: SSL Integration Tests (PG ${{ matrix.pg_version }})
     runs-on: ubuntu-latest

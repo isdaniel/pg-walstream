@@ -815,18 +815,15 @@ impl NativeConnection {
         output_plugin: Option<&str>,
         options: &ReplicationSlotOptions,
     ) -> Result<NativePgResult> {
-        let sql = Self::build_create_slot_sql(slot_name, slot_type, output_plugin, options)?;
+        crate::sql_builder::check_create_slot_version(self.server_version(), slot_type, options)?;
+        let sql = crate::sql_builder::build_create_slot_sql(
+            slot_name,
+            slot_type,
+            output_plugin,
+            options,
+        )?;
         debug!("Creating replication slot: {}", sql);
         self.exec(&sql)
-    }
-
-    fn build_create_slot_sql(
-        slot_name: &str,
-        slot_type: SlotType,
-        output_plugin: Option<&str>,
-        options: &ReplicationSlotOptions,
-    ) -> Result<String> {
-        crate::sql_builder::build_create_slot_sql(slot_name, slot_type, output_plugin, options)
     }
 
     /// Alter a replication slot (logical slots only).
@@ -836,6 +833,7 @@ impl NativeConnection {
         two_phase: Option<bool>,
         failover: Option<bool>,
     ) -> Result<NativePgResult> {
+        crate::sql_builder::check_alter_slot_version(self.server_version(), two_phase)?;
         let sql = crate::sql_builder::build_alter_slot_sql(slot_name, two_phase, failover)?;
 
         debug!("Altering replication slot: {}", sql);
@@ -844,13 +842,9 @@ impl NativeConnection {
         Ok(result)
     }
 
-    fn build_drop_slot_sql(slot_name: &str, wait: bool) -> Result<String> {
-        crate::sql_builder::build_drop_slot_sql(slot_name, wait)
-    }
-
     /// Drop a replication slot.
     pub fn drop_replication_slot(&mut self, slot_name: &str, wait: bool) -> Result<()> {
-        let sql = Self::build_drop_slot_sql(slot_name, wait)?;
+        let sql = crate::sql_builder::build_drop_slot_sql(slot_name, wait)?;
         debug!("Dropping replication slot: {}", sql);
         let result = self.exec(&sql)?;
         if !result.is_ok() {
@@ -866,16 +860,13 @@ impl NativeConnection {
         Ok(())
     }
 
-    fn build_read_slot_sql(slot_name: &str) -> Result<String> {
-        crate::sql_builder::build_read_slot_sql(slot_name)
-    }
-
     /// Read information about a replication slot.
     pub fn read_replication_slot(
         &mut self,
         slot_name: &str,
     ) -> Result<crate::types::ReplicationSlotInfo> {
-        let sql = Self::build_read_slot_sql(slot_name)?;
+        crate::sql_builder::check_read_slot_version(self.server_version())?;
+        let sql = crate::sql_builder::build_read_slot_sql(slot_name)?;
         debug!("Reading replication slot: {}", sql);
         let result = self.exec(&sql)?;
         if !result.is_ok() {
@@ -936,6 +927,7 @@ impl NativeConnection {
 
     /// Start a base backup with options.
     pub fn base_backup(&mut self, options: &BaseBackupOptions) -> Result<NativePgResult> {
+        crate::sql_builder::check_base_backup_version(self.server_version(), options)?;
         let sql = crate::sql_builder::build_base_backup_sql(options)?;
 
         debug!("Starting base backup: {}", sql);
@@ -1323,80 +1315,6 @@ mod tests {
         );
     }
 
-    // === build_create_slot_sql ===
-
-    #[test]
-    fn test_slot_sql_delegates_to_builder() {
-        // Delegates to sql_builder::build_create_slot_sql (exhaustively covered by create_slot_sql_cases there).
-        let opts = ReplicationSlotOptions {
-            failover: true,
-            ..Default::default()
-        };
-        let sql = NativeConnection::build_create_slot_sql(
-            "slot",
-            SlotType::Logical,
-            Some("pgoutput"),
-            &opts,
-        )
-        .unwrap();
-        assert_eq!(
-            sql,
-            r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" (FAILOVER);"#
-        );
-    }
-
-    // === build_drop_slot_sql ===
-
-    #[test]
-    fn test_build_drop_slot_sql_without_wait() {
-        assert_eq!(
-            NativeConnection::build_drop_slot_sql("my_slot", false).unwrap(),
-            r#"DROP_REPLICATION_SLOT "my_slot";"#
-        );
-    }
-
-    #[test]
-    fn test_build_drop_slot_sql_with_wait() {
-        assert_eq!(
-            NativeConnection::build_drop_slot_sql("my_slot", true).unwrap(),
-            r#"DROP_REPLICATION_SLOT "my_slot" WAIT;"#
-        );
-    }
-
-    #[test]
-    fn test_build_drop_slot_sql_injection() {
-        assert_eq!(
-            NativeConnection::build_drop_slot_sql(r#"evil"slot"#, false).unwrap(),
-            r#"DROP_REPLICATION_SLOT "evil""slot";"#
-        );
-    }
-
-    #[test]
-    fn test_build_drop_slot_sql_injection_with_wait() {
-        assert_eq!(
-            NativeConnection::build_drop_slot_sql(r#"evil"slot"#, true).unwrap(),
-            r#"DROP_REPLICATION_SLOT "evil""slot" WAIT;"#
-        );
-    }
-
-    // === build_read_slot_sql ===
-
-    #[test]
-    fn test_build_read_slot_sql_basic() {
-        assert_eq!(
-            NativeConnection::build_read_slot_sql("my_slot").unwrap(),
-            r#"READ_REPLICATION_SLOT "my_slot";"#
-        );
-    }
-
-    #[test]
-    fn test_build_read_slot_sql_injection() {
-        assert_eq!(
-            NativeConnection::build_read_slot_sql(r#"evil"slot"#).unwrap(),
-            r#"READ_REPLICATION_SLOT "evil""slot";"#
-        );
-    }
-
     // === ensure_replication_mode, is_alive, server_version, close_connection, Drop ===
 
     #[tokio::test]
@@ -1419,6 +1337,49 @@ mod tests {
     async fn test_server_version_returns_configured_value() {
         let conn = NativeConnection::null_for_testing();
         assert_eq!(conn.server_version(), 160000);
+    }
+
+    #[tokio::test]
+    async fn test_create_slot_preflight_rejects_failover_below_pg17() {
+        let mut conn = NativeConnection::null_for_testing();
+        let opts = ReplicationSlotOptions {
+            failover: true,
+            ..Default::default()
+        };
+        let err = conn
+            .create_replication_slot_with_options("s", SlotType::Logical, Some("pgoutput"), &opts)
+            .unwrap_err();
+        assert!(err.to_string().contains("FAILOVER"), "{err}");
+        assert!(err.to_string().contains("17+"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_alter_slot_preflight_rejects_below_pg17() {
+        let mut conn = NativeConnection::null_for_testing();
+        let err = conn
+            .alter_replication_slot("s", None, Some(true))
+            .unwrap_err();
+        assert!(err.to_string().contains("ALTER_REPLICATION_SLOT"), "{err}");
+        assert!(err.to_string().contains("17+"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_base_backup_preflight_rejects_incremental_below_pg17() {
+        let mut conn = NativeConnection::null_for_testing();
+        let opts = BaseBackupOptions {
+            incremental: true,
+            ..Default::default()
+        };
+        let err = conn.base_backup(&opts).unwrap_err();
+        assert!(err.to_string().contains("INCREMENTAL"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_read_slot_preflight_passes_on_pg16_then_hits_socket() {
+        // READ_REPLICATION_SLOT is PG15+, so the PG16 preflight passes; the call
+        // then fails at the null socket. Exercises the preflight line's Ok path.
+        let mut conn = NativeConnection::null_for_testing();
+        assert!(conn.read_replication_slot("s").is_err());
     }
 
     #[tokio::test]

@@ -4205,12 +4205,11 @@ mod tests {
         );
         stream.state.add_relation(relation);
 
-        let (schema, table, replica_id, key_cols, _rel) =
-            crate::protocol::relation_metadata(&stream.state, 100, Some('K')).unwrap();
-        assert_eq!(&*schema, "myschema");
-        assert_eq!(&*table, "mytable");
-        assert_eq!(replica_id, ReplicaIdentity::Default);
-        assert_eq!(key_cols, vec![Arc::from("pk_col")]);
+        let meta = crate::protocol::relation_metadata(&stream.state, 100, Some('K')).unwrap();
+        assert_eq!(&*meta.schema, "myschema");
+        assert_eq!(&*meta.table, "mytable");
+        assert_eq!(meta.replica_identity, ReplicaIdentity::Default);
+        assert_eq!(meta.key_columns, vec![Arc::from("pk_col")]);
     }
 
     #[test]
@@ -4720,12 +4719,11 @@ mod tests {
         );
         stream.state.add_relation(relation);
 
-        let (schema, table, _ri, _keys, _rel) =
-            crate::protocol::relation_metadata(&stream.state, 100, None).unwrap();
+        let meta = crate::protocol::relation_metadata(&stream.state, 100, None).unwrap();
         // With empty namespace, full_name is ".just_table", split gives ["", "just_table"]
-        assert_eq!(&*table, "just_table");
+        assert_eq!(&*meta.table, "just_table");
         // Schema should still work
-        assert_eq!(&*schema, "");
+        assert_eq!(&*meta.schema, "");
     }
 
     /// Build a synthetic WAL message: 'w' + start_lsn(8) + end_lsn(8) + send_time(8) + payload
