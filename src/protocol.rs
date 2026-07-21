@@ -1365,49 +1365,53 @@ pub(crate) fn key_columns_for_relation(
     }
 }
 
-/// Extract schema/table name, replica identity, and key columns for a relation
-/// from the cache in `state`.
-#[allow(clippy::type_complexity)]
+/// Schema/table name, replica identity, and key columns for a relation, plus a borrow of the cached [`RelationInfo`] to decode tuple data against. Resolved from the cache in `state` for an INSERT/UPDATE/DELETE.
+pub(crate) struct RelationMetadata<'a> {
+    pub(crate) schema: Arc<str>,
+    pub(crate) table: Arc<str>,
+    pub(crate) replica_identity: ReplicaIdentity,
+    pub(crate) key_columns: Vec<Arc<str>>,
+    pub(crate) relation: &'a RelationInfo,
+}
+
+/// Look up [`RelationMetadata`] for `relation_id` in `state`, or `None` if the
+/// relation has not been seen.
 pub(crate) fn relation_metadata(
     state: &ReplicationState,
     relation_id: u32,
     key_type: Option<char>,
-) -> Option<(
-    Arc<str>,
-    Arc<str>,
-    ReplicaIdentity,
-    Vec<Arc<str>>,
-    &RelationInfo,
-)> {
+) -> Option<RelationMetadata<'_>> {
     let relation = state.get_relation(relation_id)?;
 
-    let schema_name = Arc::clone(&relation.namespace);
-    let table_name = Arc::clone(&relation.relation_name);
-
-    let replica_identity =
-        ReplicaIdentity::from_byte(relation.replica_identity).unwrap_or(ReplicaIdentity::Default);
-
-    let key_columns = key_columns_for_relation(relation, key_type);
-
-    Some((
-        schema_name,
-        table_name,
-        replica_identity,
-        key_columns,
+    Some(RelationMetadata {
+        schema: Arc::clone(&relation.namespace),
+        table: Arc::clone(&relation.relation_name),
+        replica_identity: ReplicaIdentity::from_byte(relation.replica_identity)
+            .unwrap_or(ReplicaIdentity::Default),
+        key_columns: key_columns_for_relation(relation, key_type),
         relation,
-    ))
+    })
 }
 
 /// Convert a parsed logical replication message into a [`ChangeEvent`], reading
 /// and updating the relation cache in `state`.
 ///
-/// This is the connection-independent core of the decode path. `Relation`
-/// messages update `state` and return `Ok(None)` (or a `Relation` event on a
-/// detected schema change), data messages read `state` and return
-/// `Ok(Some(event))`, and a data message for an unknown relation logs a warning
-/// and returns `Ok(None)`. `lsn` stamps the emitted event. The network
-/// `EventStream` delegates to this function, so byte-only consumers get
-/// identical results without a connection.
+/// This is the connection-independent core of the decode path. Both the network
+/// `EventStream` and [`PgOutputDecoder`] delegate to it, so every consumer gets
+/// identical results whether or not a connection is held.
+///
+/// `Ok(None)` covers two distinct cases the caller cannot tell apart:
+/// - a first-seen `Relation` message (cache is populated, no event emitted), and
+/// - a data message for a relation not yet in `state` (dropped, logged at WARN).
+///
+/// A `Relation` whose schema differs from the cached one emits a `Relation`
+/// event before the cache is updated. `lsn` stamps every emitted event.
+///
+/// Kept `pub(crate)`: the public entry point is [`PgOutputDecoder`]. This lives
+/// in the unconditional `protocol` module (not the network-gated `stream`
+/// module), so the ChangeEvent assembly it performs also compiles into the
+/// `no_std`/parser-only build — a deliberate size cost for that target in
+/// exchange for connection-free decoding.
 pub(crate) fn message_to_change_event(
     state: &mut ReplicationState,
     message: StreamingReplicationMessage,
@@ -1507,21 +1511,19 @@ pub(crate) fn message_to_change_event(
             new_tuple,
             key_type,
         } => {
-            if let Some((schema_name, table_name, replica_identity, key_columns, relation)) =
-                relation_metadata(state, relation_id, key_type)
-            {
-                let old_data = old_tuple.map(|t| t.into_row_data(relation));
-                let new_data = new_tuple.into_row_data(relation);
+            if let Some(meta) = relation_metadata(state, relation_id, key_type) {
+                let old_data = old_tuple.map(|t| t.into_row_data(meta.relation));
+                let new_data = new_tuple.into_row_data(meta.relation);
 
                 ChangeEvent {
                     event_type: EventType::Update {
-                        schema: schema_name,
-                        table: table_name,
+                        schema: meta.schema,
+                        table: meta.table,
                         relation_oid: relation_id,
                         old_data,
                         new_data,
-                        replica_identity,
-                        key_columns,
+                        replica_identity: meta.replica_identity,
+                        key_columns: meta.key_columns,
                     },
                     lsn: Lsn::new(lsn),
                     metadata: None,
@@ -1537,19 +1539,17 @@ pub(crate) fn message_to_change_event(
             old_tuple,
             key_type,
         } => {
-            if let Some((schema_name, table_name, replica_identity, key_columns, relation)) =
-                relation_metadata(state, relation_id, Some(key_type))
-            {
-                let old_data = old_tuple.into_row_data(relation);
+            if let Some(meta) = relation_metadata(state, relation_id, Some(key_type)) {
+                let old_data = old_tuple.into_row_data(meta.relation);
 
                 ChangeEvent {
                     event_type: EventType::Delete {
-                        schema: schema_name,
-                        table: table_name,
+                        schema: meta.schema,
+                        table: meta.table,
                         relation_oid: relation_id,
                         old_data,
-                        replica_identity,
-                        key_columns,
+                        replica_identity: meta.replica_identity,
+                        key_columns: meta.key_columns,
                     },
                     lsn: Lsn::new(lsn),
                     metadata: None,
@@ -1899,7 +1899,21 @@ impl PgOutputDecoder {
     /// `'w'` XLogData header, no CopyData wrapper), the same contract as
     /// [`LogicalReplicationParser::parse_wal_message`]. Returns `Ok(None)` for a
     /// first-seen `Relation` (cache update only) or a data message referencing an
-    /// unknown relation, and `Ok(Some(event))` otherwise. `lsn` stamps the event.
+    /// unknown relation, and `Ok(Some(event))` otherwise.
+    ///
+    /// `lsn` stamps the emitted event; pass the WAL start position of this
+    /// message (the network path uses `XLogData.wal_start`). When draining a slot
+    /// over SQL, pass the `lsn` column returned alongside `data` by
+    /// `pg_logical_slot_peek_binary_changes` / `pg_logical_slot_get_binary_changes`.
+    ///
+    /// # Precondition
+    /// Feed a *complete* stream from a `START_REPLICATION` (or slot-drain)
+    /// boundary. pgoutput is self-describing — a `Relation` precedes the first
+    /// data row for each table and repeats on schema change — so a decoder that
+    /// starts empty builds its own cache. A data message whose `Relation` has not
+    /// yet been seen is **silently dropped** (logged at WARN, returns `Ok(None)`);
+    /// do not resume mid-stream without replaying the preceding `Relation`
+    /// messages.
     #[inline]
     pub fn decode_message(
         &mut self,
@@ -2112,6 +2126,83 @@ mod tests {
                 assert_eq!(data.get("name").unwrap(), "alice");
             }
             ref other => panic!("expected Insert, got {other:?}"),
+        }
+
+        // Concrete decode of Update/Delete/Truncate on the same warm decoder
+        // (its cache holds relation 42 from the leading Relation at 0x10),
+        // asserting golden field values instead of re-deriving them through the
+        // function under test — this removes the reference-oracle circularity.
+        let ev = d
+            .decode_message(
+                encode_message_to_bytes(&messages[2].0, VERSION as u8).freeze(),
+                Lsn::new(0x30),
+            )
+            .unwrap()
+            .expect("update yields an event");
+        assert_eq!(ev.lsn, Lsn::new(0x30));
+        match ev.event_type {
+            EventType::Update {
+                ref schema,
+                ref table,
+                relation_oid,
+                ref old_data,
+                ref new_data,
+                ref key_columns,
+                ..
+            } => {
+                assert_eq!(&**schema, "public");
+                assert_eq!(&**table, "users");
+                assert_eq!(relation_oid, 42);
+                assert!(old_data.is_none(), "this UPDATE carried no old tuple");
+                assert_eq!(new_data.get("id").unwrap(), "1");
+                assert_eq!(new_data.get("name").unwrap(), "bob");
+                // key_type None on UPDATE falls back to the relation's key columns.
+                assert_eq!(key_columns, &vec![Arc::from("id")]);
+            }
+            ref other => panic!("expected Update, got {other:?}"),
+        }
+
+        let ev = d
+            .decode_message(
+                encode_message_to_bytes(&messages[3].0, VERSION as u8).freeze(),
+                Lsn::new(0x40),
+            )
+            .unwrap()
+            .expect("delete yields an event");
+        assert_eq!(ev.lsn, Lsn::new(0x40));
+        match ev.event_type {
+            EventType::Delete {
+                ref schema,
+                ref table,
+                relation_oid,
+                ref old_data,
+                ref key_columns,
+                ..
+            } => {
+                assert_eq!(&**schema, "public");
+                assert_eq!(&**table, "users");
+                assert_eq!(relation_oid, 42);
+                assert_eq!(old_data.get("id").unwrap(), "1");
+                assert!(old_data.get("name").unwrap().is_null(), "name was NULL");
+                // key_type 'K' → replica-identity / key columns.
+                assert_eq!(key_columns, &vec![Arc::from("id")]);
+            }
+            ref other => panic!("expected Delete, got {other:?}"),
+        }
+
+        let ev = d
+            .decode_message(
+                encode_message_to_bytes(&messages[4].0, VERSION as u8).freeze(),
+                Lsn::new(0x50),
+            )
+            .unwrap()
+            .expect("truncate yields an event");
+        assert_eq!(ev.lsn, Lsn::new(0x50));
+        match ev.event_type {
+            EventType::Truncate(ref tables) => {
+                assert_eq!(tables, &vec![Arc::from("public.users")]);
+            }
+            ref other => panic!("expected Truncate, got {other:?}"),
         }
     }
 

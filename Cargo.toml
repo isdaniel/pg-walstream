@@ -30,7 +30,7 @@ rust-version = "1.87"
 pg-walstream-macros = { path = "macros", version = "=0.8.0" }
 
 [dependencies]
-tokio = { version = "1.53.0", features = ["io-util", "net", "time", "macros", "rt", "rt-multi-thread"], optional = true }
+tokio = { version = "1.53.1", features = ["io-util", "net", "time", "macros", "rt", "rt-multi-thread"], optional = true }
 tokio-util = { version = "0.7.18", optional = true }
 serde = { version = "1.0.229", default-features = false, features = ["derive", "rc", "alloc"] }
 chrono = { version = "0.4.45", default-features = false, features = ["serde", "alloc"] }
@@ -85,12 +85,12 @@ rustls-tls = [
 ]
 
 [dev-dependencies]
-tokio = { version = "1.53.0", features = ["full"] }
+tokio = { version = "1.53.1", features = ["full"] }
 criterion = { package = "codspeed-criterion-compat", version = "5.0.1", features = ["html_reports"] }
 futures = "0.3.33"
 serde_bytes = "0.11.19"
 proptest = "1.11"
-serde_json = "1.0.150"
+serde_json = "1.0.151"
 tracing-subscriber = "0.3.23"
 
 [[test]]
@@ -156,6 +156,10 @@ path = "integration-tests/slot_matrix.rs"
 [[test]]
 name = "base_backup_options"
 path = "integration-tests/base_backup_options.rs"
+
+[[test]]
+name = "version_preflight"
+path = "integration-tests/version_preflight.rs"
 
 [[bench]]
 name = "wal_pipeline"

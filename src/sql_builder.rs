@@ -478,6 +478,259 @@ pub fn build_base_backup_sql(options: &BaseBackupOptions) -> Result<String> {
     Ok(format!("BASE_BACKUP{}", build_sql_options(&opts)))
 }
 
+// The builders above are pure and hold no server-version state by design. The preflight below is the separate, equally-pure gate a *connection* applies (with  its known `server_version()`) before issuing a version-gated command, so an unsupported option fails with an actionable client-side error instead of an opaque server-side `syntax error`. Only the `libpq` / `rustls-tls` backends call these, so the whole group lives in a feature-gated module: the parser-only / no_std (`--no-default-features`) build compiles it out entirely — no callers, no `dead_code`, no per-item `allow`.
+#[cfg(any(feature = "libpq", feature = "rustls-tls"))]
+mod version_preflight {
+    use super::*;
+
+    /// PostgreSQL 15.0 on the `server_version` (`PQserverVersion`) scale
+    /// (major * 10000 + minor, e.g. 14.23 → 140023). `server_version == 0` (unknown) passes.
+    const PG15: i32 = 150000;
+    /// PostgreSQL 17.0 on the `server_version` scale.
+    const PG17: i32 = 170000;
+    /// PostgreSQL 18.0 on the `server_version` scale.
+    const PG18: i32 = 180000;
+
+    /// Format a `PQserverVersion`-scale integer as `major.minor` for error messages.
+    fn format_server_version(v: i32) -> String {
+        format!("{}.{}", v / 10000, v % 10000)
+    }
+
+    /// Preflight `CREATE_REPLICATION_SLOT` options against the server version.
+    ///
+    /// Returns a clear [`ReplicationError::config`] when the connected server is too old for a requested option, instead of letting the server reject the emitted SQL with a bare `syntax error`. `server_version == 0` (unknown) passes.
+    ///
+    /// Gates: `TWO_PHASE` requires PostgreSQL 15+, `FAILOVER` requires PostgreSQL 17+.
+    pub(crate) fn check_create_slot_version(
+        server_version: i32,
+        slot_type: SlotType,
+        options: &ReplicationSlotOptions,
+    ) -> Result<()> {
+        if server_version == 0 || !matches!(slot_type, SlotType::Logical) {
+            return Ok(());
+        }
+        if options.two_phase && server_version < PG15 {
+            return Err(ReplicationError::config(format!(
+                "TWO_PHASE replication slots require PostgreSQL 15+, but the server reports {}",
+                format_server_version(server_version)
+            )));
+        }
+        if options.failover && server_version < PG17 {
+            return Err(ReplicationError::config(format!(
+                "FAILOVER replication slots require PostgreSQL 17+, but the server reports {}",
+                format_server_version(server_version)
+            )));
+        }
+        Ok(())
+    }
+
+    /// Preflight `ALTER_REPLICATION_SLOT` against the server version.
+    ///
+    /// Gates: the command itself requires PostgreSQL 17+; altering `TWO_PHASE` additionally requires PostgreSQL 18+ (PostgreSQL 17 rejects `two_phase` with `unrecognized option`). `server_version == 0` (unknown) passes. `FAILOVER` needs no separate gate — it was introduced with the command in PostgreSQL 17, so the command-level check already covers it.
+    pub(crate) fn check_alter_slot_version(
+        server_version: i32,
+        two_phase: Option<bool>,
+    ) -> Result<()> {
+        if server_version == 0 {
+            return Ok(());
+        }
+        if server_version < PG17 {
+            return Err(ReplicationError::config(format!(
+                "ALTER_REPLICATION_SLOT requires PostgreSQL 17+, but the server reports {}",
+                format_server_version(server_version)
+            )));
+        }
+        if two_phase.is_some() && server_version < PG18 {
+            return Err(ReplicationError::config(format!(
+                "altering TWO_PHASE on a replication slot requires PostgreSQL 18+, \
+             but the server reports {}",
+                format_server_version(server_version)
+            )));
+        }
+        Ok(())
+    }
+
+    /// Preflight `READ_REPLICATION_SLOT` against the server version.
+    ///
+    /// Gate: requires PostgreSQL 15+. `server_version == 0` (unknown) passes.
+    pub(crate) fn check_read_slot_version(server_version: i32) -> Result<()> {
+        if server_version != 0 && server_version < PG15 {
+            return Err(ReplicationError::config(format!(
+                "READ_REPLICATION_SLOT requires PostgreSQL 15+, but the server reports {}",
+                format_server_version(server_version)
+            )));
+        }
+        Ok(())
+    }
+
+    /// Preflight `BASE_BACKUP` options against the server version.
+    ///
+    /// Gates: `INCREMENTAL` requires PostgreSQL 17+; any option at all switches the
+    /// command to the PostgreSQL 15+ parenthesized generic-option grammar, which
+    /// PostgreSQL 14 cannot parse (a bare `BASE_BACKUP` still works everywhere).
+    /// `server_version == 0` (unknown) passes.
+    pub(crate) fn check_base_backup_version(
+        server_version: i32,
+        options: &BaseBackupOptions,
+    ) -> Result<()> {
+        if server_version == 0 {
+            return Ok(());
+        }
+        if options.incremental && server_version < PG17 {
+            return Err(ReplicationError::config(format!(
+                "INCREMENTAL base backup requires PostgreSQL 17+, but the server reports {}",
+                format_server_version(server_version)
+            )));
+        }
+        if server_version < PG15 && base_backup_has_options(options) {
+            return Err(ReplicationError::config(format!(
+                "BASE_BACKUP with options uses the PostgreSQL 15+ parenthesized grammar, \
+             but the server reports {}; omit all options or use PostgreSQL 15+",
+                format_server_version(server_version)
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether any `BASE_BACKUP` option is set — i.e. the emitted SQL would use the parenthesized option list rather than a bare `BASE_BACKUP`.
+    fn base_backup_has_options(o: &BaseBackupOptions) -> bool {
+        o.label.is_some()
+            || o.target.is_some()
+            || o.target_detail.is_some()
+            || o.progress
+            || o.checkpoint.is_some()
+            || o.wal
+            || o.wait
+            || o.compression.is_some()
+            || o.compression_detail.is_some()
+            || o.max_rate.is_some()
+            || o.tablespace_map
+            || o.verify_checksums
+            || o.manifest.is_some()
+            || o.manifest_checksums.is_some()
+            || o.incremental
+    }
+
+    #[cfg(test)]
+    mod preflight_tests {
+        use super::*;
+
+        fn logical_opts(two_phase: bool, failover: bool) -> ReplicationSlotOptions {
+            ReplicationSlotOptions {
+                two_phase,
+                failover,
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn preflight_create_slot_gates_two_phase_pg15() {
+            let opts = logical_opts(true, false);
+            let err = check_create_slot_version(140023, SlotType::Logical, &opts).unwrap_err();
+            assert!(err.to_string().contains("TWO_PHASE"), "{err}");
+            assert!(err.to_string().contains("15+"), "{err}");
+            assert!(check_create_slot_version(150000, SlotType::Logical, &opts).is_ok());
+            assert!(check_create_slot_version(180000, SlotType::Logical, &opts).is_ok());
+        }
+
+        #[test]
+        fn preflight_create_slot_gates_failover_pg17() {
+            let opts = logical_opts(false, true);
+            let err = check_create_slot_version(160000, SlotType::Logical, &opts).unwrap_err();
+            assert!(err.to_string().contains("FAILOVER"), "{err}");
+            assert!(err.to_string().contains("17+"), "{err}");
+            assert!(check_create_slot_version(170000, SlotType::Logical, &opts).is_ok());
+        }
+
+        #[test]
+        fn preflight_create_slot_unknown_version_passes() {
+            // server_version 0 (undeterminable) never blocks.
+            let opts = logical_opts(true, true);
+            assert!(check_create_slot_version(0, SlotType::Logical, &opts).is_ok());
+        }
+
+        #[test]
+        fn preflight_create_slot_physical_ignores_logical_gates() {
+            // two_phase/failover gates are logical-only; the builder separately rejects failover on physical slots.
+            let opts = logical_opts(true, true);
+            assert!(check_create_slot_version(140000, SlotType::Physical, &opts).is_ok());
+        }
+
+        #[test]
+        fn preflight_create_slot_default_options_pass_on_any_version() {
+            let opts = ReplicationSlotOptions::default();
+            assert!(check_create_slot_version(140000, SlotType::Logical, &opts).is_ok());
+            assert!(check_create_slot_version(0, SlotType::Logical, &opts).is_ok());
+        }
+
+        #[test]
+        fn preflight_alter_slot_requires_pg17() {
+            let err = check_alter_slot_version(160000, None).unwrap_err();
+            assert!(err.to_string().contains("ALTER_REPLICATION_SLOT"), "{err}");
+            assert!(err.to_string().contains("17+"), "{err}");
+            assert!(check_alter_slot_version(170000, None).is_ok());
+            assert!(check_alter_slot_version(0, None).is_ok());
+        }
+
+        #[test]
+        fn preflight_alter_slot_two_phase_requires_pg18() {
+            let err = check_alter_slot_version(170004, Some(true)).unwrap_err();
+            assert!(err.to_string().contains("TWO_PHASE"), "{err}");
+            assert!(err.to_string().contains("18+"), "{err}");
+            assert!(check_alter_slot_version(180000, Some(true)).is_ok());
+            // A non-two_phase alter (e.g. failover-only) is fine on PG17.
+            assert!(check_alter_slot_version(170000, None).is_ok());
+        }
+
+        #[test]
+        fn preflight_read_slot_requires_pg15() {
+            let err = check_read_slot_version(140023).unwrap_err();
+            assert!(err.to_string().contains("READ_REPLICATION_SLOT"), "{err}");
+            assert!(err.to_string().contains("15+"), "{err}");
+            assert!(check_read_slot_version(150000).is_ok());
+            assert!(check_read_slot_version(0).is_ok());
+        }
+
+        #[test]
+        fn preflight_base_backup_options_require_pg15() {
+            let with_opt = BaseBackupOptions {
+                progress: true,
+                ..Default::default()
+            };
+            assert!(check_base_backup_version(140023, &with_opt).is_err());
+            assert!(check_base_backup_version(150000, &with_opt).is_ok());
+            // Bare BASE_BACKUP (no options) parses on any version.
+            let bare = BaseBackupOptions::default();
+            assert!(check_base_backup_version(140023, &bare).is_ok());
+        }
+
+        #[test]
+        fn preflight_base_backup_incremental_requires_pg17() {
+            let inc = BaseBackupOptions {
+                incremental: true,
+                ..Default::default()
+            };
+            let err = check_base_backup_version(160000, &inc).unwrap_err();
+            assert!(err.to_string().contains("INCREMENTAL"), "{err}");
+            assert!(check_base_backup_version(170000, &inc).is_ok());
+            assert!(check_base_backup_version(0, &inc).is_ok());
+        }
+
+        #[test]
+        fn format_server_version_renders_major_minor() {
+            assert_eq!(format_server_version(140023), "14.23");
+            assert_eq!(format_server_version(150000), "15.0");
+            assert_eq!(format_server_version(170004), "17.4");
+        }
+    }
+}
+
+#[cfg(any(feature = "libpq", feature = "rustls-tls"))]
+pub(crate) use version_preflight::{
+    check_alter_slot_version, check_base_backup_version, check_create_slot_version,
+    check_read_slot_version,
+};
+
 /// Options for building a `CREATE SUBSCRIPTION` SQL statement.
 ///
 /// All fields borrow from the caller — no allocation or cloning required.
