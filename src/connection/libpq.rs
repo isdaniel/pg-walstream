@@ -1199,11 +1199,14 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_backslash_and_quote() {
-        // Backslashes should not be specially treated, only single quotes
-        let input = "test\\'value";
-        let sanitized = sanitize_sql_string_value(input);
-        assert_eq!(sanitized, "test\\''value");
+    fn test_quote_backslash_and_quote() {
+        // A backslash switches quote_literal to the escape-string form ` E'…'`
+        // (safe under standard_conforming_strings off or on); both the backslash
+        // and the single quote are doubled.
+        assert_eq!(
+            quote_sql_string_value("test\\'value"),
+            r#" E'test\\''value'"#
+        );
     }
 
     #[test]
