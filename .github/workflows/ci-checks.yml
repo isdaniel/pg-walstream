@@ -336,6 +336,9 @@ jobs:
         # Server-version preflight: end-to-end core CDC path (create slot -> stream -> decode INSERT) plus PG17+ gated slot ops (FAILOVER create + ALTER) that must pass the client-side version gate and execute; the gated portion skips gracefully on PG<17.
         cargo test --test version_preflight -- --ignored --nocapture --test-threads=1
 
+        # quote_literal escaping: proves quote_literal stays injection-safe under standard_conforming_strings off and on (a backslash+quote payload roundtrips byte-for-byte); uses the regular connection and creates no replication slot.
+        cargo test --test quote_literal_scs_off -- --ignored --nocapture --test-threads=1
+
   integration-ssl:
     name: SSL Integration Tests (PG ${{ matrix.pg_version }})
     runs-on: ubuntu-latest

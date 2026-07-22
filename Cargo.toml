@@ -161,6 +161,10 @@ path = "integration-tests/base_backup_options.rs"
 name = "version_preflight"
 path = "integration-tests/version_preflight.rs"
 
+[[test]]
+name = "quote_literal_scs_off"
+path = "integration-tests/quote_literal_scs_off.rs"
+
 [[bench]]
 name = "wal_pipeline"
 harness = false

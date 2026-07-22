@@ -12,6 +12,89 @@ use crate::types::{
     INVALID_XLOG_REC_PTR,
 };
 
+/// Identifier (double quotes) vs string literal (single quotes). Selects the quote character, backslash handling, and null-byte error wording for [`quote_internal`].
+#[derive(Clone, Copy)]
+enum QuoteStyle {
+    Identifier,
+    Literal,
+}
+
+impl QuoteStyle {
+    /// The wrapping/escaping quote character for this style.
+    #[inline]
+    fn quote_char(self) -> char {
+        match self {
+            QuoteStyle::Identifier => '"',
+            QuoteStyle::Literal => '\'',
+        }
+    }
+
+    /// The error message used when the input contains a null byte.
+    #[inline]
+    fn null_byte_error(self) -> &'static str {
+        match self {
+            QuoteStyle::Identifier => "SQL identifier must not contain null bytes",
+            QuoteStyle::Literal => "SQL literal must not contain null bytes",
+        }
+    }
+}
+
+/// Shared quoting core for [`quote_ident`] and [`quote_literal`].
+///
+/// Wraps `value` in the style's quote character, doubling any embedded quote character. For string literals only, a backslash switches the result to the escape-string form ` E'…'` (a leading space, then `E'`) with backslashes doubled, so the result is safe regardless of the server's `standard_conforming_strings` setting. Identifiers never interpret backslashes, so they never need this.
+///
+/// Rejects null bytes, which are invalid in both identifiers and literals and could otherwise cause truncation-based injection through the C-string wire protocol.
+///
+/// Mirrors libpq's `PQescapeInternal` (which rust-postgres's `escape_internal` ports), with the added null-byte rejection.
+fn quote_internal(value: &str, style: QuoteStyle) -> Result<String> {
+    if value.contains('\0') {
+        return Err(ReplicationError::config(
+            style.null_byte_error().to_string(),
+        ));
+    }
+
+    let quote_char = style.quote_char();
+    let escape_backslashes = matches!(style, QuoteStyle::Literal);
+
+    let mut num_quotes = 0usize;
+    let mut num_backslashes = 0usize;
+    for ch in value.chars() {
+        if ch == quote_char {
+            num_quotes += 1;
+        } else if escape_backslashes && ch == '\\' {
+            num_backslashes += 1;
+        }
+    }
+
+    // Backslash doubling only happens for literals, so a non-zero count implies literal mode — which is exactly when the escape-string syntax is required.
+    let use_escape_string = num_backslashes > 0;
+    let mut out = String::with_capacity(
+        value.len() + num_quotes + num_backslashes + if use_escape_string { 4 } else { 2 },
+    );
+
+    // ` E'…'` (with a leading space so the literal cannot fuse onto a preceding identifier) is emitted only when backslashes are being doubled.
+    if use_escape_string {
+        out.push(' ');
+        out.push('E');
+    }
+    out.push(quote_char);
+
+    if num_quotes == 0 && num_backslashes == 0 {
+        // Fast path: nothing to escape.
+        out.push_str(value);
+    } else {
+        for ch in value.chars() {
+            if ch == quote_char || (escape_backslashes && ch == '\\') {
+                out.push(ch);
+            }
+            out.push(ch);
+        }
+    }
+
+    out.push(quote_char);
+    Ok(out)
+}
+
 /// Quote a PostgreSQL identifier by wrapping in double quotes and escaping
 /// internal double quotes (doubling them).
 ///
@@ -32,25 +115,15 @@ use crate::types::{
 /// ```
 #[inline]
 pub fn quote_ident(name: &str) -> Result<String> {
-    if name.contains('\0') {
-        return Err(ReplicationError::config(
-            "SQL identifier must not contain null bytes".to_string(),
-        ));
-    }
-    let mut out = String::with_capacity(name.len() + 2);
-    out.push('"');
-    for ch in name.chars() {
-        if ch == '"' {
-            out.push('"');
-        }
-        out.push(ch);
-    }
-    out.push('"');
-    Ok(out)
+    quote_internal(name, QuoteStyle::Identifier)
 }
 
 /// Quote a PostgreSQL string literal by wrapping in single quotes and escaping
 /// internal single quotes (doubling them).
+///
+/// If `value` contains a backslash, the escape-string form ` E'…'` is emitted
+/// with backslashes doubled, so the result is safe under either value of the
+/// server's `standard_conforming_strings` setting.
 ///
 /// # Errors
 ///
@@ -65,25 +138,14 @@ pub fn quote_ident(name: &str) -> Result<String> {
 ///
 /// assert_eq!(quote_literal("hello").unwrap(), "'hello'");
 /// assert_eq!(quote_literal("it's").unwrap(), "'it''s'");
+/// // A backslash switches to the escape-string form, safe under any
+/// // `standard_conforming_strings` setting.
+/// assert_eq!(quote_literal(r"a\b").unwrap(), r" E'a\\b'");
 /// assert!(quote_literal("bad\0value").is_err());
 /// ```
 #[inline]
 pub fn quote_literal(value: &str) -> Result<String> {
-    if value.contains('\0') {
-        return Err(ReplicationError::config(
-            "SQL literal must not contain null bytes".to_string(),
-        ));
-    }
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('\'');
-    for ch in value.chars() {
-        if ch == '\'' {
-            out.push('\'');
-        }
-        out.push(ch);
-    }
-    out.push('\'');
-    Ok(out)
+    quote_internal(value, QuoteStyle::Literal)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -972,7 +1034,38 @@ mod tests {
 
     #[test]
     fn quote_literal_backslash_and_quote() {
-        assert_eq!(quote_literal("test\\'value").unwrap(), "'test\\''value'");
+        // A backslash switches to the escape-string form ` E'…'`, with both the
+        // backslash and the single quote doubled — safe under standard_conforming_strings
+        // off or on.
+        assert_eq!(
+            quote_literal("test\\'value").unwrap(),
+            r#" E'test\\''value'"#
+        );
+    }
+
+    #[test]
+    fn quote_literal_backslash_only() {
+        // A backslash with no quote still uses the escape-string form.
+        assert_eq!(quote_literal("a\\b").unwrap(), r#" E'a\\b'"#);
+    }
+
+    #[test]
+    fn quote_literal_backslash_injection_neutralized() {
+        // The classic standard_conforming_strings=off breakout payload becomes inert:
+        // the backslash and quote are both doubled inside an E'' string, so nothing
+        // after the intended literal can execute.
+        assert_eq!(
+            quote_literal("\\'; DROP TABLE t; --").unwrap(),
+            r#" E'\\''; DROP TABLE t; --'"#
+        );
+    }
+
+    #[test]
+    fn quote_literal_no_backslash_is_legacy_form() {
+        // Without a backslash the output is byte-identical to the plain '…' form
+        // (no E prefix, no leading space) — no existing builder output shifts.
+        assert_eq!(quote_literal("it's").unwrap(), "'it''s'");
+        assert_eq!(quote_literal("plain").unwrap(), "'plain'");
     }
 
     #[test]
@@ -1904,6 +1997,25 @@ mod tests {
              CONNECTION 'host=localhost' \
              PUBLICATION \"pub\" \
              WITH (create_slot = false, slot_name = 'slot', enabled = false, copy_data = false)"
+        );
+    }
+
+    #[test]
+    fn create_subscription_backslash_in_connection_uses_escape_string() {
+        // A backslash in a free-form literal propagates the escape-string form
+        // through a real builder. The doubled space (template space + the escape's
+        // leading space) is valid SQL.
+        let opts = CreateSubscriptionOptions {
+            subscription_name: "sub",
+            connection_string: r"host=db\x",
+            publication: "pub",
+            slot_name: "slot",
+            ..Default::default()
+        };
+        let sql = build_create_subscription_sql(&opts).unwrap();
+        assert!(
+            sql.contains(r"CONNECTION  E'host=db\\x'"),
+            "connection literal not escaped as expected: {sql}"
         );
     }
 
