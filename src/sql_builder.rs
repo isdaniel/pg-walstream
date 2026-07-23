@@ -46,6 +46,8 @@ impl QuoteStyle {
 /// Rejects null bytes, which are invalid in both identifiers and literals and could otherwise cause truncation-based injection through the C-string wire protocol.
 ///
 /// Mirrors libpq's `PQescapeInternal` (which rust-postgres's `escape_internal` ports), with the added null-byte rejection.
+///
+/// Assumes the connection uses a UTF-8 (ASCII-safe) `client_encoding`, which both backends force at connect time (the native backend sends `client_encoding=UTF8` in its startup packet; the libpq backend calls `PQsetClientEncoding(conn, "UTF8")` after connecting). Because `'` and `\` are ASCII and a Rust `&str` is UTF-8, scanning by `char` can never mistake a multibyte continuation byte for a quote or backslash — so libpq's `PQescapeInternal` multibyte handling (needed only for ASCII-unsafe server encodings such as SJIS/GBK) is safely omitted here.
 fn quote_internal(value: &str, style: QuoteStyle) -> Result<String> {
     if value.contains('\0') {
         return Err(ReplicationError::config(
@@ -970,6 +972,17 @@ mod tests {
     }
 
     #[test]
+    fn quote_ident_backslash_stays_plain() {
+        // Identifiers never interpret backslashes: a backslash passes through verbatim inside "…" — no doubling and, crucially, no ` E'…'` escape-string form (that is literal-only). Locks the "backslash handling is literal-only" invariant so a future QuoteStyle refactor cannot silently regress quote_ident.
+        assert_eq!(quote_ident(r"a\b").unwrap(), r#""a\b""#);
+        // Even a backslash + single-quote + trailing SQL stays a plain  double-quoted identifier (only " would be doubled; there is none).
+        assert_eq!(
+            quote_ident(r"a\'; DROP TABLE t; --").unwrap(),
+            r#""a\'; DROP TABLE t; --""#
+        );
+    }
+
+    #[test]
     fn quote_ident_unicode() {
         assert_eq!(quote_ident("テスト").unwrap(), r#""テスト""#);
     }
@@ -1058,6 +1071,17 @@ mod tests {
             quote_literal("\\'; DROP TABLE t; --").unwrap(),
             r#" E'\\''; DROP TABLE t; --'"#
         );
+    }
+
+    #[test]
+    fn quote_literal_backslash_ordering_regression() {
+        // Placement/counting guards (all safe today — these lock the behavior):
+        // consecutive backslashes are doubled individually,
+        assert_eq!(quote_literal("\\\\").unwrap(), r#" E'\\\\'"#);
+        // a quote *before* a backslash keeps both doubled, in order,
+        assert_eq!(quote_literal("'\\").unwrap(), r#" E'''\\'"#);
+        // and a lone trailing backslash is doubled so it cannot fuse the closing quote.
+        assert_eq!(quote_literal("x\\").unwrap(), r#" E'x\\'"#);
     }
 
     #[test]
