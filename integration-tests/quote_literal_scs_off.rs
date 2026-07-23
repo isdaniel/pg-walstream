@@ -34,8 +34,11 @@ fn regular_conn_string() -> String {
             .unwrap_or_else(|_| {
                 "postgresql://postgres:postgres@localhost:5432/test_walstream".to_string()
             })
-            .replace("?replication=database", "")
+            // Drop the replication flag: this test needs a *regular* (non-replication) connection so `SET` and a plain `SELECT` work.
+            // Handle it as the first, a later, or the sole query parameter without leaving a dangling `?`/`&`.
+            .replace("?replication=database&", "?")
             .replace("&replication=database", "")
+            .replace("?replication=database", "")
     })
 }
 

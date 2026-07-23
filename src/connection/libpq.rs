@@ -217,6 +217,22 @@ impl PgReplicationConnection {
             }
         }
 
+        // Force UTF-8 client_encoding so quote_literal/quote_ident's ASCII-only escaping is multibyte-safe regardless of the server/locale default , parity with the native backend, which sends client_encoding=UTF8 in its startup packet. Under an ASCII-unsafe encoding (SJIS/GBK/BIG5) a raw lead byte could otherwise fuse with an escaping quote and reopen a literal breakout.
+        if unsafe { PQsetClientEncoding(conn, c"UTF8".as_ptr()) } != 0 {
+            let error_msg = unsafe {
+                let error_ptr = PQerrorMessage(conn);
+                if error_ptr.is_null() {
+                    "Unknown error".to_string()
+                } else {
+                    CStr::from_ptr(error_ptr).to_string_lossy().into_owned()
+                }
+            };
+            unsafe { PQfinish(conn) };
+            return Err(ReplicationError::permanent_connection(format!(
+                "Failed to set client_encoding=UTF8: {error_msg}"
+            )));
+        }
+
         // Check server version - logical replication requires PostgreSQL 14+
         let server_version = unsafe { PQserverVersion(conn) };
         if server_version < 140000 {
