@@ -281,7 +281,7 @@ impl<'de> MapAccess<'de> for RowDataMapAccess<'de> {
             .current_value
             .take()
             .expect("next_value_seed called before next_key_seed");
-        seed.deserialize(ColumnValueDeserializer { value })
+        seed.deserialize(ColumnValueDeserializer::strict(value))
     }
 
     #[inline]
@@ -293,94 +293,219 @@ impl<'de> MapAccess<'de> for RowDataMapAccess<'de> {
 
 // ---------------------------------------------------------------------------
 // ColumnValueDeserializer — deserializes a single ColumnValue
+//
+// One deserializer, two error policies. `Strict` returns `Err` on any coercion failure; `Lenient` records a `FieldError` and substitutes a default so every field is visited. The policy is a compile-time type parameter, so it monomorphizes away and the strict path keeps its `#[inline]` zero-copy shape.
+//
+// The one axis the two policies cannot share is the terminal string/bytes visit: strict borrows for `'de` (`visit_borrowed_str`), while the lenient value borrow is decoupled from `'de` (`visit_str`) — so those methods, and only those, live in the two separate `Deserializer` impls below. Every value coercion (parse rule + message) is single-sourced here.
 // ---------------------------------------------------------------------------
 
-struct ColumnValueDeserializer<'a> {
-    value: &'a ColumnValue,
+/// Structural-shape rejections — identical for both policies (both error).
+const MSG_SEQ: &str = "sequences are not supported in RowData deserialization";
+const MSG_TUPLE: &str = "tuples are not supported in RowData deserialization";
+const MSG_TUPLE_STRUCT: &str = "tuple structs are not supported in RowData deserialization";
+const MSG_MAP: &str = "nested maps are not supported in RowData deserialization";
+const MSG_STRUCT: &str = "nested structs are not supported in RowData deserialization";
+
+#[cold]
+#[inline(never)]
+fn null_msg(target: &str) -> String {
+    format!("cannot deserialize NULL as {target} (use Option<{target}>)")
 }
 
-impl<'de> ColumnValueDeserializer<'de> {
-    /// Get the text content or return an error for the given target type.
+#[cold]
+#[inline(never)]
+fn binary_msg(target: &str) -> String {
+    format!("cannot deserialize binary column as {target}")
+}
+
+/// Build a numeric-parse message. Performs UTF-8 validation only on this cold path so that invalid-UTF-8 inputs still surface the expected diagnostic.
+#[cold]
+#[inline(never)]
+fn numeric_parse_msg(b: &[u8], type_name: &str) -> String {
+    match core::str::from_utf8(b) {
+        Ok(s) => format!("failed to parse '{s}' as {type_name}"),
+        Err(e) => format!("invalid UTF-8 for {type_name}: {e}"),
+    }
+}
+
+/// Compile-time error policy: how a failed column coercion is surfaced.
+///
+///  `Strict` returns an `Err`; `Lenient` records a [`FieldError`] against the current column and returns a type-appropriate fallback (so a lenient run visits every field). This is the ONLY axis on which the two column deserializers differ in their value coercions.
+trait ErrorPolicy {
+    /// Surface a coercion failure. `make` builds the message lazily (cold path);
+    /// `fallback` is the lenient substitute, ignored by `Strict`.
+    fn fail<T>(
+        &self,
+        make: impl FnOnce() -> String,
+        fallback: impl FnOnce() -> T,
+    ) -> Result<T, ReplicationError>;
+}
+
+/// Strict policy: any coercion failure is a hard error.
+struct Strict;
+
+impl ErrorPolicy for Strict {
     #[inline]
-    fn text_or_err(&self, target: &str) -> Result<&'de str, ReplicationError> {
+    fn fail<T>(
+        &self,
+        make: impl FnOnce() -> String,
+        _fallback: impl FnOnce() -> T,
+    ) -> Result<T, ReplicationError> {
+        Err(ReplicationError::deserialize(make()))
+    }
+}
+
+/// Lenient policy: record the failure against `field` and substitute a default.
+struct Lenient<'a> {
+    ctx: &'a LenientCtx,
+    field: &'a str,
+}
+
+impl ErrorPolicy for Lenient<'_> {
+    #[inline]
+    fn fail<T>(
+        &self,
+        make: impl FnOnce() -> String,
+        fallback: impl FnOnce() -> T,
+    ) -> Result<T, ReplicationError> {
+        self.ctx.push(self.field, make());
+        Ok(fallback())
+    }
+}
+
+struct ColumnValueDeserializer<'a, P> {
+    value: &'a ColumnValue,
+    policy: P,
+}
+
+impl<'a> ColumnValueDeserializer<'a, Strict> {
+    #[inline]
+    fn strict(value: &'a ColumnValue) -> Self {
+        Self {
+            value,
+            policy: Strict,
+        }
+    }
+
+    /// Borrowed UTF-8 text for the strict terminal string paths. Errors on `Null`/`Binary`/invalid-UTF-8 — strict never substitutes.
+    #[inline]
+    fn text_or_err(&self, target: &str) -> Result<&'a str, ReplicationError> {
         match self.value {
             ColumnValue::Text(b) => core::str::from_utf8(b).map_err(|e| {
                 ReplicationError::deserialize(format!("invalid UTF-8 for {target}: {e}"))
             }),
-            ColumnValue::Null => Err(ReplicationError::deserialize(format!(
-                "cannot deserialize NULL as {target} (use Option<{target}>)"
-            ))),
-            ColumnValue::Binary(_) => Err(ReplicationError::deserialize(format!(
-                "cannot deserialize binary column as {target}"
-            ))),
+            ColumnValue::Null => Err(ReplicationError::deserialize(null_msg(target))),
+            ColumnValue::Binary(_) => Err(ReplicationError::deserialize(binary_msg(target))),
         }
     }
+}
 
-    /// Like [`text_or_err`] but returns raw bytes — skips the UTF-8 pass.
-    /// Use only for paths where the parser itself rejects non-ASCII bytes
-    /// (numeric, bool). String-shaped paths must use `text_or_err`.
+impl<'a, P: ErrorPolicy> ColumnValueDeserializer<'a, P> {
+    /// Raw text bytes (no UTF-8 pass) for numeric/bool coercion. `Text` → the
+    /// bytes; `Null`/`Binary` → policy failure yielding `None`.
     #[inline]
-    fn bytes_or_err(&self, target: &str) -> Result<&'de [u8], ReplicationError> {
+    fn text_bytes(&self, target: &str) -> Result<Option<&'a [u8]>, ReplicationError> {
         match self.value {
-            ColumnValue::Text(b) => Ok(b.as_ref()),
-            ColumnValue::Null => Err(ReplicationError::deserialize(format!(
-                "cannot deserialize NULL as {target} (use Option<{target}>)"
-            ))),
-            ColumnValue::Binary(_) => Err(ReplicationError::deserialize(format!(
-                "cannot deserialize binary column as {target}"
-            ))),
+            ColumnValue::Text(b) => Ok(Some(b.as_ref())),
+            ColumnValue::Null => self.policy.fail(|| null_msg(target), || None),
+            ColumnValue::Binary(_) => self.policy.fail(|| binary_msg(target), || None),
         }
     }
 
-    /// Parse text as a numeric type via the std `FromStr` (used for floats).
+    /// UTF-8 text. `Text(valid)` → the str; `Null`/`Binary`/invalid → policy failure.
     #[inline]
-    fn parse_text<T: core::str::FromStr>(&self, type_name: &str) -> Result<T, ReplicationError>
+    fn text(&self, target: &str) -> Result<Option<&'a str>, ReplicationError> {
+        match self.value {
+            ColumnValue::Text(b) => match core::str::from_utf8(b) {
+                Ok(s) => Ok(Some(s)),
+                Err(e) => self
+                    .policy
+                    .fail(|| format!("invalid UTF-8 for {target}: {e}"), || None),
+            },
+            ColumnValue::Null => self.policy.fail(|| null_msg(target), || None),
+            ColumnValue::Binary(_) => self.policy.fail(|| binary_msg(target), || None),
+        }
+    }
+
+    #[inline]
+    fn signed<T: TryFrom<i64> + Default>(&self, target: &str) -> Result<T, ReplicationError> {
+        let Some(b) = self.text_bytes(target)? else {
+            return Ok(T::default());
+        };
+        match parse_int_signed::<T>(b) {
+            Some(v) => Ok(v),
+            None => self
+                .policy
+                .fail(|| numeric_parse_msg(b, target), T::default),
+        }
+    }
+
+    #[inline]
+    fn unsigned<T: TryFrom<u64> + Default>(&self, target: &str) -> Result<T, ReplicationError> {
+        let Some(b) = self.text_bytes(target)? else {
+            return Ok(T::default());
+        };
+        match parse_int_unsigned::<T>(b) {
+            Some(v) => Ok(v),
+            None => self
+                .policy
+                .fail(|| numeric_parse_msg(b, target), T::default),
+        }
+    }
+
+    #[inline]
+    fn float<T>(&self, target: &str) -> Result<T, ReplicationError>
     where
+        T: core::str::FromStr + Default,
         T::Err: core::fmt::Display,
     {
-        let s = self.text_or_err(type_name)?;
-        s.parse::<T>().map_err(|e| {
-            ReplicationError::deserialize(format!(
-                "failed to parse '{}' as {}: {}",
-                s, type_name, e
-            ))
-        })
+        let Some(s) = self.text(target)? else {
+            return Ok(T::default());
+        };
+        match s.parse::<T>() {
+            Ok(v) => Ok(v),
+            Err(e) => self.policy.fail(
+                || format!("failed to parse '{s}' as {target}: {e}"),
+                T::default,
+            ),
+        }
     }
 
-    /// Fast signed-int parse from bytes; emits an error string equivalent
-    /// to the std parser (token + type name) so existing tests still match.
     #[inline]
-    fn parse_signed<T>(&self, type_name: &str) -> Result<T, ReplicationError>
-    where
-        T: TryFrom<i64>,
-    {
-        let b = self.bytes_or_err(type_name)?;
-        parse_int_signed::<T>(b).ok_or_else(|| numeric_parse_error(b, type_name))
+    fn boolean(&self) -> Result<bool, ReplicationError> {
+        let Some(b) = self.text_bytes("bool")? else {
+            return Ok(false);
+        };
+        match parse_pg_bool(b) {
+            Some(v) => Ok(v),
+            None => self.policy.fail(
+                || {
+                    format!(
+                        "cannot parse '{}' as bool (expected t/f/true/false/1/0/on/off/yes/no)",
+                        lossy_token(b)
+                    )
+                },
+                || false,
+            ),
+        }
     }
 
-    /// Fast unsigned-int parse from bytes.
     #[inline]
-    fn parse_unsigned<T>(&self, type_name: &str) -> Result<T, ReplicationError>
-    where
-        T: TryFrom<u64>,
-    {
-        let b = self.bytes_or_err(type_name)?;
-        parse_int_unsigned::<T>(b).ok_or_else(|| numeric_parse_error(b, type_name))
+    fn character(&self) -> Result<char, ReplicationError> {
+        let Some(s) = self.text("char")? else {
+            return Ok('\0');
+        };
+        let mut chars = s.chars();
+        match (chars.next(), chars.next()) {
+            (Some(c), None) => Ok(c),
+            _ => self
+                .policy
+                .fail(|| format!("expected single char, got '{s}'"), || '\0'),
+        }
     }
 }
 
-/// Build a numeric-parse error. Performs UTF-8 validation only on the cold
-/// path so that invalid-UTF-8 inputs still surface the expected diagnostic.
-#[cold]
-#[inline(never)]
-fn numeric_parse_error(b: &[u8], type_name: &str) -> ReplicationError {
-    match core::str::from_utf8(b) {
-        Ok(s) => ReplicationError::deserialize(format!("failed to parse '{s}' as {type_name}")),
-        Err(e) => ReplicationError::deserialize(format!("invalid UTF-8 for {type_name}: {e}")),
-    }
-}
-
-impl<'de> de::Deserializer<'de> for ColumnValueDeserializer<'de> {
+impl<'de> de::Deserializer<'de> for ColumnValueDeserializer<'de, Strict> {
     type Error = ReplicationError;
 
     #[inline]
@@ -397,88 +522,72 @@ impl<'de> de::Deserializer<'de> for ColumnValueDeserializer<'de> {
 
     #[inline]
     fn deserialize_bool<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        let b = self.bytes_or_err("bool")?;
-        let val = parse_pg_bool(b).ok_or_else(|| {
-            ReplicationError::deserialize(format!(
-                "cannot parse '{}' as bool (expected t/f/true/false/1/0/on/off/yes/no)",
-                lossy_token(b)
-            ))
-        })?;
-        visitor.visit_bool(val)
+        visitor.visit_bool(self.boolean()?)
     }
 
     #[inline]
     fn deserialize_i8<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_i8(self.parse_signed::<i8>("i8")?)
+        visitor.visit_i8(self.signed::<i8>("i8")?)
     }
 
     #[inline]
     fn deserialize_i16<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_i16(self.parse_signed::<i16>("i16")?)
+        visitor.visit_i16(self.signed::<i16>("i16")?)
     }
 
     #[inline]
     fn deserialize_i32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_i32(self.parse_signed::<i32>("i32")?)
+        visitor.visit_i32(self.signed::<i32>("i32")?)
     }
 
     #[inline]
     fn deserialize_i64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_i64(self.parse_signed::<i64>("i64")?)
+        visitor.visit_i64(self.signed::<i64>("i64")?)
     }
 
     #[inline]
     fn deserialize_u8<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_u8(self.parse_unsigned::<u8>("u8")?)
+        visitor.visit_u8(self.unsigned::<u8>("u8")?)
     }
 
     #[inline]
     fn deserialize_u16<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_u16(self.parse_unsigned::<u16>("u16")?)
+        visitor.visit_u16(self.unsigned::<u16>("u16")?)
     }
 
     #[inline]
     fn deserialize_u32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_u32(self.parse_unsigned::<u32>("u32")?)
+        visitor.visit_u32(self.unsigned::<u32>("u32")?)
     }
 
     #[inline]
     fn deserialize_u64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_u64(self.parse_unsigned::<u64>("u64")?)
+        visitor.visit_u64(self.unsigned::<u64>("u64")?)
     }
 
     #[inline]
     fn deserialize_f32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_f32(self.parse_text("f32")?)
+        visitor.visit_f32(self.float::<f32>("f32")?)
     }
 
     #[inline]
     fn deserialize_f64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_f64(self.parse_text("f64")?)
+        visitor.visit_f64(self.float::<f64>("f64")?)
     }
 
     #[inline]
     fn deserialize_char<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        let s = self.text_or_err("char")?;
-        let mut chars = s.chars();
-        match (chars.next(), chars.next()) {
-            (Some(c), None) => visitor.visit_char(c),
-            _ => Err(ReplicationError::deserialize(format!(
-                "expected single char, got '{s}'"
-            ))),
-        }
+        visitor.visit_char(self.character()?)
     }
 
     #[inline]
     fn deserialize_str<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        let s = self.text_or_err("str")?;
-        visitor.visit_borrowed_str(s)
+        visitor.visit_borrowed_str(self.text_or_err("str")?)
     }
 
     #[inline]
     fn deserialize_string<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        let s = self.text_or_err("String")?;
-        visitor.visit_borrowed_str(s)
+        visitor.visit_borrowed_str(self.text_or_err("String")?)
     }
 
     #[inline]
@@ -537,9 +646,7 @@ impl<'de> de::Deserializer<'de> for ColumnValueDeserializer<'de> {
 
     #[inline]
     fn deserialize_seq<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value, Self::Error> {
-        Err(ReplicationError::deserialize(
-            "sequences are not supported in RowData deserialization",
-        ))
+        Err(ReplicationError::deserialize(MSG_SEQ))
     }
 
     #[inline]
@@ -548,9 +655,7 @@ impl<'de> de::Deserializer<'de> for ColumnValueDeserializer<'de> {
         _len: usize,
         _visitor: V,
     ) -> Result<V::Value, Self::Error> {
-        Err(ReplicationError::deserialize(
-            "tuples are not supported in RowData deserialization",
-        ))
+        Err(ReplicationError::deserialize(MSG_TUPLE))
     }
 
     #[inline]
@@ -560,16 +665,12 @@ impl<'de> de::Deserializer<'de> for ColumnValueDeserializer<'de> {
         _len: usize,
         _visitor: V,
     ) -> Result<V::Value, Self::Error> {
-        Err(ReplicationError::deserialize(
-            "tuple structs are not supported in RowData deserialization",
-        ))
+        Err(ReplicationError::deserialize(MSG_TUPLE_STRUCT))
     }
 
     #[inline]
     fn deserialize_map<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value, Self::Error> {
-        Err(ReplicationError::deserialize(
-            "nested maps are not supported in RowData deserialization",
-        ))
+        Err(ReplicationError::deserialize(MSG_MAP))
     }
 
     #[inline]
@@ -579,9 +680,7 @@ impl<'de> de::Deserializer<'de> for ColumnValueDeserializer<'de> {
         _fields: &'static [&'static str],
         _visitor: V,
     ) -> Result<V::Value, Self::Error> {
-        Err(ReplicationError::deserialize(
-            "nested structs are not supported in RowData deserialization",
-        ))
+        Err(ReplicationError::deserialize(MSG_STRUCT))
     }
 
     #[inline]
@@ -759,10 +858,12 @@ impl<'de, 'a> MapAccess<'de> for LenientMapAccess<'a> {
             .current
             .take()
             .expect("next_value_seed called before next_key_seed");
-        seed.deserialize(LenientColumnValueDeserializer {
+        seed.deserialize(ColumnValueDeserializer {
             value,
-            field,
-            ctx: self.ctx,
+            policy: Lenient {
+                ctx: self.ctx,
+                field,
+            },
         })
     }
 
@@ -772,65 +873,12 @@ impl<'de, 'a> MapAccess<'de> for LenientMapAccess<'a> {
     }
 }
 
-struct LenientColumnValueDeserializer<'a> {
-    value: &'a ColumnValue,
-    field: &'a str,
-    ctx: &'a LenientCtx,
-}
-
-impl<'a> LenientColumnValueDeserializer<'a> {
-    /// Get the text content, recording a field error and returning `None` on failure.
-    fn try_text(&self, target: &str) -> Option<&'a str> {
-        match self.value {
-            ColumnValue::Text(b) => match core::str::from_utf8(b) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    self.ctx
-                        .push(self.field, format!("invalid UTF-8 for {target}: {e}"));
-                    None
-                }
-            },
-            ColumnValue::Null => {
-                self.ctx.push(
-                    self.field,
-                    format!("cannot deserialize NULL as {target} (use Option<{target}>)"),
-                );
-                None
-            }
-            ColumnValue::Binary(_) => {
-                self.ctx.push(
-                    self.field,
-                    format!("cannot deserialize binary column as {target}"),
-                );
-                None
-            }
-        }
-    }
-
-    /// Parse text into `T`; record an error and return the type's default on failure.
-    fn parse_or_default<T>(&self, target: &str) -> T
-    where
-        T: core::str::FromStr + Default,
-        T::Err: core::fmt::Display,
-    {
-        match self.try_text(target) {
-            Some(s) => s.parse::<T>().unwrap_or_else(|e| {
-                self.ctx.push(
-                    self.field,
-                    format!("failed to parse '{s}' as {target}: {e}"),
-                );
-                T::default()
-            }),
-            None => T::default(),
-        }
-    }
-}
-
-impl<'de, 'a> de::Deserializer<'de> for LenientColumnValueDeserializer<'a> {
+impl<'de, 'a> de::Deserializer<'de> for ColumnValueDeserializer<'a, Lenient<'a>> {
     type Error = ReplicationError;
 
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        // Mirror strict deserialize_any; these paths don't error.
+        // Owned visits: the value borrow is decoupled from `'de`. These paths
+        // don't error.
         match self.value {
             ColumnValue::Null => visitor.visit_none(),
             ColumnValue::Text(b) => match core::str::from_utf8(b) {
@@ -842,82 +890,58 @@ impl<'de, 'a> de::Deserializer<'de> for LenientColumnValueDeserializer<'a> {
     }
 
     fn deserialize_bool<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        let v = match self.try_text("bool") {
-            Some(s) => parse_pg_bool(s.as_bytes()).unwrap_or_else(|| {
-                self.ctx
-                    .push(self.field, format!("cannot parse '{s}' as bool"));
-                false
-            }),
-            None => false,
-        };
-        visitor.visit_bool(v)
+        visitor.visit_bool(self.boolean()?)
     }
 
     fn deserialize_i8<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_i8(self.parse_or_default::<i8>("i8"))
+        visitor.visit_i8(self.signed::<i8>("i8")?)
     }
     fn deserialize_i16<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_i16(self.parse_or_default::<i16>("i16"))
+        visitor.visit_i16(self.signed::<i16>("i16")?)
     }
     fn deserialize_i32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_i32(self.parse_or_default::<i32>("i32"))
+        visitor.visit_i32(self.signed::<i32>("i32")?)
     }
     fn deserialize_i64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_i64(self.parse_or_default::<i64>("i64"))
+        visitor.visit_i64(self.signed::<i64>("i64")?)
     }
     fn deserialize_u8<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_u8(self.parse_or_default::<u8>("u8"))
+        visitor.visit_u8(self.unsigned::<u8>("u8")?)
     }
     fn deserialize_u16<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_u16(self.parse_or_default::<u16>("u16"))
+        visitor.visit_u16(self.unsigned::<u16>("u16")?)
     }
     fn deserialize_u32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_u32(self.parse_or_default::<u32>("u32"))
+        visitor.visit_u32(self.unsigned::<u32>("u32")?)
     }
     fn deserialize_u64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_u64(self.parse_or_default::<u64>("u64"))
+        visitor.visit_u64(self.unsigned::<u64>("u64")?)
     }
     fn deserialize_f32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_f32(self.parse_or_default::<f32>("f32"))
+        visitor.visit_f32(self.float::<f32>("f32")?)
     }
     fn deserialize_f64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_f64(self.parse_or_default::<f64>("f64"))
+        visitor.visit_f64(self.float::<f64>("f64")?)
     }
 
     fn deserialize_char<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        let c = match self.try_text("char") {
-            Some(s) => {
-                let mut chars = s.chars();
-                match (chars.next(), chars.next()) {
-                    (Some(c), None) => c,
-                    _ => {
-                        self.ctx
-                            .push(self.field, format!("expected single char, got '{s}'"));
-                        '\0'
-                    }
-                }
-            }
-            None => '\0',
-        };
-        visitor.visit_char(c)
+        visitor.visit_char(self.character()?)
     }
 
     fn deserialize_str<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        let s = self.try_text("str").unwrap_or("");
-        visitor.visit_str(s)
+        visitor.visit_str(self.text("str")?.unwrap_or(""))
     }
 
     fn deserialize_string<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        let s = self.try_text("String").unwrap_or("");
-        visitor.visit_str(s)
+        visitor.visit_str(self.text("String")?.unwrap_or(""))
     }
 
     fn deserialize_bytes<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self.value {
             ColumnValue::Binary(b) | ColumnValue::Text(b) => visitor.visit_bytes(b),
             ColumnValue::Null => {
-                self.ctx
-                    .push(self.field, "cannot deserialize NULL as bytes".to_string());
+                self.policy
+                    .fail::<()>(|| "cannot deserialize NULL as bytes".to_string(), || ())?;
                 visitor.visit_bytes(&[])
             }
         }
@@ -927,10 +951,8 @@ impl<'de, 'a> de::Deserializer<'de> for LenientColumnValueDeserializer<'a> {
         match self.value {
             ColumnValue::Binary(b) | ColumnValue::Text(b) => visitor.visit_byte_buf(b.to_vec()),
             ColumnValue::Null => {
-                self.ctx.push(
-                    self.field,
-                    "cannot deserialize NULL as byte_buf".to_string(),
-                );
+                self.policy
+                    .fail::<()>(|| "cannot deserialize NULL as byte_buf".to_string(), || ())?;
                 visitor.visit_byte_buf(Vec::new())
             }
         }
@@ -945,8 +967,8 @@ impl<'de, 'a> de::Deserializer<'de> for LenientColumnValueDeserializer<'a> {
 
     fn deserialize_unit<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         if !matches!(self.value, ColumnValue::Null) {
-            self.ctx
-                .push(self.field, "expected NULL for unit type".to_string());
+            self.policy
+                .fail::<()>(|| "expected NULL for unit type".to_string(), || ())?;
         }
         visitor.visit_unit()
     }
@@ -968,9 +990,7 @@ impl<'de, 'a> de::Deserializer<'de> for LenientColumnValueDeserializer<'a> {
     }
 
     fn deserialize_seq<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value, Self::Error> {
-        Err(ReplicationError::deserialize(
-            "sequences are not supported in RowData deserialization",
-        ))
+        Err(ReplicationError::deserialize(MSG_SEQ))
     }
 
     fn deserialize_tuple<V: Visitor<'de>>(
@@ -978,9 +998,7 @@ impl<'de, 'a> de::Deserializer<'de> for LenientColumnValueDeserializer<'a> {
         _len: usize,
         _visitor: V,
     ) -> Result<V::Value, Self::Error> {
-        Err(ReplicationError::deserialize(
-            "tuples are not supported in RowData deserialization",
-        ))
+        Err(ReplicationError::deserialize(MSG_TUPLE))
     }
 
     fn deserialize_tuple_struct<V: Visitor<'de>>(
@@ -989,15 +1007,11 @@ impl<'de, 'a> de::Deserializer<'de> for LenientColumnValueDeserializer<'a> {
         _len: usize,
         _visitor: V,
     ) -> Result<V::Value, Self::Error> {
-        Err(ReplicationError::deserialize(
-            "tuple structs are not supported in RowData deserialization",
-        ))
+        Err(ReplicationError::deserialize(MSG_TUPLE_STRUCT))
     }
 
     fn deserialize_map<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value, Self::Error> {
-        Err(ReplicationError::deserialize(
-            "nested maps are not supported in RowData deserialization",
-        ))
+        Err(ReplicationError::deserialize(MSG_MAP))
     }
 
     fn deserialize_struct<V: Visitor<'de>>(
@@ -1006,9 +1020,7 @@ impl<'de, 'a> de::Deserializer<'de> for LenientColumnValueDeserializer<'a> {
         _fields: &'static [&'static str],
         _visitor: V,
     ) -> Result<V::Value, Self::Error> {
-        Err(ReplicationError::deserialize(
-            "nested structs are not supported in RowData deserialization",
-        ))
+        Err(ReplicationError::deserialize(MSG_STRUCT))
     }
 
     fn deserialize_enum<V: Visitor<'de>>(
@@ -1017,7 +1029,7 @@ impl<'de, 'a> de::Deserializer<'de> for LenientColumnValueDeserializer<'a> {
         _variants: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
-        // Enum has no sensible per-field default; propagate strict behavior.
+        // Enum has no sensible per-field default; both policies error.
         let s = match self.value {
             ColumnValue::Text(b) => core::str::from_utf8(b).map_err(|e| {
                 ReplicationError::deserialize(format!("invalid UTF-8 for enum: {e}"))
@@ -1025,13 +1037,13 @@ impl<'de, 'a> de::Deserializer<'de> for LenientColumnValueDeserializer<'a> {
             ColumnValue::Null => {
                 return Err(ReplicationError::deserialize(format!(
                     "cannot deserialize NULL as enum (field '{}')",
-                    self.field
+                    self.policy.field
                 )))
             }
             ColumnValue::Binary(_) => {
                 return Err(ReplicationError::deserialize(format!(
                     "cannot deserialize binary as enum (field '{}')",
-                    self.field
+                    self.policy.field
                 )))
             }
         };
@@ -3881,12 +3893,12 @@ mod tests {
 
         // Text (valid UTF-8) → visit_borrowed_str
         let cv = ColumnValue::text("hello");
-        let d = super::ColumnValueDeserializer { value: &cv };
+        let d = super::ColumnValueDeserializer::strict(&cv);
         assert_eq!(d.deserialize_any(Rec).unwrap(), Got::Str("hello".into()));
 
         // Text (invalid UTF-8) → visit_borrowed_bytes
         let cv = ColumnValue::text_bytes(Bytes::from_static(&[0xff, 0xfe]));
-        let d = super::ColumnValueDeserializer { value: &cv };
+        let d = super::ColumnValueDeserializer::strict(&cv);
         assert_eq!(
             d.deserialize_any(Rec).unwrap(),
             Got::Bytes(vec![0xff, 0xfe])
@@ -3894,13 +3906,203 @@ mod tests {
 
         // Binary → visit_borrowed_bytes
         let cv = ColumnValue::binary_bytes(Bytes::from_static(&[1, 2, 3]));
-        let d = super::ColumnValueDeserializer { value: &cv };
+        let d = super::ColumnValueDeserializer::strict(&cv);
         assert_eq!(d.deserialize_any(Rec).unwrap(), Got::Bytes(vec![1, 2, 3]));
 
         // Null → visit_none
         let cv = ColumnValue::Null;
-        let d = super::ColumnValueDeserializer { value: &cv };
+        let d = super::ColumnValueDeserializer::strict(&cv);
         assert_eq!(d.deserialize_any(Rec).unwrap(), Got::None);
+    }
+
+    #[test]
+    fn test_lenient_column_value_terminal_visits() {
+        // Directly exercise the lenient ColumnValueDeserializer's owned terminal
+        // visits: deserialize_any (str/bytes/none), deserialize_bytes (Text +
+        // NULL), deserialize_str, and deserialize_identifier.
+        use serde::de::{Deserializer as _, Visitor};
+        use std::fmt;
+
+        #[derive(Debug, PartialEq)]
+        enum Got {
+            Str(String),
+            Bytes(Vec<u8>),
+            None,
+        }
+        struct Rec;
+        impl<'de> Visitor<'de> for Rec {
+            type Value = Got;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(f, "anything")
+            }
+            fn visit_str<E>(self, v: &str) -> Result<Got, E> {
+                Ok(Got::Str(v.to_string()))
+            }
+            fn visit_bytes<E>(self, v: &[u8]) -> Result<Got, E> {
+                Ok(Got::Bytes(v.to_vec()))
+            }
+            fn visit_none<E>(self) -> Result<Got, E> {
+                Ok(Got::None)
+            }
+        }
+
+        let ctx = super::LenientCtx::new();
+
+        // deserialize_any: Text(valid) → visit_str
+        let cv = ColumnValue::text("hello");
+        let d = super::ColumnValueDeserializer {
+            value: &cv,
+            policy: super::Lenient {
+                ctx: &ctx,
+                field: "f",
+            },
+        };
+        assert_eq!(d.deserialize_any(Rec).unwrap(), Got::Str("hello".into()));
+
+        // deserialize_any: Text(invalid UTF-8) → visit_bytes
+        let cv = ColumnValue::text_bytes(Bytes::from_static(&[0xff, 0xfe]));
+        let d = super::ColumnValueDeserializer {
+            value: &cv,
+            policy: super::Lenient {
+                ctx: &ctx,
+                field: "f",
+            },
+        };
+        assert_eq!(
+            d.deserialize_any(Rec).unwrap(),
+            Got::Bytes(vec![0xff, 0xfe])
+        );
+
+        // deserialize_any: Binary → visit_bytes
+        let cv = ColumnValue::binary_bytes(Bytes::from_static(&[1, 2, 3]));
+        let d = super::ColumnValueDeserializer {
+            value: &cv,
+            policy: super::Lenient {
+                ctx: &ctx,
+                field: "f",
+            },
+        };
+        assert_eq!(d.deserialize_any(Rec).unwrap(), Got::Bytes(vec![1, 2, 3]));
+
+        // deserialize_any: Null → visit_none
+        let cv = ColumnValue::Null;
+        let d = super::ColumnValueDeserializer {
+            value: &cv,
+            policy: super::Lenient {
+                ctx: &ctx,
+                field: "f",
+            },
+        };
+        assert_eq!(d.deserialize_any(Rec).unwrap(), Got::None);
+
+        // deserialize_bytes: Text → visit_bytes
+        let cv = ColumnValue::text("abc");
+        let d = super::ColumnValueDeserializer {
+            value: &cv,
+            policy: super::Lenient {
+                ctx: &ctx,
+                field: "f",
+            },
+        };
+        assert_eq!(
+            d.deserialize_bytes(Rec).unwrap(),
+            Got::Bytes(b"abc".to_vec())
+        );
+
+        // deserialize_str + deserialize_identifier: Text → visit_str
+        let cv = ColumnValue::text("id");
+        let d = super::ColumnValueDeserializer {
+            value: &cv,
+            policy: super::Lenient {
+                ctx: &ctx,
+                field: "f",
+            },
+        };
+        assert_eq!(d.deserialize_str(Rec).unwrap(), Got::Str("id".into()));
+        let d = super::ColumnValueDeserializer {
+            value: &cv,
+            policy: super::Lenient {
+                ctx: &ctx,
+                field: "f",
+            },
+        };
+        assert_eq!(
+            d.deserialize_identifier(Rec).unwrap(),
+            Got::Str("id".into())
+        );
+
+        // deserialize_bytes: NULL → records an error and visits empty bytes
+        let cv = ColumnValue::Null;
+        let d = super::ColumnValueDeserializer {
+            value: &cv,
+            policy: super::Lenient {
+                ctx: &ctx,
+                field: "nb",
+            },
+        };
+        assert_eq!(d.deserialize_bytes(Rec).unwrap(), Got::Bytes(vec![]));
+        assert!(ctx.into_errors().iter().any(|e| e.message.contains("NULL")));
+    }
+
+    #[test]
+    fn test_try_lenient_all_integer_widths() {
+        // Exercises the lenient signed/unsigned/float coercion for every width.
+        #[derive(Debug, Deserialize)]
+        struct S {
+            a: i8,
+            b: i16,
+            c: i32,
+            d: i64,
+            e: u8,
+            f: u16,
+            g: u32,
+            h: u64,
+            i: f32,
+            j: f64,
+        }
+        let row = RowData::from_pairs(vec![
+            ("a", ColumnValue::text("-1")),
+            ("b", ColumnValue::text("-2")),
+            ("c", ColumnValue::text("-3")),
+            ("d", ColumnValue::text("-4")),
+            ("e", ColumnValue::text("5")),
+            ("f", ColumnValue::text("6")),
+            ("g", ColumnValue::text("7")),
+            ("h", ColumnValue::text("8")),
+            ("i", ColumnValue::text("1.5")),
+            ("j", ColumnValue::text("2.5")),
+        ]);
+        let r = row.try_deserialize_into::<S>().unwrap();
+        assert!(r.is_clean());
+        assert_eq!((r.value.b, r.value.f, r.value.h), (-2, 6, 8));
+        assert_eq!((r.value.i, r.value.j), (1.5, 2.5));
+    }
+
+    #[test]
+    fn test_try_lenient_null_integer_defaults_to_zero() {
+        // NULL through the lenient integer path records an error and substitutes 0.
+        #[derive(Debug, Deserialize)]
+        struct S {
+            n: u64,
+            m: i16,
+        }
+        let row = RowData::from_pairs(vec![("n", ColumnValue::Null), ("m", ColumnValue::Null)]);
+        let r = row.try_deserialize_into::<S>().unwrap();
+        assert_eq!(r.value.n, 0);
+        assert_eq!(r.value.m, 0);
+        assert_eq!(r.errors.len(), 2);
+        assert!(r.errors.iter().all(|e| e.message.contains("NULL")));
+    }
+
+    #[test]
+    fn test_try_lenient_tuple_errors() {
+        // A tuple-typed field hits the lenient deserialize_tuple structural reject.
+        #[derive(Debug, Deserialize)]
+        struct S {
+            t: (u32, u32),
+        }
+        let row = RowData::from_pairs(vec![("t", ColumnValue::text("1"))]);
+        assert!(row.try_deserialize_into::<S>().is_err());
     }
 
     #[test]

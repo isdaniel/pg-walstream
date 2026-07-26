@@ -690,8 +690,8 @@ impl PgReplicationConnection {
         output_plugin: Option<&str>,
         options: &ReplicationSlotOptions,
     ) -> Result<PgResult> {
-        crate::sql_builder::check_create_slot_version(self.server_version(), slot_type, options)?;
-        let sql = crate::sql_builder::build_create_slot_sql(
+        let sql = crate::sql_builder::prepare_create_slot(
+            self.server_version(),
             slot_name,
             slot_type,
             output_plugin,
@@ -708,9 +708,12 @@ impl PgReplicationConnection {
         two_phase: Option<bool>,
         failover: Option<bool>,
     ) -> Result<PgResult> {
-        crate::sql_builder::check_alter_slot_version(self.server_version(), two_phase)?;
-        let alter_slot_sql =
-            crate::sql_builder::build_alter_slot_sql(slot_name, two_phase, failover)?;
+        let alter_slot_sql = crate::sql_builder::prepare_alter_slot(
+            self.server_version(),
+            slot_name,
+            two_phase,
+            failover,
+        )?;
 
         debug!("Altering replication slot: {}", alter_slot_sql);
         let result = self.exec(&alter_slot_sql)?;
@@ -754,8 +757,7 @@ impl PgReplicationConnection {
         &mut self,
         slot_name: &str,
     ) -> Result<crate::types::ReplicationSlotInfo> {
-        crate::sql_builder::check_read_slot_version(self.server_version())?;
-        let sql = crate::sql_builder::build_read_slot_sql(slot_name)?;
+        let sql = crate::sql_builder::prepare_read_slot(self.server_version(), slot_name)?;
 
         debug!("Reading replication slot: {}", sql);
         let result = self.exec(&sql)?;
@@ -908,6 +910,21 @@ impl PgReplicationConnection {
     /// Push a message into the pending queue for testing
     fn push_pending_message_for_testing(&mut self, msg: Bytes) {
         self.pending_messages.push_back(msg);
+    }
+
+    /// Test-only: a null connection pre-seeded with COPY-data frames that
+    /// `get_copy_data_async` serves in order from `pending_messages` before any
+    /// FFI. `is_replication_conn` is set so the replication-mode gate passes.
+    ///
+    /// Mirrors the native backend's `null_for_testing_with_frames`, giving the
+    /// shared stream pump one frame-injection seam across both adapters. The
+    /// `conn` pointer is null, so no FFI path (feedback send, CopyDone) is safe
+    /// to drive here — those stay backend-specific and integration-tested.
+    pub(crate) fn null_for_testing_with_frames(frames: Vec<Bytes>) -> Self {
+        let mut conn = Self::null_for_testing();
+        conn.is_replication_conn = true;
+        conn.pending_messages.extend(frames);
+        conn
     }
 }
 

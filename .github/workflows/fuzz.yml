@@ -22,7 +22,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        # Pinned around the 2026-07-24 codegen ICE (rustc da86f4d07) that panics in rustc_codegen_ssa (operand.rs:291 "not immediate") while compiling tokio under -Zsanitizer=address. nightly-2026-07-23 ships the last-good compiler (rustc 6f72b5dd5, 2026-07-22). Un-pin once fixed upstream.
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-23
 
       - name: Install system dependencies
         run: |
