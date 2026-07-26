@@ -7035,7 +7035,6 @@ mod tests {
         assert_eq!(stream.state.last_received_lsn, 0xABCD);
     }
 
-    #[cfg(feature = "rustls-tls")]
     #[tokio::test]
     async fn next_raw_event_arms_transport_stop_at_or_past_lsn() {
         // Arming now lives in next_raw_event (decode_raw_frame is policy-free), so
@@ -7057,16 +7056,11 @@ mod tests {
         assert_eq!(stream2.stop_at_reached, Some(Lsn::new(0x2000)));
     }
 
-    // ---- next_raw_event / next_wal_frame (connection-driven) ----
-    //
-    // These drive the raw pump through a null connection pre-seeded with
-    // CopyData frames. Native-backend only: the frame-seeding seam reaches into
-    // the native driver's `pending` queue. The coverage job runs default
-    // features (rustls-tls), so these count toward the coverage gate.
+    // These drive the shared raw pump through a null connection pre-seeded with CopyData frames. Both backends now expose the frame-seeding seam (`null_for_testing_with_frames`), so these run on libpq and rustls-tls alike — the pump serves each frame from the pending queue before any FFI.
+    // The one exception below (`..._terminates_after_transport_stop`) drives CopyDone, a backend-specific FFI send that is unsafe on libpq's null-pointer conn, so it stays rustls-tls-only (integration-tested for libpq).
 
     /// Build a test stream whose connection serves `frames` in order from its
     /// `pending` queue, so the connection-driven raw path is unit-testable.
-    #[cfg(feature = "rustls-tls")]
     fn create_test_stream_with_frames(
         config: ReplicationStreamConfig,
         frames: Vec<bytes::Bytes>,
@@ -7076,7 +7070,6 @@ mod tests {
         stream
     }
 
-    #[cfg(feature = "rustls-tls")]
     #[tokio::test]
     async fn next_raw_event_returns_seeded_wal_payload() {
         let payload = build_begin_payload(0x2000, 7);
@@ -7092,7 +7085,6 @@ mod tests {
         assert_eq!(stream.state.last_received_lsn, 0x2000);
     }
 
-    #[cfg(feature = "rustls-tls")]
     #[tokio::test]
     async fn next_raw_event_returns_header_only_frame() {
         // A header-only 'w' frame (len == 25) is returned directly with an empty
@@ -7107,7 +7099,6 @@ mod tests {
         assert!(raw.data.is_empty());
     }
 
-    #[cfg(feature = "rustls-tls")]
     #[tokio::test]
     async fn next_raw_event_handles_keepalive_then_wal() {
         // A keepalive ('k', no reply requested) is consumed internally and
@@ -7127,7 +7118,6 @@ mod tests {
         assert_eq!(stream.state.last_received_lsn, 0x2000);
     }
 
-    #[cfg(feature = "rustls-tls")]
     #[tokio::test]
     async fn next_raw_event_skips_empty_and_unknown_frames() {
         // An empty CopyData payload is skipped; an unknown message type is logged
@@ -7148,7 +7138,6 @@ mod tests {
         assert_eq!(raw.wal_end, Lsn::new(0x2000));
     }
 
-    #[cfg(feature = "rustls-tls")]
     #[tokio::test]
     async fn next_raw_event_cancelled_returns_error() {
         // A pre-cancelled token short-circuits the pump before any read.
@@ -7160,7 +7149,6 @@ mod tests {
         assert!(matches!(err, ReplicationError::Cancelled(_)));
     }
 
-    #[cfg(feature = "rustls-tls")]
     #[tokio::test]
     async fn next_raw_event_runs_periodic_feedback_check() {
         // Pre-arm the throttle counter so the next pumped frame lands on the
@@ -7199,7 +7187,6 @@ mod tests {
         assert!(stream.copy_done_sent);
     }
 
-    #[cfg(feature = "rustls-tls")]
     #[tokio::test]
     async fn next_event_returns_decoded_event() {
         // Drive the TYPED path end-to-end through the seeded pump: a Begin frame
@@ -7216,7 +7203,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "rustls-tls")]
     #[tokio::test]
     async fn next_event_arms_commit_boundary_stop() {
         // A Commit whose end_lsn reaches stop_at_lsn is delivered AND arms the

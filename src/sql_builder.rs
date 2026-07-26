@@ -627,6 +627,37 @@ mod version_preflight {
         Ok(())
     }
 
+    // The `check_*` preflight and the pure `build_*` grammar are deliberately separate (the parser-only `no_std` build compiles the builders without the feature-gated preflight). These `prepare_*` helpers pair them so the "emit-this-SQL-implies-this-version" rule lives in one place instead of being re-paired by each connection backend. Backend-independent glue is shared, not duplicated across the libpq/rustls adapters.
+
+    /// Preflight + build `CREATE_REPLICATION_SLOT`.
+    pub(crate) fn prepare_create_slot(
+        server_version: i32,
+        slot_name: &str,
+        slot_type: SlotType,
+        output_plugin: Option<&str>,
+        options: &ReplicationSlotOptions,
+    ) -> Result<String> {
+        check_create_slot_version(server_version, slot_type, options)?;
+        build_create_slot_sql(slot_name, slot_type, output_plugin, options)
+    }
+
+    /// Preflight + build `ALTER_REPLICATION_SLOT`.
+    pub(crate) fn prepare_alter_slot(
+        server_version: i32,
+        slot_name: &str,
+        two_phase: Option<bool>,
+        failover: Option<bool>,
+    ) -> Result<String> {
+        check_alter_slot_version(server_version, two_phase)?;
+        build_alter_slot_sql(slot_name, two_phase, failover)
+    }
+
+    /// Preflight + build `READ_REPLICATION_SLOT`.
+    pub(crate) fn prepare_read_slot(server_version: i32, slot_name: &str) -> Result<String> {
+        check_read_slot_version(server_version)?;
+        build_read_slot_sql(slot_name)
+    }
+
     /// Preflight `BASE_BACKUP` options against the server version.
     ///
     /// Gates: `INCREMENTAL` requires PostgreSQL 17+; any option at all switches the
@@ -791,8 +822,7 @@ mod version_preflight {
 
 #[cfg(any(feature = "libpq", feature = "rustls-tls"))]
 pub(crate) use version_preflight::{
-    check_alter_slot_version, check_base_backup_version, check_create_slot_version,
-    check_read_slot_version,
+    check_base_backup_version, prepare_alter_slot, prepare_create_slot, prepare_read_slot,
 };
 
 /// Options for building a `CREATE SUBSCRIPTION` SQL statement.

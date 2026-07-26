@@ -815,8 +815,8 @@ impl NativeConnection {
         output_plugin: Option<&str>,
         options: &ReplicationSlotOptions,
     ) -> Result<NativePgResult> {
-        crate::sql_builder::check_create_slot_version(self.server_version(), slot_type, options)?;
-        let sql = crate::sql_builder::build_create_slot_sql(
+        let sql = crate::sql_builder::prepare_create_slot(
+            self.server_version(),
             slot_name,
             slot_type,
             output_plugin,
@@ -833,8 +833,12 @@ impl NativeConnection {
         two_phase: Option<bool>,
         failover: Option<bool>,
     ) -> Result<NativePgResult> {
-        crate::sql_builder::check_alter_slot_version(self.server_version(), two_phase)?;
-        let sql = crate::sql_builder::build_alter_slot_sql(slot_name, two_phase, failover)?;
+        let sql = crate::sql_builder::prepare_alter_slot(
+            self.server_version(),
+            slot_name,
+            two_phase,
+            failover,
+        )?;
 
         debug!("Altering replication slot: {}", sql);
         let result = self.exec(&sql)?;
@@ -865,8 +869,7 @@ impl NativeConnection {
         &mut self,
         slot_name: &str,
     ) -> Result<crate::types::ReplicationSlotInfo> {
-        crate::sql_builder::check_read_slot_version(self.server_version())?;
-        let sql = crate::sql_builder::build_read_slot_sql(slot_name)?;
+        let sql = crate::sql_builder::prepare_read_slot(self.server_version(), slot_name)?;
         debug!("Reading replication slot: {}", sql);
         let result = self.exec(&sql)?;
         if !result.is_ok() {
