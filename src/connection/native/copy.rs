@@ -16,11 +16,8 @@ use tokio_util::sync::CancellationToken;
 /// Prevents unbounded queue growth under extreme throughput.
 const MAX_DRAIN_BATCH: usize = 4096;
 
-/// Minimum header size: 1 (tag) + 4 (length) = 5 bytes.
-const HEADER_LEN: usize = 5;
-
-/// Maximum allowed message body length (128 MiB), matching wire.rs.
-const MAX_MESSAGE_LEN: usize = 128 * 1024 * 1024;
+// Header framing and body-length bounds are shared with the query path (single source in `wire`).
+use super::wire::{HEADER_LEN, MAX_MESSAGE_LEN};
 
 /// Headroom reserved on `read_buf` before each socket read.
 ///

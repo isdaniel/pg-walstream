@@ -47,9 +47,6 @@ pub enum ReplicationError {
     /// String conversion errors (from CString operations)
     StringConversion(std::ffi::NulError),
 
-    /// Generic replication errors
-    Generic(String),
-
     /// Deserialization errors (when converting RowData to user types)
     Deserialize(String),
 
@@ -79,7 +76,6 @@ impl core::fmt::Display for ReplicationError {
             Self::Io(err) => write!(f, "IO error: {err}"),
             #[cfg(feature = "std")]
             Self::StringConversion(err) => write!(f, "String conversion error: {err}"),
-            Self::Generic(msg) => write!(f, "Replication error: {msg}"),
             Self::Deserialize(msg) => write!(f, "Deserialization error: {msg}"),
             Self::Backend(msg) => write!(f, "Backend worker error: {msg}"),
             Self::StreamStopped(lsn) => {
@@ -143,11 +139,6 @@ impl ReplicationError {
     }
 
     /// Create a new replication connection error
-    pub fn replication_connection<S: Into<String>>(msg: S) -> Self {
-        ReplicationError::ReplicationConnection(msg.into())
-    }
-
-    /// Create a new connection error (alias for replication_connection)
     pub fn connection<S: Into<String>>(msg: S) -> Self {
         ReplicationError::ReplicationConnection(msg.into())
     }
@@ -177,11 +168,6 @@ impl ReplicationError {
         ReplicationError::Config(msg.into())
     }
 
-    /// Create a new generic error
-    pub fn generic<S: Into<String>>(msg: S) -> Self {
-        ReplicationError::Generic(msg.into())
-    }
-
     /// Create a new deserialization error
     pub fn deserialize<S: Into<String>>(msg: S) -> Self {
         ReplicationError::Deserialize(msg.into())
@@ -202,7 +188,9 @@ impl ReplicationError {
         ReplicationError::StreamStopped(lsn)
     }
 
-    /// Check if the error is transient (can be retried)
+    /// Check if the error is transient (can be retried).
+    ///
+    /// Note: this is an advisory classification for consumers (logging, metrics, custom retry policies). It is NOT the predicate the library itself uses to drive retries — the streaming layer retries anything that is not [`is_permanent`](Self::is_permanent), [`is_cancelled`](Self::is_cancelled), or the internal stream-stopped terminal. So the "grey zone" variants (e.g. `Protocol`, `Buffer`, `Config`, `Deserialize`) return `false` here yet are still retried by the stream.
     pub fn is_transient(&self) -> bool {
         #[cfg(feature = "std")]
         if matches!(self, ReplicationError::Io(_)) {
@@ -340,15 +328,6 @@ mod tests {
     }
 
     #[test]
-    fn test_generic_error() {
-        let err = ReplicationError::generic("something went wrong");
-        match err {
-            ReplicationError::Generic(msg) => assert_eq!(msg, "something went wrong"),
-            _ => panic!("Expected Generic error"),
-        }
-    }
-
-    #[test]
     fn test_connection_alias() {
         let err = ReplicationError::connection("test");
         match err {
@@ -367,14 +346,6 @@ mod tests {
     }
 
     #[test]
-    fn test_replication_connection_display() {
-        let err = ReplicationError::replication_connection("slot error");
-        assert_eq!(err.to_string(), "Replication connection error: slot error");
-        assert!(err.is_transient());
-        assert!(!err.is_permanent());
-    }
-
-    #[test]
     fn test_replication_slot_display() {
         let err = ReplicationError::replication_slot("slot not found");
         assert_eq!(err.to_string(), "Replication slot error: slot not found");
@@ -390,15 +361,6 @@ mod tests {
     fn test_config_error_display() {
         let err = ReplicationError::config("missing field");
         assert_eq!(err.to_string(), "Configuration error: missing field");
-        assert!(!err.is_transient());
-        assert!(!err.is_permanent());
-        assert!(!err.is_cancelled());
-    }
-
-    #[test]
-    fn test_generic_error_display() {
-        let err = ReplicationError::generic("unknown issue");
-        assert_eq!(err.to_string(), "Replication error: unknown issue");
         assert!(!err.is_transient());
         assert!(!err.is_permanent());
         assert!(!err.is_cancelled());

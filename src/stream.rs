@@ -1141,6 +1141,22 @@ impl LogicalReplicationStream {
         Ok(())
     }
 
+    /// Fetch the consumer's flushed/applied LSNs from the shared tracker, each capped
+    /// to `last_received_lsn` — a consumer must never report progress ahead of what we
+    /// have actually received. A zero from the tracker means "unset" and stays zero.
+    #[inline]
+    fn capped_feedback_lsns(&self) -> (u64, u64) {
+        let (f, a) = self.shared_lsn_feedback.get_feedback_lsn();
+        let cap = |v: u64| {
+            if v > 0 {
+                v.min(self.state.last_received_lsn)
+            } else {
+                0
+            }
+        };
+        (cap(f), cap(a))
+    }
+
     /// Check if feedback should be sent and send it
     ///
     /// Implements intelligent throttling: only sends feedback if the configured
@@ -1157,17 +1173,7 @@ impl LogicalReplicationStream {
         }
 
         // Get current LSN values that would be sent
-        let (f, a) = self.shared_lsn_feedback.get_feedback_lsn();
-        let flushed_lsn = if f > 0 {
-            f.min(self.state.last_received_lsn)
-        } else {
-            0
-        };
-        let applied_lsn = if a > 0 {
-            a.min(self.state.last_received_lsn)
-        } else {
-            0
-        };
+        let (flushed_lsn, applied_lsn) = self.capped_feedback_lsns();
 
         // Only send feedback if LSN values have changed
         if self.state.lsn_has_changed(flushed_lsn, applied_lsn) {
@@ -1195,19 +1201,9 @@ impl LogicalReplicationStream {
             return Ok(());
         }
 
-        // This allows the consumer to update these values after committing to destination
-        let (f, a) = self.shared_lsn_feedback.get_feedback_lsn();
-        // Cap LSN values to last_received_lsn (consumer shouldn't be ahead, but handle gracefully)
-        let flushed_lsn = if f > 0 {
-            f.min(self.state.last_received_lsn)
-        } else {
-            0
-        };
-        let applied_lsn = if a > 0 {
-            a.min(self.state.last_received_lsn)
-        } else {
-            0
-        };
+        // Fetch the consumer's committed progress (capped to what we've received).
+        // This allows the consumer to update these values after committing to destination.
+        let (flushed_lsn, applied_lsn) = self.capped_feedback_lsns();
 
         // Update local state from shared feedback for consistency
         if flushed_lsn > self.state.last_flushed_lsn {
@@ -3762,7 +3758,7 @@ mod tests {
     #[tokio::test]
     async fn test_timeout_or_error_inner_error() {
         let result = timeout_or_error(Duration::from_secs(5), async {
-            Err::<i32, _>(ReplicationError::generic("inner error".to_string()))
+            Err::<i32, _>(ReplicationError::protocol("inner error".to_string()))
         })
         .await;
         assert!(result.is_err());

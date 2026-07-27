@@ -9,7 +9,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::error::ReplicationError;
 
 /// Minimum message size: 1 (tag) + 4 (length) = 5 bytes header.
-const HEADER_LEN: usize = 5;
+pub(crate) const HEADER_LEN: usize = 5;
 
 /// Maximum allowed message body length (128 MiB).
 ///
@@ -17,7 +17,7 @@ const HEADER_LEN: usize = 5;
 /// `body_len` close to `i32::MAX` (2 GiB). PostgreSQL's own max message size
 /// is 1 GiB, but 128 MiB is more than sufficient for any replication message
 /// and provides a safety margin for large TOAST values.
-const MAX_MESSAGE_LEN: usize = 128 * 1024 * 1024;
+pub(crate) const MAX_MESSAGE_LEN: usize = 128 * 1024 * 1024;
 
 /// Read a single complete PostgreSQL backend message from the transport.
 ///

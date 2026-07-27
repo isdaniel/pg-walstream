@@ -12,8 +12,8 @@
 //! we need a thread-safe way to share the committed LSN from consumer back to producer
 //! for accurate feedback to PostgreSQL.
 
-use crate::prelude::*;
-use crate::types::{format_lsn, CachePadded, XLogRecPtr};
+use crate::types::{CachePadded, XLogRecPtr};
+use crate::{format_lsn, prelude::*};
 use core::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, info};
 
@@ -228,7 +228,7 @@ impl SharedLsnFeedback {
         (flushed, applied)
     }
 
-    /// Log current LSN state (for debugging)
+    /// Log current LSN state
     pub fn log_state(&self, prefix: &str) {
         let flushed = self.get_flushed_lsn();
         let applied = self.get_applied_lsn();
@@ -244,15 +244,6 @@ impl SharedLsnFeedback {
 impl Default for SharedLsnFeedback {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl Clone for SharedLsnFeedback {
-    fn clone(&self) -> Self {
-        Self {
-            flushed_lsn: CachePadded::new(AtomicU64::new(self.flushed_lsn.load(Ordering::Acquire))),
-            applied_lsn: CachePadded::new(AtomicU64::new(self.applied_lsn.load(Ordering::Acquire))),
-        }
     }
 }
 
@@ -316,22 +307,6 @@ mod tests {
         let (flushed, applied) = feedback.get_feedback_lsn();
         assert_eq!(flushed, 100);
         assert_eq!(applied, 50);
-    }
-
-    #[test]
-    fn test_clone() {
-        let feedback = SharedLsnFeedback::new();
-        feedback.update_flushed_lsn(100);
-        feedback.update_applied_lsn(50);
-
-        let cloned = feedback.clone();
-        assert_eq!(cloned.get_flushed_lsn(), 100);
-        assert_eq!(cloned.get_applied_lsn(), 50);
-
-        // Modifying the clone should not affect the original
-        cloned.update_applied_lsn(200);
-        assert_eq!(feedback.get_applied_lsn(), 50);
-        assert_eq!(cloned.get_applied_lsn(), 200);
     }
 
     #[test]
@@ -429,52 +404,6 @@ mod tests {
         let (f, a) = feedback.get_feedback_lsn();
         assert_eq!(f, 0);
         assert_eq!(a, 0);
-    }
-
-    #[test]
-    fn test_log_state() {
-        // Just ensure log_state doesn't panic
-        let feedback = SharedLsnFeedback::new();
-        feedback.update_flushed_lsn(1000);
-        feedback.update_applied_lsn(500);
-        feedback.log_state("test_prefix");
-    }
-
-    #[test]
-    fn test_clone_independence() {
-        let feedback = SharedLsnFeedback::new();
-        feedback.update_flushed_lsn(500);
-        feedback.update_applied_lsn(300);
-
-        let cloned = feedback.clone();
-
-        // Verify cloned has same initial values
-        assert_eq!(cloned.get_flushed_lsn(), 500);
-        assert_eq!(cloned.get_applied_lsn(), 300);
-
-        // Modify original
-        feedback.update_flushed_lsn(1000);
-        feedback.update_applied_lsn(800);
-
-        // Clone should not be affected
-        assert_eq!(cloned.get_flushed_lsn(), 500);
-        assert_eq!(cloned.get_applied_lsn(), 300);
-
-        // Modify clone
-        cloned.update_flushed_lsn(2000);
-        cloned.update_applied_lsn(1500);
-
-        // Original should not be affected
-        assert_eq!(feedback.get_flushed_lsn(), 1000);
-        assert_eq!(feedback.get_applied_lsn(), 800);
-    }
-
-    #[test]
-    fn test_log_state_with_nonzero_lsns() {
-        let feedback = SharedLsnFeedback::new();
-        feedback.update_flushed_lsn(0x16B374D848);
-        feedback.update_applied_lsn(0x16B374D800);
-        feedback.log_state("replication");
     }
 
     #[test]

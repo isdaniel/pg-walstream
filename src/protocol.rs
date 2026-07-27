@@ -2009,6 +2009,37 @@ pub fn build_hot_standby_feedback_message(
     Ok(buffer.freeze())
 }
 
+/// Build a Standby Status Update ('r') message body — the client→server feedback reply
+/// sent inside a `CopyData` frame during logical replication.
+///
+/// The message format is:
+/// - Byte1('r'): Message type identifier
+/// - Int64: received LSN (last WAL byte written)
+/// - Int64: flushed LSN
+/// - Int64: applied LSN (last WAL byte replayed)
+/// - Int64: client timestamp
+/// - Byte1: 1 to request an immediate server reply, else 0
+#[cfg(feature = "std")]
+pub(crate) fn build_standby_status_update_message(
+    received_lsn: XLogRecPtr,
+    flushed_lsn: XLogRecPtr,
+    applied_lsn: XLogRecPtr,
+    reply_requested: bool,
+) -> Bytes {
+    let timestamp = system_time_to_postgres_timestamp(SystemTime::now());
+    // `b'r'` here is the client→server COPY feedback tag; it is distinct from the
+    // identically-valued server→client `message_types::ROLLBACK_PREPARED` tag.
+    let mut buffer = BufferWriter::with_capacity(34); // 1 + 8*4 + 1
+    buffer.write_u8(b'r');
+    buffer.write_u64(received_lsn);
+    buffer.write_u64(flushed_lsn);
+    buffer.write_u64(applied_lsn);
+    buffer.write_i64(timestamp);
+    buffer.write_u8(if reply_requested { 1 } else { 0 });
+
+    buffer.freeze()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2759,6 +2790,25 @@ mod tests {
         assert_eq!(catalog_xmin, 200);
         let catalog_xmin_epoch = reader.read_u32().unwrap();
         assert_eq!(catalog_xmin_epoch, 2);
+    }
+
+    #[test]
+    fn test_build_standby_status_update_message() {
+        let message =
+            build_standby_status_update_message(0x1122_3344_5566_7788, 0xAABB_CCDD, 0x99, true);
+        assert_eq!(message.len(), 34); // 1 tag + 8*4 LSNs/ts + 1 reply flag
+
+        let mut reader = BufferReader::new(&message);
+        assert_eq!(reader.read_u8().unwrap(), b'r');
+        assert_eq!(reader.read_u64().unwrap(), 0x1122_3344_5566_7788); // received
+        assert_eq!(reader.read_u64().unwrap(), 0xAABB_CCDD); // flushed
+        assert_eq!(reader.read_u64().unwrap(), 0x99); // applied
+        let _timestamp = reader.read_i64().unwrap(); // wall-clock, just verify readable
+        assert_eq!(reader.read_u8().unwrap(), 1); // reply_requested = true
+
+        // reply_requested = false → trailing flag byte is 0
+        let no_reply = build_standby_status_update_message(1, 2, 3, false);
+        assert_eq!(no_reply[no_reply.len() - 1], 0);
     }
 
     #[test]

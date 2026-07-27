@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 // PostgreSQL constants
 /// Seconds from Unix epoch (1970-01-01) to PostgreSQL epoch (2000-01-01)
-pub const PG_EPOCH_OFFSET_SECS: i64 = 946_684_800;
+pub(crate) const PG_EPOCH_OFFSET_SECS: i64 = 946_684_800;
 /// Invalid/zero LSN pointer
 pub const INVALID_XLOG_REC_PTR: u64 = 0;
 
@@ -136,19 +136,26 @@ pub fn system_time_to_postgres_timestamp(time: SystemTime) -> TimestampTz {
 }
 
 /// Convert PostgreSQL timestamp (microseconds since 2000-01-01) into `chrono::DateTime<Utc>`.
+///
+/// Never panics. This runs on the live BEGIN/COMMIT/PREPARE parse path, so a corrupt or
+/// adversarial timestamp must not abort the replication task: an overflowing or
+/// out-of-range value is clamped to `DateTime::<Utc>::MIN_UTC` / `MAX_UTC` instead.
 pub fn postgres_timestamp_to_chrono(ts: i64) -> chrono::DateTime<chrono::Utc> {
-    use chrono::{TimeZone, Utc};
+    use chrono::{DateTime, TimeZone, Utc};
 
-    // Convert back to Unix epoch microseconds
-    let unix_micros = ts + PG_EPOCH_OFFSET_SECS * 1_000_000;
+    // Rebase onto the Unix epoch, saturating rather than overflowing on extreme inputs.
+    let unix_micros = ts.saturating_add(PG_EPOCH_OFFSET_SECS * 1_000_000);
 
-    let secs = unix_micros / 1_000_000;
-    let micros = (unix_micros % 1_000_000) as u32;
+    // Euclidean div/rem keeps the subsecond part in [0, 1_000_000) for negative values too
+    // (plain `%` yields a negative remainder that wraps when cast to u32).
+    let secs = unix_micros.div_euclid(1_000_000);
+    let subsec_nanos = (unix_micros.rem_euclid(1_000_000) as u32) * 1000;
 
-    // Construct chrono DateTime<Utc>
-    Utc.timestamp_opt(secs, micros * 1000)
-        .single()
-        .expect("Invalid timestamp conversion")
+    match Utc.timestamp_opt(secs, subsec_nanos).single() {
+        Some(dt) => dt,
+        None if secs < 0 => DateTime::<Utc>::MIN_UTC,
+        None => DateTime::<Utc>::MAX_UTC,
+    }
 }
 
 /// Parse LSN from string format (e.g., "0/12345678")
@@ -1295,6 +1302,10 @@ impl ChangeEvent {
     ///
     /// This is significantly faster than JSON for both encoding and decoding,
     /// and produces a smaller payload.
+    #[deprecated(
+        since = "0.9.0",
+        note = "`ChangeEvent` derives `serde::Serialize`; serialize with a binary serde codec (e.g. bincode or postcard) instead. This bespoke codec duplicates serde and  is scheduled for removal in a future release. Note: it is NOT the pgoutput wire  format — for that, use `pg_walstream::encode_message`."
+    )]
     pub fn encode(&self, buf: &mut BytesMut) {
         // LSN
         buf.extend_from_slice(&self.lsn.0.to_be_bytes());
@@ -1586,6 +1597,10 @@ impl ChangeEvent {
     }
 
     /// Decode a `ChangeEvent` from binary data produced by [`encode`](Self::encode).
+    #[deprecated(
+        since = "0.9.0",
+        note = "`ChangeEvent` derives `serde::Deserialize`; deserialize with a binary serde codec (e.g. bincode or postcard) instead. This bespoke codec duplicates serde and  is scheduled for removal in a future release. Note: it does NOT parse the pgoutput wire format — WAL parsing lives in `pg_walstream::protocol`."
+    )]
     pub fn decode(data: &[u8]) -> Result<Self> {
         let mut reader = BufferReader::new(data);
 
@@ -1951,6 +1966,7 @@ fn micros_to_chrono(micros: i64) -> Result<chrono::DateTime<chrono::Utc>> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)] // round-trip tests intentionally exercise the deprecated ChangeEvent::encode/decode
     use super::*;
     use bytes::Bytes;
     use chrono::{TimeZone, Utc};
@@ -2016,6 +2032,22 @@ mod tests {
         // Allow slight difference due to truncation to microseconds
         let diff = (dt.timestamp_micros() - chrono_now.timestamp_micros()).abs();
         assert!(diff < 2, "Round trip difference too large: {diff}");
+    }
+
+    #[test]
+    fn test_postgres_timestamp_extremes_do_not_panic() {
+        // Runs on the live parse path — corrupt/adversarial values must clamp, not panic.
+        assert_eq!(
+            postgres_timestamp_to_chrono(i64::MAX),
+            chrono::DateTime::<Utc>::MAX_UTC
+        );
+        assert_eq!(
+            postgres_timestamp_to_chrono(i64::MIN),
+            chrono::DateTime::<Utc>::MIN_UTC
+        );
+        // A negative pre-epoch value keeps a well-formed (non-wrapped) subsecond part.
+        let dt = postgres_timestamp_to_chrono(-1);
+        assert!(dt.timestamp_subsec_micros() < 1_000_000);
     }
 
     #[test]
