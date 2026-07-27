@@ -62,13 +62,6 @@ impl BufferReader {
         Self { data }
     }
 
-    #[inline]
-    pub fn from_vec(data: Vec<u8>) -> Self {
-        Self {
-            data: Bytes::from(data),
-        }
-    }
-
     /// Get remaining bytes in the buffer
     #[inline]
     pub fn remaining(&self) -> usize {
@@ -251,19 +244,9 @@ impl BufferWriter {
         self.data.len()
     }
 
-    /// Get bytes written so far
-    pub fn bytes_written(&self) -> usize {
-        self.data.len()
-    }
-
     /// Get the data as bytes
     pub fn freeze(self) -> Bytes {
         self.data.freeze()
-    }
-
-    /// Get the data as a `Vec<u8>`
-    pub fn into_vec(self) -> Vec<u8> {
-        self.data.to_vec()
     }
 
     /// Write a single byte.
@@ -335,21 +318,10 @@ impl BufferWriter {
         self.data.put_slice(s.as_bytes());
     }
 
-    /// Reserve capacity for at least additional bytes
-    pub fn reserve(&mut self, additional: usize) {
-        self.data.reserve(additional);
-    }
-
     /// Clear the buffer, resetting length to 0
     pub fn clear(&mut self) {
         self.data.clear();
     }
-
-    /// Get remaining capacity
-    pub fn capacity(&self) -> usize {
-        self.data.capacity()
-    }
-
     /// Get a reference to the internal data  
     pub fn as_bytes(&self) -> &[u8] {
         &self.data
@@ -404,7 +376,7 @@ mod tests {
         writer.write_u16(0x0203);
         writer.write_u32(0x04050607);
 
-        assert_eq!(writer.bytes_written(), 7);
+        assert_eq!(writer.position(), 7);
 
         let data = writer.freeze();
         assert_eq!(&data[..], &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]);
@@ -589,15 +561,6 @@ mod tests {
     }
 
     #[test]
-    fn test_buffer_reader_from_vec() {
-        let data = vec![0x01, 0x02, 0x03];
-        let mut reader = BufferReader::from_vec(data);
-
-        assert_eq!(reader.read_u8().unwrap(), 0x01);
-        assert_eq!(reader.remaining(), 2);
-    }
-
-    #[test]
     fn test_buffer_writer_signed_integers() {
         let mut writer = BufferWriter::new();
 
@@ -618,7 +581,7 @@ mod tests {
     fn test_buffer_writer_with_capacity() {
         let mut writer = BufferWriter::with_capacity(100);
         writer.write_u64(0x0102030405060708);
-        assert_eq!(writer.bytes_written(), 8);
+        assert_eq!(writer.position(), 8);
     }
 
     #[test]
@@ -657,14 +620,6 @@ mod tests {
         let mut reader = BufferReader::from_bytes(bytes);
         assert_eq!(reader.read_u8().unwrap(), 0x01);
         assert_eq!(reader.remaining(), 2);
-    }
-
-    #[test]
-    fn test_buffer_reader_from_vec_full() {
-        let data = vec![0xAA, 0xBB, 0xCC, 0xDD];
-        let mut reader = BufferReader::from_vec(data);
-        assert_eq!(reader.read_u32().unwrap(), 0xAABBCCDD);
-        assert_eq!(reader.remaining(), 0);
     }
 
     #[test]
@@ -718,30 +673,15 @@ mod tests {
         let data = writer.freeze();
         assert_eq!(&data[..], b"hello");
     }
-
-    #[test]
-    fn test_buffer_writer_reserve() {
-        let mut writer = BufferWriter::new();
-        writer.reserve(1024);
-        assert!(writer.capacity() >= 1024);
-    }
-
     #[test]
     fn test_buffer_writer_clear() {
         let mut writer = BufferWriter::new();
         writer.write_u8(0x01);
         writer.write_u8(0x02);
-        assert_eq!(writer.bytes_written(), 2);
+        assert_eq!(writer.position(), 2);
 
         writer.clear();
-        assert_eq!(writer.bytes_written(), 0);
         assert_eq!(writer.position(), 0);
-    }
-
-    #[test]
-    fn test_buffer_writer_capacity() {
-        let writer = BufferWriter::with_capacity(256);
-        assert!(writer.capacity() >= 256);
     }
 
     #[test]
@@ -764,16 +704,7 @@ mod tests {
     fn test_buffer_writer_default() {
         let mut writer = BufferWriter::default();
         writer.write_u8(0xFF);
-        assert_eq!(writer.bytes_written(), 1);
-    }
-
-    #[test]
-    fn test_buffer_writer_into_vec() {
-        let mut writer = BufferWriter::new();
-        writer.write_u8(0x01);
-        writer.write_u16(0x0203);
-        let vec = writer.into_vec();
-        assert_eq!(vec, vec![0x01, 0x02, 0x03]);
+        assert_eq!(writer.position(), 1);
     }
 
     #[test]

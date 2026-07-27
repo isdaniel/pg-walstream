@@ -15,6 +15,6 @@ categories = ["database"]
 proc-macro = true
 
 [dependencies]
-syn = { version = "2.0.118", features = ["full"] }
+syn = { version = "2.0.118" }
 quote = "1.0.46"
 proc-macro2 = "1.0.106"

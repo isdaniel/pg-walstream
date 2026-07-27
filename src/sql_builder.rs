@@ -687,6 +687,15 @@ mod version_preflight {
         Ok(())
     }
 
+    /// Preflight + build `BASE_BACKUP`.
+    pub(crate) fn prepare_base_backup(
+        server_version: i32,
+        options: &BaseBackupOptions,
+    ) -> Result<String> {
+        check_base_backup_version(server_version, options)?;
+        build_base_backup_sql(options)
+    }
+
     /// Whether any `BASE_BACKUP` option is set — i.e. the emitted SQL would use the parenthesized option list rather than a bare `BASE_BACKUP`.
     fn base_backup_has_options(o: &BaseBackupOptions) -> bool {
         o.label.is_some()
@@ -812,6 +821,21 @@ mod version_preflight {
         }
 
         #[test]
+        fn prepare_base_backup_builds_and_gates() {
+            // Unknown version (0) passes preflight and builds a bare BASE_BACKUP.
+            let sql = prepare_base_backup(0, &BaseBackupOptions::default()).unwrap();
+            assert!(sql.starts_with("BASE_BACKUP"), "{sql}");
+
+            // Preflight is wired in: INCREMENTAL is rejected below PG17, accepted at PG17+.
+            let inc = BaseBackupOptions {
+                incremental: true,
+                ..Default::default()
+            };
+            assert!(prepare_base_backup(160000, &inc).is_err());
+            assert!(prepare_base_backup(170000, &inc).is_ok());
+        }
+
+        #[test]
         fn format_server_version_renders_major_minor() {
             assert_eq!(format_server_version(140023), "14.23");
             assert_eq!(format_server_version(150000), "15.0");
@@ -822,7 +846,7 @@ mod version_preflight {
 
 #[cfg(any(feature = "libpq", feature = "rustls-tls"))]
 pub(crate) use version_preflight::{
-    check_base_backup_version, prepare_alter_slot, prepare_create_slot, prepare_read_slot,
+    prepare_alter_slot, prepare_base_backup, prepare_create_slot, prepare_read_slot,
 };
 
 /// Options for building a `CREATE SUBSCRIPTION` SQL statement.
@@ -959,7 +983,7 @@ pub fn build_drop_subscription_sql(name: &str) -> Result<String> {
 /// Format a list of options as ` (opt1, opt2, ...)`.
 /// Returns an empty string if the list is empty.
 #[inline]
-pub fn build_sql_options(options: &[String]) -> String {
+pub(crate) fn build_sql_options(options: &[String]) -> String {
     if options.is_empty() {
         String::new()
     } else {

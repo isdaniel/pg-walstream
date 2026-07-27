@@ -29,20 +29,15 @@
 //!
 //! This ensures that no thread is blocked waiting for network I/O, maximizing
 //! throughput and enabling efficient concurrent processing of multiple replication streams.
-use crate::buffer::BufferWriter;
 use crate::error::{ReplicationError, Result};
 use crate::protocol::build_hot_standby_feedback_message;
-use crate::types::{
-    format_lsn, system_time_to_postgres_timestamp, BaseBackupOptions, ReplicationSlotOptions,
-    SlotType, XLogRecPtr,
-};
+use crate::types::{format_lsn, BaseBackupOptions, ReplicationSlotOptions, SlotType, XLogRecPtr};
 use bytes::{BufMut, Bytes, BytesMut};
 use pq_sys::*;
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 use std::os::unix::io::RawFd;
-use std::time::SystemTime;
 use std::{ptr, slice};
 use tokio::io::unix::AsyncFd;
 use tokio_util::sync::CancellationToken;
@@ -343,19 +338,12 @@ impl PgReplicationConnection {
     ) -> Result<()> {
         self.ensure_replication_mode()?;
 
-        let timestamp = system_time_to_postgres_timestamp(SystemTime::now());
-
-        // Build the standby status update message using BufferWriter
-        let mut buffer = BufferWriter::with_capacity(34); // 1 + 8 + 8 + 8 + 8 + 1
-
-        buffer.write_u8(b'r'); // Message type
-        buffer.write_u64(received_lsn);
-        buffer.write_u64(flushed_lsn);
-        buffer.write_u64(applied_lsn);
-        buffer.write_i64(timestamp);
-        buffer.write_u8(if reply_requested { 1 } else { 0 });
-
-        let reply_data = buffer.freeze();
+        let reply_data = crate::protocol::build_standby_status_update_message(
+            received_lsn,
+            flushed_lsn,
+            applied_lsn,
+            reply_requested,
+        );
         self.put_copy_data_and_flush(&reply_data).await?;
 
         info!(
@@ -832,8 +820,8 @@ impl PgReplicationConnection {
 
     /// Start a base backup with options
     pub fn base_backup(&mut self, options: &BaseBackupOptions) -> Result<PgResult> {
-        crate::sql_builder::check_base_backup_version(self.server_version(), options)?;
-        let base_backup_sql = crate::sql_builder::build_base_backup_sql(options)?;
+        let base_backup_sql =
+            crate::sql_builder::prepare_base_backup(self.server_version(), options)?;
 
         debug!("Starting base backup: {}", base_backup_sql);
         let result = self.exec(&base_backup_sql)?;

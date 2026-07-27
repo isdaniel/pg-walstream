@@ -69,16 +69,13 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let config = ReplicationStreamConfig::new(
-//!         "my_slot".to_string(),
-//!         "my_publication".to_string(),
-//!         2,
-//!         StreamingMode::On,
-//!         Duration::from_secs(10),
-//!         Duration::from_secs(30),
-//!         Duration::from_secs(60),
-//!         RetryConfig::default(),
-//!     );
+//!     let config = ReplicationStreamConfig::builder("my_slot", "my_publication")
+//!         .with_protocol_version(2)
+//!         .with_streaming_mode(StreamingMode::On)
+//!         .with_feedback_interval(Duration::from_secs(10))
+//!         .with_connection_timeout(Duration::from_secs(30))
+//!         .with_health_check_interval(Duration::from_secs(60))
+//!         .with_retry_config(RetryConfig::default());
 //!
 //!     let mut stream = LogicalReplicationStream::new(
 //!         "postgresql://postgres:password@localhost:5432/mydb?replication=database",
@@ -210,7 +207,6 @@ pub use types::{
     Xid,
     // Constants
     INVALID_XLOG_REC_PTR,
-    PG_EPOCH_OFFSET_SECS,
 };
 
 // `system_time_to_postgres_timestamp` needs a `SystemTime`, so it is std-only.
@@ -224,7 +220,7 @@ pub use protocol::{
     RelationInfo, ReplicationState, StreamingReplicationMessage, TupleData,
 };
 
-// pgoutput encoder. `encode_message` emits pgoutput, unlike `ChangeEvent::encode`.
+// pgoutput encoder: `encode_message` emits pgoutput wire bytes.
 pub use pgoutput_encode::{
     encode_message, encode_message_to_bytes, encode_streaming_message,
     encode_streaming_message_to_bytes,

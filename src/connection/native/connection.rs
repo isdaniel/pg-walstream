@@ -8,7 +8,6 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
-use std::time::SystemTime;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
@@ -18,13 +17,9 @@ use super::startup::{self, Transport};
 use super::{copy, query, wire};
 use super::{NativePgResult, NativeResultStatus};
 
-use crate::buffer::BufferWriter;
 use crate::error::{ReplicationError, Result};
 use crate::protocol::build_hot_standby_feedback_message;
-use crate::types::{
-    format_lsn, system_time_to_postgres_timestamp, BaseBackupOptions, ReplicationSlotOptions,
-    SlotType, XLogRecPtr,
-};
+use crate::types::{format_lsn, BaseBackupOptions, ReplicationSlotOptions, SlotType, XLogRecPtr};
 
 // A `NativeConnection` is a handle. A dedicated worker thread owns the socket on
 // its own current-thread runtime, so all I/O stays on one reactor and the
@@ -684,17 +679,13 @@ impl NativeConnection {
     ) -> Result<()> {
         self.ensure_replication_mode()?;
 
-        let timestamp = system_time_to_postgres_timestamp(SystemTime::now());
-
-        let mut buffer = BufferWriter::with_capacity(34);
-        buffer.write_u8(b'r');
-        buffer.write_u64(received_lsn);
-        buffer.write_u64(flushed_lsn);
-        buffer.write_u64(applied_lsn);
-        buffer.write_i64(timestamp);
-        buffer.write_u8(if reply_requested { 1 } else { 0 });
-
-        self.put_copy_data(buffer.freeze()).await?;
+        let reply_data = crate::protocol::build_standby_status_update_message(
+            received_lsn,
+            flushed_lsn,
+            applied_lsn,
+            reply_requested,
+        );
+        self.put_copy_data(reply_data).await?;
 
         info!(
             "Sent standby status update: received={}, flushed={}, applied={}, reply_requested={}",
@@ -930,8 +921,7 @@ impl NativeConnection {
 
     /// Start a base backup with options.
     pub fn base_backup(&mut self, options: &BaseBackupOptions) -> Result<NativePgResult> {
-        crate::sql_builder::check_base_backup_version(self.server_version(), options)?;
-        let sql = crate::sql_builder::build_base_backup_sql(options)?;
+        let sql = crate::sql_builder::prepare_base_backup(self.server_version(), options)?;
 
         debug!("Starting base backup: {}", sql);
         let result = self.exec(&sql)?;

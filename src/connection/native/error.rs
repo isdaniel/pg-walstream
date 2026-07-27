@@ -71,27 +71,6 @@ pub fn parse_error_fields(payload: &[u8]) -> PgErrorFields {
 mod tests {
     use super::*;
 
-    fn error_response_to_replication_error(msg: &[u8]) -> crate::error::ReplicationError {
-        let fields = parse_error_fields(&msg[5..]); // skip tag + length
-        let error_lower = fields.message.to_lowercase();
-
-        if error_lower.contains("authentication")
-            || error_lower.contains("password")
-            || fields.code.starts_with("28")
-        {
-            crate::error::ReplicationError::authentication(format!(
-                "PostgreSQL authentication failed: {}",
-                fields
-            ))
-        } else if fields.severity == "FATAL" || fields.severity == "PANIC" {
-            crate::error::ReplicationError::permanent_connection(format!(
-                "PostgreSQL fatal error: {}",
-                fields
-            ))
-        } else {
-            crate::error::ReplicationError::protocol(format!("PostgreSQL error: {}", fields))
-        }
-    }
     #[test]
     fn test_parse_error_fields() {
         let mut payload = Vec::new();
@@ -161,8 +140,9 @@ mod tests {
     }
 
     #[test]
-    fn test_error_response_to_replication_error_fatal() {
-        // Build a raw 'E' message with FATAL severity
+    fn test_parse_error_fields_from_framed_message() {
+        // A full ErrorResponse frame: tag 'E' + i32 length + field payload.
+        // Verifies fields parse out of the framed form (payload starts at msg[5..]).
         let mut payload = Vec::new();
         payload.push(b'S');
         payload.extend_from_slice(b"FATAL\0");
@@ -177,38 +157,10 @@ mod tests {
         msg.extend_from_slice(&len.to_be_bytes());
         msg.extend_from_slice(&payload);
 
-        let err = error_response_to_replication_error(&msg);
-        // Should be a permanent connection error for FATAL
-        let err_str = err.to_string();
-        assert!(
-            err_str.contains("FATAL") || err_str.contains("terminating"),
-            "Got: {err_str}"
-        );
-    }
-
-    #[test]
-    fn test_error_response_to_replication_error_auth() {
-        // Build a raw 'E' message with auth error (SQLSTATE 28000)
-        let mut payload = Vec::new();
-        payload.push(b'S');
-        payload.extend_from_slice(b"FATAL\0");
-        payload.push(b'C');
-        payload.extend_from_slice(b"28000\0");
-        payload.push(b'M');
-        payload.extend_from_slice(b"password authentication failed\0");
-        payload.push(0);
-
-        let mut msg = vec![b'E'];
-        let len = (4 + payload.len()) as i32;
-        msg.extend_from_slice(&len.to_be_bytes());
-        msg.extend_from_slice(&payload);
-
-        let err = error_response_to_replication_error(&msg);
-        let err_str = err.to_string();
-        assert!(
-            err_str.contains("authentication") || err_str.contains("password"),
-            "Got: {err_str}"
-        );
+        let fields = parse_error_fields(&msg[5..]);
+        assert_eq!(fields.severity, "FATAL");
+        assert_eq!(fields.code, "57P01");
+        assert!(fields.message.contains("terminating"));
     }
 
     #[test]
