@@ -1951,7 +1951,8 @@ mod tests {
 
     #[test]
     fn test_deserialize_data_truncate_errors() {
-        let event = ChangeEvent::truncate(vec![Arc::from("public.users")], Lsn::new(100));
+        let event =
+            ChangeEvent::truncate(vec![Arc::from("public.users")], false, false, Lsn::new(100));
         let result: crate::error::Result<UserModel> = event.deserialize_data();
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -3462,7 +3463,7 @@ mod tests {
         let commit = ChangeEvent::commit(ts, Lsn::new(5), Lsn::new(5), Lsn::new(6));
         assert_eq!(commit.event_type_str(), "commit");
 
-        let truncate = ChangeEvent::truncate(vec![Arc::from("t")], Lsn::new(7));
+        let truncate = ChangeEvent::truncate(vec![Arc::from("t")], false, false, Lsn::new(7));
         assert_eq!(truncate.event_type_str(), "truncate");
     }
 

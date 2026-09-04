@@ -400,7 +400,12 @@ pub struct BaseBackupOptions {
     /// Manifest checksum algorithm: 'NONE', 'CRC32C', 'SHA224', 'SHA256', 'SHA384', 'SHA512'
     pub manifest_checksums: Option<String>,
 
-    /// Request an incremental backup
+    /// Request an incremental backup (PostgreSQL 17+).
+    ///
+    /// Only legal after `upload_manifest()` has been called on the **same**
+    /// connection with the `backup_manifest` of the prior full backup; the
+    /// server otherwise answers `must UPLOAD_MANIFEST before performing an
+    /// incremental BASE_BACKUP`. The server must also have `summarize_wal = on`.
     pub incremental: bool,
 }
 
@@ -508,7 +513,18 @@ pub enum EventType {
         replica_identity: ReplicaIdentity,
         key_columns: Vec<Arc<str>>,
     },
-    Truncate(Vec<Arc<str>>),
+    /// One or more tables were truncated.
+    ///
+    /// PostgreSQL expands `CASCADE` before writing WAL, so `tables` already
+    /// lists every published relation that was emptied. The flags say how the
+    /// origin statement was written, which a sink needs to reproduce it:
+    /// `cascade` to clear dependants on the target, `restart_identity` to reset
+    /// its sequences.
+    Truncate {
+        tables: Vec<Arc<str>>,
+        cascade: bool,
+        restart_identity: bool,
+    },
     Begin {
         transaction_id: u32,
         final_lsn: Lsn,
@@ -872,10 +888,21 @@ impl ChangeEvent {
     /// # Arguments
     ///
     /// * `tables` - List of table names that were truncated
+    /// * `cascade` - The origin statement carried `CASCADE`
+    /// * `restart_identity` - The origin statement carried `RESTART IDENTITY`
     /// * `lsn` - Log Sequence Number for this event
-    pub fn truncate(tables: Vec<Arc<str>>, lsn: Lsn) -> Self {
+    pub fn truncate(
+        tables: Vec<Arc<str>>,
+        cascade: bool,
+        restart_identity: bool,
+        lsn: Lsn,
+    ) -> Self {
         Self {
-            event_type: EventType::Truncate(tables),
+            event_type: EventType::Truncate {
+                tables,
+                cascade,
+                restart_identity,
+            },
             lsn,
             metadata: None,
         }
@@ -1269,7 +1296,7 @@ impl ChangeEvent {
             EventType::Insert { .. } => "insert",
             EventType::Update { .. } => "update",
             EventType::Delete { .. } => "delete",
-            EventType::Truncate(_) => "truncate",
+            EventType::Truncate { .. } => "truncate",
             EventType::Begin { .. } => "begin",
             EventType::Commit { .. } => "commit",
             EventType::StreamStart { .. } => "stream_start",
@@ -1388,8 +1415,15 @@ impl ChangeEvent {
                     encode_arc_str(buf, kc);
                 }
             }
-            EventType::Truncate(tables) => {
+            EventType::Truncate {
+                tables,
+                cascade,
+                restart_identity,
+            } => {
                 buf.extend_from_slice(&[message_types::TRUNCATE]);
+                // Same flag bits pgoutput uses: 1 = CASCADE, 2 = RESTART IDENTITY.
+                let flags = u8::from(*cascade) | (u8::from(*restart_identity) << 1);
+                buf.extend_from_slice(&[flags]);
                 buf.extend_from_slice(&(tables.len() as u16).to_be_bytes());
                 for t in tables {
                     encode_arc_str(buf, t);
@@ -1695,12 +1729,17 @@ impl ChangeEvent {
                 }
             }
             message_types::TRUNCATE => {
+                let flags = reader.read_u8()?;
                 let count = reader.read_u16()? as usize;
                 let mut tables = Vec::with_capacity(count);
                 for _ in 0..count {
                     tables.push(decode_arc_str(&mut reader)?);
                 }
-                EventType::Truncate(tables)
+                EventType::Truncate {
+                    tables,
+                    cascade: flags & 1 != 0,
+                    restart_identity: flags & 2 != 0,
+                }
             }
             message_types::BEGIN => {
                 let transaction_id = reader.read_u32()?;
@@ -2322,12 +2361,18 @@ mod tests {
     #[test]
     fn test_change_event_truncate() {
         let tables: Vec<Arc<str>> = vec![Arc::from("public.users"), Arc::from("public.orders")];
-        let event = ChangeEvent::truncate(tables.clone(), Lsn::new(7000));
+        let event = ChangeEvent::truncate(tables.clone(), true, true, Lsn::new(7000));
 
         assert_eq!(event.lsn.value(), 7000);
         match &event.event_type {
-            EventType::Truncate(t) => {
+            EventType::Truncate {
+                tables: t,
+                cascade,
+                restart_identity,
+            } => {
                 assert_eq!(t, &tables);
+                assert!(cascade);
+                assert!(restart_identity);
             }
             _ => panic!("Expected Truncate event"),
         }
@@ -2435,7 +2480,7 @@ mod tests {
         assert_eq!(keys, &vec![Arc::<str>::from("id")]);
 
         // Truncate has no key_columns
-        let truncate = ChangeEvent::truncate(vec![], Lsn::new(400));
+        let truncate = ChangeEvent::truncate(vec![], false, false, Lsn::new(400));
         assert!(truncate.get_key_columns().is_none());
 
         // Begin has no key_columns
@@ -2511,7 +2556,7 @@ mod tests {
         );
         assert_eq!(delete.event_type_str(), "delete");
 
-        let truncate = ChangeEvent::truncate(vec![Arc::from("t")], Lsn::new(400));
+        let truncate = ChangeEvent::truncate(vec![Arc::from("t")], false, false, Lsn::new(400));
         assert_eq!(truncate.event_type_str(), "truncate");
 
         // "other" for Begin, Commit, Relation, Type, Origin, Message
@@ -2707,13 +2752,13 @@ mod tests {
     #[test]
     fn test_encode_decode_truncate() {
         let tables = vec![Arc::from("public.a"), Arc::from("public.b")];
-        let event = ChangeEvent::truncate(tables, Lsn::new(4000));
+        let event = ChangeEvent::truncate(tables, true, false, Lsn::new(4000));
         assert_encode_decode_round_trip(&event);
     }
 
     #[test]
     fn test_encode_decode_truncate_empty() {
-        let event = ChangeEvent::truncate(vec![], Lsn::new(4100));
+        let event = ChangeEvent::truncate(vec![], false, true, Lsn::new(4100));
         assert_encode_decode_round_trip(&event);
     }
 
@@ -3184,7 +3229,11 @@ mod tests {
                 replica_identity: ReplicaIdentity::Default,
                 key_columns: vec![],
             },
-            EventType::Truncate(vec![]),
+            EventType::Truncate {
+                tables: vec![],
+                cascade: false,
+                restart_identity: false,
+            },
             EventType::Begin {
                 transaction_id: 1,
                 final_lsn: Lsn::new(1),

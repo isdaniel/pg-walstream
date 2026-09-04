@@ -154,12 +154,15 @@ fn drain_read_buffer(
                 drained += 1;
             }
             b'E' => {
-                // ErrorResponse inside COPY mode — return as a protocol error
+                // ErrorResponse inside COPY mode — the server terminated the
+                // stream. Classify on SQLSTATE so an invalidated slot surfaces
+                // as a permanent error rather than a retryable protocol one.
                 let frame = read_buf.split_to(total_len);
                 let fields = super::error::parse_error_fields(&frame[5..]);
-                return Some(ReplicationError::protocol(format!(
-                    "server error during replication: {fields}"
-                )));
+                return Some(ReplicationError::from_sqlstate(
+                    &fields.code,
+                    format!("server error during replication: {fields}"),
+                ));
             }
             b'c' => {
                 // CopyDone — replication stream ended

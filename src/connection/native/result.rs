@@ -23,6 +23,7 @@ pub struct NativePgResult {
     pub(crate) columns: Vec<String>,
     pub(crate) rows: Vec<Vec<Option<Vec<u8>>>>,
     pub(crate) error_msg: Option<String>,
+    pub(crate) error_code: Option<String>,
 }
 
 impl NativePgResult {
@@ -32,6 +33,7 @@ impl NativePgResult {
             columns: Vec::new(),
             rows: Vec::new(),
             error_msg: None,
+            error_code: None,
         }
     }
 
@@ -84,6 +86,14 @@ impl NativePgResult {
     /// Get error message if any.
     pub fn error_message(&self) -> Option<String> {
         self.error_msg.clone()
+    }
+
+    /// The SQLSTATE of the failing `ErrorResponse`, or `""` when there was none.
+    ///
+    /// Mirrors the libpq backend's `PgResult::error_sqlstate`, so both backends
+    /// can feed `ReplicationError::from_sqlstate`. Crate-internal: `exec` maps every non-OK result to `Err`, so callers never hold a failing result.
+    pub(crate) fn error_sqlstate(&self) -> String {
+        self.error_code.clone().unwrap_or_default()
     }
 
     // ── Internal parsing helpers ─────────────────────────────────────────
@@ -202,6 +212,20 @@ mod tests {
         result.parse_data_row(&payload);
         assert_eq!(result.get_value(0, 0), Some("abc".to_string()));
         assert_eq!(result.get_value(0, 1), None);
+    }
+
+    /// The SQLSTATE survives onto the result, and an error-free result reports
+    /// an empty string rather than panicking.
+    #[test]
+    fn test_error_sqlstate() {
+        let mut r = NativePgResult::new();
+        assert_eq!(r.error_sqlstate(), "");
+
+        r.status = NativeResultStatus::FatalError;
+        r.error_code = Some("55000".to_string());
+        r.error_msg = Some("can no longer access replication slot".to_string());
+        assert_eq!(r.error_sqlstate(), "55000");
+        assert!(r.error_message().unwrap().contains("no longer"));
     }
 
     #[test]

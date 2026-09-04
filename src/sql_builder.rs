@@ -459,7 +459,10 @@ pub fn build_start_physical_replication_sql(
 /// # Compatibility
 ///
 /// This emits the PostgreSQL 15+ parenthesized generic-option form
-/// (`BASE_BACKUP (LABEL '…', …)`). PostgreSQL 14 used a different positional  grammar with different keywords (`FAST`, `NOWAIT`, `NOVERIFY_CHECKSUMS`, …), so this builder is **not** compatible with PostgreSQL 14. The `incremental` option additionally requires PostgreSQL 17+. Matching options to the server version is the caller's responsibility.
+/// (`BASE_BACKUP (LABEL '…', …)`). PostgreSQL 14 used a different positional  grammar with different keywords (`FAST`, `NOWAIT`, `NOVERIFY_CHECKSUMS`, …), so this builder is **not** compatible with PostgreSQL 14. Matching options to the server version is the caller's responsibility.
+///
+/// `INCREMENTAL` requires PostgreSQL 17+ **and** a prior `UPLOAD_MANIFEST` on
+/// the same connection (see `PgReplicationConnection::upload_manifest`).
 ///
 /// # Example
 ///
@@ -621,6 +624,20 @@ mod version_preflight {
         if server_version != 0 && server_version < PG15 {
             return Err(ReplicationError::config(format!(
                 "READ_REPLICATION_SLOT requires PostgreSQL 15+, but the server reports {}",
+                format_server_version(server_version)
+            )));
+        }
+        Ok(())
+    }
+
+    /// Preflight `UPLOAD_MANIFEST` against the server version.
+    ///
+    /// Gate: the command was added alongside incremental backup in PostgreSQL 17.
+    /// `server_version == 0` (unknown) passes.
+    pub(crate) fn check_upload_manifest_version(server_version: i32) -> Result<()> {
+        if server_version != 0 && server_version < PG17 {
+            return Err(ReplicationError::config(format!(
+                "UPLOAD_MANIFEST requires PostgreSQL 17+, but the server reports {}",
                 format_server_version(server_version)
             )));
         }
@@ -821,6 +838,17 @@ mod version_preflight {
         }
 
         #[test]
+        fn preflight_upload_manifest_requires_pg17() {
+            let err = check_upload_manifest_version(160000).unwrap_err();
+            assert!(err.to_string().contains("UPLOAD_MANIFEST"), "{err}");
+            assert!(err.to_string().contains("17+"), "{err}");
+            assert!(check_upload_manifest_version(170000).is_ok());
+            assert!(check_upload_manifest_version(180000).is_ok());
+            // Unknown version passes; the server gets the final say.
+            assert!(check_upload_manifest_version(0).is_ok());
+        }
+
+        #[test]
         fn prepare_base_backup_builds_and_gates() {
             // Unknown version (0) passes preflight and builds a bare BASE_BACKUP.
             let sql = prepare_base_backup(0, &BaseBackupOptions::default()).unwrap();
@@ -846,7 +874,8 @@ mod version_preflight {
 
 #[cfg(any(feature = "libpq", feature = "rustls-tls"))]
 pub(crate) use version_preflight::{
-    prepare_alter_slot, prepare_base_backup, prepare_create_slot, prepare_read_slot,
+    check_upload_manifest_version, prepare_alter_slot, prepare_base_backup, prepare_create_slot,
+    prepare_read_slot,
 };
 
 /// Options for building a `CREATE SUBSCRIPTION` SQL statement.
@@ -1839,18 +1868,6 @@ mod tests {
     }
 
     #[test]
-    fn base_backup_incremental() {
-        let opts = BaseBackupOptions {
-            incremental: true,
-            ..Default::default()
-        };
-        assert_eq!(
-            build_base_backup_sql(&opts).unwrap(),
-            "BASE_BACKUP (INCREMENTAL)"
-        );
-    }
-
-    #[test]
     fn base_backup_multiple_options() {
         let opts = BaseBackupOptions {
             label: Some("backup".to_string()),
@@ -1862,6 +1879,18 @@ mod tests {
         assert_eq!(
             build_base_backup_sql(&opts).unwrap(),
             "BASE_BACKUP (LABEL 'backup', PROGRESS true, WAL true, VERIFY_CHECKSUMS true)"
+        );
+    }
+
+    #[test]
+    fn base_backup_incremental() {
+        let opts = BaseBackupOptions {
+            incremental: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            build_base_backup_sql(&opts).unwrap(),
+            "BASE_BACKUP (INCREMENTAL)"
         );
     }
 

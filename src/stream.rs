@@ -82,6 +82,9 @@ const HEALTH_CHECK_EVENT_INTERVAL: u32 = 1024;
 #[derive(Debug, Clone)]
 pub struct ReplicationStreamConfig {
     pub slot_name: String,
+    /// Publication to replicate from.
+    ///
+    /// To stream from several publications at once, pass them comma-separated  with each name quoted — `r#"pub_a","pub_b"#` — which produces the `publication_names '"pub_a","pub_b"'` list pgoutput expects. One stream and one slot cover all of them.
     pub publication_name: String,
     pub protocol_version: u32,
     pub streaming_mode: StreamingMode,
@@ -892,6 +895,10 @@ impl LogicalReplicationStream {
 
         self.connection
             .start_replication(&self.config.slot_name, last_lsn, &options_ref)?;
+
+        // The server resumes at a transaction boundary, so a StreamStart seen
+        // before the disconnect has no matching StreamStop coming.
+        self.parser.reset();
 
         info!("Replication connection recovered and restarted");
         Ok(())
@@ -4288,9 +4295,18 @@ mod tests {
 
         let result =
             crate::protocol::message_to_change_event(&mut stream.state, msg, 0x500).unwrap();
-        // Relation messages return None (they update internal state)
-        assert!(result.is_none());
-        // But the relation should be stored in state
+        // A first sighting emits a Relation event and caches the schema.
+        match result.expect("first Relation emits an event").event_type {
+            EventType::Relation {
+                relation_id,
+                relation_name,
+                ..
+            } => {
+                assert_eq!(relation_id, 100);
+                assert_eq!(&*relation_name, "test_table");
+            }
+            other => panic!("Expected Relation event, got {other:?}"),
+        }
         assert!(stream.state.get_relation(100).is_some());
     }
 
@@ -4529,7 +4545,7 @@ mod tests {
         assert!(result.is_some());
         let event = result.unwrap();
         match event.event_type {
-            EventType::Truncate(tables) => {
+            EventType::Truncate { tables, .. } => {
                 assert_eq!(tables.len(), 1); // Only known relation
                 assert_eq!(&*tables[0], "public.users");
             }
@@ -4957,7 +4973,7 @@ mod tests {
 
         let wal = build_wal_message(0x1000, 0x1100, &rel_payload);
         let result = stream.process_wal_message(wal).unwrap();
-        assert!(result.is_none()); // Relation => None
+        assert!(result.is_some()); // First sighting of a relation emits an event
         assert!(stream.state.get_relation(100).is_some());
 
         // Now build an Insert payload: 'I' + relation_id(4) + 'N' + ncols(2) + columns
@@ -5312,7 +5328,7 @@ mod tests {
             crate::protocol::message_to_change_event(&mut stream.state, msg, 0x500).unwrap();
         assert!(result.is_some());
         match result.unwrap().event_type {
-            EventType::Truncate(tables) => {
+            EventType::Truncate { tables, .. } => {
                 assert!(tables.is_empty());
             }
             _ => panic!("Expected Truncate event"),
@@ -6950,7 +6966,7 @@ mod tests {
 
         let wal = Bytes::from(build_wal_message(0x1000, 0x1500, &rel_payload));
         let result = stream.process_wal_message(wal).unwrap();
-        assert!(result.is_none()); // Relation messages don't produce events
+        assert!(result.is_some()); // First sighting of a relation emits an event
 
         // Build Insert payload
         let mut ins_payload = Vec::new();
@@ -8002,31 +8018,37 @@ mod tests {
     // ================================================================
 
     #[test]
-    fn test_convert_to_change_event_relation_first_time_returns_none() {
+    fn test_convert_to_change_event_relation_first_time_emits_then_dedups() {
         use crate::protocol::ColumnInfo;
         use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
 
         let config = create_test_config();
         let mut stream = create_test_stream(config);
 
-        // First time seeing this relation — should cache it and return None
-        let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Relation {
-            relation_id: 200,
-            namespace: Arc::from("public"),
-            relation_name: Arc::from("orders"),
-            replica_identity: b'd',
-            columns: vec![
-                ColumnInfo::new(1, "id".to_string(), 23, -1),
-                ColumnInfo::new(0, "total".to_string(), 1700, -1),
-            ],
-        });
+        let mk = || {
+            StreamingReplicationMessage::new(LogicalReplicationMessage::Relation {
+                relation_id: 200,
+                namespace: Arc::from("public"),
+                relation_name: Arc::from("orders"),
+                replica_identity: b'd',
+                columns: vec![
+                    ColumnInfo::new(1, "id".to_string(), 23, -1),
+                    ColumnInfo::new(0, "total".to_string(), 1700, -1),
+                ],
+            })
+        };
 
-        let result =
-            crate::protocol::message_to_change_event(&mut stream.state, msg, 0xB000).unwrap();
-        assert!(result.is_none(), "First-time relation should return None");
-
-        // Verify it was cached
+        // First sighting: emit, and cache the schema.
+        let first =
+            crate::protocol::message_to_change_event(&mut stream.state, mk(), 0xB000).unwrap();
+        assert!(first.is_some(), "First-time relation should emit an event");
         assert!(stream.state.get_relation(200).is_some());
+
+        // pgoutput repeats Relation at the start of every transaction; an
+        // unchanged repeat must stay silent.
+        let repeat =
+            crate::protocol::message_to_change_event(&mut stream.state, mk(), 0xB100).unwrap();
+        assert!(repeat.is_none(), "Unchanged repeat should return None");
     }
 
     #[test]
