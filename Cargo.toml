@@ -38,18 +38,18 @@ bytes = { version = "1.12.1", default-features = false, features = ["serde"] }
 tracing = { version = "0.1.44", default-features = false }
 futures-core = { version = "0.3.34", default-features = false }
 memchr = { version = "2.8.3", default-features = false }
-smallvec = { version = "1.15.2", features = ["serde"] }
+smallvec = { version = "1.16.0", features = ["serde"] }
 pg-walstream-macros = { workspace = true, optional = true }
 
 # libpq backend (opt-in) — pq-sys: raw FFI to the system libpq via pkg-config, with pre-generated bindings (no libclang/bindgen at build time).
 pq-sys = { version = "0.7.5", optional = true }
 
 # rustls-tls
-tokio-rustls = { version = "0.26.4", optional = true }
+tokio-rustls = { version = "0.26.5", optional = true }
 rustls = { version = "0.23.43", default-features = false, features = ["std", "tls12"], optional = true }
 webpki-roots = { version = "1.0.9", optional = true }
 postgres-protocol = { version = "0.6.12", optional = true }
-aws-lc-rs = { version = "1.18.0", optional = true }
+aws-lc-rs = { version = "1.18.1", optional = true }
 socket2 = { version = "0.6.5", features = ["all"], optional = true }
 
 [features]
@@ -164,6 +164,18 @@ path = "integration-tests/version_preflight.rs"
 [[test]]
 name = "quote_literal_scs_off"
 path = "integration-tests/quote_literal_scs_off.rs"
+
+[[test]]
+name = "truncate_flags"
+path = "integration-tests/truncate_flags.rs"
+
+[[test]]
+name = "error_classification"
+path = "integration-tests/error_classification.rs"
+
+[[test]]
+name = "upload_manifest"
+path = "integration-tests/upload_manifest.rs"
 
 [[bench]]
 name = "wal_pipeline"

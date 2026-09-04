@@ -227,6 +227,10 @@ jobs:
         psql -h localhost -U postgres -d test_walstream -c "ALTER SYSTEM SET max_prepared_transactions = 16;"
         # streaming_decode forces protocol-v2 streaming by keeping the reorder buffer tiny.
         psql -h localhost -U postgres -d test_walstream -c "ALTER SYSTEM SET logical_decoding_work_mem = '64kB';"
+        # upload_manifest's incremental BASE_BACKUP needs WAL summaries. The GUC is PG17+;
+        # on 15/16 this fails and the test skips itself.
+        psql -h localhost -U postgres -d test_walstream -c "ALTER SYSTEM SET summarize_wal = 'on';" \
+          || echo "summarize_wal unsupported (PG<17) - the incremental backup test will skip"
         # Restart PostgreSQL container to apply wal_level change (requires restart)
         docker restart ${{ job.services.postgres.id }}
         # Wait for PostgreSQL to be ready after restart
@@ -244,100 +248,83 @@ jobs:
         psql -h localhost -U postgres -d test_walstream -c "SHOW max_replication_slots;"
         psql -h localhost -U postgres -d test_walstream -c "SHOW max_wal_senders;"
 
+    # A real backup_manifest for the incremental BASE_BACKUP test. Taken inside the
+    # container so the local trust rule applies: the image's pg_hba.conf has no
+    # `host replication` entry for the runner's address, and pg_basebackup opens a
+    # physical replication connection (unlike the logical `replication=database`
+    # connections every other test uses, which match on database name instead).
+    - name: Prepare a backup manifest (PG17+)
+      env:
+        PGPASSWORD: postgres
+      run: |
+        VER=$(psql -h localhost -U postgres -d test_walstream -tAc "SHOW server_version_num")
+        if [ "$VER" -ge 170000 ]; then
+          docker exec ${{ job.services.postgres.id }} rm -rf /tmp/bb
+          docker exec -u postgres ${{ job.services.postgres.id }} \
+            pg_basebackup -D /tmp/bb -Fp -X stream --no-sync
+          docker cp ${{ job.services.postgres.id }}:/tmp/bb/backup_manifest ./backup_manifest
+          echo "BACKUP_MANIFEST_PATH=$PWD/backup_manifest" >> $GITHUB_ENV
+          echo "prepared a backup manifest for PG $VER"
+        else
+          echo "PG $VER < 17: UPLOAD_MANIFEST does not exist, the test will skip"
+        fi
+
     - name: Run integration tests
       env:
         DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/test_walstream?replication=database"
         DATABASE_URL_REGULAR: "postgresql://postgres:postgres@localhost:5432/test_walstream"
+        PGPASSWORD: postgres
         RUST_BACKTRACE: 1
+      # The suite list comes from the filesystem, so a new integration-tests/*.rs
+      # runs automatically, and one that is missing its `[[test]]` target in
+      # Cargo.toml fails here ("no test target named ...") instead of being
+      # silently skipped. Only the exceptions need naming below; every other
+      # suite runs once on default features. Each suite's purpose is documented
+      # in its own `//!` header rather than duplicated here.
       run: |
-        cargo test --test snapshot_export -- --ignored --nocapture --test-threads=1
+        set -uo pipefail
+        failed=()
 
-        # Clean up any lingering replication slots between test suites
-        PGPASSWORD=postgres psql -h localhost -U postgres -d test_walstream \
-          -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_type = 'logical';" || true
+        for f in integration-tests/*.rs; do
+          suite=$(basename "$f" .rs)
 
-        cargo test --test rate_limited_streaming -- --ignored --nocapture --test-threads=1
+          case "$suite" in
+            # `ssl_*` suites belong to the integration-ssl job below, which has a
+            # TLS-configured server and generated certificates. The two jobs
+            # partition integration-tests/ on this prefix, so every file lands in
+            # exactly one of them.
+            ssl_*) continue ;;
+            # Exercise the opt-in derive-macro layer.
+            typed_deserialization|ergonomics) variants=("--features derive") ;;
+            # libpq-only API surface.
+            pg_result_get_bytes) variants=("--no-default-features --features libpq") ;;
+            # Server diagnostics and COPY framing are parsed independently by each
+            # backend, so these must prove out on both.
+            error_classification|upload_manifest)
+              variants=("" "--no-default-features --features libpq") ;;
+            *) variants=("") ;;
+          esac
 
-        PGPASSWORD=postgres psql -h localhost -U postgres -d test_walstream \
-          -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_type = 'logical';" || true
+          for v in "${variants[@]}"; do
+            label="$suite${v:+ [$v]}"
+            echo "::group::$label"
+            cargo test --test "$suite" $v -- --ignored --nocapture --test-threads=1 \
+              || failed+=("$label")
+            echo "::endgroup::"
+            # Drop every slot between suites: an orphan blocks WAL recycling and
+            # can exhaust the server's disk.
+            psql -h localhost -U postgres -d test_walstream \
+              -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots;" \
+              >/dev/null 2>&1 || true
+          done
+        done
 
-        cargo test --test safe_transaction_consumer -- --ignored --nocapture --test-threads=1
-
-        PGPASSWORD=postgres psql -h localhost -U postgres -d test_walstream \
-          -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_type = 'logical';" || true
-
-        cargo test --test complex_types -- --ignored --nocapture --test-threads=1
-
-        PGPASSWORD=postgres psql -h localhost -U postgres -d test_walstream \
-          -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_type = 'logical';" || true
-
-        cargo test --test typed_deserialization --features derive -- --ignored --nocapture --test-threads=1
-
-        PGPASSWORD=postgres psql -h localhost -U postgres -d test_walstream \
-          -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_type = 'logical';" || true
-
-        cargo test --test pgoutput_fidelity -- --ignored --nocapture --test-threads=1
-
-        PGPASSWORD=postgres psql -h localhost -U postgres -d test_walstream \
-          -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_type = 'logical';" || true
-
-        cargo test --test streaming_decode -- --ignored --nocapture --test-threads=1
-
-        PGPASSWORD=postgres psql -h localhost -U postgres -d test_walstream \
-          -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_type = 'logical';" || true
-
-        cargo test --test binary_columns -- --ignored --nocapture --test-threads=1
-
-        PGPASSWORD=postgres psql -h localhost -U postgres -d test_walstream \
-          -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_type = 'logical';" || true
-
-        cargo test --test pg_result_get_bytes --no-default-features --features libpq -- --ignored --nocapture --test-threads=1
-
-        PGPASSWORD=postgres psql -h localhost -U postgres -d test_walstream \
-          -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_type = 'logical';" || true
-
-        # Ergonomics layer (WalRouter, for_each_event) + derive layer (WalTable /
-        # on_*_of) — the derive module is #[cfg(feature = "derive")].
-        cargo test --test ergonomics --features derive -- --ignored --nocapture --test-threads=1
-
-        PGPASSWORD=postgres psql -h localhost -U postgres -d test_walstream \
-          -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_type = 'logical';" || true
-
-        # Bounded replay: stream to a target LSN, stop cleanly at the commit boundary.
-        cargo test --test bounded_replay -- --ignored --nocapture --test-threads=1
-
-        PGPASSWORD=postgres psql -h localhost -U postgres -d test_walstream \
-          -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_type = 'logical';" || true
-
-        # Raw XLogData bytes API: round-trip raw pgoutput through the parser, stop at target LSN.
-        cargo test --test raw_xlogdata -- --ignored --nocapture --test-threads=1
-
-        PGPASSWORD=postgres psql -h localhost -U postgres -d test_walstream \
-          -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_type = 'logical';" || true
-
-        # FAILOVER slot creation (issue #103): parenthesized option grammar, skips gracefully on PG<17; verifies pg_replication_slots.failover on 17/18.
-        cargo test --test failover_slot -- --ignored --nocapture --test-threads=1
-
-        PGPASSWORD=postgres psql -h localhost -U postgres -d test_walstream \
-          -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_type = 'logical';" || true
-
-        # CREATE_REPLICATION_SLOT option matrix: every emitted option combination executed against the live server, version-gated (issue #103).
-        cargo test --test slot_matrix -- --ignored --nocapture --test-threads=1
-
-        PGPASSWORD=postgres psql -h localhost -U postgres -d test_walstream \
-          -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots;" || true
-
-        # BASE_BACKUP option combination: asserts the server accepts every generated option name (PG15+), then aborts the backup without draining.
-        cargo test --test base_backup_options -- --ignored --nocapture --test-threads=1
-
-        PGPASSWORD=postgres psql -h localhost -U postgres -d test_walstream \
-          -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_type = 'logical';" || true
-
-        # Server-version preflight: end-to-end core CDC path (create slot -> stream -> decode INSERT) plus PG17+ gated slot ops (FAILOVER create + ALTER) that must pass the client-side version gate and execute; the gated portion skips gracefully on PG<17.
-        cargo test --test version_preflight -- --ignored --nocapture --test-threads=1
-
-        # quote_literal escaping: proves quote_literal stays injection-safe under standard_conforming_strings off and on (a backslash+quote payload roundtrips byte-for-byte); uses the regular connection and creates no replication slot.
-        cargo test --test quote_literal_scs_off -- --ignored --nocapture --test-threads=1
+        if [ ${#failed[@]} -gt 0 ]; then
+          printf '::error::%d integration suite(s) failed:\n' "${#failed[@]}"
+          printf '  - %s\n' "${failed[@]}"
+          exit 1
+        fi
+        echo "All integration suites passed."
 
   integration-ssl:
     name: SSL Integration Tests (PG ${{ matrix.pg_version }})
@@ -485,8 +472,17 @@ jobs:
         PGSSLMODE=require psql -h localhost -U postgres -d test_walstream \
           -c "SELECT ssl, version FROM pg_stat_ssl WHERE pid = pg_backend_pid();"
 
-    - name: Build SSL test binary
-      run: cargo test --test ssl_connections --no-default-features --features rustls-tls --no-run
+    # Compile first so a build break is reported before the server setup above is
+    # blamed for it. SSL is a rustls-tls capability; the libpq backend delegates
+    # TLS to libpq and has nothing to exercise here.
+    - name: Build SSL test binaries
+      run: |
+        set -uo pipefail
+        shopt -s nullglob
+        for f in integration-tests/ssl_*.rs; do
+          cargo test --test "$(basename "$f" .rs)" \
+            --no-default-features --features rustls-tls --no-run
+        done
 
     - name: Run SSL integration tests
       env:
@@ -495,9 +491,37 @@ jobs:
         SSL_CA_CERT_PATH: "/tmp/pg-ssl/ca.crt"
         SSL_WRONG_CA_CERT_PATH: "/tmp/pg-ssl/wrong-ca.crt"
         RUST_BACKTRACE: 1
+      # Same filesystem enumeration as the integration job, over the `ssl_*`
+      # half of the partition: a new SSL suite is picked up automatically.
       run: |
-        cargo test --test ssl_connections --no-default-features --features rustls-tls -- --ignored --nocapture --test-threads=1
+        set -uo pipefail
+        shopt -s nullglob
+        failed=()
+        ran=0
 
-        # Clean up any lingering replication slots between runs
-        PGPASSWORD=postgres psql -h localhost -U postgres -d test_walstream \
-          -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_type = 'logical';" || true
+        for f in integration-tests/ssl_*.rs; do
+          suite=$(basename "$f" .rs)
+          ran=$((ran + 1))
+          echo "::group::$suite"
+          cargo test --test "$suite" --no-default-features --features rustls-tls \
+            -- --ignored --nocapture --test-threads=1 || failed+=("$suite")
+          echo "::endgroup::"
+          # Drop every slot between suites: an orphan blocks WAL recycling.
+          PGPASSWORD=postgres psql -h localhost -U postgres -d test_walstream \
+            -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots;" \
+            >/dev/null 2>&1 || true
+        done
+
+        # Without this the job would pass silently if the suites were renamed out
+        # of the `ssl_*` prefix the integration job skips on.
+        if [ "$ran" -eq 0 ]; then
+          echo "::error::no integration-tests/ssl_*.rs found - SSL coverage would be silently skipped"
+          exit 1
+        fi
+
+        if [ ${#failed[@]} -gt 0 ]; then
+          printf '::error::%d SSL suite(s) failed:\n' "${#failed[@]}"
+          printf '  - %s\n' "${failed[@]}"
+          exit 1
+        fi
+        echo "All $ran SSL suite(s) passed." 

@@ -37,6 +37,13 @@ enum Command {
         sql: String,
         reply: std_mpsc::Sender<Result<NativePgResult>>,
     },
+    /// Run a simple query that answers with `CopyInResponse`, streaming
+    /// `payload` into it. Only `UPLOAD_MANIFEST` uses this.
+    QueryCopyIn {
+        sql: String,
+        payload: Bytes,
+        reply: std_mpsc::Sender<Result<NativePgResult>>,
+    },
     /// Enter the streaming push loop: the worker continuously reads CopyData
     /// batches and pushes them down `batch_tx` until the token is cancelled, the
     /// receiver is dropped, or a read error occurs. Replaces the old per-event
@@ -84,6 +91,10 @@ struct Worker {
 impl Worker {
     async fn query(&mut self, sql: &str) -> Result<NativePgResult> {
         query::simple_query(&mut self.transport, &mut self.read_buf, sql).await
+    }
+
+    async fn query_copy_in(&mut self, sql: &str, payload: &[u8]) -> Result<NativePgResult> {
+        query::simple_query_copy_in(&mut self.transport, &mut self.read_buf, sql, payload).await
     }
 
     /// Streaming push loop. Continuously reads CopyData batches and pushes them to `batch_tx`, while still servicing interleaved commands (feedback `PutCopyData`, `Close`) on `cmd_rx`. Returns `true` if a `Close` was  handled (the worker should stop), `false` if streaming ended for any other reason (cancel, read error, or the consumer dropped the receiver).
@@ -154,6 +165,14 @@ impl Worker {
             }
             Some(Command::Query { sql, reply }) => {
                 let _ = reply.send(self.query(&sql).await);
+                StreamCmd::Continue
+            }
+            Some(Command::QueryCopyIn {
+                sql,
+                payload,
+                reply,
+            }) => {
+                let _ = reply.send(self.query_copy_in(&sql, &payload).await);
                 StreamCmd::Continue
             }
             Some(Command::Close {
@@ -292,6 +311,13 @@ fn run_worker(
             match cmd {
                 Command::Query { sql, reply } => {
                     let _ = reply.send(worker.query(&sql).await);
+                }
+                Command::QueryCopyIn {
+                    sql,
+                    payload,
+                    reply,
+                } => {
+                    let _ = reply.send(worker.query_copy_in(&sql, &payload).await);
                 }
                 Command::StreamCopy { token, batch_tx } => {
                     // Runs its own loop, servicing interleaved commands, until
@@ -501,6 +527,26 @@ impl NativeConnection {
         }
     }
 
+    /// Run a CopyIn query: inline on the worker, or over the command channel.
+    fn run_query_copy_in(&mut self, sql: &str, payload: &[u8]) -> Result<NativePgResult> {
+        match &mut self.driver {
+            Driver::Inline { worker, handle, .. } => {
+                run_sync(handle, worker.query_copy_in(sql, payload))
+            }
+            Driver::Threaded { cmd_tx, .. } => {
+                let (reply_tx, reply_rx) = std_mpsc::channel();
+                cmd_tx
+                    .send(Command::QueryCopyIn {
+                        sql: sql.to_string(),
+                        payload: Bytes::copy_from_slice(payload),
+                        reply: reply_tx,
+                    })
+                    .map_err(|_| Self::worker_gone())?;
+                reply_rx.recv().map_err(|_| Self::worker_gone())?
+            }
+        }
+    }
+
     #[cold]
     fn worker_gone() -> ReplicationError {
         ReplicationError::backend("native worker thread is gone")
@@ -522,9 +568,10 @@ impl NativeConnection {
             let error_msg = result
                 .error_message()
                 .unwrap_or_else(|| "Unknown error".to_string());
-            return Err(ReplicationError::protocol(format!(
-                "Query execution failed: {error_msg}"
-            )));
+            return Err(ReplicationError::from_sqlstate(
+                &result.error_sqlstate(),
+                format!("Query execution failed: {error_msg}"),
+            ));
         }
 
         Ok(result)
@@ -568,9 +615,10 @@ impl NativeConnection {
             let error_msg = result
                 .error_message()
                 .unwrap_or_else(|| "Unknown error".to_string());
-            return Err(ReplicationError::protocol(format!(
-                "START_REPLICATION did not enter COPY mode: {error_msg}"
-            )));
+            return Err(ReplicationError::from_sqlstate(
+                &result.error_sqlstate(),
+                format!("START_REPLICATION did not enter COPY mode: {error_msg}"),
+            ));
         }
 
         self.in_copy_mode = true;
@@ -908,14 +956,38 @@ impl NativeConnection {
                 let error_msg = result
                     .error_message()
                     .unwrap_or_else(|| "Unknown error".to_string());
-                return Err(ReplicationError::protocol(format!(
-                    "START_REPLICATION did not enter COPY mode: {error_msg}"
-                )));
+                return Err(ReplicationError::from_sqlstate(
+                    &result.error_sqlstate(),
+                    format!("START_REPLICATION did not enter COPY mode: {error_msg}"),
+                ));
             }
         }
 
         self.in_copy_mode = true;
         debug!("Physical replication started successfully");
+        Ok(())
+    }
+
+    /// Upload a backup manifest in preparation for an incremental base backup.
+    ///
+    /// Sends `UPLOAD_MANIFEST` and streams `manifest` (the `backup_manifest` file from the prior full backup) into the resulting CopyIn. The server keeps it for the duration of the connection, so the following  [`base_backup`](Self::base_backup) with [`BaseBackupOptions::incremental`] must run on this same connection.
+    ///
+    /// Requires PostgreSQL 17+. The server also needs `summarize_wal = on`, or the subsequent incremental backup fails with a WAL-summary error.
+    pub fn upload_manifest(&mut self, manifest: &[u8]) -> Result<()> {
+        crate::sql_builder::check_upload_manifest_version(self.server_version())?;
+
+        debug!("Uploading backup manifest ({} bytes)", manifest.len());
+        let result = self.run_query_copy_in("UPLOAD_MANIFEST", manifest)?;
+        if !result.is_ok() {
+            let error_msg = result
+                .error_message()
+                .unwrap_or_else(|| "Unknown error".to_string());
+            return Err(ReplicationError::from_sqlstate(
+                &result.error_sqlstate(),
+                format!("UPLOAD_MANIFEST failed: {error_msg}"),
+            ));
+        }
+        debug!("Backup manifest uploaded");
         Ok(())
     }
 
@@ -1363,22 +1435,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_base_backup_preflight_rejects_incremental_below_pg17() {
-        let mut conn = NativeConnection::null_for_testing();
-        let opts = BaseBackupOptions {
-            incremental: true,
-            ..Default::default()
-        };
-        let err = conn.base_backup(&opts).unwrap_err();
-        assert!(err.to_string().contains("INCREMENTAL"), "{err}");
-    }
-
-    #[tokio::test]
     async fn test_read_slot_preflight_passes_on_pg16_then_hits_socket() {
         // READ_REPLICATION_SLOT is PG15+, so the PG16 preflight passes; the call
         // then fails at the null socket. Exercises the preflight line's Ok path.
         let mut conn = NativeConnection::null_for_testing();
         assert!(conn.read_replication_slot("s").is_err());
+    }
+
+    /// `null_for_testing` reports PG16, so the PG17 gate rejects UPLOAD_MANIFEST
+    /// before any socket I/O — the preflight's Err path.
+    #[tokio::test]
+    async fn test_upload_manifest_preflight_rejects_below_pg17() {
+        let mut conn = NativeConnection::null_for_testing();
+        let err = conn.upload_manifest(b"{}").unwrap_err();
+        assert!(err.to_string().contains("UPLOAD_MANIFEST"), "{err}");
+        assert!(err.to_string().contains("17+"), "{err}");
     }
 
     #[tokio::test]

@@ -14,10 +14,9 @@
 //!
 //! `build_base_backup_sql` emits the PostgreSQL 15+ parenthesized generic-option
 //! form, so this test is gated to `server_version_num >= 150000` and skips with a
-//! `warn!` on PostgreSQL 14. The `INCREMENTAL` option (PG17+) is intentionally NOT
-//! exercised here: an incremental backup requires a prior `UPLOAD_MANIFEST`
-//! handshake that this crate does not implement. `INCREMENTAL` is covered at the
-//! unit level (`build_base_backup_sql` golden test) instead.
+//! `warn!` on PostgreSQL 14. The `INCREMENTAL` option (PG17+) is not exercised
+//! here because it needs a prior `UPLOAD_MANIFEST` on the same connection; that
+//! pairing has its own test in `upload_manifest.rs`.
 //!
 //! ## Prerequisites
 //!
@@ -67,9 +66,9 @@ fn server_version_num(conn: &mut PgReplicationConnection) -> i64 {
         .expect("server_version_num is numeric")
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "requires live PostgreSQL 15+"]
-fn test_base_backup_options_accepted() {
+async fn test_base_backup_options_accepted() {
     init_tracing();
 
     let mut regular =

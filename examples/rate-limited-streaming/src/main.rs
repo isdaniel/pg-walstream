@@ -187,8 +187,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     EventType::Commit { commit_lsn, .. } => {
                         info!("COMMIT transaction at LSN {}", commit_lsn);
                     }
-                    EventType::Truncate(tables) => {
-                        warn!("TRUNCATE tables: {:?}", tables);
+                    EventType::Truncate {
+                        tables,
+                        cascade,
+                        restart_identity,
+                    } => {
+                        warn!(
+                            "TRUNCATE tables: {:?} (cascade={}, restart_identity={})",
+                            tables, cascade, restart_identity
+                        );
                     }
                     _ => {
                         info!("Event at LSN {}", event.lsn);

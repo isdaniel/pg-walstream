@@ -3,11 +3,11 @@
 ## Build & Test Commands
 
 ```bash
-# Build (default libpq backend)
+# Build (default: pure-Rust rustls-tls backend)
 cargo build
 
-# Build (pure-Rust rustls-tls backend)
-cargo build --no-default-features --features rustls-tls
+# Build (opt-in libpq FFI backend)
+cargo build --no-default-features --features libpq
 
 # Run unit tests (no PostgreSQL required)
 cargo test --lib
@@ -48,8 +48,8 @@ src/
 ├── retry.rs         # Exponential backoff retry logic
 └── connection/      # PostgreSQL connection backends
     ├── mod.rs
-    ├── libpq.rs     # libpq FFI backend (default)
-    └── native/      # Pure-Rust rustls-tls backend
+    ├── libpq.rs     # libpq FFI backend (opt-in)
+    └── native/      # Pure-Rust rustls-tls backend (default)
 
 macros/              # pg-walstream-macros proc-macro crate (opt-in `derive` feature)
 └── src/lib.rs       #   #[derive(WalTable)] → impl WalTable { const TABLE }

@@ -52,17 +52,46 @@ enum ReadResult {
     WouldBlock,
     /// COPY stream has ended gracefully
     CopyDone,
+    /// COPY stream was ended by a server error: `(sqlstate, message)`
+    CopyFailed(String, String),
 }
 
 /// Result of draining all available messages from libpq
 #[derive(Debug, PartialEq)]
 enum DrainResult {
-    /// One or more messages were queued
-    Drained,
-    /// No complete message available
+    /// Messages were queued, and/or the end of the COPY stream was latched.
+    /// Either way the caller loops: it drains the queue first, then acts on the
+    /// latch.
+    Progressed,
+    /// No complete message available and the stream is still open.
     WouldBlock,
-    /// COPY stream has ended
-    CopyDone,
+}
+
+/// How the COPY stream ended, latched on the connection.
+///
+/// `PQgetCopyData` reports the end of the stream only once, and it can do so in
+/// the same drain pass that queued messages. Reporting the end immediately would
+/// discard those messages, so the terminal state is parked here and surfaces
+/// only after the queue is empty. It is sticky rather than consumed: once the
+/// stream is over, every subsequent read reports the same reason.
+#[derive(Debug, Clone, PartialEq)]
+enum CopyEnd {
+    /// Graceful CopyDone.
+    Done,
+    /// The server terminated the stream: `(sqlstate, message)`.
+    Failed(String, String),
+}
+
+impl CopyEnd {
+    fn to_error(&self) -> ReplicationError {
+        match self {
+            CopyEnd::Done => ReplicationError::Cancelled("COPY stream ended".to_string()),
+            CopyEnd::Failed(sqlstate, message) => ReplicationError::from_sqlstate(
+                sqlstate,
+                format!("replication stream terminated by server: {message}"),
+            ),
+        }
+    }
 }
 
 /// Maximum messages to drain from libpq in a single batch.
@@ -75,6 +104,11 @@ const MAX_DRAIN_BATCH: usize = 4096;
 /// 64 KiB to amortize `PQgetCopyData` → `BytesMut::put_slice` copies under
 /// bulk WAL traffic.
 const READ_BUF_INITIAL_CAPACITY: usize = 256 * 1024;
+
+/// Largest payload put in a single `PQputCopyData` call.
+///
+/// A backup manifest is a few hundred KiB; chunking bounds libpq's output buffer and keeps each message far below the server's 1 GiB message limit.
+const COPY_IN_CHUNK: usize = 64 * 1024;
 
 /// Safe wrapper around PostgreSQL connection for replication
 ///
@@ -121,6 +155,8 @@ pub struct PgReplicationConnection {
     pending_messages: VecDeque<Bytes>,
     /// Reusable buffer for copying data from libpq (avoids per-message heap alloc).
     read_buf: BytesMut,
+    /// How the COPY stream ended, once it has. Surfaces only after `pending_messages` is drained, so a stream that ends in the same pass that queued messages still delivers them.
+    copy_end: Option<CopyEnd>,
 }
 
 impl PgReplicationConnection {
@@ -245,6 +281,7 @@ impl PgReplicationConnection {
             async_fd: None,
             pending_messages: VecDeque::with_capacity(MAX_DRAIN_BATCH),
             read_buf: BytesMut::with_capacity(READ_BUF_INITIAL_CAPACITY),
+            copy_end: None,
         })
     }
 
@@ -279,9 +316,10 @@ impl PgReplicationConnection {
             let error_msg = pg_result
                 .error_message()
                 .unwrap_or_else(|| "Unknown error".to_string());
-            return Err(ReplicationError::protocol(format!(
-                "Query execution failed: {error_msg}"
-            )));
+            return Err(ReplicationError::from_sqlstate(
+                &pg_result.error_sqlstate(),
+                format!("Query execution failed: {error_msg}"),
+            ));
         }
 
         Ok(pg_result)
@@ -319,6 +357,9 @@ impl PgReplicationConnection {
 
         debug!("Starting replication: {}", sql);
         let _result = self.exec(&sql)?;
+
+        // A fresh COPY stream: drop any terminal state left by a previous one.
+        self.copy_end = None;
 
         // Initialize the async socket first; mark the connection as being in replication mode only AFTER it succeeds, preserving the invariant `is_replication_conn == true ⇒ async_fd is Some`. Otherwise a failed socket setup would leave the flag true with no async_fd, and a later `end_copy`/Drop would reach the writable-wait path with `async_fd == None`.
         self.initialize_async_socket()?;
@@ -411,14 +452,20 @@ impl PgReplicationConnection {
                 return Ok(msg);
             }
 
+            // Queue empty: a latched end of stream now takes effect.
+            if let Some(end) = &self.copy_end {
+                return Err(end.to_error());
+            }
+
             // ── Try to drain any messages already buffered inside libpq ──
-            match drain_buffered_messages(self.conn, &mut self.pending_messages, &mut self.read_buf)
-            {
-                DrainResult::Drained => continue, // messages queued, loop to pop
-                DrainResult::CopyDone => {
-                    debug!("COPY stream ended gracefully");
-                    return Err(ReplicationError::Cancelled("COPY stream ended".to_string()));
-                }
+            match drain_buffered_messages(
+                self.conn,
+                &mut self.pending_messages,
+                &mut self.read_buf,
+                &mut self.copy_end,
+            ) {
+                // Messages queued and/or the stream ended: loop to pop, then latch.
+                DrainResult::Progressed => continue,
                 DrainResult::WouldBlock => {} // need to wait for socket
             }
 
@@ -448,15 +495,11 @@ impl PgReplicationConnection {
                     }
 
                     // Drain all available messages
-                    match drain_buffered_messages(self.conn, &mut self.pending_messages, &mut self.read_buf) {
-                        DrainResult::Drained => {
-                            // Messages queued; guard drops and clears ready flag
-                        }
-                        DrainResult::CopyDone => {
-                            debug!("COPY stream ended after consuming input");
-                            return Err(ReplicationError::Cancelled(
-                                "COPY stream ended".to_string(),
-                            ));
+                    match drain_buffered_messages(self.conn, &mut self.pending_messages, &mut self.read_buf, &mut self.copy_end) {
+                        DrainResult::Progressed => {
+                            // Messages queued and/or the stream ended; the next
+                            // loop iteration pops the queue, then the latch.
+                            // Guard drops and clears ready flag.
                         }
                         DrainResult::WouldBlock => {
                             // No complete message yet, clear ready flag to re-arm epoll
@@ -477,16 +520,21 @@ impl PgReplicationConnection {
             return Ok(msg);
         }
         // Try one last drain
-        match drain_buffered_messages(self.conn, &mut self.pending_messages, &mut self.read_buf) {
-            DrainResult::Drained => {
+        match drain_buffered_messages(
+            self.conn,
+            &mut self.pending_messages,
+            &mut self.read_buf,
+            &mut self.copy_end,
+        ) {
+            DrainResult::Progressed => {
                 if let Some(msg) = self.pending_messages.pop_front() {
                     info!("Found buffered data after cancellation, returning it");
                     return Ok(msg);
                 }
-            }
-            DrainResult::CopyDone => {
-                info!("COPY stream ended during cancellation check");
-                return Err(ReplicationError::Cancelled("COPY stream ended".to_string()));
+                if let Some(end) = &self.copy_end {
+                    info!("COPY stream ended during cancellation check");
+                    return Err(end.to_error());
+                }
             }
             DrainResult::WouldBlock => {
                 info!("Cancellation token triggered with no buffered data");
@@ -818,6 +866,111 @@ impl PgReplicationConnection {
         Ok(())
     }
 
+    /// Upload a backup manifest in preparation for an incremental base backup.
+    ///
+    /// Sends `UPLOAD_MANIFEST` and streams `manifest` (the `backup_manifest` file from the prior full backup) into the resulting CopyIn. The server keeps it for the duration of the connection, so the following  [`base_backup`](Self::base_backup) with [`BaseBackupOptions::incremental`] must run on this same connection.
+    ///
+    /// Requires PostgreSQL 17+. The server also needs `summarize_wal = on`, or the subsequent incremental backup fails with a WAL-summary error.
+    pub fn upload_manifest(&mut self, manifest: &[u8]) -> Result<()> {
+        crate::sql_builder::check_upload_manifest_version(self.server_version())?;
+
+        let c_query = CString::new("UPLOAD_MANIFEST")
+            .map_err(|e| ReplicationError::protocol(format!("Invalid query string: {e}")))?;
+
+        // `exec` rejects PGRES_COPY_IN, and PQputCopyData would have to be
+        // flush-looped in non-blocking mode. This is a one-shot setup step on a
+        // connection that has not started streaming yet, so drop to blocking
+        // for the transfer and restore the caller's mode afterwards.
+        let was_nonblocking = unsafe { PQisnonblocking(self.conn) } == 1;
+        if was_nonblocking && unsafe { PQsetnonblocking(self.conn, 0) } != 0 {
+            return Err(ReplicationError::protocol(
+                "Failed to set blocking mode for UPLOAD_MANIFEST".to_string(),
+            ));
+        }
+        let restore = |conn| {
+            if was_nonblocking {
+                unsafe { PQsetnonblocking(conn, 1) };
+            }
+        };
+
+        debug!("Uploading backup manifest ({} bytes)", manifest.len());
+        let res = unsafe { PQexec(self.conn, c_query.as_ptr()) };
+        if res.is_null() {
+            restore(self.conn);
+            return Err(ReplicationError::protocol(
+                "UPLOAD_MANIFEST failed - null result".to_string(),
+            ));
+        }
+        let pg_result = PgResult::new(res);
+        if !matches!(pg_result.status(), ExecStatusType::PGRES_COPY_IN) {
+            restore(self.conn);
+            let error_msg = pg_result
+                .error_message()
+                .unwrap_or_else(|| "Unknown error".to_string());
+            return Err(ReplicationError::from_sqlstate(
+                &pg_result.error_sqlstate(),
+                format!("UPLOAD_MANIFEST did not enter CopyIn mode: {error_msg}"),
+            ));
+        }
+        drop(pg_result);
+
+        // The server validates the manifest only once the CopyIn completes, so
+        // the whole payload goes out before any verdict is available.
+        for chunk in manifest.chunks(COPY_IN_CHUNK) {
+            let sent = unsafe {
+                PQputCopyData(
+                    self.conn,
+                    chunk.as_ptr().cast::<std::os::raw::c_char>(),
+                    chunk.len() as i32,
+                )
+            };
+            if sent != 1 {
+                let error_msg = self.last_error_message();
+                restore(self.conn);
+                return Err(ReplicationError::protocol(format!(
+                    "PQputCopyData failed while uploading manifest: {error_msg}"
+                )));
+            }
+        }
+        if unsafe { PQputCopyEnd(self.conn, ptr::null()) } != 1 {
+            let error_msg = self.last_error_message();
+            restore(self.conn);
+            return Err(ReplicationError::protocol(format!(
+                "PQputCopyEnd failed while uploading manifest: {error_msg}"
+            )));
+        }
+
+        // Drain every trailing result; libpq needs them reclaimed and the first
+        // failure carries the manifest diagnostics.
+        let mut failure = None;
+        loop {
+            let raw = unsafe { PQgetResult(self.conn) };
+            if raw.is_null() {
+                break;
+            }
+            let res = PgResult::new(raw);
+            if !matches!(res.status(), ExecStatusType::PGRES_COMMAND_OK) && failure.is_none() {
+                failure = Some(ReplicationError::from_sqlstate(
+                    &res.error_sqlstate(),
+                    format!(
+                        "UPLOAD_MANIFEST failed: {}",
+                        res.error_message()
+                            .unwrap_or_else(|| "Unknown error".to_string())
+                    ),
+                ));
+            }
+        }
+        restore(self.conn);
+
+        match failure {
+            Some(e) => Err(e),
+            None => {
+                debug!("Backup manifest uploaded");
+                Ok(())
+            }
+        }
+    }
+
     /// Start a base backup with options
     pub fn base_backup(&mut self, options: &BaseBackupOptions) -> Result<PgResult> {
         let base_backup_sql =
@@ -892,6 +1045,7 @@ impl PgReplicationConnection {
             async_fd: None,
             pending_messages: VecDeque::new(),
             read_buf: BytesMut::new(),
+            copy_end: None,
         }
     }
 
@@ -994,6 +1148,20 @@ impl PgResult {
             unsafe { Some(CStr::from_ptr(error_ptr).to_string_lossy().into_owned()) }
         }
     }
+
+    /// The result's SQLSTATE, or `""` when the server supplied no diagnostics.
+    ///
+    /// Unlike [`error_message`](Self::error_message), this is stable across
+    /// PostgreSQL major versions, so it is what `ReplicationError::from_sqlstate`
+    /// classifies on. Crate-internal: `exec` maps every non-OK result to `Err`, so callers never hold a failing result.
+    pub(crate) fn error_sqlstate(&self) -> String {
+        let ptr = unsafe { PQresultErrorField(self.result, PG_DIAG_SQLSTATE as i32) };
+        if ptr.is_null() {
+            String::new()
+        } else {
+            unsafe { CStr::from_ptr(ptr).to_string_lossy().into_owned() }
+        }
+    }
 }
 
 impl Drop for PgResult {
@@ -1013,6 +1181,46 @@ unsafe impl Send for PgResult {}
 // These are free functions (not methods) to avoid borrow-checker conflicts:
 // `get_copy_data_async` needs `&self.async_fd` (immutable borrow of struct)
 // while simultaneously calling these to mutate `pending_messages` / `read_buf`.
+
+/// Classify why the COPY stream ended.
+///
+/// `PQgetCopyData` returns -1 both for a clean `CopyDone` and for a server error
+/// that terminated the stream — only the trailing `PGresult` distinguishes them.
+/// Without this, `pg_terminate_backend`, a `wal_sender_timeout` expiry, or a slot
+/// invalidation are indistinguishable from a graceful shutdown, and the caller
+/// reports a clean exit while the server's diagnostics are discarded.
+///
+/// `PQgetResult` blocks on a non-blocking connection when the result is not yet
+/// complete, so results are only collected while `PQisBusy` says libpq has
+/// already parsed one. An `ErrorResponse` that ended the COPY is always
+/// available: libpq stores it before leaving copy mode.
+fn copy_end_status(conn: *mut PGconn) -> ReadResult {
+    let mut end = ReadResult::CopyDone;
+
+    while unsafe { PQisBusy(conn) } == 0 {
+        let raw = unsafe { PQgetResult(conn) };
+        if raw.is_null() {
+            break;
+        }
+        // Wrapped so PQclear runs on drop; libpq needs every result reclaimed.
+        let res = PgResult::new(raw);
+        if matches!(res.status(), ExecStatusType::PGRES_FATAL_ERROR)
+            && matches!(end, ReadResult::CopyDone)
+        {
+            let message = res
+                .error_message()
+                .unwrap_or_else(|| "Unknown error".to_string());
+            let sqlstate = res.error_sqlstate();
+            warn!("COPY stream terminated by server [{sqlstate}]: {message}");
+            end = ReadResult::CopyFailed(sqlstate, message);
+        }
+    }
+
+    if matches!(end, ReadResult::CopyDone) {
+        debug!("COPY stream finished gracefully (PQgetCopyData returned -1)");
+    }
+    end
+}
 
 /// Read a single message from libpq's internal buffer using a reusable `BytesMut`.
 ///
@@ -1047,10 +1255,7 @@ fn try_read_buffered_data_raw(conn: *mut PGconn, read_buf: &mut BytesMut) -> Res
             Ok(ReadResult::Data(data))
         }
         0 => Ok(ReadResult::WouldBlock),
-        -1 => {
-            debug!("COPY stream finished (PQgetCopyData returned -1)");
-            Ok(ReadResult::CopyDone)
-        }
+        -1 => Ok(copy_end_status(conn)),
         -2 => {
             let error_msg = unsafe {
                 let error_ptr = PQerrorMessage(conn);
@@ -1080,6 +1285,7 @@ fn drain_buffered_messages(
     conn: *mut PGconn,
     pending_messages: &mut VecDeque<Bytes>,
     read_buf: &mut BytesMut,
+    copy_end: &mut Option<CopyEnd>,
 ) -> DrainResult {
     let mut drained = false;
 
@@ -1090,13 +1296,21 @@ fn drain_buffered_messages(
                 drained = true;
             }
             Ok(ReadResult::WouldBlock) => break,
-            Ok(ReadResult::CopyDone) => return DrainResult::CopyDone,
+            // Latch and stop reading; anything already queued is delivered first.
+            Ok(ReadResult::CopyDone) => {
+                *copy_end = Some(CopyEnd::Done);
+                break;
+            }
+            Ok(ReadResult::CopyFailed(sqlstate, message)) => {
+                *copy_end = Some(CopyEnd::Failed(sqlstate, message));
+                break;
+            }
             Err(_) => break, // treat errors as would-block for drain purposes
         }
     }
 
-    if drained {
-        DrainResult::Drained
+    if drained || copy_end.is_some() {
+        DrainResult::Progressed
     } else {
         DrainResult::WouldBlock
     }
@@ -1458,37 +1672,62 @@ mod tests {
     // ========================================
 
     #[test]
-    fn test_drain_result_drained_variant() {
-        let result = DrainResult::Drained;
-        assert_eq!(result, DrainResult::Drained);
-        assert_ne!(result, DrainResult::WouldBlock);
-        assert_ne!(result, DrainResult::CopyDone);
-    }
-
-    #[test]
-    fn test_drain_result_would_block_variant() {
-        let result = DrainResult::WouldBlock;
-        assert_eq!(result, DrainResult::WouldBlock);
-        assert_ne!(result, DrainResult::Drained);
-    }
-
-    #[test]
-    fn test_drain_result_copy_done_variant() {
-        let result = DrainResult::CopyDone;
-        assert_eq!(result, DrainResult::CopyDone);
-        assert_ne!(result, DrainResult::Drained);
+    fn test_drain_result_variants() {
+        assert_eq!(DrainResult::Progressed, DrainResult::Progressed);
+        assert_ne!(DrainResult::Progressed, DrainResult::WouldBlock);
     }
 
     #[test]
     fn test_drain_result_debug_format() {
-        let drained = format!("{:?}", DrainResult::Drained);
-        assert!(drained.contains("Drained"));
+        assert!(format!("{:?}", DrainResult::Progressed).contains("Progressed"));
+        assert!(format!("{:?}", DrainResult::WouldBlock).contains("WouldBlock"));
+    }
 
-        let would_block = format!("{:?}", DrainResult::WouldBlock);
-        assert!(would_block.contains("WouldBlock"));
+    // ========================================
+    // CopyEnd latch
+    // ========================================
 
-        let copy_done = format!("{:?}", DrainResult::CopyDone);
-        assert!(copy_done.contains("CopyDone"));
+    /// A graceful end is reported as `Cancelled`; a server-terminated one keeps
+    /// its SQLSTATE classification, so an invalidated slot stays permanent.
+    #[test]
+    fn test_copy_end_to_error() {
+        assert!(matches!(
+            CopyEnd::Done.to_error(),
+            ReplicationError::Cancelled(_)
+        ));
+
+        let invalidated =
+            CopyEnd::Failed("55000".to_string(), "can no longer access slot".to_string())
+                .to_error();
+        assert!(matches!(invalidated, ReplicationError::ReplicationSlot(_)));
+        assert!(invalidated.is_permanent());
+        assert!(invalidated.to_string().contains("55000"), "{invalidated}");
+
+        let other = CopyEnd::Failed("57P01".to_string(), "terminating".to_string()).to_error();
+        assert!(matches!(other, ReplicationError::Protocol(_)));
+        assert!(!other.is_permanent());
+    }
+
+    /// Regression: a drain pass that queues messages and *then* sees the end of
+    /// the stream must deliver the messages first. Reporting the end immediately
+    /// used to discard everything still queued.
+    #[test]
+    fn test_latched_copy_end_surfaces_only_after_the_queue_drains() {
+        let mut conn = PgReplicationConnection::null_for_testing();
+        conn.push_pending_message_for_testing(Bytes::from_static(b"first"));
+        conn.push_pending_message_for_testing(Bytes::from_static(b"second"));
+        conn.copy_end = Some(CopyEnd::Done);
+
+        // handle_cancellation drains the queue before honouring the latch.
+        assert_eq!(conn.handle_cancellation().unwrap(), &b"first"[..]);
+        assert_eq!(conn.handle_cancellation().unwrap(), &b"second"[..]);
+    }
+
+    /// The latch is sticky: once the stream is over, every read reports why.
+    #[test]
+    fn test_copy_end_latch_is_sticky() {
+        let end = CopyEnd::Failed("55000".to_string(), "gone".to_string());
+        assert_eq!(end.to_error().to_string(), end.to_error().to_string());
     }
 
     // ========================================

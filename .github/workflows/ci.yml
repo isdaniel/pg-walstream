@@ -39,6 +39,9 @@ jobs:
     - name: Clippy no_std (alloc)
       run: cargo clippy --no-default-features --lib -- -D warnings
 
+    - name: Build lib tests without a backend
+      run: cargo test --lib --no-default-features --features std --no-run
+
   security:
     name: Security Audit
     runs-on: ubuntu-latest

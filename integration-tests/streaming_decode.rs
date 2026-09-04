@@ -11,7 +11,7 @@
 //! `-c logical_decoding_work_mem=64kB`:
 //!
 //! ```bash
-//! export DATABASE_URL="postgresql://postgres:postgres@localhost:5433/postgres?replication=database"
+//! export DATABASE_URL="postgresql://postgres:postgres@localhost:5432/test_walstream?replication=database"
 //! cargo test --test streaming_decode -- --ignored --test-threads=1 --nocapture
 //! ```
 //!
@@ -49,7 +49,8 @@ const ROWS: usize = 5000;
 
 fn replication_conn_string() -> String {
     std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgresql://postgres:postgres@localhost:5433/postgres?replication=database".to_string()
+        "postgresql://postgres:postgres@localhost:5432/test_walstream?replication=database"
+            .to_string()
     })
 }
 

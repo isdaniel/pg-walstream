@@ -741,6 +741,17 @@ async fn startup_and_auth(
     Ok(server_version)
 }
 
+/// Leading ASCII-digit run of `s`, or 0. Pre-release servers report
+/// "19beta3"/"19rc1"/"19devel"; a plain `parse` yields 0 for those, which the
+/// caller's `< 140000` floor then rejects as "version 0".
+fn leading_num(s: &str) -> i32 {
+    s.split(|c: char| !c.is_ascii_digit())
+        .next()
+        .unwrap_or("")
+        .parse()
+        .unwrap_or(0)
+}
+
 /// Parse a server_version string like "16.1" or "16.1 (Debian 16.1-1)"
 /// into the integer format used by libpq (e.g. 160001).
 fn parse_server_version(version_str: &str) -> i32 {
@@ -750,21 +761,16 @@ fn parse_server_version(version_str: &str) -> i32 {
     let parts: Vec<&str> = version.split('.').collect();
     match parts.len() {
         1 => {
-            // e.g. "16" → 160000
-            parts[0].parse::<i32>().unwrap_or(0) * 10000
+            // e.g. "16" → 160000, "19beta3" → 190000
+            leading_num(parts[0]) * 10000
         }
         2 => {
             // e.g. "16.1" → 160001
-            let major = parts[0].parse::<i32>().unwrap_or(0);
-            let minor = parts[1].parse::<i32>().unwrap_or(0);
-            major * 10000 + minor
+            leading_num(parts[0]) * 10000 + leading_num(parts[1])
         }
         _ => {
             // e.g. "14.2.1" → 140201
-            let major = parts[0].parse::<i32>().unwrap_or(0);
-            let minor = parts[1].parse::<i32>().unwrap_or(0);
-            let patch = parts[2].parse::<i32>().unwrap_or(0);
-            major * 10000 + minor * 100 + patch
+            leading_num(parts[0]) * 10000 + leading_num(parts[1]) * 100 + leading_num(parts[2])
         }
     }
 }
@@ -825,6 +831,16 @@ mod tests {
             160004
         );
         assert_eq!(parse_server_version("16.12 - Azure"), 160012);
+    }
+
+    /// Pre-release servers report a non-numeric major ("19beta3"). These must
+    /// clear the 140000 floor, not parse to 0 and be rejected as unsupported.
+    #[test]
+    fn test_parse_server_version_prerelease() {
+        assert_eq!(parse_server_version("19beta3"), 190000);
+        assert_eq!(parse_server_version("19rc1"), 190000);
+        assert_eq!(parse_server_version("19devel"), 190000);
+        assert_eq!(parse_server_version("18beta1 (Debian 18~beta1-1)"), 180000);
     }
 
     #[test]

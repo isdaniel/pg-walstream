@@ -693,6 +693,21 @@ impl LogicalReplicationParser {
         self.streaming_context.is_some()
     }
 
+    /// Drop any in-progress streaming-transaction context.
+    ///
+    /// Call this after re-issuing `START_REPLICATION` on a new connection. A
+    /// `StreamStart`/`StreamStop` pair can straddle a disconnect, and the server
+    /// resumes from a transaction boundary — but a parser still holding the
+    /// context would read a phantom xid prefix off every subsequent message.
+    ///
+    /// Crate-internal: the only caller is the backend-gated stream layer, which
+    /// is also the only thing that reconnects.
+    #[cfg(any(feature = "libpq", feature = "rustls-tls"))]
+    #[inline]
+    pub(crate) fn reset(&mut self) {
+        self.streaming_context = None;
+    }
+
     /// Parse a WAL data message from the replication stream
     #[inline]
     pub fn parse_wal_message(&mut self, data: &[u8]) -> Result<StreamingReplicationMessage> {
@@ -1425,9 +1440,10 @@ pub(crate) fn message_to_change_event(
             replica_identity,
             columns,
         } => {
-            // Detect schema changes: if we already have this relation cached
-            // and the schema differs, emit a Relation event before updating.
-            let schema_changed = if let Some(existing) = state.get_relation(relation_id) {
+            // Emit a Relation event the first time a table is seen and whenever
+            // its schema changes; stay silent for the identical repeats pgoutput
+            // sends at the start of every transaction.
+            let emit = if let Some(existing) = state.get_relation(relation_id) {
                 existing.namespace.as_ref() != namespace.as_ref()
                     || existing.relation_name.as_ref() != relation_name.as_ref()
                     || existing.replica_identity != replica_identity
@@ -1439,10 +1455,10 @@ pub(crate) fn message_to_change_event(
                             || a.is_key() != b.is_key()
                     })
             } else {
-                false
+                true
             };
 
-            if schema_changed {
+            if emit {
                 let ri = ReplicaIdentity::from_byte(replica_identity)
                     .unwrap_or(ReplicaIdentity::Default);
                 let relation_columns = columns
@@ -1621,7 +1637,11 @@ pub(crate) fn message_to_change_event(
             }
 
             ChangeEvent {
-                event_type: EventType::Truncate(truncate_tables),
+                event_type: EventType::Truncate {
+                    tables: truncate_tables,
+                    cascade: flags & 1 != 0,
+                    restart_identity: flags & 2 != 0,
+                },
                 lsn: Lsn::new(lsn),
                 metadata: None,
             }
@@ -2019,7 +2039,7 @@ pub fn build_hot_standby_feedback_message(
 /// - Int64: applied LSN (last WAL byte replayed)
 /// - Int64: client timestamp
 /// - Byte1: 1 to request an immediate server reply, else 0
-#[cfg(feature = "std")]
+#[cfg(any(feature = "libpq", feature = "rustls-tls"))]
 pub(crate) fn build_standby_status_update_message(
     received_lsn: XLogRecPtr,
     flushed_lsn: XLogRecPtr,
@@ -2120,8 +2140,8 @@ mod tests {
             }
         }
 
-        // The leading Relation only populated the cache; data messages that
-        // followed produced events, so the relation must be cached.
+        // The leading Relation populated the cache and emitted an event; the
+        // data messages that followed produced events off that cache.
         assert!(decoder.state().get_relation(42).is_some());
 
         // Concrete decode of the Insert, independent of the reference path.
@@ -2132,8 +2152,8 @@ mod tests {
                 Lsn::new(0x10),
             )
             .unwrap()
-            .is_none(),
-            "first Relation is a cache update, not an event"
+            .is_some(),
+            "first Relation emits an event and caches the schema"
         );
         let ev = d
             .decode_message(
@@ -2230,10 +2250,52 @@ mod tests {
             .expect("truncate yields an event");
         assert_eq!(ev.lsn, Lsn::new(0x50));
         match ev.event_type {
-            EventType::Truncate(ref tables) => {
+            EventType::Truncate { ref tables, .. } => {
                 assert_eq!(tables, &vec![Arc::from("public.users")]);
             }
             ref other => panic!("expected Truncate, got {other:?}"),
+        }
+    }
+
+    /// TRUNCATE's option byte reaches the user event: 1 = CASCADE,
+    /// 2 = RESTART IDENTITY. A sink needs both to reproduce the statement.
+    #[test]
+    fn test_truncate_flags_reach_change_event() {
+        for (flags, cascade, restart) in [
+            (0u8, false, false),
+            (1, true, false),
+            (2, false, true),
+            (3, true, true),
+        ] {
+            let mut state = ReplicationState::new();
+            state.add_relation(RelationInfo::new(
+                7,
+                Arc::from("public"),
+                Arc::from("t"),
+                b'd',
+                vec![ColumnInfo::new(1, "id".to_string(), 23, -1)],
+            ));
+
+            let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Truncate {
+                relation_ids: vec![7],
+                flags,
+            });
+            let ev = message_to_change_event(&mut state, msg, 0x900)
+                .unwrap()
+                .expect("truncate yields an event");
+
+            match ev.event_type {
+                EventType::Truncate {
+                    ref tables,
+                    cascade: c,
+                    restart_identity: r,
+                } => {
+                    assert_eq!(tables, &vec![Arc::<str>::from("public.t")]);
+                    assert_eq!(c, cascade, "cascade for flags={flags}");
+                    assert_eq!(r, restart, "restart_identity for flags={flags}");
+                }
+                ref other => panic!("expected Truncate, got {other:?}"),
+            }
         }
     }
 
@@ -2792,6 +2854,7 @@ mod tests {
         assert_eq!(catalog_xmin_epoch, 2);
     }
 
+    #[cfg(any(feature = "libpq", feature = "rustls-tls"))]
     #[test]
     fn test_build_standby_status_update_message() {
         let message =
@@ -3426,6 +3489,42 @@ mod tests {
         let result = parser.parse_wal_message(&data).unwrap();
         assert!(result.is_streaming);
         assert_eq!(result.xid, Some(42));
+        match result.message {
+            LogicalReplicationMessage::Insert { relation_id, .. } => {
+                assert_eq!(relation_id, 12345);
+            }
+            _ => panic!("Expected Insert"),
+        }
+    }
+
+    /// A disconnect can land between StreamStart and StreamStop. After
+    /// reconnecting, the server resumes at a transaction boundary, so a parser
+    /// still holding the context would eat 4 bytes of the next message body as
+    /// a phantom xid — silently corrupting the relation cache.
+    #[cfg(any(feature = "libpq", feature = "rustls-tls"))]
+    #[test]
+    fn test_reset_clears_streaming_context() {
+        let mut parser = LogicalReplicationParser::with_protocol_version(2);
+
+        let mut stream_start = vec![message_types::STREAM_START];
+        stream_start.extend_from_slice(&write_u32_be(42)); // xid
+        stream_start.push(0x01); // first_segment
+        let _ = parser.parse_wal_message(&stream_start).unwrap();
+
+        parser.reset();
+
+        // No xid prefix now — relation_id must be read from offset 1.
+        let mut data = vec![message_types::INSERT];
+        data.extend_from_slice(&write_u32_be(12345)); // relation_id
+        data.push(b'N');
+        data.extend_from_slice(&[0x00, 0x01]); // 1 column
+        data.push(b't');
+        data.extend_from_slice(&write_u32_be(4));
+        data.extend_from_slice(b"test");
+
+        let result = parser.parse_wal_message(&data).unwrap();
+        assert!(!result.is_streaming);
+        assert_eq!(result.xid, None);
         match result.message {
             LogicalReplicationMessage::Insert { relation_id, .. } => {
                 assert_eq!(relation_id, 12345);

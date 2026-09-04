@@ -153,6 +153,39 @@ impl ReplicationError {
         ReplicationError::ReplicationSlot(msg.into())
     }
 
+    /// Classify a server error by its SQLSTATE.
+    ///
+    /// Only the two codes that are unambiguously terminal for a replication
+    /// slot are promoted to [`ReplicationSlot`](Self::ReplicationSlot) (which
+    /// [`is_permanent`](Self::is_permanent) reports as `true`, stopping the
+    /// retry loop); everything else stays `Protocol` so the streaming layer
+    /// keeps retrying:
+    ///
+    /// - `55000` *object_not_in_prerequisite_state* — the slot was invalidated
+    ///   (`wal_removed`, `rows_removed`, `wal_level_insufficient`, or PG18's
+    ///   `idle_timeout`), or `wal_level` is below `logical`. Recovery requires
+    ///   dropping the slot and re-syncing; retrying cannot help.
+    /// - `42704` *undefined_object* — the slot does not exist.
+    ///
+    /// Match on the code rather than the message: PostgreSQL 18 reworded slot
+    /// invalidation from "can no longer get changes from" to "can no longer
+    /// access", but the SQLSTATE is stable across major versions.
+    ///
+    /// An empty `sqlstate` (no diagnostics available) yields a plain `Protocol`
+    /// error with no prefix.
+    ///
+    /// Crate-internal, and gated on a connection backend for the same reason as
+    /// [`Self::stream_stopped`]: only the backends parse server diagnostics.
+    #[cfg(any(feature = "libpq", feature = "rustls-tls"))]
+    pub(crate) fn from_sqlstate<S: Into<String>>(sqlstate: &str, msg: S) -> Self {
+        let msg = msg.into();
+        match sqlstate {
+            "" => ReplicationError::Protocol(msg),
+            "55000" | "42704" => ReplicationError::ReplicationSlot(format!("[{sqlstate}] {msg}")),
+            _ => ReplicationError::Protocol(format!("[{sqlstate}] {msg}")),
+        }
+    }
+
     /// Create a new timeout error
     pub fn timeout<S: Into<String>>(msg: S) -> Self {
         ReplicationError::Timeout(msg.into())
@@ -182,8 +215,8 @@ impl ReplicationError {
     ///
     /// Crate-internal: the library emits this; external consumers match the [`ReplicationError::StreamStopped`] variant rather than constructing it.
     ///
-    /// Gated on a connection backend: the streaming layer that emits it  (`crate::stream`) is compiled only with `libpq`/`rustls-tls`, so this helper is dead code in the parser-only `no_std` build without the gate.
-    #[cfg(feature = "std")]
+    /// Gated on a connection backend: the streaming layer that emits it  (`crate::stream`) is compiled only with `libpq`/`rustls-tls`, so this helper is dead code in any build without one — including `--features std` on its own.
+    #[cfg(any(feature = "libpq", feature = "rustls-tls"))]
     pub(crate) fn stream_stopped(lsn: Lsn) -> Self {
         ReplicationError::StreamStopped(lsn)
     }
@@ -223,7 +256,7 @@ impl ReplicationError {
     /// Check if the error is the terminal bounded-replay stop signal.
     ///
     /// Gated on a connection backend for the same reason as [`Self::stream_stopped`]: its only caller lives in the backend-gated `crate::stream`.
-    #[cfg(feature = "std")]
+    #[cfg(any(feature = "libpq", feature = "rustls-tls"))]
     pub(crate) fn is_stream_stopped(&self) -> bool {
         matches!(self, ReplicationError::StreamStopped(_))
     }
@@ -498,6 +531,44 @@ mod tests {
 mod stop_signal_tests {
     use super::*;
     use crate::types::Lsn;
+
+    /// The two slot-fatal SQLSTATEs must become permanent errors so the retry
+    /// loop gives up instead of reconnecting into the same dead slot.
+    #[test]
+    fn test_from_sqlstate_slot_fatal_is_permanent() {
+        for code in ["55000", "42704"] {
+            let err = ReplicationError::from_sqlstate(code, "can no longer access slot");
+            assert!(
+                matches!(err, ReplicationError::ReplicationSlot(_)),
+                "{code} should map to ReplicationSlot, got {err:?}"
+            );
+            assert!(err.is_permanent(), "{code} should be permanent");
+            assert!(err.to_string().contains(code), "{err}");
+        }
+    }
+
+    /// Everything else stays retryable — a busy slot (55006) or a transient
+    /// server hiccup must not be mistaken for a dead slot.
+    #[test]
+    fn test_from_sqlstate_other_codes_stay_retryable() {
+        for code in ["55006", "57P01", "53300"] {
+            let err = ReplicationError::from_sqlstate(code, "boom");
+            assert!(
+                matches!(err, ReplicationError::Protocol(_)),
+                "{code} should stay Protocol, got {err:?}"
+            );
+            assert!(!err.is_permanent(), "{code} should not be permanent");
+            assert!(err.to_string().contains(code), "{err}");
+        }
+    }
+
+    /// No diagnostics available: no empty `[]` prefix in the message.
+    #[test]
+    fn test_from_sqlstate_empty_code() {
+        let err = ReplicationError::from_sqlstate("", "connection reset");
+        assert!(matches!(err, ReplicationError::Protocol(_)));
+        assert!(!err.to_string().contains('['), "{err}");
+    }
 
     #[test]
     fn stream_stopped_is_terminal_not_retryable() {
