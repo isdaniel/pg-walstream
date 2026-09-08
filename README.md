@@ -277,7 +277,9 @@ The library provides full control over replication slot creation. The correct SQ
 | `snapshot` | Snapshot behavior: `"export"`, `"use"`, or `"nothing"` | 14+ |
 | `failover` | Enable slot synchronization to standbys for HA | 16+ |
 
-> **Note:** If both `two_phase` and `snapshot` are set, `two_phase` takes priority. The `failover` option is not available on PG14 and will return an error.
+> **Note:** If both `two_phase` and `snapshot` are set, `two_phase` takes priority. An option newer than the connected server is rejected client-side with the required version in the message, before any SQL is sent.
+
+`failover` slots also need the standby configured for slot sync: `sync_replication_slots = on`, `hot_standby_feedback = on`, and a `primary_conninfo` that **includes `dbname`** (`pg_basebackup -R` omits it). After a promotion the consumer only changes its connection string — the slot is already there.
 
 ## Message Types
 
@@ -504,6 +506,7 @@ sudo sysctl --system
 - Logical replication slot must be created before streaming
 - Binary protocol only (no text-based protocol support)
 - Requires `replication` permission for the database user
+- A reconnect that lands on a different cluster or a new timeline (failover, PITR) is rejected as a permanent error rather than resumed: an LSN is only meaningful within one cluster on one timeline. Compare the confirmed LSN against the switchpoint in `TIMELINE_HISTORY <tli>` to decide whether to resume or re-sync
 
 ## Resources
 
