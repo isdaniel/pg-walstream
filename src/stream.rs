@@ -44,6 +44,8 @@ pub struct LogicalReplicationStream {
     pub shared_lsn_feedback: Arc<SharedLsnFeedback>,
     /// The snapshot name exported when the replication slot was created with `EXPORT_SNAPSHOT`.
     exported_snapshot_name: Option<String>,
+    /// `IDENTIFY_SYSTEM`'s identity from the first successful connection, re-checked on every reconnect. See [`ServerIdentity`].
+    identity: Option<ServerIdentity>,
     /// Counter that throttles per-event time checks inside `next_event`. We only consult `Instant::now()` once every `FEEDBACK_CHECK_EVENT_INTERVAL` events so the hot path avoids a syscall on every message.
     feedback_check_counter: u32,
     /// Bounded replay: set to the crossing commit's `end_lsn` once that event has been delivered; the next `next_event` sends CopyDone and returns `StreamStopped`. `None` when bounded replay is off or not yet reached.
@@ -77,6 +79,31 @@ const FEEDBACK_CHECK_EVENT_INTERVAL: u32 = 128;
 /// `Instant::now()` call is a vDSO syscall, so we additionally amortize it
 /// across this many events on the hot path.
 const HEALTH_CHECK_EVENT_INTERVAL: u32 = 1024;
+
+/// The `systemid` and `timeline` reported by `IDENTIFY_SYSTEM`.
+///
+/// Captured on the first connection and compared after every reconnect. Both
+/// values come from a row the connection already fetches, so the check costs
+/// nothing extra.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServerIdentity {
+    system_id: String,
+    timeline: u32,
+}
+
+impl ServerIdentity {
+    /// Read the first row of an `IDENTIFY_SYSTEM` result.
+    ///
+    /// `None` when a column is missing or the timeline is not a number — an
+    /// unexpected result shape disables the check rather than failing the
+    /// connection, since the check is a safety net, not a requirement.
+    fn from_identify_system(result: &crate::connection::PgResult) -> Option<Self> {
+        Some(Self {
+            system_id: result.get_value(0, 0)?,
+            timeline: result.get_value(0, 1)?.parse().ok()?,
+        })
+    }
+}
 
 /// Configuration for the replication stream
 #[derive(Debug, Clone)]
@@ -476,6 +503,7 @@ impl LogicalReplicationStream {
             last_health_check,
             shared_lsn_feedback,
             exported_snapshot_name: None,
+            identity: None,
             feedback_check_counter: 0,
             stop_at_reached: None,
             copy_done_sent: false,
@@ -486,8 +514,10 @@ impl LogicalReplicationStream {
     async fn initialize(&mut self) -> Result<()> {
         info!("Initializing replication stream");
 
-        // Identify the system
-        let _system_id = self.connection.identify_system()?;
+        // Identify the system, and remember who it is: a later reconnect that
+        // lands on a different cluster or a forked timeline is rejected.
+        let identity = self.connection.identify_system()?;
+        self.identity = ServerIdentity::from_identify_system(&identity);
         info!("System identification successful");
 
         // Create replication slot if it doesn't exist
@@ -861,6 +891,39 @@ impl LogicalReplicationStream {
         Ok(())
     }
 
+    /// Reject a reconnect that landed on a different cluster or a forked timeline.
+    ///
+    /// An LSN only identifies a WAL record within one cluster on one timeline. After a promotion (failover, switchover, or point-in-time recovery) the server runs on a new timeline whose WAL diverges from the old one at the switchpoint; records the consumer already saw past that point no longer exist. Resuming silently would stream a different history under the same LSNs, and nothing downstream could tell.
+    ///
+    /// A promoted standby keeps the primary's `systemid`, so the timeline is the only signal for a failover; the `systemid` check catches the separate mistake of pointing the consumer at an unrelated cluster that happens to have a slot by the same name.
+    ///
+    /// Returns [`ReplicationError::ReplicationSlot`], which [`is_permanent`](ReplicationError::is_permanent) reports as `true`, so the  retry loop stops instead of reconnecting into the fork. Deciding whether the stored LSN survived requires the switchpoint from `TIMELINE_HISTORY <tli>`, which is a policy call left to the caller.
+    fn check_server_identity(&self, current: &ServerIdentity) -> Result<()> {
+        let Some(previous) = self.identity.as_ref() else {
+            return Ok(());
+        };
+
+        if previous.system_id != current.system_id {
+            return Err(ReplicationError::replication_slot(format!(
+                "reconnected to a different cluster: system identifier was {}, now {}; \
+                 the stored LSN belongs to the old cluster",
+                previous.system_id, current.system_id
+            )));
+        }
+
+        if previous.timeline != current.timeline {
+            return Err(ReplicationError::replication_slot(format!(
+                "server switched timeline {} -> {} (failover or point-in-time recovery); \
+                 WAL diverges at the switchpoint, so the stored LSN may name a record that \
+                 no longer exists. Check the confirmed LSN against the switchpoint reported \
+                 by `TIMELINE_HISTORY {}` before resuming, or re-sync from a new snapshot",
+                previous.timeline, current.timeline, current.timeline
+            )));
+        }
+
+        Ok(())
+    }
+
     /// Recover connection after a failure
     async fn recover_connection(&mut self) -> Result<()> {
         info!("Attempting to recover replication connection");
@@ -872,8 +935,12 @@ impl LogicalReplicationStream {
         )
         .await?;
 
-        // Re-initialize the connection
-        self.connection.identify_system()?;
+        // Re-initialize the connection. A reconnect can land somewhere other than where we left off, and the stored LSN is only meaningful on the original cluster and timeline.
+        let identity = self.connection.identify_system()?;
+        if let Some(current) = ServerIdentity::from_identify_system(&identity) {
+            self.check_server_identity(&current)?;
+            self.identity = Some(current);
+        }
 
         // Temporary slots are dropped when the connection dies, so we must
         // recreate them on recovery.
@@ -3837,10 +3904,142 @@ mod tests {
             last_health_check: Instant::now(),
             shared_lsn_feedback: SharedLsnFeedback::new_shared(),
             exported_snapshot_name: None,
+            identity: None,
             feedback_check_counter: 0,
             stop_at_reached: None,
             copy_done_sent: false,
         }
+    }
+
+    /// Build an `IDENTIFY_SYSTEM`-shaped result. Native-only: the libpq
+    /// `PgResult` wraps a `PGresult` pointer and cannot be fabricated this way.
+    #[cfg(feature = "rustls-tls")]
+    fn identify_system_result(cols: &[&str], row: &[Option<&str>]) -> crate::connection::PgResult {
+        let mut r = crate::connection::PgResult::new();
+        r.columns = cols.iter().map(|c| c.to_string()).collect();
+        r.rows = vec![row
+            .iter()
+            .map(|v| v.map(|v| v.as_bytes().to_vec()))
+            .collect()];
+        r
+    }
+
+    /// Pins the column order of `IDENTIFY_SYSTEM`: systemid is column 0 and
+    /// timeline is column 1. Reading these transposed would silently compare the
+    /// wrong values on every reconnect.
+    #[cfg(feature = "rustls-tls")]
+    #[test]
+    fn identity_parses_an_identify_system_row() {
+        let r = identify_system_result(
+            &["systemid", "timeline", "xlogpos", "dbname"],
+            &[
+                Some("7682669593620992043"),
+                Some("2"),
+                Some("0/30001A0"),
+                Some("test_walstream"),
+            ],
+        );
+        assert_eq!(
+            ServerIdentity::from_identify_system(&r),
+            Some(identity("7682669593620992043", 2))
+        );
+    }
+
+    /// An unexpected result shape disables the check rather than failing the
+    /// connection, so each malformed case must yield `None`, not a panic.
+    #[cfg(feature = "rustls-tls")]
+    #[test]
+    fn identity_returns_none_for_an_unusable_row() {
+        // No rows at all.
+        let mut empty = crate::connection::PgResult::new();
+        empty.columns = vec!["systemid".into(), "timeline".into()];
+        assert_eq!(ServerIdentity::from_identify_system(&empty), None);
+
+        // Timeline column missing.
+        let short = identify_system_result(&["systemid"], &[Some("7682")]);
+        assert_eq!(ServerIdentity::from_identify_system(&short), None);
+
+        // Timeline present but not a number.
+        let bad = identify_system_result(&["systemid", "timeline"], &[Some("7682"), Some("x")]);
+        assert_eq!(ServerIdentity::from_identify_system(&bad), None);
+
+        // Timeline is SQL NULL.
+        let null = identify_system_result(&["systemid", "timeline"], &[Some("7682"), None]);
+        assert_eq!(ServerIdentity::from_identify_system(&null), None);
+    }
+
+    fn identity(system_id: &str, timeline: u32) -> ServerIdentity {
+        ServerIdentity {
+            system_id: system_id.to_string(),
+            timeline,
+        }
+    }
+
+    /// The first connection has nothing to compare against, so anything passes.
+    #[test]
+    fn identity_check_passes_before_the_first_connection() {
+        let stream = create_test_stream(create_test_config());
+        assert!(stream.identity.is_none());
+        assert!(stream.check_server_identity(&identity("7682", 1)).is_ok());
+    }
+
+    /// Reconnecting to the same cluster on the same timeline is the normal case.
+    #[test]
+    fn identity_check_passes_on_an_unchanged_server() {
+        let mut stream = create_test_stream(create_test_config());
+        stream.identity = Some(identity("7682", 1));
+        assert!(stream.check_server_identity(&identity("7682", 1)).is_ok());
+    }
+
+    /// A promoted standby keeps the primary's systemid, so only the timeline
+    /// moves. This is the failover case, and it must be permanent: retrying
+    /// would stream the post-fork history under LSNs the consumer already used.
+    #[test]
+    fn identity_check_rejects_a_timeline_switch() {
+        let mut stream = create_test_stream(create_test_config());
+        stream.identity = Some(identity("7682", 1));
+
+        let err = stream
+            .check_server_identity(&identity("7682", 2))
+            .unwrap_err();
+        assert!(
+            matches!(err, ReplicationError::ReplicationSlot(_)),
+            "expected ReplicationSlot, got {err:?}"
+        );
+        assert!(err.is_permanent(), "a fork must stop the retry loop: {err}");
+        let msg = err.to_string();
+        assert!(msg.contains("timeline 1 -> 2"), "{msg}");
+        assert!(msg.contains("TIMELINE_HISTORY 2"), "{msg}");
+    }
+
+    /// Pointing the consumer at an unrelated cluster (a clone, or staging vs
+    /// production) that happens to have a slot by the same name.
+    #[test]
+    fn identity_check_rejects_a_different_cluster() {
+        let mut stream = create_test_stream(create_test_config());
+        stream.identity = Some(identity("7682", 1));
+
+        let err = stream
+            .check_server_identity(&identity("9999", 1))
+            .unwrap_err();
+        assert!(err.is_permanent(), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("different cluster"), "{msg}");
+        assert!(msg.contains("7682") && msg.contains("9999"), "{msg}");
+    }
+
+    /// systemid is checked first: a wholesale cluster swap is the more
+    /// actionable diagnosis even when the timeline also differs.
+    #[test]
+    fn identity_check_reports_the_cluster_when_both_differ() {
+        let mut stream = create_test_stream(create_test_config());
+        stream.identity = Some(identity("7682", 1));
+
+        let msg = stream
+            .check_server_identity(&identity("9999", 3))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("different cluster"), "{msg}");
     }
 
     #[tokio::test]

@@ -46,7 +46,7 @@ pq-sys = { version = "0.7.5", optional = true }
 
 # rustls-tls
 tokio-rustls = { version = "0.26.5", optional = true }
-rustls = { version = "0.23.43", default-features = false, features = ["std", "tls12"], optional = true }
+rustls = { version = "0.23.44", default-features = false, features = ["std", "tls12"], optional = true }
 webpki-roots = { version = "1.0.9", optional = true }
 postgres-protocol = { version = "0.6.12", optional = true }
 aws-lc-rs = { version = "1.18.1", optional = true }
