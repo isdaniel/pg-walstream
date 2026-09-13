@@ -110,9 +110,11 @@ impl<T> core::ops::DerefMut for CachePadded<T> {
 ///
 /// Microseconds since PostgreSQL epoch (2000-01-01 00:00:00 UTC)
 ///
-/// # Panics
-///
-/// Panics if the SystemTime is before Unix epoch (1970-01-01).
+/// Never panics: this runs on the standby-status-update send path, so a clock set
+/// before the Unix epoch (or absurdly far ahead) must not abort the replication
+/// task. Pre-1970 clocks yield a negative timestamp; out-of-range magnitudes
+/// saturate. Mirrors the "never panics" contract of
+/// [`postgres_timestamp_to_chrono`], the inverse conversion.
 ///
 /// # Example
 ///
@@ -124,15 +126,14 @@ impl<T> core::ops::DerefMut for CachePadded<T> {
 /// let pg_timestamp = system_time_to_postgres_timestamp(now);
 /// ```
 pub fn system_time_to_postgres_timestamp(time: SystemTime) -> TimestampTz {
-    let duration_since_unix = time
-        .duration_since(UNIX_EPOCH)
-        .expect("SystemTime is before Unix epoch");
-
-    let unix_secs = duration_since_unix.as_secs() as i64;
-    let unix_micros = unix_secs * 1_000_000 + (duration_since_unix.subsec_micros() as i64);
+    // `duration_since` errors when `time` predates the epoch; the error carries the magnitude, so a backwards clock becomes a negative timestamp instead of a panic.
+    let unix_micros = match time.duration_since(UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_micros()).unwrap_or(i64::MAX),
+        Err(e) => i64::try_from(e.duration().as_micros()).map_or(i64::MIN, |micros| -micros),
+    };
 
     // Convert from Unix epoch to PostgreSQL epoch
-    unix_micros - PG_EPOCH_OFFSET_SECS * 1_000_000
+    unix_micros.saturating_sub(PG_EPOCH_OFFSET_SECS * 1_000_000)
 }
 
 /// Convert PostgreSQL timestamp (microseconds since 2000-01-01) into `chrono::DateTime<Utc>`.
@@ -176,6 +177,7 @@ pub fn postgres_timestamp_to_chrono(ts: i64) -> chrono::DateTime<chrono::Utc> {
 /// Returns an error if:
 /// - The string format is invalid (doesn't contain exactly one '/')
 /// - Either part cannot be parsed as hexadecimal
+/// - Either part does not fit in 32 bits
 ///
 /// # Example
 ///
@@ -187,6 +189,9 @@ pub fn postgres_timestamp_to_chrono(ts: i64) -> chrono::DateTime<chrono::Utc> {
 ///
 /// let lsn = parse_lsn("0/0").unwrap();
 /// assert_eq!(lsn, 0);
+///
+/// // Each half is a 32-bit word: an oversized half is rejected rather than silently carried into the other half.
+/// assert!(parse_lsn("0/1FFFFFFFF").is_err());
 /// ```
 pub fn parse_lsn(lsn_str: &str) -> Result<XLogRecPtr> {
     let (high_str, low_str) = lsn_str.split_once('/').ok_or_else(|| {
@@ -195,12 +200,13 @@ pub fn parse_lsn(lsn_str: &str) -> Result<XLogRecPtr> {
         ))
     })?;
 
-    let high = u64::from_str_radix(high_str, 16)
+    // Parse each half as u32, not u64: PostgreSQL formats an LSN as two 32-bit words, so a half wider than 32 bits is malformed.
+    let high = u32::from_str_radix(high_str, 16)
         .map_err(|e| ReplicationError::protocol(format!("Invalid LSN high part: {e}")))?;
-    let low = u64::from_str_radix(low_str, 16)
+    let low = u32::from_str_radix(low_str, 16)
         .map_err(|e| ReplicationError::protocol(format!("Invalid LSN low part: {e}")))?;
 
-    Ok((high << 32) | low)
+    Ok(((high as u64) << 32) | low as u64)
 }
 
 /// Format LSN as string (e.g., "0/12345678")
@@ -356,7 +362,15 @@ pub struct ReplicationSlotOptions {
 }
 
 /// Options for BASE_BACKUP command
-#[derive(Debug, Clone, Default)]
+///
+/// `Default` is hand-written rather than derived because `wait` and
+/// `verify_checksums` default to **`true`**, matching the server. A derived
+/// `Default` would make them `false`, and since `false` is what emits the
+/// negative form, every `..Default::default()` backup would silently ship
+/// `WAIT false, VERIFY_CHECKSUMS false` — disabling checksum verification on
+/// every default backup. Adding a field to this struct is a compile error here
+/// until it is listed, which is the intended safety net.
+#[derive(Debug, Clone)]
 pub struct BaseBackupOptions {
     /// Backup label (default: \"base backup\")
     pub label: Option<String>,
@@ -376,7 +390,24 @@ pub struct BaseBackupOptions {
     /// Include WAL files in the backup
     pub wal: bool,
 
-    /// Wait for WAL archiving (default: true)
+    /// Wait for WAL archiving to complete before finishing the backup.
+    ///
+    /// `true` (default) omits the option, which is the server's own default. The
+    /// affirmative `WAIT true` is never emitted because it would be redundant:
+    /// `opt->nowait` is a field in a `MemSet`-zeroed struct, so an omitted option
+    /// and `WAIT true` are byte-for-byte the same thing to
+    /// `do_pg_backup_stop(..., !opt->nowait)`.
+    ///
+    /// `false` emits `WAIT false` — what `pg_basebackup` sends (as `WAIT 0`)
+    /// whenever it collects the WAL itself (`-X fetch`/`-X stream`), spelled
+    /// `NOWAIT` before PG15. The backup then completes with WAL segments possibly
+    /// not yet archived, leaving the caller responsible for their availability at
+    /// restore time.
+    ///
+    /// **Behaviour change.** This field used to be inert: `true` emitted
+    /// `WAIT true` (= the default) and `false` emitted nothing (= the default),
+    /// so no-wait was unreachable. `false` now does what it says. The default is
+    /// unchanged, and so is `wait: true`.
     pub wait: bool,
 
     /// Compression method: 'gzip', 'lz4', or 'zstd'
@@ -385,13 +416,51 @@ pub struct BaseBackupOptions {
     /// Compression details (level, workers, etc.)
     pub compression_detail: Option<String>,
 
-    /// Maximum transfer rate in KB/s (0 = unlimited)
+    /// Maximum transfer rate in KB/s.
+    ///
+    /// The **server** validates the range (`parse_basebackup_options`); at the time
+    /// of writing that is `32..=1_048_576` KB/s, and it answers
+    /// `ERROR: 0 is outside the valid range for parameter "MAX_RATE" (32 .. 1048576)`.
+    /// This crate forwards the value rather than duplicating those bounds, so a
+    /// future server that widens them just works.
+    ///
+    /// Use `None` for unlimited — `0` is **not** "unlimited", it is out of range.
     pub max_rate: Option<u64>,
 
     /// Include tablespace map
     pub tablespace_map: bool,
 
-    /// Verify checksums during backup
+    /// Verify data-page checksums while reading files.
+    ///
+    /// `true` (default) omits the option. The affirmative `VERIFY_CHECKSUMS true`
+    /// is never emitted — see the gap note below for the one case where that
+    /// would have mattered.
+    ///
+    /// `false` emits `VERIFY_CHECKSUMS false` (`pg_basebackup
+    /// --no-verify-checksums`, spelled `NOVERIFY_CHECKSUMS` before PG15),
+    /// skipping the check that otherwise fails the whole backup with SQLSTATE
+    /// `XX001` *checksum verification failure during base backup*. That trades a
+    /// corruption safety net for speed.
+    ///
+    /// **Behaviour change.** This field used to be inert: `true` emitted
+    /// `VERIFY_CHECKSUMS true` (= the default) and `false` emitted nothing
+    /// (= the default), so skipping verification was unreachable. `false` now
+    /// actually skips it. The default is unchanged, and so is
+    /// `verify_checksums: true`.
+    ///
+    /// **Known gap, accepted.** Unlike `wait`, the server keeps this one in a
+    /// file-scope `static bool noverify_checksums` (`basebackup.c`) that
+    /// `parse_basebackup_options` writes only when the option is present and
+    /// never resets. So omitting it does not mean "the server default", it means
+    /// "whatever the last `BASE_BACKUP` on this walsender process set". Issue two
+    /// backups on one connection, the first with `verify_checksums: false`, and
+    /// the second silently inherits it even with `verify_checksums: true`.
+    /// Forcing it back on would need a tri-state here and not on `wait`, which is
+    /// not worth the asymmetry — use a fresh connection if it matters.
+    ///
+    /// All of this is inert on a cluster with `data_checksums = off` (the
+    /// `initdb` default before PG18): the read site is guarded by
+    /// `DataChecksumsEnabled()`, so both values are silent no-ops there.
     pub verify_checksums: bool,
 
     /// Manifest option: 'yes', 'no', or 'force-encode'
@@ -407,6 +476,33 @@ pub struct BaseBackupOptions {
     /// server otherwise answers `must UPLOAD_MANIFEST before performing an
     /// incremental BASE_BACKUP`. The server must also have `summarize_wal = on`.
     pub incremental: bool,
+}
+
+impl Default for BaseBackupOptions {
+    /// Everything off except `wait` and `verify_checksums`, which default to
+    /// `true` to match the server. Both then emit nothing, so
+    /// `BaseBackupOptions::default()` produces a bare `BASE_BACKUP` — identical
+    /// to what a derived `Default` used to produce, and identical to what
+    /// `pg_basebackup` sends with no flags.
+    fn default() -> Self {
+        Self {
+            label: None,
+            target: None,
+            target_detail: None,
+            progress: false,
+            checkpoint: None,
+            wal: false,
+            wait: true,
+            compression: None,
+            compression_detail: None,
+            max_rate: None,
+            tablespace_map: false,
+            verify_checksums: true,
+            manifest: None,
+            manifest_checksums: None,
+            incremental: false,
+        }
+    }
 }
 
 /// LSN (Log Sequence Number) representation
@@ -2209,6 +2305,32 @@ mod tests {
         assert!(parse_lsn("A/B/C/D").is_err());
     }
 
+    /// Each half of an LSN is a 32-bit word. Parsing the halves as u64 accepted an
+    /// oversized half and carried it into the neighbouring word, turning a malformed
+    /// string into a valid-but-wrong position (`0/1FFFFFFFF` -> `1/FFFFFFFF`). This
+    /// parses server output (`READ_REPLICATION_SLOT`'s restart_lsn) as well as user
+    /// input via the public `Lsn::from_str`, so a wrong-but-plausible answer is
+    /// worse than an error.
+    #[test]
+    fn parse_lsn_rejects_oversized_halves() {
+        assert!(parse_lsn("0/1FFFFFFFF").is_err());
+        assert!(parse_lsn("FFFFFFFFF/0").is_err());
+        // The widest well-formed value still round-trips.
+        assert_eq!(parse_lsn("FFFFFFFF/FFFFFFFF").unwrap(), u64::MAX);
+        assert_eq!(format_lsn(parse_lsn("16/B374D848").unwrap()), "16/B374D848");
+    }
+
+    /// The feedback path calls this on every standby status update; a clock set
+    /// before 1970 used to panic the whole replication task.
+    #[test]
+    fn system_time_before_unix_epoch_does_not_panic() {
+        let before = UNIX_EPOCH - std::time::Duration::from_secs(1);
+        assert_eq!(
+            system_time_to_postgres_timestamp(before),
+            -(1 + PG_EPOCH_OFFSET_SECS) * 1_000_000
+        );
+    }
+
     #[test]
     fn test_constants() {
         assert_eq!(INVALID_XLOG_REC_PTR, 0);
@@ -3163,11 +3285,15 @@ mod tests {
         assert!(opts.target.is_none());
         assert!(!opts.progress);
         assert!(!opts.wal);
-        assert!(!opts.wait);
+        // These two default to `true`, not `false` — the server waits and
+        // verifies unless told otherwise, and `Default` is hand-written to say
+        // so. A derived `Default` would give `false`, which is the value that
+        // emits the negative form.
+        assert!(opts.wait);
         assert!(opts.compression.is_none());
         assert!(opts.max_rate.is_none());
         assert!(!opts.tablespace_map);
-        assert!(!opts.verify_checksums);
+        assert!(opts.verify_checksums);
         assert!(opts.manifest.is_none());
         assert!(!opts.incremental);
     }

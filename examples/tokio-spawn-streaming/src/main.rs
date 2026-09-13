@@ -73,7 +73,7 @@ async fn run_producer(
                 // Update applied LSN so PostgreSQL can reclaim WAL
                 stream
                     .shared_lsn_feedback
-                    .update_applied_lsn(event.lsn.value());
+                    .update_applied_lsn(event.lsn);
 
                 // Send event to consumer; if the receiver is dropped, stop
                 if tx.send(event).await.is_err() {

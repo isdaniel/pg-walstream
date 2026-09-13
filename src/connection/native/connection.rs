@@ -143,7 +143,7 @@ impl Worker {
                             held = Some(batch);
                         }
                         Err(err) => {
-                            if matches!(err, ReplicationError::TransientConnection(_)) {
+                            if !err.is_cancelled() {
                                 self.alive.store(false, Ordering::Relaxed);
                             }
 
@@ -651,7 +651,8 @@ impl NativeConnection {
                     cancellation_token,
                 )
                 .await;
-                if let Err(ReplicationError::TransientConnection(_)) = &result {
+
+                if result.as_ref().err().is_some_and(|e| !e.is_cancelled()) {
                     alive.store(false, Ordering::Relaxed);
                 }
                 result

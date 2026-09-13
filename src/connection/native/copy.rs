@@ -58,12 +58,24 @@ pub async fn get_copy_data<R: AsyncRead + Unpin>(
     cancellation_token: &CancellationToken,
 ) -> Result<Bytes, ReplicationError> {
     loop {
-        // ── Fast path: return from pre-drained queue (no syscall) ──
+        // Re-drain before blocking: the `MAX_DRAIN_BATCH` cap can leave complete
+        // frames behind, and `drain_read_buffer` latches a terminal ('c'/'E') in
+        // `read_buf` while frames are still queued. Without this they stay
+        // invisible until the next byte arrives — up to `wal_sender_timeout/2`
+        // (30 s) of latency on data already in hand, or a hang if the server has
+        // stopped talking. Only when the queue is empty: a non-empty queue is the
+        // zero-syscall fast path, and it is also the precondition the terminal
+        // latch inside `drain_read_buffer` is written against.
+        if pending.is_empty() {
+            if let Some(err) = drain_read_buffer(read_buf, pending) {
+                return Err(err);
+            }
+        }
         if let Some(payload) = pending.pop_front() {
             return Ok(payload);
         }
 
-        // Ensure a large contiguous headroom BEFORE the read so one read() pulls as much as possible. Reserve only when free headroom drops below MIN_HEADROOM (not READ_CHUNK), so one 256 KiB reservation serves many reads instead of reallocating every iteration. `pending` is empty here (fast path returned above).
+        // Ensure a large contiguous headroom BEFORE the read so one read() pulls as much as possible. Reserve only when free headroom drops below MIN_HEADROOM (not READ_CHUNK), so one 256 KiB reservation serves many reads instead of reallocating every iteration. `pending` is empty here (the pop above returned otherwise).
         if read_buf.capacity() - read_buf.len() < MIN_HEADROOM {
             read_buf.reserve(READ_CHUNK);
         }
@@ -157,6 +169,13 @@ fn drain_read_buffer(
                 // ErrorResponse inside COPY mode — the server terminated the
                 // stream. Classify on SQLSTATE so an invalidated slot surfaces
                 // as a permanent error rather than a retryable protocol one.
+                //
+                // Anything already queued in this pass is delivered first: leaving
+                // the frame in `read_buf` instead of consuming it makes the
+                // terminal sticky, so the caller re-reads it once the queue drains.
+                if !pending.is_empty() {
+                    break;
+                }
                 let frame = read_buf.split_to(total_len);
                 let fields = super::error::parse_error_fields(&frame[5..]);
                 return Some(ReplicationError::from_sqlstate(
@@ -165,10 +184,29 @@ fn drain_read_buffer(
                 ));
             }
             b'c' => {
-                // CopyDone — replication stream ended
+                // CopyDone — the server ended the replication stream.
+                //
+                // Previously this was skipped with only a debug log, leaving
+                // `get_copy_data` with no exit condition: it looped back to await
+                // a socket that would never produce another byte, so the consumer
+                // hung. Reachable via `start_physical_replication` — a physical
+                // walsender sends an unprompted CopyDone on a timeline switch
+                // (`XLogSendPhysical`). A *logical* walsender only sends one in
+                // reply to ours (`ProcessRepliesIfAny`); its shutdown path goes
+                // through `WalSndDone` → CommandComplete → `proc_exit`, which the
+                // existing `read() == 0` arm already handled. Report it as
+                // transient so the stream layer reconnects — matching the libpq
+                // backend, which latches the same condition.
+                //
+                // Same sticky trick as 'E': queued frames go out first.
+                if !pending.is_empty() {
+                    break;
+                }
                 read_buf.advance(total_len);
-                tracing::debug!("CopyDone received");
-                // Don't break — there might be more messages after CopyDone
+                tracing::debug!("CopyDone received — server ended the replication stream");
+                return Some(ReplicationError::transient_connection(
+                    "replication stream ended by server (CopyDone)",
+                ));
             }
             b'N' => {
                 // NoticeResponse inside COPY
@@ -296,10 +334,20 @@ mod tests {
         buf.put_i32(4);
 
         let mut pending = VecDeque::new();
-        drain_read_buffer(&mut buf, &mut pending);
-
+        // Pass 1: the queued frame wins; the terminal is left in the buffer.
+        assert!(drain_read_buffer(&mut buf, &mut pending).is_none());
         assert_eq!(pending.len(), 1);
         assert_eq!(&pending[0][..], b"abc");
+        assert!(!buf.is_empty(), "CopyDone must stay latched in the buffer");
+
+        // Pass 2, queue drained: the terminal surfaces. Sticky with no extra state.
+        pending.clear();
+        let err = drain_read_buffer(&mut buf, &mut pending)
+            .expect("CopyDone must terminate once the queue is empty");
+        assert!(
+            matches!(err, ReplicationError::TransientConnection(_)),
+            "{err:?}"
+        );
         assert!(buf.is_empty());
     }
 
@@ -461,6 +509,10 @@ mod tests {
         assert_eq!(buf.len(), 10 * 6); // 10 * (1 + 4 + 1) bytes
     }
 
+    /// Notices are consumed inline and do not interrupt the drain; CopyDone does.
+    /// (A conforming server never sends CopyData after CopyDone — it waits for the
+    /// client's own CopyDone first — so the trailing frame here only exists to
+    /// prove the drain stops at the terminal rather than reading past it.)
     #[test]
     fn test_drain_interleaved_types() {
         let mut buf = BytesMut::new();
@@ -481,23 +533,25 @@ mod tests {
         buf.put_i32(4 + 1);
         buf.put_u8(b'b');
 
-        // CopyDone (consumed, not queued)
+        // CopyDone — terminal, stops the drain here
         buf.put_u8(b'c');
         buf.put_i32(4);
 
-        // CopyData "c"
+        // CopyData "c" — must NOT be read past the terminal
         buf.put_u8(b'd');
         buf.put_i32(4 + 1);
         buf.put_u8(b'c');
 
         let mut pending = VecDeque::new();
-        drain_read_buffer(&mut buf, &mut pending);
+        assert!(drain_read_buffer(&mut buf, &mut pending).is_none());
 
-        assert_eq!(pending.len(), 3); // 3 CopyData messages
+        assert_eq!(pending.len(), 2, "drain must stop at CopyDone");
         assert_eq!(&pending[0][..], b"a");
         assert_eq!(&pending[1][..], b"b");
-        assert_eq!(&pending[2][..], b"c");
-        assert!(buf.is_empty());
+        assert!(
+            !buf.is_empty(),
+            "CopyDone and everything after it stay latched"
+        );
     }
 
     // === Async tests ===

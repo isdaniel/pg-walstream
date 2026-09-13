@@ -12,7 +12,7 @@
 //! we need a thread-safe way to share the committed LSN from consumer back to producer
 //! for accurate feedback to PostgreSQL.
 
-use crate::types::{CachePadded, XLogRecPtr};
+use crate::types::{CachePadded, Lsn, XLogRecPtr};
 use crate::{format_lsn, prelude::*};
 use core::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, info};
@@ -101,8 +101,12 @@ impl SharedLsnFeedback {
     ///
     /// This should be called when data has been written/flushed to the destination
     /// database, but not yet committed (e.g., during batch writes).
+    ///
+    /// Accepts anything convertible to [`Lsn`], so `event.lsn` and a raw `u64`
+    /// both work without an explicit `.value()`.
     #[inline]
-    pub fn update_flushed_lsn(&self, lsn: XLogRecPtr) {
+    pub fn update_flushed_lsn(&self, lsn: impl Into<Lsn>) {
+        let lsn = lsn.into().value();
         if lsn == 0 {
             return;
         }
@@ -135,8 +139,12 @@ impl SharedLsnFeedback {
     /// This should be called when a transaction has been successfully committed
     /// to the destination database. This is the most important LSN as PostgreSQL
     /// uses it to determine which WAL can be recycled.
+    ///
+    /// Accepts anything convertible to [`Lsn`], so `event.lsn` and a raw `u64`
+    /// both work without an explicit `.value()`.
     #[inline]
-    pub fn update_applied_lsn(&self, lsn: XLogRecPtr) {
+    pub fn update_applied_lsn(&self, lsn: impl Into<Lsn>) {
+        let lsn = lsn.into().value();
         if lsn == 0 {
             return;
         }
@@ -199,11 +207,21 @@ impl SharedLsnFeedback {
         self.applied_lsn.load(Ordering::Acquire)
     }
 
-    /// Get both LSN values atomically for feedback
+    /// Get both LSN values for feedback, preserving `applied <= flushed`.
     ///
-    /// Retrieves both flushed and applied LSN values. Note that these are read
-    /// sequentially but both use atomic operations, so they represent a consistent
-    /// state at the time of reading.
+    /// The two loads are separate atomics, so they can straddle a concurrent
+    /// `update_applied_lsn`, which publishes `applied` before bumping `flushed`.
+    /// A reader landing in that window would otherwise observe `flushed < applied`
+    /// and ship a Standby Status Update whose `flush_lsn` trails its `replay_lsn`
+    /// — which PostgreSQL uses to advance `confirmed_flush_lsn` and to release
+    /// `SYNC_REP_WAIT_FLUSH` waiters, so the inversion is not cosmetic.
+    ///
+    /// Reordering the two loads does **not** fix this (the reader can still land
+    /// between the `applied` CAS and the `flushed` `fetch_max`); clamping does.
+    /// `applied` is the conservative side: it is the position the consumer claims
+    /// to have durably applied, and `update_applied_lsn` folds the implicit flush
+    /// bump in, so `applied <= flushed` is the steady-state invariant being
+    /// restored here, not a value being invented.
     ///
     /// # Returns
     ///
@@ -220,12 +238,13 @@ impl SharedLsnFeedback {
     /// let (flushed, applied) = feedback.get_feedback_lsn();
     /// assert_eq!(flushed, 1000);
     /// assert_eq!(applied, 1000);
+    /// assert!(applied <= flushed, "feedback must never report replay ahead of flush");
     /// ```
     #[inline(always)]
     pub fn get_feedback_lsn(&self) -> (XLogRecPtr, XLogRecPtr) {
         let flushed = self.flushed_lsn.load(Ordering::Acquire);
         let applied = self.applied_lsn.load(Ordering::Acquire);
-        (flushed, applied)
+        (flushed.max(applied), applied)
     }
 
     /// Log current LSN state

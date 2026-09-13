@@ -715,10 +715,10 @@ async fn startup_and_auth(
             }
             b'E' => {
                 let fields = super::error::parse_error_fields(&msg[5..]);
-                return Err(ReplicationError::permanent_connection(format!(
-                    "Server error during startup: {}",
-                    fields
-                )));
+                return Err(ReplicationError::from_sqlstate_startup(
+                    &fields.code,
+                    format!("Server error during startup: {fields}"),
+                ));
             }
             b'N' => {
                 // NoticeResponse — log and continue

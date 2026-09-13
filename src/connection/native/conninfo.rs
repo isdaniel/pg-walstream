@@ -95,11 +95,26 @@ impl std::fmt::Debug for ConnInfo {
 
 impl ConnInfo {
     pub fn parse(conninfo: &str) -> Result<Self, ReplicationError> {
-        if conninfo.starts_with("postgresql://") || conninfo.starts_with("postgres://") {
-            Self::parse_uri(conninfo)
+        let info = if conninfo.starts_with("postgresql://") || conninfo.starts_with("postgres://") {
+            Self::parse_uri(conninfo)?
         } else {
-            Self::parse_key_value(conninfo)
+            Self::parse_key_value(conninfo)?
+        };
+
+        if info.sslnegotiation == SslNegotiation::Direct
+            && !matches!(
+                info.sslmode,
+                SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull
+            )
+        {
+            return Err(ReplicationError::config(
+                "sslnegotiation=direct requires sslmode=require, verify-ca or verify-full; \
+                 a weaker mode may silently fall back to plaintext"
+                    .to_string(),
+            ));
         }
+
+        Ok(info)
     }
 
     fn parse_uri(uri: &str) -> Result<Self, ReplicationError> {
@@ -107,9 +122,24 @@ impl ConnInfo {
             .trim_start_matches("postgresql://")
             .trim_start_matches("postgres://");
 
-        // Split on @ to get credentials and host
-        let (creds, rest) = stripped.split_once('@').unwrap_or(("", stripped));
-        let (user, password) = if creds.is_empty() {
+        // The userinfo lookahead must stop at the authority boundary. libpq scans
+        // `while (*p && *p != '@' && *p != '/')` in `conninfo_uri_parse_options`, so
+        // a literal '@' inside the path or query is NOT a credentials designator.
+        // Splitting on the first '@' anywhere made
+        // `postgresql://pg.internal:5432/appdb?application_name=svc@prod` parse as
+        // host="prod", user="pg.internal" — the wrong host, and sslmode dropped
+        // along with the rest of the query.
+        //
+        // Stop at '@' and '/' ONLY, exactly as libpq does. Adding '?' to the set
+        // looks harmless but suppresses credential detection for a userinfo that
+        // legitimately contains one: `postgresql://us?er@host/db` parsed as
+        // host="us", and `postgresql://user:p?ss@host/db` fell into
+        // `parse_port("p")` and failed. libpq accepts both.
+        let (creds, rest) = match stripped.find(['@', '/']) {
+            Some(i) if stripped.as_bytes()[i] == b'@' => (&stripped[..i], &stripped[i + 1..]),
+            _ => ("", stripped),
+        };
+        let (mut user, mut password) = if creds.is_empty() {
             ("postgres".to_string(), None)
         } else if let Some((u, p)) = creds.split_once(':') {
             (
@@ -124,19 +154,61 @@ impl ConnInfo {
             (url_decode(creds), None)
         };
 
-        // Split rest on / to get host:port and db?params
-        let (host_port, db_params) = rest.split_once('/').unwrap_or((rest, ""));
-        let (host, port) = if host_port.contains(':') {
-            let (h, p) = host_port.rsplit_once(':').unwrap();
-            (h.to_string(), p.parse::<u16>().unwrap_or(5432))
+        // Split rest into authority and the `db?params` tail.
+        //
+        // The path is OPTIONAL in a libpq URI: `postgres://host?sslmode=verify-full`
+        // is valid and carries no `/`. Splitting only on `/` swallowed the whole
+        // query string into the hostname and dropped every parameter — which
+        // silently downgraded sslmode back to the default. Cut at whichever of
+        // `/` or `?` comes first.
+        let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
+        let host_port = &rest[..authority_end];
+        let db_params = match rest.as_bytes().get(authority_end) {
+            Some(b'/') => &rest[authority_end + 1..],
+            // A bare `?...` tail: no database name, query params follow.
+            Some(b'?') => &rest[authority_end..],
+            _ => "",
+        };
+
+        // An IPv6 literal is bracketed (`[::1]`, `[::1]:5433`); splitting on the
+        // last `:` would otherwise cut inside the address.
+        let (mut host, mut port) = if let Some(rest_after_bracket) = host_port.strip_prefix('[') {
+            let (addr, tail) = rest_after_bracket.split_once(']').ok_or_else(|| {
+                ReplicationError::config(format!(
+                    "unterminated IPv6 address in connection URI: \"{host_port}\""
+                ))
+            })?;
+            let port = match tail.strip_prefix(':') {
+                Some(p) => parse_port(p)?,
+                None if tail.is_empty() => 5432,
+                // Anything else after `]` is junk. Defaulting the port here would
+                // connect to 5432 silently: libpq answers `unexpected character
+                // "5" at position N in URI (expected ":" or "/")`.
+                None => {
+                    return Err(ReplicationError::config(format!(
+                        "unexpected character in connection URI after IPv6 address \
+                         (expected \":\" or \"/\"): \"{tail}\""
+                    )))
+                }
+            };
+            if addr.is_empty() {
+                return Err(ReplicationError::config(
+                    "IPv6 host address may not be empty in connection URI".to_string(),
+                ));
+            }
+            (addr.to_string(), port)
+        } else if let Some((h, p)) = host_port.rsplit_once(':') {
+            (h.to_string(), parse_port(p)?)
         } else {
             (host_port.to_string(), 5432)
         };
 
-        // Split db from query params
+        // Split db from query params. The user fallback is applied AFTER the
+        // query loop, as libpq does it in `pqConnectOptions2` (`connectOptions2` before PG17) — otherwise
+        // `postgresql:///?user=alice` would yield dbname="postgres".
         let (db, params_str) = db_params.split_once('?').unwrap_or((db_params, ""));
-        let dbname = if db.is_empty() {
-            user.clone()
+        let mut dbname = if db.is_empty() {
+            String::new()
         } else {
             url_decode(db)
         };
@@ -157,27 +229,82 @@ impl ConnInfo {
                 continue;
             }
             if let Some((key, val)) = param.split_once('=') {
+                // Query values are percent-encoded like the rest of the URI.
+                let val = url_decode(val);
+                let val = val.as_str();
                 match key {
-                    "sslmode" => sslmode = parse_sslmode(val),
-                    "sslrootcert" => sslrootcert = Some(url_decode(val)),
-                    "sslnegotiation" => sslnegotiation = parse_ssl_negotiation(val),
-                    "replication" => replication = parse_replication_mode(val),
+                    "sslmode" => sslmode = parse_sslmode(val)?,
+                    "sslrootcert" => sslrootcert = Some(val.to_string()),
+                    "sslnegotiation" => sslnegotiation = parse_ssl_negotiation(val)?,
+                    "replication" => replication = parse_replication_mode(val)?,
                     "connect_timeout" => {
-                        connect_timeout = val.parse().unwrap_or(0);
+                        connect_timeout = parse_connect_timeout("connect_timeout", val)?;
                     }
-                    "keepalives" => keepalives = val != "0",
+                    // libpq parses this as an integer (`pqParseIntParam` via
+                    // `useKeepalives`), so `keepalives=abc` is an error there, not
+                    // "on". Every sibling keepalive option is validated; so is this.
+                    "keepalives" => keepalives = parse_num::<i32>("keepalives", val)? != 0,
                     "keepalives_idle" => {
-                        keepalives_idle = val.parse().unwrap_or(120);
+                        keepalives_idle = parse_num("keepalives_idle", val)?;
                     }
                     "keepalives_interval" => {
-                        keepalives_interval = val.parse().unwrap_or(10);
+                        keepalives_interval = parse_num("keepalives_interval", val)?;
                     }
                     "keepalives_count" => {
-                        keepalives_count = val.parse().unwrap_or(3);
+                        keepalives_count = parse_num("keepalives_count", val)?;
                     }
-                    _ => {} // ignore unknown params
+                    // libpq docs 32.1.1.2: "Values that would normally appear in
+                    // the hierarchical part of the URI can alternatively be given
+                    // as named parameters", e.g.
+                    // `postgresql:///mydb?host=localhost&port=5433`. The query
+                    // overrides the hierarchical part, matching
+                    // `conninfo_uri_parse_options`, which stores host/port/dbname
+                    // before calling `conninfo_uri_parse_params`. Without these
+                    // arms the new error below would reject a legal URI.
+                    "host" | "hostaddr" => host = val.to_string(),
+                    "port" => port = parse_port(val)?,
+                    "user" => user = val.to_string(),
+                    "password" => password = Some(val.to_string()),
+                    "dbname" => dbname = val.to_string(),
+                    // libpq translates both of these to sslmode; dropping them is
+                    // the same silent downgrade this arm exists to prevent.
+                    // `requiressl` is handled in `conninfo_storeval`; `ssl=true`
+                    // is JDBC compatibility, hardcoded in
+                    // `conninfo_uri_parse_params` and therefore URI-query only.
+                    "requiressl" => {
+                        sslmode = if val.starts_with('1') {
+                            SslMode::Require
+                        } else {
+                            SslMode::Prefer
+                        }
+                    }
+                    "ssl" if val == "true" => sslmode = SslMode::Require,
+                    k => check_unhandled(k, val)?,
                 }
+            } else {
+                // No `=` at all. Dropping it silently is the same downgrade the
+                // unknown-key arm above exists to prevent, through a wider door:
+                // `?sslmodeverify-full` would leave sslmode at its Prefer default.
+                // libpq answers `missing key/value separator "=" in URI query
+                // parameter: "%s"` (`conninfo_uri_parse_params`).
+                return Err(ReplicationError::config(format!(
+                    "missing key/value separator \"=\" in URI query parameter: \"{param}\""
+                )));
             }
+        }
+
+        // libpq applies this fallback in `pqConnectOptions2` (`connectOptions2` before PG17), i.e. AFTER the query
+        // params are parsed — so `postgresql:///?user=alice` gives dbname=alice.
+        if dbname.is_empty() {
+            dbname = user.clone();
+        }
+
+        // `postgresql:///mydb` has no authority at all. libpq reads an empty host
+        // as "use the Unix socket"; this backend is TCP-only, so fall back to the
+        // same default the key/value path uses rather than handing
+        // `TcpStream::connect(":5432")` an unparsable address.
+        if host.is_empty() {
+            host = "localhost".to_string();
         }
 
         // Check PGPASSWORD env var if no password in URI
@@ -232,6 +359,15 @@ impl ConnInfo {
             let key: String = chars.by_ref().take_while(|c| *c != '=').collect();
             let key = key.trim();
 
+            // Skip whitespace after '='. libpq's own docs show `keyword = 'a value'`
+            // as valid, and `conninfo_parse` skips space on both sides of the `=`.
+            // Without this the value reads back empty and the next token is taken
+            // as a key — harmless while unknown keys were ignored, fatal now that
+            // they are rejected.
+            while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                chars.next();
+            }
+
             // Read value (may be quoted with single quotes).
             // Doubled single quotes inside a quoted value represent a literal quote,
             // e.g. password='it''s' → it's (matches libpq behavior).
@@ -261,20 +397,33 @@ impl ConnInfo {
 
             match key {
                 "host" | "hostaddr" => host = value,
-                "port" => port = value.parse().unwrap_or(5432),
+                "port" => port = parse_port(&value)?,
                 "user" => user = value,
                 "password" => password = Some(value),
                 "dbname" | "database" => dbname = Some(value),
-                "sslmode" => sslmode = parse_sslmode(&value),
+                "sslmode" => sslmode = parse_sslmode(&value)?,
                 "sslrootcert" => sslrootcert = Some(value),
-                "sslnegotiation" => sslnegotiation = parse_ssl_negotiation(&value),
-                "replication" => replication = parse_replication_mode(&value),
-                "connect_timeout" => connect_timeout = value.parse().unwrap_or(0),
-                "keepalives" => keepalives = value != "0",
-                "keepalives_idle" => keepalives_idle = value.parse().unwrap_or(120),
-                "keepalives_interval" => keepalives_interval = value.parse().unwrap_or(10),
-                "keepalives_count" => keepalives_count = value.parse().unwrap_or(3),
-                _ => {} // ignore unknown
+                "sslnegotiation" => sslnegotiation = parse_ssl_negotiation(&value)?,
+                "replication" => replication = parse_replication_mode(&value)?,
+                "connect_timeout" => {
+                    connect_timeout = parse_connect_timeout("connect_timeout", &value)?
+                }
+                "keepalives" => keepalives = parse_num::<i32>("keepalives", &value)? != 0,
+                "keepalives_idle" => keepalives_idle = parse_num("keepalives_idle", &value)?,
+                "keepalives_interval" => {
+                    keepalives_interval = parse_num("keepalives_interval", &value)?
+                }
+                "keepalives_count" => keepalives_count = parse_num("keepalives_count", &value)?,
+                // libpq translates this to sslmode in `conninfo_storeval`, so it
+                // works in both syntaxes. Dropping it is a silent downgrade.
+                "requiressl" => {
+                    sslmode = if value.starts_with('1') {
+                        SslMode::Require
+                    } else {
+                        SslMode::Prefer
+                    }
+                }
+                k => check_unhandled(k, &value)?,
             }
         }
 
@@ -301,51 +450,280 @@ impl ConnInfo {
     }
 }
 
-fn parse_sslmode(s: &str) -> SslMode {
+/// Parse an `sslmode` value, rejecting anything unrecognised.
+///
+/// Returning a default here would be a silent security downgrade: a typo
+/// (`verify_full`, `requirre`) or a case difference (`REQUIRE`) would land on
+/// `prefer`, which accepts any certificate and falls back to plaintext. libpq
+/// hard-fails instead (`invalid sslmode value: "..."`, `pqConnectOptions2` (`connectOptions2` before PG17) in
+/// fe-connect.c), and so do we.
+fn parse_sslmode(s: &str) -> Result<SslMode, ReplicationError> {
     match s {
-        "disable" => SslMode::Disable,
-        "allow" => SslMode::Allow,
-        "prefer" => SslMode::Prefer,
-        "require" => SslMode::Require,
-        "verify-ca" => SslMode::VerifyCa,
-        "verify-full" => SslMode::VerifyFull,
-        _ => SslMode::Prefer,
+        "disable" => Ok(SslMode::Disable),
+        "allow" => Ok(SslMode::Allow),
+        "prefer" => Ok(SslMode::Prefer),
+        "require" => Ok(SslMode::Require),
+        "verify-ca" => Ok(SslMode::VerifyCa),
+        "verify-full" => Ok(SslMode::VerifyFull),
+        other => Err(ReplicationError::config(format!(
+            "invalid sslmode value: \"{other}\" \
+             (expected disable, allow, prefer, require, verify-ca or verify-full)"
+        ))),
     }
 }
 
-fn parse_replication_mode(s: &str) -> ReplicationMode {
+/// libpq keywords this parser does not implement, where dropping one cannot
+/// weaken the connection's security posture. Accepted and ignored, so a conninfo
+/// psql accepts does not start failing here.
+///
+/// **Maintenance contract.** This list plus [`UNSUPPORTED_OPTIONS`] plus the
+/// keywords handled in the two match arms must equal `PQconninfoOptions[]`
+/// exactly. **Synced against PostgreSQL 18** (52 keywords; PG14's 36 are a strict
+/// subset — 16 added, none removed across PG14→PG18). When libpq adds a keyword,
+/// a conninfo using it hard-fails here until this list is updated; that is the
+/// deliberate price of rejecting unknown keys at all, and it is why the two lists
+/// are a union across majors rather than a single version.
+///
+/// Source: `PQconninfoOptions[]` in `src/interfaces/libpq/fe-connect.c` — the
+/// union over REL_14_STABLE..master, so a string written for a newer libpq still
+/// parses and a keyword absent from the reader's server is simply inert.
+///
+/// `sslcert`/`sslkey`/`sslpassword`/`sslcertmode` are here despite being
+/// unhonourable (every rustls builder ends in `with_no_client_auth()`) because
+/// they fail **closed**: the server rejects the authentication loudly. Contrast
+/// `sslcrl`, which fails **open** — a revoked certificate would be silently
+/// accepted — so that one is in [`UNSUPPORTED_OPTIONS`].
+const IGNORED_OPTIONS: &[&str] = &[
+    "application_name",
+    // `require` only: `auth.rs` DOES negotiate SCRAM-SHA-256-PLUS with
+    // `tls-server-end-point` binding when the server offers it — what is missing
+    // is the *enforcement* (erroring when the server declines PLUS), so we cannot
+    // honour `require`, but the mechanism itself is implemented.
+    "channel_binding",
+    "client_encoding",
+    "fallback_application_name",
+    "gssdelegation",
+    "gssencmode", // `require` only: no GSSAPI transport encryption here
+    "gsslib",
+    "krbsrvname",
+    "load_balance_hosts",
+    "max_protocol_version",
+    "min_protocol_version",
+    "options",
+    "passfile",
+    "servicefile",
+    "ssl_max_protocol_version",
+    "ssl_min_protocol_version", // only a TLSv1.3 floor is unhonourable
+    "sslcert",
+    "sslcertmode", // `require` only: no client certificate is ever sent
+    "sslcompression",
+    "sslkey",
+    "sslkeylogfile",
+    "sslpassword",
+    "sslsni",
+    "target_session_attrs",
+    "tcp_user_timeout",
+];
+
+/// libpq keywords whose whole purpose is to tighten authentication or transport
+/// security and that this backend cannot honour. Silently dropping one leaves
+/// the connection weaker than the caller asked for, with nothing on the wire to
+/// say so, so these are a hard error.
+///
+/// `require_auth` is what stops a rogue server demanding
+/// `AuthenticationCleartextPassword` (auth type 3, which `auth.rs` answers);
+/// `sslcrl`/`sslcrldir` are what reject a revoked certificate; `service` names
+/// the host we would otherwise silently replace with the default.
+const UNSUPPORTED_OPTIONS: &[&str] = &[
+    "oauth_ca_file",
+    "oauth_client_id",
+    "oauth_client_secret",
+    "oauth_issuer",
+    "oauth_scope",
+    "require_auth",
+    "requirepeer",
+    "scram_client_key",
+    "scram_server_key",
+    "service",
+    "sslcrl",
+    "sslcrldir",
+];
+
+/// Classify a connection option this parser does not implement.
+///
+/// libpq rejects any keyword outside `PQconninfoOptions[]`: `conninfo_storeval`
+/// emits `invalid connection option "%s"` and the URI query loop adds
+/// `invalid URI query parameter: "%s"`. Silently ignoring instead turned a typo
+/// like `sslmod=verify-full` into `sslmode=prefer` — `NoVerification` plus a
+/// plaintext fallback, from a string that asked for the strongest posture.
+/// That is the same downgrade [`parse_sslmode`] exists to prevent, through a
+/// one-character-different door.
+fn check_unhandled(key: &str, value: &str) -> Result<(), ReplicationError> {
+    // Options we can honour in their loose form but not in their strict one.
+    let unhonourable = match key {
+        // libpq validates these three with strcmp, so an exact match is correct.
+        "channel_binding" | "gssencmode" | "sslcertmode" => value == "require",
+        // rustls is built with the `tls12` feature, so the floor is already
+        // TLSv1.2 and every looser value is satisfied. Only a TLSv1.3 floor is
+        // something we cannot promise. libpq compares with `pg_strcasecmp`
+        // (`sslVerifyProtocolVersion`), so we must be case-insensitive too.
+        "ssl_min_protocol_version" => value.eq_ignore_ascii_case("TLSv1.3"),
+        other => UNSUPPORTED_OPTIONS.contains(&other),
+    };
+    if unhonourable {
+        return Err(ReplicationError::config(format!(
+            "connection option \"{key}={value}\" is not supported by the native backend; \
+             ignoring it would silently weaken the connection \
+             (use the `libpq` backend, or remove it)"
+        )));
+    }
+    if IGNORED_OPTIONS.contains(&key) {
+        tracing::debug!("ignoring unimplemented connection option \"{key}\"");
+        return Ok(());
+    }
+    Err(ReplicationError::config(format!(
+        "invalid connection option \"{key}\""
+    )))
+}
+
+/// Parse a `connect_timeout`, mapping a negative value to "no timeout".
+///
+/// libpq documents this verbatim: "Zero, negative, or not specified means wait
+/// indefinitely" (`libpq-connect.html`), and accepts `connect_timeout=-1`. The
+/// startup path already gates on `connect_timeout > 0`, so 0 is that state.
+/// Rejecting a negative here would fail a connection string psql accepts — and
+/// as a `Config` error it is permanent, so it would never retry.
+fn parse_connect_timeout(key: &str, value: &str) -> Result<u64, ReplicationError> {
+    Ok(parse_num::<i64>(key, value)?.max(0) as u64)
+}
+
+/// Parse a `port` value, treating an empty one as the default.
+///
+/// libpq substitutes `DEF_PGPORT` for a null or empty port field, so `port=` and
+/// `postgres://host:/db` must keep working. Malformed and out-of-range values are
+/// still rejected — only emptiness is special, and only for `port`. `0` is not
+/// empty: libpq rejects `thisport < 1 || thisport > 65535` with
+/// `invalid port number`.
+fn parse_port(value: &str) -> Result<u16, ReplicationError> {
+    if value.is_empty() {
+        return Ok(5432);
+    }
+    let port = parse_num::<u16>("port", value)?;
+    if port == 0 {
+        return Err(ReplicationError::config(format!(
+            "invalid port number: \"{value}\""
+        )));
+    }
+    Ok(port)
+}
+
+/// Parse an integer connection option, rejecting anything malformed.
+///
+/// Silently defaulting is worse than failing: `port=99999` would connect to
+/// whatever is listening on 5432, and `keepalives_idle=abc` would become a
+/// value the caller never asked for. libpq rejects both
+/// (`pqParseIntParam`/`parse_int_param`, same message text).
+///
+/// Note this is deliberately NOT used for `connect_timeout`, where libpq accepts
+/// a negative — see [`parse_connect_timeout`].
+fn parse_num<T: core::str::FromStr>(key: &str, value: &str) -> Result<T, ReplicationError> {
+    value.parse::<T>().map_err(|_| {
+        ReplicationError::config(format!(
+            "invalid integer value \"{value}\" for connection option \"{key}\""
+        ))
+    })
+}
+
+/// Parse a `replication` value, rejecting anything unrecognised.
+///
+/// Defaulting here is worse than for most options: in a logical-replication
+/// library a typo like `replication=dattabase` would silently open an ordinary
+/// connection, and the failure only surfaces much later as an opaque server
+/// error on `START_REPLICATION`. libpq forwards the value to the server, which
+/// rejects it outright.
+///
+/// The accepted set is libpq's boolean spellings plus `database`
+/// (`GUC_bool` in `guc.c`: on/off/true/false/yes/no/1/0).
+fn parse_replication_mode(s: &str) -> Result<ReplicationMode, ReplicationError> {
     match s {
-        "database" => ReplicationMode::Database,
-        "true" | "yes" | "1" => ReplicationMode::Physical,
-        _ => ReplicationMode::None,
+        "database" => Ok(ReplicationMode::Database),
+        "true" | "yes" | "on" | "1" => Ok(ReplicationMode::Physical),
+        "false" | "no" | "off" | "0" => Ok(ReplicationMode::None),
+        other => Err(ReplicationError::config(format!(
+            "invalid replication value: \"{other}\" \
+             (expected database, or a boolean: true/false/yes/no/on/off/1/0)"
+        ))),
     }
 }
 
-fn parse_ssl_negotiation(s: &str) -> SslNegotiation {
+/// Parse an `sslnegotiation` value, rejecting anything unrecognised.
+///
+/// Falling back to `postgres` would be the *safe* direction — it costs one
+/// round-trip, not any security — but libpq hard-errors here
+/// (`invalid sslnegotiation value`), and silently ignoring a typo in a TLS
+/// option is exactly what [`parse_sslmode`] was hardened against.
+fn parse_ssl_negotiation(s: &str) -> Result<SslNegotiation, ReplicationError> {
     match s {
-        "direct" => SslNegotiation::Direct,
-        _ => SslNegotiation::Postgres,
+        "direct" => Ok(SslNegotiation::Direct),
+        "postgres" => Ok(SslNegotiation::Postgres),
+        other => Err(ReplicationError::config(format!(
+            "invalid sslnegotiation value: \"{other}\" (expected postgres or direct)"
+        ))),
     }
 }
 
-/// Simple percent-decoding for URI components.
+/// Percent-decode a URI component per RFC 3986.
+///
+/// Decodes to raw OCTETS and then interprets the result as UTF-8. The previous
+/// `byte as char` form was a Latin-1 lift, not a decode: `%C3%A9` became the two
+/// chars U+00C3 U+00A9, which re-encode to four UTF-8 bytes instead of the two
+/// the user wrote. That silently corrupted any non-ASCII password before it
+/// reached SCRAM, producing an unexplainable "password authentication failed" —
+/// SASLprep (RFC 5802 §5.1, which RFC 7677 inherits; `pg_saslprep` in libpq)
+/// normalises the password but its NFKC pass does not undo mojibake, so the
+/// corruption survived to the key derivation. libpq's `conninfo_uri_decode`
+/// writes raw octets for the same reason.
+///
+/// Divergence from `conninfo_uri_decode`, deliberate: libpq hard-fails a
+/// malformed escape (`invalid percent-encoded token`) and `%00` (`forbidden
+/// value %00 in percent-encoded value`). This passes both through, which keeps
+/// the function infallible.
+///
+/// Known gap, not currently guarded anywhere: `%00` decodes to a real NUL, and
+/// NUL is the field separator in the StartupMessage — so
+/// `postgresql://u%00replication%00false@h/db` injects startup parameters the
+/// caller never asked for. It needs an operator to paste a hostile URI, which
+/// is already game over, but if that assumption ever weakens the fix is a
+/// rejection either here or in `wire::build_startup_message`.
 fn url_decode(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '%' {
-            let hex: String = chars.by_ref().take(2).collect();
-            if let Ok(byte) = u8::from_str_radix(&hex, 16) {
-                result.push(byte as char);
-            } else {
-                result.push('%');
-                result.push_str(&hex);
-            }
-        } else {
-            result.push(c);
+    #[inline]
+    fn hex_val(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
         }
     }
-    result
+
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // Byte-indexed throughout: `%` is ASCII, so this can never split a
+        // multi-byte UTF-8 sequence the way slicing by char index could.
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]
@@ -380,6 +758,342 @@ mod tests {
     fn parse_uri_encoded_password() {
         let ci = ConnInfo::parse("postgresql://user:p%40ss@host/db").unwrap();
         assert_eq!(ci.password, Some("p@ss".to_string()));
+    }
+
+    /// The userinfo lookahead must stop at the authority boundary, as libpq's
+    /// `conninfo_uri_parse_options` does. Splitting on the first `@` anywhere made a
+    /// literal `@` in the query hijack the host — and silently dropped sslmode with
+    /// the rest of the query, the exact downgrade the query-parsing fix exists to
+    /// prevent.
+    #[test]
+    fn uri_at_sign_in_query_is_not_credentials() {
+        let ci = ConnInfo::parse(
+            "postgresql://pg.internal:5432/appdb?sslmode=require&application_name=svc@prod",
+        )
+        .unwrap();
+        assert_eq!(ci.host, "pg.internal");
+        assert_eq!(ci.port, 5432);
+        assert_eq!(ci.dbname, "appdb");
+        assert!(matches!(ci.sslmode, SslMode::Require));
+
+        // ...and a genuine userinfo still parses.
+        let ci = ConnInfo::parse("postgresql://u:p@h/db").unwrap();
+        assert_eq!(ci.user, "u");
+        assert_eq!(ci.host, "h");
+    }
+
+    /// The userinfo lookahead must stop at `@` and `/` ONLY, as libpq does.
+    /// Adding `?` to that set suppressed credential detection whenever the
+    /// userinfo itself contained one: libpq accepts both of these.
+    #[test]
+    fn uri_question_mark_in_userinfo_is_not_an_authority_boundary() {
+        let ci = ConnInfo::parse("postgresql://user:p?ss@host/db").unwrap();
+        assert_eq!(ci.host, "host");
+        assert_eq!(ci.user, "user");
+        assert_eq!(ci.password.as_deref(), Some("p?ss"));
+        assert_eq!(ci.port, 5432);
+
+        // The silent variant: no password, so nothing failed to parse — it just
+        // connected to the wrong host.
+        let ci = ConnInfo::parse("postgresql://us?er@host/db").unwrap();
+        assert_eq!(ci.host, "host");
+        assert_eq!(ci.user, "us?er");
+
+        // The case the '?' stop was added for is still covered by the '/' stop.
+        let ci =
+            ConnInfo::parse("postgresql://pg.internal/appdb?application_name=svc@prod").unwrap();
+        assert_eq!(ci.host, "pg.internal");
+    }
+
+    /// A bracketed IPv6 literal followed by junk must not silently default the
+    /// port: `[2001:db8::1]5433` resolves as a host and would connect to 5432.
+    /// libpq answers `unexpected character "5" ... (expected ":" or "/")`.
+    #[test]
+    fn uri_ipv6_trailing_junk_is_rejected() {
+        assert!(ConnInfo::parse("postgresql://u@[2001:db8::1]5433/db").is_err());
+        assert!(ConnInfo::parse("postgresql://u@[::1]junk/db").is_err());
+        // An empty address is rejected too, as in libpq.
+        assert!(ConnInfo::parse("postgresql://u@[]/db").is_err());
+        // Well-formed forms still parse.
+        assert_eq!(
+            ConnInfo::parse("postgresql://u@[2001:db8::1]:5433/db")
+                .unwrap()
+                .port,
+            5433
+        );
+        assert_eq!(
+            ConnInfo::parse("postgresql://u@[::1]/db").unwrap().host,
+            "::1"
+        );
+    }
+
+    /// libpq documents "Zero, negative, or not specified means wait
+    /// indefinitely" for `connect_timeout` and accepts `-1`. Rejecting it made a
+    /// connection string psql accepts a *permanent* `Config` failure.
+    #[test]
+    fn negative_connect_timeout_means_no_timeout_not_an_error() {
+        assert_eq!(
+            ConnInfo::parse("host=h connect_timeout=-1")
+                .unwrap()
+                .connect_timeout,
+            0
+        );
+        assert_eq!(
+            ConnInfo::parse("postgresql://u@h/db?connect_timeout=-30")
+                .unwrap()
+                .connect_timeout,
+            0
+        );
+        // Non-numeric is still an error, and a positive value still lands.
+        assert!(ConnInfo::parse("host=h connect_timeout=abc").is_err());
+        assert_eq!(
+            ConnInfo::parse("host=h connect_timeout=10")
+                .unwrap()
+                .connect_timeout,
+            10
+        );
+    }
+
+    /// `port=0` is not the same as an omitted port: libpq rejects
+    /// `thisport < 1 || thisport > 65535` with `invalid port number`.
+    #[test]
+    fn port_zero_is_rejected() {
+        assert!(ConnInfo::parse("host=h port=0").is_err());
+        assert!(ConnInfo::parse("postgresql://u@h:0/db").is_err());
+        // Empty is still the documented default-substitution case.
+        assert_eq!(ConnInfo::parse("host=h port=").unwrap().port, 5432);
+    }
+
+    /// The originating bug: a typo'd KEY was silently dropped, so sslmode stayed
+    /// at the `Prefer` default and startup installed `NoVerification` with a
+    /// plaintext fallback — from a string that asked for the strongest posture.
+    /// libpq hard-errors on the same input.
+    #[test]
+    fn typo_in_security_option_is_rejected_not_dropped() {
+        for s in [
+            "host=h sslmod=verify-full",
+            "postgresql://u@h/db?sslmod=verify-full",
+        ] {
+            let err = ConnInfo::parse(s).unwrap_err().to_string();
+            assert!(err.contains("invalid connection option"), "{s}: {err}");
+            assert!(err.contains("sslmod"), "{s}: {err}");
+        }
+        // libpq's key compare is strcmp, so case variants are unknown keys too.
+        assert!(ConnInfo::parse("host=h SSLMODE=require").is_err());
+    }
+
+    /// The unknown-KEY fix left a wider door open: a query parameter with no `=`
+    /// at all was dropped by the `if let Some(..) = split_once('=')` with no else,
+    /// so `?sslmodeverify-full` still silently left sslmode at `Prefer` — the same
+    /// downgrade, one keystroke away. libpq reports a missing separator.
+    #[test]
+    fn uri_query_param_without_separator_is_rejected() {
+        let err = ConnInfo::parse("postgresql://u@h/db?sslmodeverify-full")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing key/value separator"), "{err}");
+        assert!(err.contains("sslmodeverify-full"), "{err}");
+        // A trailing `&` is still just an empty segment, not an error.
+        assert!(ConnInfo::parse("postgresql://u@h/db?sslmode=require&").is_ok());
+    }
+
+    /// libpq's own docs show `keyword = 'a value'` with spaces around the `=`.
+    /// The value reader never skipped whitespace after `=`, so the value came back
+    /// empty and the next token was taken as a key — harmless while unknown keys
+    /// were ignored, fatal once they are rejected.
+    #[test]
+    fn key_value_tolerates_spaces_around_equals() {
+        let ci = ConnInfo::parse("host = h  sslmode = require  port = 5433").unwrap();
+        assert_eq!(ci.host, "h");
+        assert!(matches!(ci.sslmode, SslMode::Require));
+        assert_eq!(ci.port, 5433);
+
+        // Quoted values still work with a space before the opening quote.
+        let ci = ConnInfo::parse("host=h password = 'it''s'").unwrap();
+        assert_eq!(ci.password.as_deref(), Some("it's"));
+    }
+
+    /// `negotiate_tls` retries a failed direct handshake over standard SSLRequest,
+    /// and under `prefer`/`allow` that retry may fall back to plaintext — so
+    /// asking for the *faster* TLS path could silently yield no TLS. libpq refuses
+    /// the same combination for the same stated reason.
+    #[test]
+    fn direct_ssl_negotiation_requires_a_non_falling_back_sslmode() {
+        for weak in ["prefer", "allow", "disable"] {
+            assert!(
+                ConnInfo::parse(&format!("host=h sslnegotiation=direct sslmode={weak}")).is_err(),
+                "sslnegotiation=direct must not pair with sslmode={weak}"
+            );
+        }
+        // Default sslmode is `prefer`, so direct alone must be refused too.
+        assert!(ConnInfo::parse("host=h sslnegotiation=direct").is_err());
+        assert!(ConnInfo::parse("postgresql://u@h/db?sslnegotiation=direct").is_err());
+
+        for strong in ["require", "verify-ca", "verify-full"] {
+            let ci = ConnInfo::parse(&format!("host=h sslnegotiation=direct sslmode={strong}"))
+                .unwrap_or_else(|e| panic!("sslmode={strong} must be allowed: {e}"));
+            assert!(matches!(ci.sslnegotiation, SslNegotiation::Direct));
+        }
+    }
+
+    /// `postgresql:///mydb` carries no authority. An empty host reached
+    /// `TcpStream::connect(":5432")` and failed with an opaque address error,
+    /// while the key/value path defaulted to localhost — the two syntaxes
+    /// disagreed.
+    #[test]
+    fn uri_without_authority_defaults_the_host() {
+        let ci = ConnInfo::parse("postgresql:///mydb").unwrap();
+        assert_eq!(ci.host, "localhost");
+        assert_eq!(ci.dbname, "mydb");
+        assert_eq!(ci.port, 5432);
+    }
+
+    /// `keepalives` was the one option the numeric-validation sweep skipped, so
+    /// `keepalives=abc` silently meant "on" while `keepalives_idle=abc` was fatal.
+    /// libpq parses it with `pqParseIntParam`, so `00`/`+0`/`-0` all disable.
+    #[test]
+    fn keepalives_is_validated_like_its_siblings() {
+        assert!(ConnInfo::parse("host=h keepalives=abc").is_err());
+        assert!(!ConnInfo::parse("host=h keepalives=0").unwrap().keepalives);
+        assert!(!ConnInfo::parse("host=h keepalives=+0").unwrap().keepalives);
+        assert!(ConnInfo::parse("host=h keepalives=1").unwrap().keepalives);
+        assert!(ConnInfo::parse("postgresql://u@h/db?keepalives=x").is_err());
+    }
+
+    /// Anti-regression for the fix above: a conninfo psql accepts must not start
+    /// failing here. These are real `PQconninfoOptions[]` keywords this parser
+    /// does not implement, and dropping any of them cannot weaken the connection.
+    #[test]
+    fn libpq_options_we_do_not_implement_still_parse() {
+        for kv in [
+            "application_name=myapp",
+            "client_encoding=UTF8",
+            "target_session_attrs=read-write",
+            "passfile=/x/.pgpass",
+            "tcp_user_timeout=5000",
+            "sslsni=1",
+            "sslcompression=0",
+            // Unhonourable but fail-CLOSED: the server rejects the auth loudly.
+            "sslcert=/etc/ssl/client.crt",
+            "sslkey=/etc/ssl/client.key",
+            "gsslib=gssapi",
+            "krbsrvname=postgres",
+            "load_balance_hosts=random",
+            "fallback_application_name=fb",
+            "sslkeylogfile=/tmp/k",
+            "min_protocol_version=3.0",
+            // Value-sensitive: the loose forms are all satisfiable.
+            "channel_binding=prefer",
+            "gssencmode=disable",
+            "sslcertmode=disable",
+            "ssl_min_protocol_version=TLSv1.2",
+            "ssl_min_protocol_version=tlsv1.2",
+            "ssl_min_protocol_version=TLSv1",
+        ] {
+            assert!(
+                ConnInfo::parse(&format!("host=h {kv}")).is_ok(),
+                "key=value rejected: {kv}"
+            );
+            assert!(
+                ConnInfo::parse(&format!("postgresql://u@h/db?{kv}")).is_ok(),
+                "URI rejected: {kv}"
+            );
+        }
+
+        // `options` carries a space, so each syntax has to escape it the way
+        // libpq does: single quotes in key=value, percent-encoding in a URI.
+        assert!(ConnInfo::parse("host=h options='-c statement_timeout=0'").is_ok());
+        assert!(ConnInfo::parse("postgresql://u@h/db?options=-c%20statement_timeout%3D0").is_ok());
+    }
+
+    /// Every fail-OPEN option must be refused in both syntaxes, and the message
+    /// must not claim the option is invalid — it is a valid libpq option this
+    /// backend cannot honour, which is a different thing to tell an operator.
+    #[test]
+    fn security_relevant_options_we_cannot_honour_are_refused() {
+        for key in UNSUPPORTED_OPTIONS {
+            let err = ConnInfo::parse(&format!("host=h {key}=x"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("not supported"), "{key}: {err}");
+            assert!(!err.contains("invalid connection option"), "{key}: {err}");
+            assert!(
+                ConnInfo::parse(&format!("postgresql://u@h/db?{key}=x")).is_err(),
+                "URI accepted {key}"
+            );
+        }
+        // Value-sensitive: only the strict form is unhonourable.
+        for kv in [
+            "channel_binding=require",
+            "gssencmode=require",
+            "sslcertmode=require",
+            "ssl_min_protocol_version=TLSv1.3",
+            "ssl_min_protocol_version=tlsv1.3",
+        ] {
+            assert!(ConnInfo::parse(&format!("host=h {kv}")).is_err(), "{kv}");
+        }
+    }
+
+    /// `requiressl=1` is `sslmode=require` (translated in `conninfo_storeval`, so
+    /// it works in both syntaxes); `ssl=true` is JDBC compatibility and is
+    /// URI-query only. Dropping either is the same downgrade as the headline bug.
+    #[test]
+    fn deprecated_ssl_aliases_are_translated_like_libpq() {
+        assert!(matches!(
+            ConnInfo::parse("host=h requiressl=1").unwrap().sslmode,
+            SslMode::Require
+        ));
+        assert!(matches!(
+            ConnInfo::parse("host=h requiressl=0").unwrap().sslmode,
+            SslMode::Prefer
+        ));
+        assert!(matches!(
+            ConnInfo::parse("postgresql://u@h/db?requiressl=1")
+                .unwrap()
+                .sslmode,
+            SslMode::Require
+        ));
+        assert!(matches!(
+            ConnInfo::parse("postgresql://u@h/db?ssl=true")
+                .unwrap()
+                .sslmode,
+            SslMode::Require
+        ));
+        // `ssl` is not a libpq keyword outside the URI query loop.
+        assert!(ConnInfo::parse("host=h ssl=true").is_err());
+    }
+
+    /// libpq docs 32.1.1.2: the hierarchical values may instead be given as
+    /// named query parameters. Without these arms the new unknown-key error
+    /// would reject a URI libpq documents as valid — this URI previously parsed
+    /// to host == "".
+    #[test]
+    fn uri_query_may_carry_the_hierarchical_params() {
+        let ci = ConnInfo::parse("postgresql:///mydb?host=localhost&port=5433").unwrap();
+        assert_eq!(ci.host, "localhost");
+        assert_eq!(ci.port, 5433);
+        assert_eq!(ci.dbname, "mydb");
+
+        // Query overrides the hierarchical part, as in libpq.
+        let ci = ConnInfo::parse("postgresql://a:5432/db?host=b&port=5433").unwrap();
+        assert_eq!(ci.host, "b");
+        assert_eq!(ci.port, 5433);
+
+        // The dbname->user fallback runs AFTER the query loop, so a
+        // query-supplied user still names the database.
+        let ci = ConnInfo::parse("postgresql://h/?user=alice").unwrap();
+        assert_eq!(ci.user, "alice");
+        assert_eq!(ci.dbname, "alice");
+    }
+
+    /// libpq substitutes the default port for an empty port field, so tightening
+    /// numeric validation must not break `port=` / `host:`.
+    #[test]
+    fn empty_port_falls_back_to_default() {
+        assert_eq!(ConnInfo::parse("host=h port=").unwrap().port, 5432);
+        assert_eq!(ConnInfo::parse("postgresql://u@h:/db").unwrap().port, 5432);
+        // Emptiness is special only for port; other options still reject it.
+        assert!(ConnInfo::parse("host=h connect_timeout=").is_err());
     }
 
     #[test]
@@ -419,63 +1133,148 @@ mod tests {
 
     #[test]
     fn test_parse_sslmode_all_variants() {
-        assert!(matches!(parse_sslmode("disable"), SslMode::Disable));
-        assert!(matches!(parse_sslmode("allow"), SslMode::Allow));
-        assert!(matches!(parse_sslmode("prefer"), SslMode::Prefer));
-        assert!(matches!(parse_sslmode("require"), SslMode::Require));
-        assert!(matches!(parse_sslmode("verify-ca"), SslMode::VerifyCa));
-        assert!(matches!(parse_sslmode("verify-full"), SslMode::VerifyFull));
+        assert!(matches!(parse_sslmode("disable"), Ok(SslMode::Disable)));
+        assert!(matches!(parse_sslmode("allow"), Ok(SslMode::Allow)));
+        assert!(matches!(parse_sslmode("prefer"), Ok(SslMode::Prefer)));
+        assert!(matches!(parse_sslmode("require"), Ok(SslMode::Require)));
+        assert!(matches!(parse_sslmode("verify-ca"), Ok(SslMode::VerifyCa)));
+        assert!(matches!(
+            parse_sslmode("verify-full"),
+            Ok(SslMode::VerifyFull)
+        ));
     }
 
+    /// An unrecognised sslmode must be an error, never a default. Defaulting to
+    /// `prefer` turned a typo into a silent security downgrade: `prefer` accepts
+    /// any certificate and falls back to plaintext. libpq rejects these too.
     #[test]
-    fn test_parse_sslmode_unknown_defaults_prefer() {
-        assert!(matches!(parse_sslmode("something_else"), SslMode::Prefer));
-        assert!(matches!(parse_sslmode(""), SslMode::Prefer));
+    fn parse_sslmode_rejects_unknown_instead_of_downgrading() {
+        for bad in ["something_else", "", "verify_full", "REQUIRE", "requirre"] {
+            assert!(
+                parse_sslmode(bad).is_err(),
+                "sslmode {bad:?} must be rejected, not silently downgraded"
+            );
+        }
+        // ...and the whole conninfo parse fails rather than connecting weakly.
+        assert!(ConnInfo::parse("host=h sslmode=verify_full").is_err());
+        assert!(ConnInfo::parse("postgresql://u@h/db?sslmode=verify_full").is_err());
+    }
+
+    /// `byte as char` is a Latin-1 lift, not a percent-decode: it re-encoded every
+    /// escape >= %80 as two UTF-8 bytes, corrupting non-ASCII passwords before
+    /// SCRAM hashed them.
+    #[test]
+    fn url_decode_produces_raw_octets_not_latin1() {
+        assert_eq!(url_decode("p%C3%A9ss").as_bytes(), "péss".as_bytes());
+        assert_eq!(url_decode("%E6%97%A5%E6%9C%AC"), "日本");
+        // Malformed escapes are passed through rather than dropped.
+        assert_eq!(url_decode("100%"), "100%");
+        assert_eq!(url_decode("a%zz"), "a%zz");
+        assert_eq!(url_decode("plain"), "plain");
+    }
+
+    /// The path is optional in a libpq URI. Splitting only on `/` swallowed the
+    /// query string into the hostname, dropping every parameter — including
+    /// sslmode, which then silently fell back to the default.
+    #[test]
+    fn uri_query_without_path_is_parsed() {
+        let info = ConnInfo::parse("postgresql://u@myhost?sslmode=require").unwrap();
+        assert_eq!(info.host, "myhost");
+        assert!(matches!(info.sslmode, SslMode::Require));
+
+        let info = ConnInfo::parse("postgres://h?replication=database").unwrap();
+        assert_eq!(info.host, "h");
+        assert!(matches!(info.replication, ReplicationMode::Database));
+    }
+
+    /// A bracketed IPv6 literal must not be split on its own colons.
+    #[test]
+    fn uri_ipv6_host_is_unbracketed() {
+        let info = ConnInfo::parse("postgresql://u@[::1]/db").unwrap();
+        assert_eq!(info.host, "::1");
+        assert_eq!(info.port, 5432);
+
+        let info = ConnInfo::parse("postgresql://u@[2001:db8::1]:5433/db").unwrap();
+        assert_eq!(info.host, "2001:db8::1");
+        assert_eq!(info.port, 5433);
+
+        assert!(ConnInfo::parse("postgresql://u@[::1/db").is_err());
+    }
+
+    /// Silently defaulting a malformed number is worse than failing: `port=99999`
+    /// would connect to whatever is on 5432, and `connect_timeout=abc` becomes 0,
+    /// which the startup path reads as "no timeout".
+    #[test]
+    fn numeric_options_are_validated_not_defaulted() {
+        for bad in [
+            "host=h port=99999",
+            "host=h port=abc",
+            "host=h port=-1",
+            "host=h connect_timeout=abc",
+            "host=h keepalives_idle=x",
+        ] {
+            assert!(ConnInfo::parse(bad).is_err(), "{bad:?} must be rejected");
+        }
+        assert!(ConnInfo::parse("postgresql://u@h:99999/db").is_err());
+        // Valid values still parse.
+        let info = ConnInfo::parse("host=h port=5433 connect_timeout=10").unwrap();
+        assert_eq!(info.port, 5433);
+        assert_eq!(info.connect_timeout, 10);
     }
 
     #[test]
     fn test_parse_replication_mode_variants() {
         assert!(matches!(
             parse_replication_mode("database"),
-            ReplicationMode::Database
+            Ok(ReplicationMode::Database)
         ));
-        assert!(matches!(
-            parse_replication_mode("true"),
-            ReplicationMode::Physical
-        ));
-        assert!(matches!(
-            parse_replication_mode("yes"),
-            ReplicationMode::Physical
-        ));
-        assert!(matches!(
-            parse_replication_mode("1"),
-            ReplicationMode::Physical
-        ));
-        assert!(matches!(
-            parse_replication_mode("unknown"),
-            ReplicationMode::None
-        ));
-        assert!(matches!(parse_replication_mode(""), ReplicationMode::None));
+        for on in ["true", "yes", "on", "1"] {
+            assert!(
+                matches!(parse_replication_mode(on), Ok(ReplicationMode::Physical)),
+                "{on}"
+            );
+        }
+        for off in ["false", "no", "off", "0"] {
+            assert!(
+                matches!(parse_replication_mode(off), Ok(ReplicationMode::None)),
+                "{off}"
+            );
+        }
+    }
+
+    /// A typo here used to silently open an ordinary connection, and the failure
+    /// only surfaced much later as an opaque server error on `START_REPLICATION`.
+    /// In a logical-replication library that is the worst place to learn about it.
+    #[test]
+    fn parse_replication_mode_rejects_unknown() {
+        for bad in ["dattabase", "", "DATABASE", "unknown"] {
+            assert!(parse_replication_mode(bad).is_err(), "{bad:?}");
+        }
+        assert!(ConnInfo::parse("host=h replication=dattabase").is_err());
+        assert!(ConnInfo::parse("postgresql://u@h/db?replication=dattabase").is_err());
     }
 
     #[test]
     fn test_parse_ssl_negotiation_variants() {
         assert!(matches!(
             parse_ssl_negotiation("direct"),
-            SslNegotiation::Direct
+            Ok(SslNegotiation::Direct)
         ));
         assert!(matches!(
             parse_ssl_negotiation("postgres"),
-            SslNegotiation::Postgres
+            Ok(SslNegotiation::Postgres)
         ));
-        assert!(matches!(
-            parse_ssl_negotiation(""),
-            SslNegotiation::Postgres
-        ));
-        assert!(matches!(
-            parse_ssl_negotiation("unknown"),
-            SslNegotiation::Postgres
-        ));
+    }
+
+    /// libpq hard-errors on an unrecognised `sslnegotiation`. Defaulting would be
+    /// the *safe* direction here (one extra round-trip, no security loss), but
+    /// silently ignoring a typo in a TLS option is what `parse_sslmode` was
+    /// hardened against — so this stays consistent with it.
+    #[test]
+    fn parse_ssl_negotiation_rejects_unknown() {
+        for bad in ["drect", "", "DIRECT", "unknown"] {
+            assert!(parse_ssl_negotiation(bad).is_err(), "{bad:?}");
+        }
     }
 
     // === URI edge cases ===
