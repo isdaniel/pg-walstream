@@ -66,7 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Auto-ack: advance the applied LSN AFTER the payload is durably processed. Ack with `wal_end` (next byte after this message).
                 stream
                     .shared_lsn_feedback
-                    .update_applied_lsn(raw.wal_end.value());
+                    .update_applied_lsn(raw.wal_end);
             }
             Err(ReplicationError::Cancelled(_) | ReplicationError::StreamStopped(_)) => {
                 info!("Stream ended gracefully");

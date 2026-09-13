@@ -108,7 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 info!("Received event: {:?}", event);
                 stream
                     .shared_lsn_feedback
-                    .update_applied_lsn(event.lsn.value());
+                    .update_applied_lsn(event.lsn);
             }
             Err(e) if matches!(e, pg_walstream::ReplicationError::Cancelled(_)) => {
                 info!("Operation cancelled, shutting down gracefully");

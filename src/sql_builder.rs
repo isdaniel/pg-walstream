@@ -16,7 +16,10 @@ use crate::types::{
 #[derive(Clone, Copy)]
 enum QuoteStyle {
     Identifier,
+    /// Literal for the **normal SQL parser** (`scan.l`), where `standard_conforming_strings` decides whether a backslash is an escape.
     Literal,
+    /// Literal for the **replication command parser** (`repl_scanner.l`), which is a separate lexer with no `E''` syntax and no backslash processing at all.
+    ReplicationLiteral,
 }
 
 impl QuoteStyle {
@@ -25,7 +28,7 @@ impl QuoteStyle {
     fn quote_char(self) -> char {
         match self {
             QuoteStyle::Identifier => '"',
-            QuoteStyle::Literal => '\'',
+            QuoteStyle::Literal | QuoteStyle::ReplicationLiteral => '\'',
         }
     }
 
@@ -34,14 +37,20 @@ impl QuoteStyle {
     fn null_byte_error(self) -> &'static str {
         match self {
             QuoteStyle::Identifier => "SQL identifier must not contain null bytes",
-            QuoteStyle::Literal => "SQL literal must not contain null bytes",
+            QuoteStyle::Literal | QuoteStyle::ReplicationLiteral => {
+                "SQL literal must not contain null bytes"
+            }
         }
     }
 }
 
-/// Shared quoting core for [`quote_ident`] and [`quote_literal`].
+/// Shared quoting core for [`quote_ident`], [`quote_literal`], and [`quote_replication_literal`].
 ///
-/// Wraps `value` in the style's quote character, doubling any embedded quote character. For string literals only, a backslash switches the result to the escape-string form ` E'…'` (a leading space, then `E'`) with backslashes doubled, so the result is safe regardless of the server's `standard_conforming_strings` setting. Identifiers never interpret backslashes, so they never need this.
+/// Wraps `value` in the style's quote character, doubling any embedded quote character.
+///
+/// For [`QuoteStyle::Literal`] only, a backslash switches the result to the escape-string form ` E'…'` (a leading space, then `E'`) with backslashes doubled, so the result is safe regardless of the server's `standard_conforming_strings` setting.
+///
+/// [`QuoteStyle::Identifier`] and [`QuoteStyle::ReplicationLiteral`] never do this — neither grammar interprets a backslash, so doubling one would corrupt the value. See [`quote_replication_literal`] for why the replication grammar is different.
 ///
 /// Rejects null bytes, which are invalid in both identifiers and literals and could otherwise cause truncation-based injection through the C-string wire protocol.
 ///
@@ -148,6 +157,39 @@ pub fn quote_ident(name: &str) -> Result<String> {
 #[inline]
 pub fn quote_literal(value: &str) -> Result<String> {
     quote_internal(value, QuoteStyle::Literal)
+}
+
+/// Quote a string literal for a **replication command** (`START_REPLICATION`,
+/// `BASE_BACKUP`, …), doubling embedded single quotes and nothing else.
+///
+/// Replication commands are not parsed by the normal SQL grammar. The walsender
+/// runs its own lexer, `src/backend/replication/repl_scanner.l`, whose entire
+/// string-literal support is:
+///
+/// ```text
+/// xqstart   {quote}
+/// xqdouble  {quote}{quote}
+/// xqinside  [^']+
+/// ```
+///
+/// There is no `E''` rule, no backslash escape processing, and
+/// `standard_conforming_strings` is never consulted — a backslash inside `'…'`
+/// is always an ordinary character, copied verbatim by `xqinside`.
+///
+/// So [`quote_literal`]'s ` E'…'` form is doubly wrong here: the `E` lexes as a
+/// separate identifier token and the command fails to parse, and the doubled
+/// backslashes would corrupt the value even if it did. A Windows path in a
+/// `BASE_BACKUP` `LABEL`/`TARGET_DETAIL` hits exactly this.
+///
+/// Doubling `'` is complete: it is the only escape the grammar recognises, so
+/// there is no way for a value to break out of the literal.
+///
+/// # Errors
+///
+/// Returns an error if `value` contains a null byte (`\0`).
+#[inline]
+pub(crate) fn quote_replication_literal(value: &str) -> Result<String> {
+    quote_internal(value, QuoteStyle::ReplicationLiteral)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -397,7 +439,11 @@ pub fn build_start_replication_sql(
 
     let mut options_parts = Vec::with_capacity(options.len());
     for (k, v) in options {
-        options_parts.push(format!("{} {}", quote_ident(k)?, quote_literal(v)?));
+        options_parts.push(format!(
+            "{} {}",
+            quote_ident(k)?,
+            quote_replication_literal(v)?
+        ));
     }
     let options_str = options_parts.join(", ");
 
@@ -477,15 +523,18 @@ pub fn build_base_backup_sql(options: &BaseBackupOptions) -> Result<String> {
     let mut opts = Vec::new();
 
     if let Some(ref label) = options.label {
-        opts.push(format!("LABEL {}", quote_literal(label)?));
+        opts.push(format!("LABEL {}", quote_replication_literal(label)?));
     }
 
     if let Some(ref target) = options.target {
-        opts.push(format!("TARGET {}", quote_literal(target)?));
+        opts.push(format!("TARGET {}", quote_replication_literal(target)?));
     }
 
     if let Some(ref target_detail) = options.target_detail {
-        opts.push(format!("TARGET_DETAIL {}", quote_literal(target_detail)?));
+        opts.push(format!(
+            "TARGET_DETAIL {}",
+            quote_replication_literal(target_detail)?
+        ));
     }
 
     if options.progress {
@@ -493,48 +542,74 @@ pub fn build_base_backup_sql(options: &BaseBackupOptions) -> Result<String> {
     }
 
     if let Some(ref checkpoint) = options.checkpoint {
-        opts.push(format!("CHECKPOINT {}", quote_literal(checkpoint)?));
+        opts.push(format!(
+            "CHECKPOINT {}",
+            quote_replication_literal(checkpoint)?
+        ));
     }
 
     if options.wal {
         opts.push("WAL true".to_string());
     }
 
-    if options.wait {
-        opts.push("WAIT true".to_string());
+    // Only the negative form is ever emitted: `WAIT true` is indistinguishable
+    // from an omitted option to the server (`opt->nowait` is MemSet-zeroed).
+    if !options.wait {
+        opts.push("WAIT false".to_string());
     }
 
     if let Some(ref compression) = options.compression {
-        opts.push(format!("COMPRESSION {}", quote_literal(compression)?));
+        opts.push(format!(
+            "COMPRESSION {}",
+            quote_replication_literal(compression)?
+        ));
     }
 
     if let Some(ref compression_detail) = options.compression_detail {
         opts.push(format!(
             "COMPRESSION_DETAIL {}",
-            quote_literal(compression_detail)?
+            quote_replication_literal(compression_detail)?
         ));
     }
 
     if let Some(max_rate) = options.max_rate {
-        opts.push(format!("MAX_RATE {}", max_rate));
+        // Deliberately NOT range-checked here. PostgreSQL's own
+        // `parse_basebackup_options` rejects anything outside its
+        // MAX_RATE_LOWER..MAX_RATE_UPPER with a better message than we could write,
+        // and hardcoding those bounds client-side would make this library stricter
+        // than the server the day they change — rejecting values the server would
+        // have accepted, with no way for the caller to override.
+        //
+        // The one thing the server cannot catch is a value that never reaches it
+        // intact: `repl_scanner.l` scans the token with `strtoul` into a `uint32`,
+        // so anything above `u32::MAX` truncates *before* the range check runs
+        // (4294967328 arrives as 32 KB/s and is silently accepted). That is a wire
+        // limit, not a tunable, so guarding it is safe.
+        if max_rate > u32::MAX as u64 {
+            return Err(ReplicationError::config(format!(
+                "BASE_BACKUP max_rate {max_rate} exceeds the 32-bit wire limit and would \
+                 silently truncate; the server's own valid range is far narrower"
+            )));
+        }
+        opts.push(format!("MAX_RATE {max_rate}"));
     }
 
     if options.tablespace_map {
         opts.push("TABLESPACE_MAP true".to_string());
     }
 
-    if options.verify_checksums {
-        opts.push("VERIFY_CHECKSUMS true".to_string());
+    if !options.verify_checksums {
+        opts.push("VERIFY_CHECKSUMS false".to_string());
     }
 
     if let Some(ref manifest) = options.manifest {
-        opts.push(format!("MANIFEST {}", quote_literal(manifest)?));
+        opts.push(format!("MANIFEST {}", quote_replication_literal(manifest)?));
     }
 
     if let Some(ref manifest_checksums) = options.manifest_checksums {
         opts.push(format!(
             "MANIFEST_CHECKSUMS {}",
-            quote_literal(manifest_checksums)?
+            quote_replication_literal(manifest_checksums)?
         ));
     }
 
@@ -721,12 +796,12 @@ mod version_preflight {
             || o.progress
             || o.checkpoint.is_some()
             || o.wal
-            || o.wait
+            || !o.wait
             || o.compression.is_some()
             || o.compression_detail.is_some()
             || o.max_rate.is_some()
             || o.tablespace_map
-            || o.verify_checksums
+            || !o.verify_checksums
             || o.manifest.is_some()
             || o.manifest_checksums.is_some()
             || o.incremental
@@ -742,6 +817,32 @@ mod version_preflight {
                 failover,
                 ..Default::default()
             }
+        }
+
+        /// `base_backup_has_options` gates the whole PG15 option-syntax preflight.
+        /// `wait`/`verify_checksums` are the only two whose "set" state is
+        /// `!field` rather than `field` or `Some(_)`, so they are the easiest to
+        /// get backwards in that predicate — and getting one wrong either ships
+        /// PG15 parenthesised syntax to a PG14 parser, or rejects a PG14 backup
+        /// that carries no options at all.
+        #[test]
+        fn preflight_negative_bool_options_still_require_pg15() {
+            for opts in [
+                BaseBackupOptions {
+                    wait: false,
+                    ..Default::default()
+                },
+                BaseBackupOptions {
+                    verify_checksums: false,
+                    ..Default::default()
+                },
+            ] {
+                let err = check_base_backup_version(140023, &opts).unwrap_err();
+                assert!(err.to_string().contains("15+"), "{err}");
+                assert!(check_base_backup_version(150000, &opts).is_ok());
+            }
+            // An all-unset option set still needs no preflight.
+            assert!(check_base_backup_version(140023, &BaseBackupOptions::default()).is_ok());
         }
 
         #[test]
@@ -1165,6 +1266,82 @@ mod tests {
         assert_eq!(quote_literal("'\\").unwrap(), r#" E'''\\'"#);
         // and a lone trailing backslash is doubled so it cannot fuse the closing quote.
         assert_eq!(quote_literal("x\\").unwrap(), r#" E'x\\'"#);
+    }
+
+    /// `repl_scanner.l` has no `E''` rule and no backslash processing (`xqinside`
+    /// is `[^']+`, copied verbatim), so the replication quoter must pass a
+    /// backslash through untouched. Emitting ` E'a\\b'` there is a syntax error —
+    /// the `E` lexes as its own identifier token — and would corrupt the value.
+    #[test]
+    fn quote_replication_literal_never_escapes_backslashes() {
+        assert_eq!(quote_replication_literal(r"a\b").unwrap(), r"'a\b'");
+        assert_eq!(
+            quote_replication_literal(r"C:\backups\db").unwrap(),
+            r"'C:\backups\db'"
+        );
+        // Doubling `'` is still the whole escape mechanism, and it is sufficient:
+        // `xqdouble` is the only escape the grammar recognises.
+        assert_eq!(quote_replication_literal("it's").unwrap(), "'it''s'");
+        assert_eq!(
+            quote_replication_literal(r"\'; DROP TABLE t; --").unwrap(),
+            r"'\''; DROP TABLE t; --'"
+        );
+        assert!(quote_replication_literal("bad\0value").is_err());
+    }
+
+    /// The two grammars are quoted differently on purpose: `BASE_BACKUP` goes to
+    /// the walsender's lexer, `CREATE SUBSCRIPTION` to the normal SQL parser.
+    #[test]
+    fn base_backup_label_with_backslash_is_replication_quoted() {
+        let opts = BaseBackupOptions {
+            label: Some(r"C:\backups\db".to_string()),
+            ..Default::default()
+        };
+        let sql = build_base_backup_sql(&opts).unwrap();
+        assert!(
+            sql.contains(r"LABEL 'C:\backups\db'"),
+            "expected verbatim backslashes, got: {sql}"
+        );
+        assert!(!sql.contains("E'"), "escape-string form leaked in: {sql}");
+    }
+
+    /// Range enforcement belongs to the server: `parse_basebackup_options` answers
+    /// `0 is outside the valid range for parameter "MAX_RATE" (32 .. 1048576)`
+    /// (verified live against PostgreSQL 17.10). Duplicating those bounds here would
+    /// make the client stricter than the server if they ever widen. We only guard
+    /// the 32-bit wire limit, which the server cannot catch because the value is
+    /// truncated by `strtoul`-into-`uint32` before its range check ever runs.
+    #[test]
+    fn base_backup_max_rate_passes_range_to_server_but_guards_wire_limit() {
+        let with_rate = |r: Option<u64>| {
+            build_base_backup_sql(&BaseBackupOptions {
+                max_rate: r,
+                ..Default::default()
+            })
+        };
+
+        // Out-of-range values are forwarded verbatim; the server rejects them.
+        for pass_through in [0u64, 1, 31, 1_048_577] {
+            let sql = with_rate(Some(pass_through)).unwrap();
+            assert!(
+                sql.contains(&format!("MAX_RATE {pass_through}")),
+                "{pass_through} must reach the server for it to judge: {sql}"
+            );
+        }
+        assert!(with_rate(Some(32)).unwrap().contains("MAX_RATE 32"));
+
+        // Above the 32-bit wire limit the value would silently truncate
+        // (4294967328 arrives as 32 KB/s), so we stop it here.
+        for wraps in [u32::MAX as u64 + 1, 4_294_967_328, u64::MAX] {
+            assert!(
+                with_rate(Some(wraps)).is_err(),
+                "max_rate={wraps} truncates on the wire and must be rejected"
+            );
+        }
+        assert!(with_rate(Some(u32::MAX as u64)).is_ok());
+
+        // Unlimited omits the option entirely.
+        assert!(!with_rate(None).unwrap().contains("MAX_RATE"));
     }
 
     #[test]
@@ -1769,15 +1946,68 @@ mod tests {
         );
     }
 
+    /// The reported bug: `wait` was inert — `true` emitted `WAIT true` (which
+    /// `opt->nowait` treats exactly like an omitted option) and `false` emitted
+    /// nothing, so a caller who asked not to wait still got a backup that blocks
+    /// on `archive_command`. `false` now emits what `pg_basebackup` sends (as
+    /// `WAIT 0`) when it collects the WAL itself.
     #[test]
-    fn base_backup_with_wait() {
+    fn base_backup_wait_false_is_emitted() {
         let opts = BaseBackupOptions {
-            wait: true,
+            wait: false,
             ..Default::default()
         };
         assert_eq!(
             build_base_backup_sql(&opts).unwrap(),
-            "BASE_BACKUP (WAIT true)"
+            "BASE_BACKUP (WAIT false)"
+        );
+    }
+
+    /// Same bug on the option that silences a corruption check: without this,
+    /// `VERIFY_CHECKSUMS false` could not be requested at all.
+    #[test]
+    fn base_backup_verify_checksums_false_is_emitted() {
+        let opts = BaseBackupOptions {
+            verify_checksums: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            build_base_backup_sql(&opts).unwrap(),
+            "BASE_BACKUP (VERIFY_CHECKSUMS false)"
+        );
+    }
+
+    /// `true` (the default) omits the option, so `BASE_BACKUP` stays bare —
+    /// byte-identical to what this builder produced before these two fields did
+    /// anything. The affirmative form is never emitted: for `WAIT` the server
+    /// cannot tell it from an omitted option, and for `VERIFY_CHECKSUMS` a
+    /// tri-state on one field but not the other is not worth the asymmetry.
+    ///
+    /// This is the test that fails if `Default` is ever switched back to a
+    /// derive — that would make both fields `false` and silently ship
+    /// `WAIT false, VERIFY_CHECKSUMS false` on every default backup.
+    #[test]
+    fn base_backup_default_bools_omit_the_option() {
+        let opts = BaseBackupOptions::default();
+        assert!(opts.wait, "the server waits by default");
+        assert!(opts.verify_checksums, "the server verifies by default");
+        let sql = build_base_backup_sql(&opts).unwrap();
+        assert_eq!(sql, "BASE_BACKUP", "{sql}");
+    }
+
+    /// The negative form must not perturb emission order.
+    #[test]
+    fn base_backup_negative_bools_keep_option_order() {
+        let opts = BaseBackupOptions {
+            wait: false,
+            verify_checksums: false,
+            wal: true,
+            progress: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            build_base_backup_sql(&opts).unwrap(),
+            "BASE_BACKUP (PROGRESS true, WAL true, WAIT false, VERIFY_CHECKSUMS false)"
         );
     }
 
@@ -1831,18 +2061,6 @@ mod tests {
     }
 
     #[test]
-    fn base_backup_with_verify_checksums() {
-        let opts = BaseBackupOptions {
-            verify_checksums: true,
-            ..Default::default()
-        };
-        assert_eq!(
-            build_base_backup_sql(&opts).unwrap(),
-            "BASE_BACKUP (VERIFY_CHECKSUMS true)"
-        );
-    }
-
-    #[test]
     fn base_backup_with_manifest() {
         let opts = BaseBackupOptions {
             manifest: Some("yes".to_string()),
@@ -1873,12 +2091,12 @@ mod tests {
             label: Some("backup".to_string()),
             progress: true,
             wal: true,
-            verify_checksums: true,
+            verify_checksums: false,
             ..Default::default()
         };
         assert_eq!(
             build_base_backup_sql(&opts).unwrap(),
-            "BASE_BACKUP (LABEL 'backup', PROGRESS true, WAL true, VERIFY_CHECKSUMS true)"
+            "BASE_BACKUP (LABEL 'backup', PROGRESS true, WAL true, VERIFY_CHECKSUMS false)"
         );
     }
 
@@ -1905,12 +2123,12 @@ mod tests {
             progress: true,
             checkpoint: Some("fast".to_string()),
             wal: true,
-            wait: true,
+            wait: false,
             compression: Some("zstd".to_string()),
             compression_detail: Some("level=3".to_string()),
             max_rate: Some(2048),
             tablespace_map: true,
-            verify_checksums: true,
+            verify_checksums: false,
             manifest: Some("yes".to_string()),
             manifest_checksums: Some("SHA256".to_string()),
             incremental: true,
@@ -1918,9 +2136,9 @@ mod tests {
         assert_eq!(
             build_base_backup_sql(&opts).unwrap(),
             "BASE_BACKUP (LABEL 'lbl', TARGET 'server', TARGET_DETAIL '/backups', \
-             PROGRESS true, CHECKPOINT 'fast', WAL true, WAIT true, COMPRESSION 'zstd', \
+             PROGRESS true, CHECKPOINT 'fast', WAL true, WAIT false, COMPRESSION 'zstd', \
              COMPRESSION_DETAIL 'level=3', MAX_RATE 2048, TABLESPACE_MAP true, \
-             VERIFY_CHECKSUMS true, MANIFEST 'yes', MANIFEST_CHECKSUMS 'SHA256', INCREMENTAL)"
+             VERIFY_CHECKSUMS false, MANIFEST 'yes', MANIFEST_CHECKSUMS 'SHA256', INCREMENTAL)"
         );
     }
 

@@ -130,7 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         progress: true,                                 // Show progress information
         checkpoint: Some("fast".to_string()),           // Fast checkpoint
         wal: true,                                      // Include WAL files for restore
-        wait: false,                                    // Wait for WAL archiving
+        wait: true,                                     // Wait for WAL archiving (omits WAIT; the server default)
         manifest: Some("yes".to_string()),              // Generate manifest for verification
         manifest_checksums: Some("SHA256".to_string()), // Use SHA256 checksums
         verify_checksums: true,                         // Verify data checksums

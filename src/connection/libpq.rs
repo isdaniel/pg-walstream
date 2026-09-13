@@ -85,7 +85,9 @@ enum CopyEnd {
 impl CopyEnd {
     fn to_error(&self) -> ReplicationError {
         match self {
-            CopyEnd::Done => ReplicationError::Cancelled("COPY stream ended".to_string()),
+            CopyEnd::Done => ReplicationError::transient_connection(
+                "replication stream ended by server (CopyDone)",
+            ),
             CopyEnd::Failed(sqlstate, message) => ReplicationError::from_sqlstate(
                 sqlstate,
                 format!("replication stream terminated by server: {message}"),
@@ -438,8 +440,10 @@ impl PgReplicationConnection {
     ///
     /// # Returns
     /// * `Ok(data)` - Successfully received data as zero-copy Bytes
-    /// * `Err(ReplicationError::Cancelled(_))` - Operation was cancelled or COPY stream ended
-    /// * `Err(_)` - Other errors occurred (connection issues, protocol errors)
+    /// * `Err(ReplicationError::Cancelled(_))` - Operation was cancelled by the caller
+    /// * `Err(ReplicationError::TransientConnection(_))` - The COPY stream ended (server
+    ///   CopyDone/CommandComplete) or the transport broke; reconnect to resume
+    /// * `Err(_)` - Other errors occurred (server-reported SQLSTATE, protocol errors)
     pub async fn get_copy_data_async(
         &mut self,
         cancellation_token: &CancellationToken,
@@ -463,7 +467,7 @@ impl PgReplicationConnection {
                 &mut self.pending_messages,
                 &mut self.read_buf,
                 &mut self.copy_end,
-            ) {
+            )? {
                 // Messages queued and/or the stream ended: loop to pop, then latch.
                 DrainResult::Progressed => continue,
                 DrainResult::WouldBlock => {} // need to wait for socket
@@ -489,13 +493,13 @@ impl PgReplicationConnection {
                     let consumed = unsafe { PQconsumeInput(self.conn) };
                     if consumed == 0 {
                         let error_msg = self.last_error_message();
-                        return Err(ReplicationError::protocol(format!(
+                        return Err(ReplicationError::transient_connection(format!(
                             "PQconsumeInput failed: {error_msg}"
                         )));
                     }
 
                     // Drain all available messages
-                    match drain_buffered_messages(self.conn, &mut self.pending_messages, &mut self.read_buf, &mut self.copy_end) {
+                    match drain_buffered_messages(self.conn, &mut self.pending_messages, &mut self.read_buf, &mut self.copy_end)? {
                         DrainResult::Progressed => {
                             // Messages queued and/or the stream ended; the next
                             // loop iteration pops the queue, then the latch.
@@ -519,14 +523,22 @@ impl PgReplicationConnection {
             info!("Found queued data after cancellation, returning it");
             return Ok(msg);
         }
-        // Try one last drain
-        match drain_buffered_messages(
+        // Try one last drain.
+        //
+        // A transport failure here is deliberately NOT propagated: the caller has
+        // already asked to stop, and the stream layer treats `Cancelled` as a clean
+        // terminal. Turning a requested shutdown into a transport error would make
+        // every cancel-on-a-dying-socket look like a failure. The streaming path
+        // (`get_copy_data_async`) still throws it — that is where the silent stall
+        // was.
+        let drained = drain_buffered_messages(
             self.conn,
             &mut self.pending_messages,
             &mut self.read_buf,
             &mut self.copy_end,
-        ) {
-            DrainResult::Progressed => {
+        );
+        match drained {
+            Ok(DrainResult::Progressed) => {
                 if let Some(msg) = self.pending_messages.pop_front() {
                     info!("Found buffered data after cancellation, returning it");
                     return Ok(msg);
@@ -536,8 +548,22 @@ impl PgReplicationConnection {
                     return Err(end.to_error());
                 }
             }
-            DrainResult::WouldBlock => {
+            Ok(DrainResult::WouldBlock) => {
                 info!("Cancellation token triggered with no buffered data");
+            }
+            Err(e) => {
+                // The drain loop pushes into `pending_messages` as it goes and
+                // only then hits the failure, so a partial batch can be sitting
+                // in the queue. Those frames were fully received before the
+                // transport broke and are just as valid as the ones the
+                // `Progressed` arm delivers — dropping them here would make this
+                // function treat already-received data two different ways
+                // depending on which frame the failure landed on.
+                if let Some(msg) = self.pending_messages.pop_front() {
+                    info!("Delivering data queued before the cancellation drain failed");
+                    return Ok(msg);
+                }
+                debug!("Transport failed during cancellation drain, reporting cancel: {e}");
             }
         }
         Err(ReplicationError::Cancelled(
@@ -689,6 +715,28 @@ impl PgReplicationConnection {
     /// Check if the connection is still alive
     pub fn is_alive(&self) -> bool {
         if self.conn.is_null() {
+            return false;
+        }
+
+        // A latched COPY end means this connection can no longer produce WAL even
+        // though libpq still reports CONNECTION_OK: a walsender that finished sends
+        // CommandComplete, which surfaces as `PQgetCopyData == -1` with no error and
+        // leaves `PQstatus` healthy. Reporting "alive" there kept
+        // `next_event_with_retry` from ever reaching `recover_connection`, so the
+        // stream retried the sticky latch three times and then handed the consumer a
+        // transient error indefinitely — `EventStream::poll_next` yields
+        // `Some(Err(..))` for a transient error *without* setting `terminated`, so a
+        // `futures::Stream` consumer spins instead of reconnecting. `copy_end` is
+        // cleared by `start_replication`, and recovery replaces the connection
+        // wholesale, so this cannot latch permanently.
+        //
+        // Gated on an empty queue to match the delivery order `get_copy_data_async`
+        // already uses: `drain_buffered_messages` can latch `copy_end` in the same
+        // pass that queues up to `MAX_DRAIN_BATCH` frames, and those frames are
+        // popped *before* the latch is honoured. Reporting "dead" while they are
+        // still pending lets a health check swap the connection out from under
+        // them, discarding received WAL that has not been handed to the consumer.
+        if self.copy_end.is_some() && self.pending_messages.is_empty() {
             return false;
         }
 
@@ -1008,14 +1056,15 @@ impl PgReplicationConnection {
                 self.is_replication_conn = false;
             }
 
-            // Close the connection
+            // Close the connection, deregister from the tokio reactor FIRST: `PQfinish` closes the socket, and `AsyncFd`'s drop then issues `epoll_ctl(EPOLL_CTL_DEL, fd)` on a closed descriptor. If another thread opened something that reused that fd number in between, that would tear down *their* registration.
+            self.async_fd = None;
+
             unsafe {
                 PQfinish(self.conn);
             }
 
             // Clear the connection pointer and reset state
             self.conn = std::ptr::null_mut();
-            self.async_fd = None;
             self.pending_messages.clear();
 
             info!("PostgreSQL replication connection closed and cleaned up");
@@ -1265,7 +1314,16 @@ fn try_read_buffered_data_raw(conn: *mut PGconn, read_buf: &mut BytesMut) -> Res
                     CStr::from_ptr(error_ptr).to_string_lossy().into_owned()
                 }
             };
-            Err(ReplicationError::protocol(format!(
+            // Thrown straight up rather than latched: libpq has no would-block
+            // path to -2 (that is what 0 is for), so every -2 is a real,
+            // non-socket-resolvable failure and there is nothing to defer.
+            // Classified transient so a consumer's own retry policy treats it as
+            // retryable. Note it does NOT by itself arm `recover_connection`: the
+            // malloc-failure and "no COPY in progress" paths leave `PQstatus` at
+            // CONNECTION_OK and do not latch `copy_end`, so `is_alive()` stays
+            // true and the stream backs off and retries in place — which is
+            // correct, since the message is still buffered.
+            Err(ReplicationError::transient_connection(format!(
                 "PQgetCopyData error: {error_msg}"
             )))
         }
@@ -1286,7 +1344,7 @@ fn drain_buffered_messages(
     pending_messages: &mut VecDeque<Bytes>,
     read_buf: &mut BytesMut,
     copy_end: &mut Option<CopyEnd>,
-) -> DrainResult {
+) -> Result<DrainResult> {
     let mut drained = false;
 
     for _ in 0..MAX_DRAIN_BATCH {
@@ -1305,15 +1363,23 @@ fn drain_buffered_messages(
                 *copy_end = Some(CopyEnd::Failed(sqlstate, message));
                 break;
             }
-            Err(_) => break, // treat errors as would-block for drain purposes
+            // A -2 from PQgetCopyData is a real transport failure, not
+            // backpressure. Latching it (rather than dropping it and reporting
+            // WouldBlock) is what keeps `get_copy_data_async` from going back to
+            // await readability on a socket that will never become ready again.
+            // Propagate, never swallow. `Err(_) => break` used to report
+            // WouldBlock for a hard transport failure, sending the caller back to
+            // await readability on a socket libpq had already closed — a silent,
+            // permanent stall.
+            Err(e) => return Err(e),
         }
     }
 
-    if drained || copy_end.is_some() {
+    Ok(if drained || copy_end.is_some() {
         DrainResult::Progressed
     } else {
         DrainResult::WouldBlock
-    }
+    })
 }
 #[cfg(test)]
 mod tests {
@@ -1687,14 +1753,19 @@ mod tests {
     // CopyEnd latch
     // ========================================
 
-    /// A graceful end is reported as `Cancelled`; a server-terminated one keeps
-    /// its SQLSTATE classification, so an invalidated slot stays permanent.
+    /// A server-side end is reported as a *transient* error so the stream
+    /// reconnects (it must never alias onto `Cancelled`, which the stream layer
+    /// treats as a clean caller-requested stop); a server-terminated one keeps its
+    /// SQLSTATE classification, so an invalidated slot stays permanent.
     #[test]
     fn test_copy_end_to_error() {
-        assert!(matches!(
-            CopyEnd::Done.to_error(),
-            ReplicationError::Cancelled(_)
-        ));
+        let done = CopyEnd::Done.to_error();
+        assert!(
+            matches!(done, ReplicationError::TransientConnection(_)),
+            "server-side stream end must not look like user cancellation: {done:?}"
+        );
+        assert!(!done.is_cancelled());
+        assert!(done.is_transient());
 
         let invalidated =
             CopyEnd::Failed("55000".to_string(), "can no longer access slot".to_string())
@@ -1703,9 +1774,77 @@ mod tests {
         assert!(invalidated.is_permanent());
         assert!(invalidated.to_string().contains("55000"), "{invalidated}");
 
+        // A walsender killed by `pg_terminate_backend()` reports 57P01 as an
+        // ErrorResponse inside the still-open COPY stream. It must classify
+        // transient so the stream reconnects: while it was `Protocol`, the
+        // "unrecoverable decode error on a live connection" guard in
+        // `next_event_with_retry` treated a routine restart as terminal.
         let other = CopyEnd::Failed("57P01".to_string(), "terminating".to_string()).to_error();
-        assert!(matches!(other, ReplicationError::Protocol(_)));
+        assert!(
+            matches!(other, ReplicationError::TransientConnection(_)),
+            "{other:?}"
+        );
         assert!(!other.is_permanent());
+        assert!(other.is_transient());
+    }
+
+    /// A `PQgetCopyData` transport failure (-2) is thrown straight up, not parked
+    /// in the `CopyEnd` latch: libpq has no would-block path to -2, so there is
+    /// nothing to defer. What must NOT come back is `WouldBlock` — that is what
+    /// sent the caller back to await readability on a socket libpq had already
+    /// closed, stalling the stream silently and permanently.
+    #[test]
+    fn drain_throws_transport_failure_instead_of_reporting_would_block() {
+        let mut pending = VecDeque::new();
+        let mut read_buf = BytesMut::new();
+        let mut copy_end = None;
+
+        // A null connection makes PQgetCopyData answer -2 ("connection pointer is NULL").
+        let result = drain_buffered_messages(
+            std::ptr::null_mut(),
+            &mut pending,
+            &mut read_buf,
+            &mut copy_end,
+        );
+
+        let err = result.expect_err("a -2 transport failure must propagate as Err");
+        assert!(
+            matches!(err, ReplicationError::TransientConnection(_)),
+            "must classify transient so the stream reconnects: {err:?}"
+        );
+        assert!(err.to_string().contains("PQgetCopyData error"), "{err}");
+        assert!(
+            copy_end.is_none(),
+            "the failure is thrown, not latched into CopyEnd"
+        );
+    }
+
+    /// The drain loop queues frames as it goes and only then hits the failure, so
+    /// a partial batch can already be in `pending` when it returns `Err`. Those
+    /// frames were fully received before the transport broke, and
+    /// `handle_cancellation` relies on them still being there to deliver instead
+    /// of reporting `Cancelled` — so the error path must not clear the queue.
+    #[test]
+    fn drain_error_preserves_already_queued_messages() {
+        let mut pending = VecDeque::new();
+        pending.push_back(Bytes::from_static(b"received before the failure"));
+        let mut read_buf = BytesMut::new();
+        let mut copy_end = None;
+
+        let result = drain_buffered_messages(
+            std::ptr::null_mut(),
+            &mut pending,
+            &mut read_buf,
+            &mut copy_end,
+        );
+
+        assert!(result.is_err(), "a null conn must fail the drain");
+        assert_eq!(
+            pending.len(),
+            1,
+            "a transport failure must not discard already-received frames"
+        );
+        assert_eq!(&pending[0][..], b"received before the failure");
     }
 
     /// Regression: a drain pass that queues messages and *then* sees the end of

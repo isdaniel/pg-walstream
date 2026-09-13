@@ -127,7 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match event_stream.next_event().await {
             Ok(event) => {
                 // Update applied LSN after successful event retrieval
-                event_stream.update_applied_lsn(event.lsn.value());
+                event_stream.update_applied_lsn(event.lsn);
                 Some((Ok(event), event_stream))
             }
             Err(e) => {

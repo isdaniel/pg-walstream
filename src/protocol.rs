@@ -404,24 +404,38 @@ impl ColumnData {
         self.data_type == b't'
     }
 
-    /// Convert to string, returning a Cow to avoid allocation when possible
-    /// If the data is valid UTF-8, returns a borrowed reference
-    /// Works for both text ('t') and binary ('b') format columns
+    /// Borrow this column's payload as UTF-8, for both text (`'t'`) and binary
+    /// (`'b'`) format columns.
+    ///
+    /// Returns `None` for a NULL (`'n'`) or unchanged-TOAST (`'u'`) column, and
+    /// for a payload that is not valid UTF-8 — like
+    /// [`ColumnValue::as_str`](crate::column_value::ColumnValue::as_str), no lossy
+    /// U+FFFD substitution. (The two are not otherwise equivalent: `ColumnValue`
+    /// always returns `None` for a binary column, this decodes it.) Use
+    /// [`as_bytes`](Self::as_bytes) for the raw payload.
+    ///
+    /// An empty *text* column is a valid empty string and yields `Some("")`; only
+    /// `'n'` means SQL NULL.
+    ///
+    /// `None` is therefore overloaded across NULL, unchanged-TOAST and undecodable
+    /// — use [`is_null`](Self::is_null) / [`is_unchanged`](Self::is_unchanged) /
+    /// [`as_bytes`](Self::as_bytes) to tell them apart. Undecodable is only
+    /// reachable in binary mode, since both backends force `client_encoding=UTF8`.
+    ///
+    /// The return type stays a [`Cow`] for source compatibility; it is always
+    /// `Cow::Borrowed` (no allocation).
     #[inline]
     pub fn as_str(&self) -> Option<Cow<'_, str>> {
-        if self.data.is_empty() || (self.data_type != b't' && self.data_type != b'b') {
+        if self.data_type != b't' && self.data_type != b'b' {
             return None;
         }
 
-        match core::str::from_utf8(&self.data) {
-            Ok(s) => Some(Cow::Borrowed(s)),
-            Err(_) => {
-                // Fallback: Use lossy conversion (rare case)
-                Some(Cow::Owned(String::from_utf8_lossy(&self.data).into_owned()))
-            }
-        }
+        // No lossy fallback: silently substituting U+FFFD would hand back a
+        // corrupted column value that reads as successfully decoded.
+        core::str::from_utf8(&self.data).ok().map(Cow::Borrowed)
     }
 
+    /// [`as_str`](Self::as_str) as an owned `String`.
     #[inline]
     pub fn as_string(&self) -> Option<String> {
         self.as_str().map(|cow| cow.into_owned())
@@ -541,31 +555,35 @@ impl StreamingReplicationMessage {
 ///
 /// # LSN Tracking
 ///
-/// This struct tracks three different LSN values according to PostgreSQL protocol:
+/// This struct owns exactly one LSN concept: **how far the wire has advanced**.
 ///
-/// - `last_received_lsn` (write_lsn): The location of the last WAL byte + 1 received
-///   from the PostgreSQL replication stream. Updated by the producer when data is received.
+/// - `last_received_lsn` (write_lsn): the location of the last WAL byte + 1
+///   received from the replication stream. Advances at frame-decode time, i.e.
+///   when bytes arrive — *not* when the consumer has processed them. Never use
+///   it as a restart point: PostgreSQL does not clamp a startpoint that is ahead
+///   of the slot, so resuming there discards everything received-but-unapplied.
 ///
-/// - `last_flushed_lsn` (flush_lsn): The location of the last WAL byte + 1 that has been
-///   successfully written/flushed to the destination. Updated when data is written to destination.
+/// The consumer's progress (flush_lsn / replay_lsn) deliberately does **not**
+/// live here — it lives in [`SharedLsnFeedback`](crate::SharedLsnFeedback),
+/// which is atomic and `Arc`-shared so a consumer can ack from another task.
+/// This struct used to mirror those two values as well; they were an exact
+/// duplicate of `last_sent_*` below, nothing read them, and their setters shared
+/// their names with `SharedLsnFeedback`'s live ones — so calling one read like
+/// an ack but did nothing. Both are gone.
 ///
-/// - `last_applied_lsn` (replay_lsn): The location of the last WAL byte + 1 that has been
-///   fully applied (committed) to the destination. Updated after transaction commit on destination.
+/// `last_sent_*` (private) records what was last reported to the server, purely
+/// so [`lsn_has_changed`](Self::lsn_has_changed) can suppress redundant updates.
 ///
-/// The PostgreSQL server uses these values to:
-/// 1. Know which WAL can be recycled (based on replay_lsn)
+/// The PostgreSQL server uses the reported values to:
+/// 1. Know which WAL can be recycled (flush_lsn, via `confirmed_flush`)
 /// 2. Calculate replication lag (sent_lsn - replay_lsn)
-/// 3. Decide when to send keepalive messages
+/// 3. Release `synchronous_commit` waiters
 #[derive(Debug)]
 pub struct ReplicationState {
     /// Relations by OID
     pub relations: RelationMap,
     /// Last received LSN (write_lsn in pg_stat_replication)
     pub last_received_lsn: XLogRecPtr,
-    /// Last flushed LSN
-    pub last_flushed_lsn: XLogRecPtr,
-    /// Last applied LSN
-    pub last_applied_lsn: XLogRecPtr,
     /// Last feedback time
     #[cfg(feature = "std")]
     pub last_feedback_time: std::time::Instant,
@@ -580,8 +598,6 @@ impl ReplicationState {
         Self {
             relations: RelationMap::new(),
             last_received_lsn: 0,
-            last_flushed_lsn: 0,
-            last_applied_lsn: 0,
             #[cfg(feature = "std")]
             last_feedback_time: std::time::Instant::now(),
             last_sent_flush_lsn: 0,
@@ -606,25 +622,6 @@ impl ReplicationState {
     pub fn update_received_lsn(&mut self, lsn: XLogRecPtr) {
         if lsn > self.last_received_lsn {
             self.last_received_lsn = lsn;
-        }
-    }
-
-    /// Update flushed LSN when data is written to destination (before commit)
-    #[inline(always)]
-    pub fn update_flushed_lsn(&mut self, lsn: XLogRecPtr) {
-        if lsn > self.last_flushed_lsn {
-            self.last_flushed_lsn = lsn;
-        }
-    }
-
-    /// Update applied LSN when transaction is committed to destination
-    #[inline(always)]
-    pub fn update_applied_lsn(&mut self, lsn: XLogRecPtr) {
-        if lsn > self.last_applied_lsn {
-            self.last_applied_lsn = lsn;
-            if lsn > self.last_flushed_lsn {
-                self.last_flushed_lsn = lsn;
-            }
         }
     }
 
@@ -2335,23 +2332,10 @@ mod tests {
 
         state.update_received_lsn(100);
         assert_eq!(state.last_received_lsn, 100);
-        assert_eq!(state.last_flushed_lsn, 0);
-        assert_eq!(state.last_applied_lsn, 0);
 
+        // Monotonic: a lower value never rewinds the wire position.
         state.update_received_lsn(50);
         assert_eq!(state.last_received_lsn, 100);
-
-        state.update_flushed_lsn(80);
-        assert_eq!(state.last_flushed_lsn, 80);
-
-        state.update_flushed_lsn(50);
-        assert_eq!(state.last_flushed_lsn, 80);
-
-        state.update_applied_lsn(70);
-        assert_eq!(state.last_applied_lsn, 70);
-
-        state.update_applied_lsn(30);
-        assert_eq!(state.last_applied_lsn, 70);
     }
 
     fn write_u32_be(val: u32) -> [u8; 4] {
@@ -2750,24 +2734,6 @@ mod tests {
     }
 
     #[test]
-    fn test_replication_state_lsn_updates() {
-        let mut state = ReplicationState::new();
-
-        // Test received LSN
-        state.update_received_lsn(100);
-        assert_eq!(state.last_received_lsn, 100);
-
-        // Test flushed LSN
-        state.update_flushed_lsn(80);
-        assert_eq!(state.last_flushed_lsn, 80);
-
-        // Test applied LSN (should also update flushed)
-        state.update_applied_lsn(90);
-        assert_eq!(state.last_applied_lsn, 90);
-        assert_eq!(state.last_flushed_lsn, 90);
-    }
-
-    #[test]
     fn test_parser_protocol_versions() {
         let parser1 = LogicalReplicationParser::with_protocol_version(1);
         assert_eq!(parser1.protocol_version, 1);
@@ -2919,12 +2885,14 @@ mod tests {
         assert_eq!(col.as_str().unwrap().as_ref(), "valid utf8");
     }
 
+    /// Invalid UTF-8 yields `None`, not a lossy U+FFFD substitution — a corrupted
+    /// value must not read back as a successfully decoded one. Matches
+    /// `ColumnValue::as_str`; use `as_bytes()` for the raw payload.
     #[test]
     fn test_column_data_as_str_binary_invalid_utf8() {
-        // Binary data with invalid UTF-8 should use lossy conversion
         let col = ColumnData::binary(vec![0xFF, 0xFE, 0x41]);
-        let s = col.as_str().unwrap();
-        assert!(s.contains('A')); // Valid byte 0x41 = 'A'
+        assert!(col.as_str().is_none());
+        assert_eq!(col.as_bytes(), &[0xFF, 0xFE, 0x41]);
     }
 
     #[test]
@@ -2939,11 +2907,14 @@ mod tests {
         assert!(col.as_str().is_none());
     }
 
+    /// An empty text column is the empty string, not NULL: only `'n'` is NULL.
     #[test]
     fn test_column_data_as_str_empty_text() {
         let col = ColumnData::text(Vec::new());
-        // Empty text data should return None since data.is_empty()
-        assert!(col.as_str().is_none());
+        assert_eq!(col.as_str().unwrap().as_ref(), "");
+        assert_eq!(col.as_string(), Some(String::new()));
+        // ...and it stays distinguishable from a NULL column.
+        assert!(ColumnData::null().as_str().is_none());
     }
 
     #[test]
@@ -3121,27 +3092,7 @@ mod tests {
     fn test_replication_state_default() {
         let state = ReplicationState::default();
         assert_eq!(state.last_received_lsn, 0);
-        assert_eq!(state.last_flushed_lsn, 0);
-        assert_eq!(state.last_applied_lsn, 0);
         assert!(state.relations.is_empty());
-    }
-
-    #[test]
-    fn test_replication_state_applied_updates_flushed() {
-        let mut state = ReplicationState::new();
-        state.update_flushed_lsn(50);
-        assert_eq!(state.last_flushed_lsn, 50);
-
-        // Applied > flushed should update flushed too
-        state.update_applied_lsn(100);
-        assert_eq!(state.last_applied_lsn, 100);
-        assert_eq!(state.last_flushed_lsn, 100);
-
-        // Applied < current flushed should not downgrade flushed
-        state.update_flushed_lsn(200);
-        state.update_applied_lsn(150);
-        assert_eq!(state.last_flushed_lsn, 200); // flushed stays at 200
-        assert_eq!(state.last_applied_lsn, 150);
     }
 
     #[test]

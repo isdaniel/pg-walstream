@@ -200,7 +200,7 @@ impl SafeReplicationConsumer {
         }
 
         if let Some(lsn) = last_safe_lsn {
-            self.feedback.update_applied_lsn(lsn.value());
+            self.feedback.update_applied_lsn(lsn);
             info!("Updated feedback LSN to {}", lsn);
         }
     }

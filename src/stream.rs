@@ -48,7 +48,7 @@ pub struct LogicalReplicationStream {
     identity: Option<ServerIdentity>,
     /// Counter that throttles per-event time checks inside `next_event`. We only consult `Instant::now()` once every `FEEDBACK_CHECK_EVENT_INTERVAL` events so the hot path avoids a syscall on every message.
     feedback_check_counter: u32,
-    /// Bounded replay: set to the crossing commit's `end_lsn` once that event has been delivered; the next `next_event` sends CopyDone and returns `StreamStopped`. `None` when bounded replay is off or not yet reached.
+    /// Bounded replay: set once the terminal is armed; the next `next_event` sends CopyDone and returns `StreamStopped`. `None` when bounded replay is off or not yet reached. Holds the crossing commit's `end_lsn` on the typed path, a keepalive's `wal_end` when the target is past the last commit, and the transport-level `wal_end` on the raw path.
     stop_at_reached: Option<Lsn>,
     /// One-shot guard so the bounded-replay CopyDone is sent at most once.
     copy_done_sent: bool,
@@ -390,6 +390,8 @@ impl ReplicationStreamConfig {
     }
 
     /// Stop replication after the first committed transaction whose commit `end_lsn` reaches `lsn`. That transaction is delivered in full, then the stream ends cleanly (client CopyDone) and `next_event` returns [`crate::ReplicationError::StreamStopped`]. `None` (default) is unbounded.
+    ///
+    /// If `lsn` lies *beyond* the last commit the server has, no commit boundary can ever reach it, so the stream instead ends once a keepalive reports the server's send position past `lsn` — rather than blocking forever waiting for a transaction that may never be written. This mirrors pg_recvlogical's `--endpos` `STREAM_STOP_KEEPALIVE` exit and is safe for the same reason: a keepalive's `wal_end` is `sentPtr`, assigned only *after* the output plugin has run and queued its data on the same socket, so nothing committing at or below it can still be undelivered. The `StreamStopped` LSN is then that keepalive position, not a commit boundary.
     #[inline]
     pub fn with_stop_at_lsn(mut self, lsn: impl Into<Lsn>) -> Self {
         self.stop_at_lsn = Some(lsn.into());
@@ -654,6 +656,13 @@ impl LogicalReplicationStream {
 
         self.initialize().await?;
         let start_lsn = start_lsn.unwrap_or(INVALID_XLOG_REC_PTR);
+
+        // Seed `applied` with the caller's startpoint: `start(Some(X))` asserts
+        // everything below X is processed, which is what `applied` means. Without
+        // it, `recover_connection` (which resumes from `applied`) would rewind an
+        // explicit startpoint to `confirmed_flush`. Monotonic and 0-ignoring, so
+        // `start(None)` is a no-op and a later ack past X wins.
+        self.shared_lsn_feedback.update_applied_lsn(start_lsn);
 
         let options = self.build_replication_options()?;
 
@@ -937,9 +946,33 @@ impl LogicalReplicationStream {
 
         // Re-initialize the connection. A reconnect can land somewhere other than where we left off, and the stored LSN is only meaningful on the original cluster and timeline.
         let identity = self.connection.identify_system()?;
-        if let Some(current) = ServerIdentity::from_identify_system(&identity) {
-            self.check_server_identity(&current)?;
-            self.identity = Some(current);
+        match ServerIdentity::from_identify_system(&identity) {
+            Some(current) => {
+                self.check_server_identity(&current)?;
+                self.identity = Some(current);
+            }
+            // Fail closed. An unreadable IDENTIFY_SYSTEM used to skip the check
+            // entirely, which is precisely backwards: we are about to resume from a
+            // stored LSN that is only meaningful on the same cluster and timeline,
+            // and we just lost the ability to confirm either. A conforming server
+            // always returns systemid and timeline, so getting here means the
+            // response was malformed — treat that as the mismatch it might be.
+            //
+            // `permanent_connection`, not `replication_slot`: the server never
+            // looked at the slot, and `ReplicationSlot` is documented as
+            // "invalidated / does not exist — drop it and re-sync", which would
+            // send an operator to destroy a healthy slot over a bad response.
+            None if self.identity.is_some() => {
+                return Err(ReplicationError::permanent_connection(
+                    "IDENTIFY_SYSTEM returned no usable system identifier/timeline on reconnect; \
+                     refusing to resume from the stored LSN without confirming the cluster and \
+                     timeline are unchanged"
+                        .to_string(),
+                ));
+            }
+            None => {
+                warn!("IDENTIFY_SYSTEM returned no usable identity; cluster/timeline changes cannot be detected");
+            }
         }
 
         // Temporary slots are dropped when the connection dies, so we must
@@ -951,8 +984,35 @@ impl LogicalReplicationStream {
         // Ensure replication slot still exists (recreate if temporary)
         self.ensure_replication_slot().await?;
 
-        // Restart replication from last known position
-        let last_lsn = self.state.last_received_lsn;
+        // Restart position for the reconnect.
+        //
+        // NEVER `last_received_lsn`. That advances at frame-decode time
+        // (`parse_xlogdata_header`, and keepalives in `process_keepalive_message`),
+        // i.e. the moment bytes arrive — long before the consumer has processed or
+        // acked them. PostgreSQL does not clamp a startpoint that is *ahead* of the
+        // slot: `CreateDecodingContext` (logical.c) forwards a startpoint that is
+        // *behind* `confirmed_flush` up to it, but has no symmetric branch for one
+        // that is ahead, and `SnapBuildXactNeedsSkip` (snapbuild.c,
+        // `ptr < start_decoding_at`) then makes `DecodeTXNNeedSkip` drop every
+        // transaction committing below it. Restarting from `last_received_lsn`
+        // therefore *permanently discards* everything received-but-not-yet-applied.
+        //
+        // Use the consumer's applied position instead. `start(Some(X))` seeds it,
+        // and every ack raises it, so it is the single authority for "where may we
+        // safely resume". Zero means "nothing acked and no explicit startpoint",
+        // which is `INVALID_XLOG_REC_PTR`, so the server resumes from
+        // `confirmed_flush` — exactly what a cold `start(None)` does. Recovery is
+        // now at-least-once like cold start, instead of at-most-once. Replaying a
+        // transaction is safe; skipping one is not.
+        let last_lsn = self.shared_lsn_feedback.get_feedback_lsn().1;
+        if last_lsn == INVALID_XLOG_REC_PTR && self.state.last_received_lsn != INVALID_XLOG_REC_PTR
+        {
+            warn!(
+                "Reconnecting with no applied LSN ever acked; replaying from the slot's \
+                 confirmed_flush. Call `shared_lsn_feedback.update_applied_lsn(..)` after \
+                 durable processing to bound replay."
+            );
+        }
 
         let options = self.build_replication_options()?;
         let options_ref = options
@@ -1072,6 +1132,36 @@ impl LogicalReplicationStream {
 
                     if e.is_permanent() {
                         error!("Permanent error in event processing: {}", e);
+                        return Err(e);
+                    }
+
+                    // A decode failure on a *live* connection is not recoverable by
+                    // retrying: `next_event` has already consumed the offending frame,
+                    // so looping just reads the NEXT frame and returns that — silently
+                    // dropping a change the consumer never saw, while the received LSN
+                    // has already advanced past it. Surface it instead.
+                    //
+                    // Server-reported conditions do NOT reach this guard as
+                    // `Protocol`: `from_sqlstate` maps the transient ones (57P01
+                    // admin shutdown, 55006 slot busy, …) to `TransientConnection`,
+                    // which is not in the match below. And any error out of the COPY
+                    // read path clears the backend's liveness first — the native
+                    // worker stores `alive = false` for every non-cancelled error,
+                    // and the libpq backend reports `is_alive() == false` once
+                    // `copy_end` is latched — so `is_alive()` is already false by the
+                    // time a server error arrives here. What this guard actually
+                    // catches is parse-stage failures on a connection that is still
+                    // healthy. Unclassified SQLSTATEs still fall back to `Protocol`;
+                    // those genuinely are terminal here for the reason above.
+                    if self.connection.is_alive()
+                        && matches!(
+                            e,
+                            ReplicationError::Protocol(_)
+                                | ReplicationError::Buffer(_)
+                                | ReplicationError::Deserialize(_)
+                        )
+                    {
+                        error!("Unrecoverable decode error on a live connection: {}", e);
                         return Err(e);
                     }
 
@@ -1208,7 +1298,40 @@ impl LogicalReplicationStream {
 
         self.state.update_received_lsn(keepalive.wal_end);
 
-        if keepalive.reply_requested {
+        // Bounded replay, idle-server terminal.
+        //
+        // On the typed path `stop_at_reached` is otherwise armed only from a
+        // delivered commit boundary (`next_event`), so a target set past the last
+        // commit never fires: the server has nothing more to send, `next_wal_frame`
+        // loops on keepalives forever (there is no read timeout), and the "catch up
+        // to now, then exit" consumer simply never exits. (`next_raw_event` also
+        // arms it, from the transport-level `wal_end`; that path is unaffected here.)
+        //
+        // Safe despite `wal_end` not being a commit boundary. A keepalive's
+        // `wal_end` is the walsender's `sentPtr`, and `XLogSendLogical` assigns
+        // `sentPtr = reader->EndRecPtr` only *after* `LogicalDecodingProcessRecord`
+        // has run the output plugin, whose `pq_putmessage_noblock` lands in the same
+        // FIFO socket buffer as the keepalive's. So everything committing at or
+        // below `wal_end` is already on the wire ahead of this keepalive; a
+        // transaction still open across `sentPtr` necessarily commits *above* it and
+        // is out of range by construction. This is pg_recvlogical's
+        // `STREAM_STOP_KEEPALIVE` exit, whose in-tree comment makes the same
+        // argument. (The "--endpos may truncate partway through a transaction"
+        // caveat in the docs is about its *per-record* endpos check, not this one.)
+        if let Some(stop) = self.config.stop_at_lsn {
+            if keepalive.wal_end >= stop.value() && self.stop_at_reached.is_none() {
+                debug!(
+                    "Bounded replay: keepalive wal_end={} reached stop_at_lsn={}",
+                    format_lsn(keepalive.wal_end),
+                    stop
+                );
+                self.stop_at_reached = Some(Lsn::new(keepalive.wal_end));
+            }
+        }
+
+        // pg_recvlogical also flushes feedback when endpos is reached, so the
+        // server records final progress before the stream is torn down.
+        if keepalive.reply_requested || self.stop_at_reached.is_some() {
             self.send_feedback().await?;
         }
 
@@ -1278,14 +1401,6 @@ impl LogicalReplicationStream {
         // Fetch the consumer's committed progress (capped to what we've received).
         // This allows the consumer to update these values after committing to destination.
         let (flushed_lsn, applied_lsn) = self.capped_feedback_lsns();
-
-        // Update local state from shared feedback for consistency
-        if flushed_lsn > self.state.last_flushed_lsn {
-            self.state.last_flushed_lsn = flushed_lsn;
-        }
-        if applied_lsn > self.state.last_applied_lsn {
-            self.state.last_applied_lsn = applied_lsn;
-        }
 
         self.connection
             .send_standby_status_update(
@@ -1685,8 +1800,11 @@ impl EventStream {
     /// Call this after data has been written/flushed to the destination database,
     /// but not yet committed (e.g., during batch writes).
     /// This method is always safe to call, even during stream polling.
+    ///
+    /// Accepts anything convertible to [`Lsn`], so `event.lsn` and a raw `u64`
+    /// both work without an explicit `.value()`.
     #[inline]
-    pub fn update_flushed_lsn(&self, lsn: XLogRecPtr) {
+    pub fn update_flushed_lsn(&self, lsn: impl Into<Lsn>) {
         self.shared_feedback.update_flushed_lsn(lsn);
     }
 
@@ -1695,8 +1813,11 @@ impl EventStream {
     /// Call this after data has been committed to the destination database.
     /// This is the most common feedback update in typical replication scenarios.
     /// This method is always safe to call, even during stream polling.
+    ///
+    /// Accepts anything convertible to [`Lsn`], so `event.lsn` and a raw `u64`
+    /// both work without an explicit `.value()`.
     #[inline]
-    pub fn update_applied_lsn(&self, lsn: XLogRecPtr) {
+    pub fn update_applied_lsn(&self, lsn: impl Into<Lsn>) {
         self.shared_feedback.update_applied_lsn(lsn);
     }
 
@@ -2107,8 +2228,6 @@ mod tests {
         let state = ReplicationState::new();
 
         assert_eq!(state.last_received_lsn, 0);
-        assert_eq!(state.last_flushed_lsn, 0);
-        assert_eq!(state.last_applied_lsn, 0);
     }
 
     #[test]
@@ -3258,8 +3377,6 @@ mod tests {
 
         // Simulate receiving data
         state.update_received_lsn(1000);
-        state.last_flushed_lsn = 900;
-        state.last_applied_lsn = 900;
 
         // Should send feedback since we have new data
         std::thread::sleep(Duration::from_millis(60));
@@ -3270,8 +3387,6 @@ mod tests {
 
         // Update with more data
         state.update_received_lsn(2000);
-        state.last_flushed_lsn = 1500;
-        state.last_applied_lsn = 1500;
 
         // Should not send immediately
         assert!(!state.should_send_feedback(feedback_interval));
@@ -5894,10 +6009,8 @@ mod tests {
         assert!(!stream.slot_created);
         // exported_snapshot_name must be None initially
         assert!(stream.exported_snapshot_name.is_none());
-        // State should be default (all LSNs at 0)
+        // State should be default (wire position at 0)
         assert_eq!(stream.state.last_received_lsn, 0);
-        assert_eq!(stream.state.last_flushed_lsn, 0);
-        assert_eq!(stream.state.last_applied_lsn, 0);
         // SharedLsnFeedback should be zeroed
         let (f, a) = stream.shared_lsn_feedback.get_feedback_lsn();
         assert_eq!(f, 0);

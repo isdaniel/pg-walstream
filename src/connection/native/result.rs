@@ -103,7 +103,7 @@ impl NativePgResult {
         if payload.len() < 2 {
             return;
         }
-        let nfields = i16::from_be_bytes(payload[0..2].try_into().unwrap()) as usize;
+        let nfields = u16::from_be_bytes(payload[0..2].try_into().unwrap()) as usize;
         self.columns.clear();
 
         let mut pos = 2;
@@ -129,8 +129,14 @@ impl NativePgResult {
         if payload.len() < 2 {
             return;
         }
-        let ncols = i16::from_be_bytes(payload[0..2].try_into().unwrap()) as usize;
-        let mut row = Vec::with_capacity(ncols);
+        // Zero-extend, matching libpq's `pqGetInt(..., 2, ...)` (`pg_ntoh16`).
+        // Sign-extending an `i16` made a hostile 0xFFFF into `usize::MAX`, and
+        // `Vec::with_capacity(usize::MAX)` aborts the process — untrusted network
+        // bytes must not be able to do that.
+        let ncols = u16::from_be_bytes(payload[0..2].try_into().unwrap()) as usize;
+        // Cap the pre-allocation to what the payload could actually hold: every
+        // column costs at least its 4-byte length prefix.
+        let mut row = Vec::with_capacity(ncols.min(payload.len() / 4));
 
         let mut pos = 2;
         for _ in 0..ncols {
@@ -169,6 +175,32 @@ impl NativePgResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hostile/corrupt DataRow must not abort the process. `i16 as usize`
+    /// sign-extended 0xFFFF to `usize::MAX`, and `Vec::with_capacity(usize::MAX)`
+    /// aborts. libpq zero-extends (`pg_ntoh16`) and validates instead.
+    #[test]
+    fn data_row_hostile_column_count_does_not_abort() {
+        let mut r = NativePgResult::new();
+        // ncols = 0xFFFF with no column data following it.
+        r.parse_data_row(&[0xFF, 0xFF]);
+        // Survived. Nothing could be decoded from an empty body.
+        assert_eq!(r.ntuples(), 1);
+
+        // Same for RowDescription.
+        let mut r2 = NativePgResult::new();
+        r2.parse_row_description(&[0xFF, 0xFF]);
+        assert_eq!(r2.nfields(), 0);
+
+        // A well-formed single-column row still decodes.
+        let mut r3 = NativePgResult::new();
+        let mut payload = vec![0x00, 0x01]; // ncols = 1
+        payload.extend_from_slice(&3i32.to_be_bytes());
+        payload.extend_from_slice(b"abc");
+        r3.parse_data_row(&payload);
+        assert_eq!(r3.ntuples(), 1);
+        assert_eq!(r3.get_value(0, 0).as_deref(), Some("abc"));
+    }
 
     #[test]
     fn test_native_result_empty() {

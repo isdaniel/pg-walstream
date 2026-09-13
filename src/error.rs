@@ -55,7 +55,9 @@ pub enum ReplicationError {
     /// retry logic can reconnect.
     Backend(String),
 
-    /// Bounded replay reached its configured `stop_at_lsn`. Carries the commit end LSN at which streaming stopped. This is a clean, expected terminal signal (treated like a graceful end of stream), never retried.
+    /// Bounded replay reached its configured `stop_at_lsn`. This is a clean, expected terminal signal (treated like a graceful end of stream), never retried.
+    ///
+    /// Carries the LSN at which streaming stopped. That is the crossing transaction's commit `end_lsn` in the usual case; when the target lies *beyond* the last commit it is instead the server's send position as reported by a keepalive, which is still a valid resume point (nothing at or below it is undelivered). On the raw path ([`LogicalReplicationStream::next_raw_event`](crate::LogicalReplicationStream::next_raw_event)) it is the transport-level `wal_end` and may fall mid-transaction.
     StreamStopped(Lsn),
 }
 
@@ -155,17 +157,64 @@ impl ReplicationError {
 
     /// Classify a server error by its SQLSTATE.
     ///
-    /// Only the two codes that are unambiguously terminal for a replication
-    /// slot are promoted to [`ReplicationSlot`](Self::ReplicationSlot) (which
-    /// [`is_permanent`](Self::is_permanent) reports as `true`, stopping the
-    /// retry loop); everything else stays `Protocol` so the streaming layer
-    /// keeps retrying:
+    /// Codes that retrying can never fix become permanent variants (which
+    /// [`is_permanent`](Self::is_permanent) reports as `true`, stopping the retry
+    /// loop); everything else stays `Protocol` so the streaming layer keeps
+    /// retrying.
     ///
+    /// Terminal for the slot — [`ReplicationSlot`](Self::ReplicationSlot):
     /// - `55000` *object_not_in_prerequisite_state* — the slot was invalidated
     ///   (`wal_removed`, `rows_removed`, `wal_level_insufficient`, or PG18's
     ///   `idle_timeout`), or `wal_level` is below `logical`. Recovery requires
     ///   dropping the slot and re-syncing; retrying cannot help.
     /// - `42704` *undefined_object* — the slot does not exist.
+    ///
+    /// Terminal for the credentials — [`Authentication`](Self::Authentication):
+    /// - `28000` *invalid_authorization_specification*, `28P01` *invalid_password*.
+    ///
+    /// Terminal for the request — [`PermanentConnection`](Self::PermanentConnection):
+    /// - `42501` *insufficient_privilege* (e.g. "must be superuser or replication
+    ///   role", "permission denied for publication"),
+    /// - `3D000` *invalid_catalog_name* — the database does not exist,
+    /// - `42601` *syntax_error* — we generated SQL the server cannot parse,
+    /// - `22023` *invalid_parameter_value* — pgoutput rejected an output-plugin
+    ///   option in `parse_output_parameters`; a retry re-sends byte-identical
+    ///   options.
+    /// - `F0000` *config_file_error* — e.g. "client certificates can only be
+    ///   checked if a root certificate store is available" (`auth.c`); a server
+    ///   misconfiguration that reconnecting cannot change.
+    ///
+    /// Deliberately **not** terminal, despite looking it:
+    /// - `0A000` *feature_not_supported* — on PG ≤ 15 this is "logical decoding
+    ///   cannot be used while in recovery" (`CheckLogicalDecodingRequirements`),
+    ///   which resolves the moment a standby is promoted; marking it permanent
+    ///   would break failover. PG 16 replaced that branch with `55000` when logical
+    ///   decoding on standby landed, so on PG 16+ the `0A000`s a logical client can
+    ///   still reach (a proto_version mismatch in `pgoutput.c`, `READ_REPLICATION_SLOT`
+    ///   on a logical slot, conflicting column lists) are genuinely terminal and this
+    ///   carve-out merely costs a bounded retry loop before they surface.
+    ///
+    /// Explicitly transient — [`TransientConnection`](Self::TransientConnection):
+    /// - `57P01`/`57P02`/`57P03` (admin shutdown, crash shutdown, cannot connect
+    ///   now), `53300` (too many connections), `55006` *object_in_use* ("replication
+    ///   slot is already active for PID"), `40001` (serialization failure), and the
+    ///   `08xxx` codes a client can actually receive: `08000`, `08003`, `08006`,
+    ///   `08P01`. `08P01` *protocol_violation* is included not on its own merits —
+    ///   a retry re-sends the same bytes — but because PgBouncer uses it as its
+    ///   default SQLSTATE for every pooler error it forwards, including a routine
+    ///   "server shutting down"; classifying it permanent would hard-kill consumers
+    ///   on a pooler bounce.
+    ///
+    /// These must NOT fall through to `Protocol`. A walsender killed by
+    /// `pg_terminate_backend()` reports 57P01 as an ErrorResponse *inside the open
+    /// COPY stream* (`ProcessInterrupts` in postgres.c), on a socket that is still
+    /// live — so `next_event_with_retry`'s "unrecoverable decode error on a live
+    /// connection" guard would classify a routine restart as terminal and end the
+    /// consumer instead of reconnecting. (Arming `recover_connection` is a separate
+    /// mechanism: both backends drop their liveness flag on any non-cancelled error
+    /// out of the COPY read path, regardless of variant. This classification is what
+    /// keeps the error away from that guard and what `is_transient` reports to
+    /// consumers.)
     ///
     /// Match on the code rather than the message: PostgreSQL 18 reworded slot
     /// invalidation from "can no longer get changes from" to "can no longer
@@ -182,8 +231,39 @@ impl ReplicationError {
         match sqlstate {
             "" => ReplicationError::Protocol(msg),
             "55000" | "42704" => ReplicationError::ReplicationSlot(format!("[{sqlstate}] {msg}")),
+            "28000" | "28P01" => ReplicationError::Authentication(format!("[{sqlstate}] {msg}")),
+            "42501" | "3D000" | "42601" | "22023" | "F0000" => {
+                ReplicationError::PermanentConnection(format!("[{sqlstate}] {msg}"))
+            }
+            "57P01" | "57P02" | "57P03" | "53300" | "55006" | "40001" | "08000" | "08003"
+            | "08006" | "08P01" => {
+                ReplicationError::TransientConnection(format!("[{sqlstate}] {msg}"))
+            }
             _ => ReplicationError::Protocol(format!("[{sqlstate}] {msg}")),
         }
+    }
+
+    /// [`from_sqlstate`](Self::from_sqlstate) for an ErrorResponse received during
+    /// connection startup, before any replication command has been issued.
+    ///
+    /// Identical except that `55000` is **not** reported as
+    /// [`ReplicationSlot`](Self::ReplicationSlot). At startup the server has not
+    /// looked at a slot: `CheckMyDatabase` (postinit.c) raises `55000` for
+    /// `database "%s" is not currently accepting connections` and
+    /// `cannot connect to invalid database "%s"`. Routing those to `ReplicationSlot`
+    /// — documented as "invalidated / does not exist, drop it and re-sync" — points
+    /// an operator at a perfectly healthy slot. Both variants are permanent, so this
+    /// changes the diagnosis, not the control flow.
+    ///
+    /// `rustls-tls` only: the libpq backend never sees a raw startup ErrorResponse
+    /// — `PQconnectdb` handles the startup exchange itself.
+    #[cfg(feature = "rustls-tls")]
+    pub(crate) fn from_sqlstate_startup<S: Into<String>>(sqlstate: &str, msg: S) -> Self {
+        let msg = msg.into();
+        if sqlstate == "55000" {
+            return ReplicationError::PermanentConnection(format!("[{sqlstate}] {msg}"));
+        }
+        Self::from_sqlstate(sqlstate, msg)
     }
 
     /// Create a new timeout error
@@ -223,7 +303,7 @@ impl ReplicationError {
 
     /// Check if the error is transient (can be retried).
     ///
-    /// Note: this is an advisory classification for consumers (logging, metrics, custom retry policies). It is NOT the predicate the library itself uses to drive retries — the streaming layer retries anything that is not [`is_permanent`](Self::is_permanent), [`is_cancelled`](Self::is_cancelled), or the internal stream-stopped terminal. So the "grey zone" variants (e.g. `Protocol`, `Buffer`, `Config`, `Deserialize`) return `false` here yet are still retried by the stream.
+    /// Note: this is an advisory classification for consumers (logging, metrics, custom retry policies). It is NOT the predicate the library itself uses to drive retries — the streaming layer retries anything that is not [`is_permanent`](Self::is_permanent), [`is_cancelled`](Self::is_cancelled), the internal stream-stopped terminal, or a decode-stage failure on a still-live connection. That last exclusion covers exactly the "grey zone" variants (`Protocol`, `Buffer`, `Deserialize`): they return `false` here, and the stream retries them only once the connection is already dead — on a live one the offending frame has been consumed and retrying would silently skip it.
     pub fn is_transient(&self) -> bool {
         #[cfg(feature = "std")]
         if matches!(self, ReplicationError::Io(_)) {
@@ -245,6 +325,7 @@ impl ReplicationError {
             ReplicationError::PermanentConnection(_)
                 | ReplicationError::Authentication(_)
                 | ReplicationError::ReplicationSlot(_)
+                | ReplicationError::Config(_)
         )
     }
 
@@ -353,11 +434,14 @@ mod tests {
         assert!(!err.is_permanent());
     }
 
+    /// A rejected configuration fails identically on every attempt without ever
+    /// opening a socket, so it is permanent — retrying it just burns the backoff
+    /// budget. (It is still not `is_transient`, which is a narrower predicate.)
     #[test]
     fn test_config_error() {
         let err = ReplicationError::config("invalid config");
         assert!(!err.is_transient());
-        assert!(!err.is_permanent());
+        assert!(err.is_permanent());
     }
 
     #[test]
@@ -395,7 +479,7 @@ mod tests {
         let err = ReplicationError::config("missing field");
         assert_eq!(err.to_string(), "Configuration error: missing field");
         assert!(!err.is_transient());
-        assert!(!err.is_permanent());
+        assert!(err.is_permanent());
         assert!(!err.is_cancelled());
     }
 
@@ -547,19 +631,109 @@ mod stop_signal_tests {
         }
     }
 
-    /// Everything else stays retryable — a busy slot (55006) or a transient
-    /// server hiccup must not be mistaken for a dead slot.
+    /// A busy slot (55006) or a transient server hiccup must stay retryable — and
+    /// must be `TransientConnection`, not `Protocol`. A walsender killed by
+    /// `pg_terminate_backend()` reports 57P01 as an ErrorResponse inside the open
+    /// COPY stream, on a still-live socket; leaving it in `Protocol` made
+    /// `next_event_with_retry`'s "unrecoverable decode error on a live connection"
+    /// guard treat a routine restart as terminal, and left the native backend's
+    /// `alive` flag set so recovery never armed.
     #[test]
     fn test_from_sqlstate_other_codes_stay_retryable() {
-        for code in ["55006", "57P01", "53300"] {
+        for code in [
+            "55006", "57P01", "57P02", "57P03", "53300", "40001", "08006",
+        ] {
             let err = ReplicationError::from_sqlstate(code, "boom");
             assert!(
-                matches!(err, ReplicationError::Protocol(_)),
-                "{code} should stay Protocol, got {err:?}"
+                matches!(err, ReplicationError::TransientConnection(_)),
+                "{code} should be TransientConnection, got {err:?}"
             );
             assert!(!err.is_permanent(), "{code} should not be permanent");
+            assert!(err.is_transient(), "{code} should report as transient");
             assert!(err.to_string().contains(code), "{err}");
         }
+    }
+
+    /// An unclassified code keeps the old `Protocol` fallback.
+    #[test]
+    fn from_sqlstate_unknown_code_falls_back_to_protocol() {
+        let err = ReplicationError::from_sqlstate("XX999", "weird");
+        assert!(matches!(err, ReplicationError::Protocol(_)), "{err:?}");
+        assert!(!err.is_permanent());
+    }
+
+    /// Credential and request failures fail identically on every attempt, so they
+    /// must stop the retry loop instead of hammering the server (and writing one
+    /// failed-login line per attempt to its log).
+    #[test]
+    fn from_sqlstate_permanent_auth_and_request_codes() {
+        for code in ["28000", "28P01"] {
+            let err = ReplicationError::from_sqlstate(code, "password authentication failed");
+            assert!(
+                matches!(err, ReplicationError::Authentication(_)),
+                "{code} should be Authentication, got {err:?}"
+            );
+            assert!(err.is_permanent(), "{code} must be permanent");
+        }
+        for code in ["42501", "3D000", "42601", "22023", "F0000"] {
+            let err = ReplicationError::from_sqlstate(code, "nope");
+            assert!(
+                matches!(err, ReplicationError::PermanentConnection(_)),
+                "{code} should be PermanentConnection, got {err:?}"
+            );
+            assert!(err.is_permanent(), "{code} must be permanent");
+        }
+    }
+
+    /// At startup the server has not looked at a slot: `CheckMyDatabase` raises
+    /// 55000 for `database "..." is not currently accepting connections`.
+    /// Reporting that as `ReplicationSlot` — documented as "invalidated, drop it
+    /// and re-sync" — sends an operator to destroy a healthy slot. Still
+    /// permanent either way, so only the diagnosis changes.
+    #[cfg(feature = "rustls-tls")]
+    #[test]
+    fn from_sqlstate_startup_does_not_blame_the_slot_for_55000() {
+        let err = ReplicationError::from_sqlstate_startup(
+            "55000",
+            "database \"app\" is not currently accepting connections",
+        );
+        assert!(
+            matches!(err, ReplicationError::PermanentConnection(_)),
+            "{err:?}"
+        );
+        assert!(err.is_permanent());
+
+        // Post-connect, 55000 still means the slot.
+        assert!(matches!(
+            ReplicationError::from_sqlstate("55000", "can no longer access slot"),
+            ReplicationError::ReplicationSlot(_)
+        ));
+
+        // Every other code classifies identically on both paths.
+        for code in ["28P01", "3D000", "57P03", "53300", "42704", "XX999"] {
+            assert_eq!(
+                core::mem::discriminant(&ReplicationError::from_sqlstate_startup(code, "m")),
+                core::mem::discriminant(&ReplicationError::from_sqlstate(code, "m")),
+                "{code} must classify the same at startup"
+            );
+        }
+    }
+
+    /// `0A000` looks permanent but PostgreSQL raises it from
+    /// `CheckLogicalDecodingRequirements` for "logical decoding cannot be used
+    /// while in recovery" — which clears when a standby is promoted. Classifying
+    /// it permanent would break failover, so it must stay retryable.
+    #[test]
+    fn from_sqlstate_feature_not_supported_stays_retryable() {
+        let err = ReplicationError::from_sqlstate(
+            "0A000",
+            "logical decoding cannot be used while in recovery",
+        );
+        assert!(matches!(err, ReplicationError::Protocol(_)), "{err:?}");
+        assert!(
+            !err.is_permanent(),
+            "0A000 must stay retryable for failover"
+        );
     }
 
     /// No diagnostics available: no empty `[]` prefix in the message.

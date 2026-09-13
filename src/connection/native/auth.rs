@@ -97,10 +97,10 @@ pub async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
             b'E' => {
                 // ErrorResponse during auth
                 let fields = super::error::parse_error_fields(&msg[5..]);
-                return Err(ReplicationError::authentication(format!(
-                    "Authentication failed: {}",
-                    fields
-                )));
+                return Err(ReplicationError::from_sqlstate_startup(
+                    &fields.code,
+                    format!("Authentication failed: {fields}"),
+                ));
             }
             _ => {
                 // Unexpected message during auth phase — skip

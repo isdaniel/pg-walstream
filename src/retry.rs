@@ -221,7 +221,12 @@ impl ReplicationConnectionRetry {
     /// Returns an error if:
     /// - All retry attempts are exhausted
     /// - Maximum duration is exceeded
-    /// - A permanent error occurs (authentication, unsupported version, etc.)
+    /// - The connection string is invalid — returned immediately on the first
+    ///   attempt, without consuming the remaining attempts or the backoff.
+    ///   Other permanent errors (authentication, missing database) are still
+    ///   retried: the server reports a transient directory outage with the same
+    ///   SQLSTATE as a wrong password, so failing fast on those would turn a
+    ///   recoverable blip into an outage.
     ///
     /// # Example
     ///
@@ -275,6 +280,11 @@ impl ReplicationConnectionRetry {
                     let error_msg = e.to_string();
                     error!("Connection attempt {} failed: {}", attempt, error_msg);
 
+                    if matches!(e, ReplicationError::Config(_)) {
+                        error!("Connection string is invalid, not retrying: {error_msg}");
+                        return Err(e);
+                    }
+
                     // If this is the last attempt, return the error
                     if attempt >= self.config.max_attempts {
                         let elapsed = start_time.elapsed();
@@ -302,6 +312,82 @@ impl ReplicationConnectionRetry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bug: a connection string that can never parse burned all five
+    /// attempts and ~15 s of backoff before returning the error it already had
+    /// on attempt 1. The *timing* assertion is the regression detector — an
+    /// `is_err()` assertion passes both before and after the fix.
+    #[cfg(feature = "rustls-tls")]
+    #[tokio::test]
+    async fn invalid_connection_string_returns_on_first_attempt() {
+        let retry = ReplicationConnectionRetry::new(
+            RetryConfig {
+                max_attempts: 5,
+                initial_delay: Duration::from_secs(5),
+                max_delay: Duration::from_secs(60),
+                multiplier: 2.0,
+                max_duration: Duration::from_secs(300),
+                jitter: false,
+            },
+            "postgresql://u@127.0.0.1/db?replication=database&sslmode=bogus".to_string(),
+        );
+
+        let start = Instant::now();
+        // `unwrap_err` would need `PgReplicationConnection: Debug`, which it is not.
+        let err = match retry.connect_with_retry().await {
+            Ok(_) => panic!("an unparsable conninfo must not connect"),
+            Err(e) => e,
+        };
+        let elapsed = start.elapsed();
+
+        // Not the generic "failed after all retry attempts" fallthrough, and not
+        // the max_duration error — the operator needs the actual diagnosis.
+        assert!(matches!(err, ReplicationError::Config(_)), "got {err:?}");
+        assert!(err.to_string().contains("sslmode"), "{err}");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "retried an unparsable conninfo for {elapsed:?}"
+        );
+    }
+
+    /// Negative control: a transient failure must still consume the ladder.
+    /// Fails if someone later widens the guard to `!e.is_transient()` or to
+    /// `is_permanent()` — a wrong password must keep being paced, because
+    /// PostgreSQL reports a transient LDAP/RADIUS outage with the same 28000.
+    #[cfg(feature = "rustls-tls")]
+    #[tokio::test]
+    async fn transient_error_still_consumes_the_backoff_ladder() {
+        // Bind then drop, so the port is almost certainly closed -> ECONNREFUSED.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let retry = ReplicationConnectionRetry::new(
+            RetryConfig {
+                max_attempts: 3,
+                initial_delay: Duration::from_millis(50),
+                max_delay: Duration::from_secs(1),
+                multiplier: 1.0,
+                max_duration: Duration::from_secs(300),
+                jitter: false,
+            },
+            format!(
+                "postgresql://u@127.0.0.1:{port}/db\
+                 ?replication=database&sslmode=disable&connect_timeout=1"
+            ),
+        );
+
+        let start = Instant::now();
+        let err = match retry.connect_with_retry().await {
+            Ok(_) => panic!("nothing should be listening on a just-released port"),
+            Err(e) => e,
+        };
+        assert!(!err.is_permanent(), "got {err:?}");
+        assert!(
+            start.elapsed() >= Duration::from_millis(100),
+            "did not back off between attempts"
+        );
+    }
 
     #[test]
     fn test_exponential_backoff_basic() {
