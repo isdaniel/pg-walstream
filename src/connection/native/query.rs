@@ -3,6 +3,9 @@
 //! Sends a `'Q'` (Query) message and collects the response sequence:
 //! `RowDescription ('T') → DataRow ('D')* → CommandComplete ('C') → ReadyForQuery ('Z')`
 //! or `ErrorResponse ('E')` or `CopyBothResponse ('W')`.
+//!
+//! `CopyInResponse ('G')` is rejected on that path — [`simple_query`] has nothing
+//! to stream — and handled by [`simple_query_copy_in`] instead.
 
 use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -31,7 +34,35 @@ pub async fn simple_query<S: AsyncRead + AsyncWrite + Unpin>(
     let mut result = NativePgResult::new();
 
     loop {
-        let msg = wire::read_message(stream, buf).await?;
+        // A FATAL ErrorResponse is followed by the server *closing*, not by
+        // ReadyForQuery — `proc_exit` runs instead of the main loop's
+        // `send_ready_for_query` (postgres.c). Propagating that read error would
+        // discard the ErrorResponse just parsed, and the SQLSTATE with it.
+        //
+        // Measured against PostgreSQL 18.4, `pg_terminate_backend` landing
+        // mid-query on this exact path:
+        //   without this -> TransientConnection("connection closed by server")
+        //   with this    -> TransientConnection("[57P01] … administrator command")
+        //
+        // Note the limit of that evidence. 57P01 maps to `TransientConnection`
+        // either way, so the reconnect decision is unchanged and what this
+        // actually saves is the diagnosis — which is the difference between an
+        // operator seeing "admin shutdown" and seeing nothing. The stronger
+        // claim — a FATAL whose code `from_sqlstate` maps elsewhere
+        // (`55000`/`42704` → ReplicationSlot, `28000` → Authentication,
+        // `3D000`/`42501` → PermanentConnection) collapsing to transient and
+        // reconnect-looping forever — is read off that table, not observed:
+        // there is no known way to provoke those codes as a mid-query FATAL.
+        // Treat it as why this is cheap insurance, not as a demonstrated bug.
+        let msg = match wire::read_message(stream, buf).await {
+            Ok(msg) => msg,
+            Err(e) => {
+                if result.status == NativeResultStatus::FatalError {
+                    return Ok(result);
+                }
+                return Err(e);
+            }
+        };
         if msg.is_empty() {
             continue;
         }
@@ -64,6 +95,31 @@ pub async fn simple_query<S: AsyncRead + AsyncWrite + Unpin>(
                 // CopyOutResponse — for physical replication / base backup
                 result.status = NativeResultStatus::CopyOut;
                 break;
+            }
+            b'G' => {
+                // CopyInResponse — the server wants us to stream data.
+                //
+                // `simple_query` has no payload to send, so the only way out is
+                // to fail the copy. Without this arm 'G' fell into the `_`
+                // catch-all and was merely debug-logged, leaving both sides
+                // waiting forever: we looped reading for a ReadyForQuery the
+                // server will not send until the CopyIn is closed, and it waited
+                // for CopyData that was never coming. There is no timeout on this
+                // path, so it hung the caller's thread outright — and `exec` is
+                // public, so `conn.exec("UPLOAD_MANIFEST")` or any
+                // `COPY ... FROM STDIN` reached it.
+                //
+                // CopyFail makes the server answer ErrorResponse + ReadyForQuery,
+                // so the connection is left synchronised and reusable rather than
+                // desynchronised for every later query.
+                let fail = wire::build_copy_fail("CopyIn not supported by this query path");
+                wire::write_all(stream, &fail).await?;
+                wire::flush(stream).await?;
+                drain_to_ready(stream, buf).await?;
+                return Err(ReplicationError::protocol(format!(
+                    "{sql} requested CopyIn mode, which this call does not support; \
+                     use the CopyIn-aware path (UPLOAD_MANIFEST) instead"
+                )));
             }
             b'E' => {
                 // ErrorResponse
@@ -159,7 +215,15 @@ pub async fn simple_query_copy_in<S: AsyncRead + AsyncWrite + Unpin>(
 
     // Phase 3: read the verdict.
     loop {
-        let msg = wire::read_message(stream, buf).await?;
+        let msg = match wire::read_message(stream, buf).await {
+            Ok(msg) => msg,
+            Err(e) => {
+                if result.status == NativeResultStatus::FatalError {
+                    return Ok(result);
+                }
+                return Err(e);
+            }
+        };
         if msg.is_empty() {
             continue;
         }
@@ -190,6 +254,29 @@ pub async fn simple_query_copy_in<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 /// Consume messages until `ReadyForQuery ('Z')`.
+///
+/// Deliberately unbounded. Against a conforming PostgreSQL there are exactly two
+/// outcomes after the ErrorResponse (or the CopyFail) that gets us here, and both
+/// end this loop:
+/// - **ERROR** — the main loop sets `send_ready_for_query = true` ("initially, or
+///   after error", `postgres.c`) and sends `'Z'`. Normal exit.
+///   `ignore_till_sync` is extended-query only; every command here is a simple
+///   query, so it does not apply.
+/// - **FATAL** — `proc_exit` closes the connection without a `'Z'`, so
+///   `read_message` returns `Err` and `?` ends the loop on the first iteration.
+///
+/// A message-count cap was tried here and removed: it is unreachable against a
+/// real server, and it did not cover the one failure mode that *is* reachable —
+/// a backend that is alive and simply not answering (blocked on a lock, stalled
+/// IO). That parks the loop inside `read_message(..).await`, where no counter is
+/// ever consulted. Bounding that needs a deadline, and there is none on the
+/// command path today: `connect_timeout` covers only `TcpStream::connect`, and
+/// TCP keepalive (~150 s) bounds a dead network, not a silent backend. A command
+/// timeout was prototyped and dropped for want of a safe default — see the note
+/// on `NativeConnection::run_query`.
+///
+/// Re-add a cap only if this client is ever pointed at something that is not
+/// stock PostgreSQL, and only together with a deadline — a cap alone buys nothing.
 async fn drain_to_ready<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     buf: &mut BytesMut,
@@ -320,6 +407,79 @@ mod tests {
         msg
     }
 
+    /// PostgreSQL answers a FATAL by closing, not by sending ReadyForQuery.
+    /// Propagating that read error discarded the ErrorResponse we had already
+    /// parsed — and the SQLSTATE with it. Since the `ReplicationError` variant is
+    /// control flow in this crate, 57P01 (admin shutdown) silently became a
+    /// generic transport error and the permanent/transient decision was skipped.
+    #[tokio::test]
+    async fn simple_query_keeps_sqlstate_when_server_fatals_and_closes() {
+        let (mut client, mut server) = tokio::io::duplex(65536);
+
+        tokio::spawn(async move {
+            let mut discard = vec![0u8; 1024];
+            let _ = server.read(&mut discard).await;
+            server
+                .write_all(&build_error_response(
+                    "FATAL",
+                    "57P01",
+                    "terminating connection due to administrator command",
+                ))
+                .await
+                .unwrap();
+            server.flush().await.unwrap();
+            // Close without ReadyForQuery — what a FATAL actually does.
+            drop(server);
+        });
+
+        let mut buf = BytesMut::new();
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            simple_query(&mut client, &mut buf, "IDENTIFY_SYSTEM"),
+        )
+        .await
+        .expect("simple_query hung");
+
+        let result = res.expect("the parsed FATAL must survive the close");
+        assert_eq!(result.status, NativeResultStatus::FatalError);
+        assert_eq!(result.error_code.as_deref(), Some("57P01"));
+    }
+
+    /// Phase 3 has the same FATAL-closes-without-ReadyForQuery hole as
+    /// `simple_query`: the manifest verdict arrives as an ErrorResponse and the
+    /// server then hangs up, so the SQLSTATE must survive the read error.
+    #[tokio::test]
+    async fn copy_in_keeps_sqlstate_when_server_fatals_after_the_payload() {
+        let (mut client, mut server) = tokio::io::duplex(65536);
+
+        tokio::spawn(async move {
+            let mut discard = vec![0u8; 1024];
+            let _ = server.read(&mut discard).await;
+            server.write_all(&build_copy_in_response()).await.unwrap();
+            server.flush().await.unwrap();
+            // Consume CopyData + CopyDone, then reject and hang up.
+            let _ = drain_client(&mut server, 5 + 3 + 5).await;
+            server
+                .write_all(&build_error_response("FATAL", "XX000", "manifest rejected"))
+                .await
+                .unwrap();
+            server.flush().await.unwrap();
+            drop(server);
+        });
+
+        let mut buf = BytesMut::new();
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            simple_query_copy_in(&mut client, &mut buf, "UPLOAD_MANIFEST", b"abc"),
+        )
+        .await
+        .expect("copy_in hung");
+
+        let result = res.expect("the parsed FATAL must survive the close");
+        assert_eq!(result.status, NativeResultStatus::FatalError);
+        assert_eq!(result.error_code.as_deref(), Some("XX000"));
+    }
+
     /// Read everything the client sends until it goes quiet, so a test can
     /// assert on the CopyData/CopyDoneframing it produced.
     async fn drain_client<S: AsyncRead + AsyncWrite + Unpin>(
@@ -336,6 +496,64 @@ mod tests {
             }
         }
         got
+    }
+
+    /// `simple_query` must not hang when the server answers a plain Query with
+    /// CopyInResponse.
+    ///
+    /// Before the `'G'` arm existed this fell into the `_` catch-all and was
+    /// debug-logged, so the loop went back to waiting for a ReadyForQuery the
+    /// server would not send until the CopyIn was closed — while the server
+    /// waited for CopyData. A deadlock with no timeout, reachable from the public
+    /// `exec` via `UPLOAD_MANIFEST` or `COPY ... FROM STDIN`. The test would hang
+    /// forever on the old code rather than fail, so it is bounded.
+    #[tokio::test]
+    async fn simple_query_fails_the_copy_instead_of_hanging() {
+        let (mut client, mut server) = tokio::io::duplex(65536);
+
+        let handle = tokio::spawn(async move {
+            let mut discard = vec![0u8; 1024];
+            let _ = server.read(&mut discard).await;
+            // Answer a plain Query with CopyInResponse.
+            server.write_all(&build_copy_in_response()).await.unwrap();
+            server.flush().await.unwrap();
+
+            // Expect the client's CopyFail ('f'), not silence.
+            let sent = drain_client(&mut server, 5).await;
+
+            // A real server replies ErrorResponse + ReadyForQuery to CopyFail.
+            server
+                .write_all(&build_error_response(
+                    "ERROR",
+                    "57014",
+                    "COPY from stdin failed",
+                ))
+                .await
+                .unwrap();
+            server
+                .write_all(&build_ready_for_query(b'I'))
+                .await
+                .unwrap();
+            server.flush().await.unwrap();
+            sent
+        });
+
+        let mut buf = BytesMut::new();
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            simple_query(&mut client, &mut buf, "COPY t FROM STDIN"),
+        )
+        .await
+        .expect("simple_query hung on CopyInResponse");
+
+        let err = res.expect_err("CopyIn on the plain query path must be an error");
+        assert!(
+            err.to_string().contains("CopyIn"),
+            "unexpected error: {err}"
+        );
+
+        let sent = handle.await.unwrap();
+        assert_eq!(sent.first(), Some(&b'f'), "client must send CopyFail");
     }
 
     /// Happy path: Query -> CopyInResponse -> CopyData -> CopyDone ->

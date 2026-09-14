@@ -90,10 +90,12 @@ struct Worker {
 
 impl Worker {
     async fn query(&mut self, sql: &str) -> Result<NativePgResult> {
+        copy::clear_latched_terminal(&mut self.read_buf);
         query::simple_query(&mut self.transport, &mut self.read_buf, sql).await
     }
 
     async fn query_copy_in(&mut self, sql: &str, payload: &[u8]) -> Result<NativePgResult> {
+        copy::clear_latched_terminal(&mut self.read_buf);
         query::simple_query_copy_in(&mut self.transport, &mut self.read_buf, sql, payload).await
     }
 
@@ -147,8 +149,43 @@ impl Worker {
                                 self.alive.store(false, Ordering::Relaxed);
                             }
 
-                            let _ = batch_tx.try_send(Err(err));
-                            return false;
+                            // Deliver the error even when the consumer is behind.
+                            //
+                            // `try_send` dropped it silently whenever the channel
+                            // was full (`BATCH_CHANNEL_CAP` = 16). The consumer
+                            // then drained its backlog, found the channel closed,
+                            // and got `worker_gone()` → `Backend`, which
+                            // `is_permanent()` reports as **retryable**. So a
+                            // permanent SQLSTATE — a dropped or invalidated slot,
+                            // the cases `from_sqlstate` exists to classify — was
+                            // laundered into a transient one and the stream
+                            // reconnect-looped forever against a server that would
+                            // never accept it. The variant is control flow here;
+                            // losing it silently disables the decision.
+                            //
+                            // `reserve()` instead, exactly as the data path above
+                            // does, and keep servicing commands while waiting so a
+                            // `Close` can never deadlock behind a stalled consumer
+                            // (the same property the struct doc claims for the
+                            // batch path).
+                            loop {
+                                tokio::select! {
+                                    biased;
+                                    cmd = cmd_rx.recv() => {
+                                        match self.handle_stream_cmd(cmd).await {
+                                            StreamCmd::Continue => {}
+                                            StreamCmd::Close => return true,
+                                            StreamCmd::WorkerGone => return false,
+                                        }
+                                    }
+                                    permit = batch_tx.reserve() => {
+                                        if let Ok(permit) = permit {
+                                            permit.send(Err(err));
+                                        }
+                                        return false;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -511,6 +548,22 @@ impl NativeConnection {
     // ── Query execution ─────────────────────────────────────────────────
 
     /// Run a simple query: inline on the worker, or over the command channel.
+    ///
+    /// No read deadline, deliberately. A command timeout was prototyped here and
+    /// removed: there is no safe default. `CREATE_REPLICATION_SLOT ... LOGICAL`
+    /// defaults to snapshot export server-side (`snapshot_action =
+    /// CRS_EXPORT_SNAPSHOT`, walsender.c) — this crate omits the keyword, so that
+    /// is what it gets — and export waits for every concurrent write transaction
+    /// to reach consistency. PostgreSQL's own comment there calls
+    /// `DecodingContextFindStartpoint` something that "can take long time". A
+    /// deadline firing on that would mark the connection dead, the stream layer
+    /// would reconnect and reissue the command, and the wait would restart: an
+    /// infinite retry loop that can never succeed. Worse than blocking, which at
+    /// least is visible and does not churn connections.
+    ///
+    /// A future knob should therefore be per-command (fast commands only) or
+    /// caller-supplied, not a blanket default. libpq takes the same position: it
+    /// ships `connect_timeout` and no statement deadline.
     fn run_query(&mut self, sql: &str) -> Result<NativePgResult> {
         match &mut self.driver {
             Driver::Inline { worker, handle, .. } => run_sync(handle, worker.query(sql)),
@@ -838,6 +891,19 @@ impl NativeConnection {
     /// Check if the connection is still alive.
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
+    }
+
+    /// Force the connection to report dead.
+    ///
+    /// The COPY read paths clear liveness themselves, but a failing *command*
+    /// does not: `start_replication` returns `Err` without touching `alive`, so a
+    /// half-initialised recovery — a live connection that never entered COPY mode
+    /// — still looked healthy. See the call site in
+    /// `LogicalReplicationStream::recover_connection`.
+    ///
+    /// Takes `&mut self` to match the libpq backend, which sets a plain flag.
+    pub(crate) fn mark_dead(&mut self) {
+        self.alive.store(false, Ordering::Relaxed);
     }
 
     /// Get the server version.
@@ -1631,6 +1697,163 @@ mod tests {
             alive: Arc::new(AtomicBool::new(true)),
         };
         (worker, server)
+    }
+
+    /// F4: a full batch channel must not swallow the terminal error.
+    ///
+    /// `try_send` dropped it whenever the consumer was `BATCH_CHANNEL_CAP`
+    /// batches behind. The consumer then drained the backlog, saw the channel
+    /// closed, and got `worker_gone()` → `Backend` → classified **transient**.
+    /// A permanent SQLSTATE therefore became retryable and the stream
+    /// reconnect-looped forever against a server that would never accept it.
+    ///
+    /// The channel has to be *full at the moment the error is produced*, which
+    /// needs choreography: frames are written individually so each becomes its
+    /// own batch, the consumer stays asleep until the channel is full and the
+    /// worker is parked on `reserve()`, and only then is one slot freed — the
+    /// worker spends it on the batch it was holding, so it reads the
+    /// ErrorResponse with the channel full again. Verified to FAIL against the
+    /// pre-fix `try_send` in a scratch worktree.
+    #[tokio::test]
+    async fn stream_copy_delivers_error_even_when_channel_is_full() {
+        use tokio::io::AsyncWriteExt;
+        let (worker, mut server) = worker_with_loopback().await;
+        let (_cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<Command>();
+        let (batch_tx, mut batch_rx) = mpsc::channel(BATCH_CHANNEL_CAP);
+        let token = CancellationToken::new();
+
+        let handle = tokio::spawn(async move {
+            let mut worker = worker;
+            worker.stream_copy(token, batch_tx, &mut cmd_rx).await
+        });
+
+        // One frame per write, spaced out, so each lands as its own batch and the
+        // channel genuinely fills. Exactly `CAP + 1`: the first `CAP` fill the
+        // channel, the extra one is what the worker is *holding* when it parks on
+        // `reserve()`. One more than that and the worker would read the spare
+        // frame after the slot frees instead of the ErrorResponse, which is
+        // precisely the window this test has to hit. Consumer reads nothing yet.
+        for i in 0..(BATCH_CHANNEL_CAP + 1) {
+            server
+                .write_all(&copy_data_frame(format!("f{i}").as_bytes()))
+                .await
+                .unwrap();
+            server.flush().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // Channel is full; the worker is parked on `reserve()` holding a batch.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Terminal with a *permanent* SQLSTATE (28000). The worker cannot read it
+        // yet — it is still blocked on the permit.
+        let payload = b"C28000\0Mslot gone\0\0";
+        let mut err_frame = vec![b'E'];
+        err_frame.extend_from_slice(&((4 + payload.len()) as i32).to_be_bytes());
+        err_frame.extend_from_slice(payload);
+        server.write_all(&err_frame).await.unwrap();
+        server.flush().await.unwrap();
+
+        // Free exactly one slot. The worker spends it on the held batch, then
+        // reads the ErrorResponse with the channel full again — the precise
+        // moment the old `try_send` threw the error away.
+        let _ = batch_rx.recv().await.expect("first batch");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Now drain. The error must still arrive, with its SQLSTATE intact.
+        let mut saw_error = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match batch_rx.recv().await {
+                Some(Ok(_)) => continue,
+                Some(Err(e)) => {
+                    saw_error = Some(e);
+                    break;
+                }
+                None => break,
+            }
+        }
+
+        let err = saw_error.expect("the terminal error must survive a full channel");
+        assert!(err.to_string().contains("28000"), "{err}");
+        assert!(
+            err.is_permanent(),
+            "a permanent SQLSTATE must not be laundered into a transient error: {err:?}"
+        );
+        let _ = handle.await;
+    }
+
+    /// `mark_dead` is what stops a failed `start_replication` from leaving a
+    /// live, non-COPY connection looking healthy — the state that made
+    /// `next_event_with_retry` skip recovery and busy-spin.
+    #[test]
+    fn mark_dead_flips_is_alive() {
+        let mut conn = NativeConnection::null_for_testing();
+        conn.alive.store(true, Ordering::Relaxed);
+        assert!(conn.is_alive());
+        conn.mark_dead();
+        assert!(!conn.is_alive());
+        // Idempotent — recovery may call it on an already-dead connection.
+        conn.mark_dead();
+        assert!(!conn.is_alive());
+    }
+
+    /// While parked delivering a terminal error on a full channel, the worker
+    /// must still service commands. A `Close` there ends the worker (`true`), the
+    /// contract `run_worker` reads; returning `false` left it serving commands on
+    /// a transport it had just Terminated.
+    #[tokio::test]
+    async fn stream_copy_services_close_while_blocked_on_error_delivery() {
+        use tokio::io::AsyncWriteExt;
+        let (worker, mut server) = worker_with_loopback().await;
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<Command>();
+        let (batch_tx, mut batch_rx) = mpsc::channel(BATCH_CHANNEL_CAP);
+        let token = CancellationToken::new();
+
+        let handle = tokio::spawn(async move {
+            let mut worker = worker;
+            worker.stream_copy(token, batch_tx, &mut cmd_rx).await
+        });
+
+        // Same choreography as `stream_copy_delivers_error_even_when_channel_is_full`:
+        // `CAP + 1` frames so the worker ends up holding one with the channel
+        // full, then the terminal.
+        for i in 0..(BATCH_CHANNEL_CAP + 1) {
+            server
+                .write_all(&copy_data_frame(format!("f{i}").as_bytes()))
+                .await
+                .unwrap();
+            server.flush().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let payload = b"C28000\0Mgone\0\0";
+        let mut err_frame = vec![b'E'];
+        err_frame.extend_from_slice(&((4 + payload.len()) as i32).to_be_bytes());
+        err_frame.extend_from_slice(payload);
+        server.write_all(&err_frame).await.unwrap();
+        server.flush().await.unwrap();
+
+        // Free one slot: the worker spends it on the held batch, reads the
+        // terminal, and parks in the *error-delivery* loop with the channel full
+        // again. That is the select! this test exists to reach.
+        let _ = batch_rx.recv().await.expect("first batch");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Close must be honoured from inside that loop.
+        let (reply_tx, reply_rx) = std_mpsc::channel();
+        cmd_tx
+            .send(Command::Close {
+                in_copy_mode: true,
+                reply: reply_tx,
+            })
+            .unwrap();
+
+        let stopped = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("Close must not deadlock behind a stalled consumer")
+            .unwrap();
+        assert!(stopped, "Close must report `true` so run_worker stops");
+        let _ = reply_rx.recv();
     }
 
     #[tokio::test]

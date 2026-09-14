@@ -38,7 +38,7 @@ bytes = { version = "1.12.1", default-features = false, features = ["serde"] }
 tracing = { version = "0.1.44", default-features = false }
 futures-core = { version = "0.3.34", default-features = false }
 memchr = { version = "2.8.3", default-features = false }
-smallvec = { version = "1.16.0", features = ["serde"] }
+smallvec = { version = "1.16.1", features = ["serde"] }
 pg-walstream-macros = { workspace = true, optional = true }
 
 # libpq backend (opt-in) — pq-sys: raw FFI to the system libpq via pkg-config, with pre-generated bindings (no libclang/bindgen at build time).
@@ -46,7 +46,7 @@ pq-sys = { version = "0.7.5", optional = true }
 
 # rustls-tls
 tokio-rustls = { version = "0.26.5", optional = true }
-rustls = { version = "0.23.44", default-features = false, features = ["std", "tls12"], optional = true }
+rustls = { version = "0.23.45", default-features = false, features = ["std", "tls12"], optional = true }
 webpki-roots = { version = "1.0.9", optional = true }
 postgres-protocol = { version = "0.6.12", optional = true }
 aws-lc-rs = { version = "1.18.1", optional = true }
