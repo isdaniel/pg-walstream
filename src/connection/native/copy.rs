@@ -170,14 +170,22 @@ fn drain_read_buffer(
                 // stream. Classify on SQLSTATE so an invalidated slot surfaces
                 // as a permanent error rather than a retryable protocol one.
                 //
-                // Anything already queued in this pass is delivered first: leaving
-                // the frame in `read_buf` instead of consuming it makes the
-                // terminal sticky, so the caller re-reads it once the queue drains.
+                // The frame is NOT consumed. That is what makes the terminal
+                // sticky in both directions:
+                //   - within a pass, anything already queued is delivered first
+                //     (the `break` below), and the terminal is re-found once the
+                //     queue drains;
+                //   - across calls, every later `get_copy_data` re-finds it and
+                //     reports the same reason, with no extra state.
+                // Consuming it reported the error exactly once and destroyed the
+                // evidence; the next call then awaited readability on a socket the
+                // server was not going to write to again — a permanent 0%-CPU hang.
+                // `start_replication` clears `read_buf`, so this cannot latch
+                // across streams.
                 if !pending.is_empty() {
                     break;
                 }
-                let frame = read_buf.split_to(total_len);
-                let fields = super::error::parse_error_fields(&frame[5..]);
+                let fields = super::error::parse_error_fields(&read_buf[HEADER_LEN..total_len]);
                 return Some(ReplicationError::from_sqlstate(
                     &fields.code,
                     format!("server error during replication: {fields}"),
@@ -196,13 +204,18 @@ fn drain_read_buffer(
                 // through `WalSndDone` → CommandComplete → `proc_exit`, which the
                 // existing `read() == 0` arm already handled. Report it as
                 // transient so the stream layer reconnects — matching the libpq
-                // backend, which latches the same condition.
+                // backend, which latches the same condition in `copy_end`.
                 //
-                // Same sticky trick as 'E': queued frames go out first.
+                // Like 'E', the frame is left in `read_buf` so the terminal is
+                // sticky across calls as well as within a pass. This one matters
+                // most: unlike an EOF or a killed backend, a CopyDone leaves the
+                // socket *open* (the server is waiting for our CopyDone in reply),
+                // so there is no transport-level signal to re-derive the terminal
+                // from. Consuming it made the very next `get_copy_data` block
+                // forever at 0% CPU — measured against a real promoted server.
                 if !pending.is_empty() {
                     break;
                 }
-                read_buf.advance(total_len);
                 tracing::debug!("CopyDone received — server ended the replication stream");
                 return Some(ReplicationError::transient_connection(
                     "replication stream ended by server (CopyDone)",
@@ -240,6 +253,32 @@ pub async fn put_copy_data<W: AsyncWrite + Unpin>(
     wire::write_all(writer, &msg).await?;
     wire::flush(writer).await?;
     Ok(())
+}
+
+/// Drop a COPY terminal (`'c'` / `'E'`) left latched at the head of `read_buf`.
+///
+/// `drain_read_buffer` deliberately does not consume terminal frames — that is
+/// what makes them sticky across `get_copy_data` calls. The latch must not
+/// outlive the stream, though: the next command issued on this connection would
+/// otherwise read the stale terminal as the first message of its own response.
+/// Called before a new simple query goes out.
+///
+/// Only a well-formed leading terminal is dropped. Anything else is left alone,
+/// so a genuine protocol desync still surfaces instead of being papered over.
+pub(super) fn clear_latched_terminal(read_buf: &mut BytesMut) {
+    use bytes::Buf;
+
+    if read_buf.len() < HEADER_LEN || !matches!(read_buf[0], b'c' | b'E') {
+        return;
+    }
+    let body_len = i32::from_be_bytes(read_buf[1..5].try_into().unwrap());
+    if body_len < 4 {
+        return;
+    }
+    let total_len = 1 + body_len as usize;
+    if read_buf.len() >= total_len {
+        read_buf.advance(total_len);
+    }
 }
 
 /// Send a CopyDone message to end the COPY stream.
@@ -348,6 +387,90 @@ mod tests {
             matches!(err, ReplicationError::TransientConnection(_)),
             "{err:?}"
         );
+
+        // Pass 3+: the terminal is NOT consumed, so every later call reports the
+        // same reason. Consuming it made the next `get_copy_data` go back to
+        // awaiting a socket the server had stopped writing to — a permanent hang.
+        assert!(
+            !buf.is_empty(),
+            "CopyDone must stay latched after reporting"
+        );
+        for _ in 0..3 {
+            let again = drain_read_buffer(&mut buf, &mut pending)
+                .expect("terminal must be sticky across calls");
+            assert!(
+                matches!(again, ReplicationError::TransientConnection(_)),
+                "{again:?}"
+            );
+        }
+        assert!(pending.is_empty(), "a terminal must not queue data");
+    }
+
+    /// ErrorResponse is sticky for the same reason, and keeps its SQLSTATE on
+    /// every repeat — the classification drives the reconnect decision.
+    #[test]
+    fn drain_error_response_is_sticky() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(b'E');
+        let payload = b"C57P01\0Mterminating connection\0\0";
+        buf.put_i32(4 + payload.len() as i32);
+        buf.put_slice(payload);
+
+        let mut pending = VecDeque::new();
+        for _ in 0..3 {
+            let err = drain_read_buffer(&mut buf, &mut pending).expect("ErrorResponse terminates");
+            assert!(err.to_string().contains("57P01"), "{err}");
+        }
+        assert!(!buf.is_empty(), "ErrorResponse must stay latched");
+    }
+
+    /// The latch must not outlive the stream: a new command on the same
+    /// connection would otherwise read the stale terminal as its own response.
+    #[test]
+    fn clear_latched_terminal_drops_only_a_terminal() {
+        // CopyDone is dropped.
+        let mut buf = BytesMut::new();
+        buf.put_u8(b'c');
+        buf.put_i32(4);
+        clear_latched_terminal(&mut buf);
+        assert!(buf.is_empty());
+
+        // ErrorResponse is dropped.
+        let mut buf = BytesMut::new();
+        buf.put_u8(b'E');
+        buf.put_i32(4 + 3);
+        buf.put_slice(b"ab\0");
+        clear_latched_terminal(&mut buf);
+        assert!(buf.is_empty());
+
+        // A CopyData frame is NOT dropped — a real desync must still surface.
+        let mut buf = BytesMut::new();
+        buf.put_u8(b'd');
+        buf.put_i32(4 + 3);
+        buf.put_slice(b"abc");
+        clear_latched_terminal(&mut buf);
+        assert_eq!(buf.len(), 8, "non-terminal data must be left alone");
+
+        // An incomplete terminal is left alone rather than half-consumed.
+        let mut buf = BytesMut::new();
+        buf.put_u8(b'c');
+        buf.put_i32(64);
+        clear_latched_terminal(&mut buf);
+        assert_eq!(buf.len(), 5);
+
+        // A malformed terminal (length field below the 4-byte minimum) is left
+        // alone rather than half-consumed — `drain_read_buffer` still has to be
+        // the one that reports it as a protocol error.
+        let mut buf = BytesMut::new();
+        buf.put_u8(b'c');
+        buf.put_i32(2);
+        buf.put_slice(b"xx");
+        clear_latched_terminal(&mut buf);
+        assert_eq!(buf.len(), 7, "a bad length must not be trusted to advance");
+
+        // Empty buffer is a no-op.
+        let mut buf = BytesMut::new();
+        clear_latched_terminal(&mut buf);
         assert!(buf.is_empty());
     }
 

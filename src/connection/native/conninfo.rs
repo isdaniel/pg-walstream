@@ -215,6 +215,7 @@ impl ConnInfo {
 
         // Parse query params
         let mut sslmode = SslMode::Prefer;
+        let mut sslmode_explicit = false;
         let mut replication = ReplicationMode::None;
         let mut sslrootcert: Option<String> = None;
         let mut sslnegotiation = SslNegotiation::Postgres;
@@ -233,7 +234,10 @@ impl ConnInfo {
                 let val = url_decode(val);
                 let val = val.as_str();
                 match key {
-                    "sslmode" => sslmode = parse_sslmode(val)?,
+                    "sslmode" => {
+                        sslmode = parse_sslmode(val)?;
+                        sslmode_explicit = true;
+                    }
                     "sslrootcert" => sslrootcert = Some(val.to_string()),
                     "sslnegotiation" => sslnegotiation = parse_ssl_negotiation(val)?,
                     "replication" => replication = parse_replication_mode(val)?,
@@ -276,9 +280,13 @@ impl ConnInfo {
                             SslMode::Require
                         } else {
                             SslMode::Prefer
-                        }
+                        };
+                        sslmode_explicit = true;
                     }
-                    "ssl" if val == "true" => sslmode = SslMode::Require,
+                    "ssl" if val == "true" => {
+                        sslmode = SslMode::Require;
+                        sslmode_explicit = true;
+                    }
                     k => check_unhandled(k, val)?,
                 }
             } else {
@@ -310,6 +318,9 @@ impl ConnInfo {
         // Check PGPASSWORD env var if no password in URI
         let password = password.or_else(|| std::env::var("PGPASSWORD").ok());
 
+        let sslmode =
+            resolve_sslrootcert_system(sslmode, sslmode_explicit, sslrootcert.as_deref())?;
+
         Ok(ConnInfo {
             host,
             port,
@@ -335,6 +346,7 @@ impl ConnInfo {
         let mut password: Option<String> = None;
         let mut dbname: Option<String> = None;
         let mut sslmode = SslMode::Prefer;
+        let mut sslmode_explicit = false;
         let mut replication = ReplicationMode::None;
         let mut sslrootcert: Option<String> = None;
         let mut sslnegotiation = SslNegotiation::Postgres;
@@ -369,15 +381,43 @@ impl ConnInfo {
             }
 
             // Read value (may be quoted with single quotes).
-            // Doubled single quotes inside a quoted value represent a literal quote,
-            // e.g. password='it''s' → it's (matches libpq behavior).
+            //
+            // KNOWN DIVERGENCE FROM libpq — this is not parity, and the previous
+            // comment here claiming `''` "matches libpq behavior" was wrong.
+            // Verified against `conninfo_parse` (fe-connect.c) and empirically
+            // with `PQconninfoParse` on libpq 18.6:
+            //
+            //   libpq                              | here
+            //   -----------------------------------|---------------------------
+            //   `\` escapes the next char, in BOTH | no backslash handling at
+            //   quoted and unquoted values:        | all: `password='it\'s'`
+            //   `password='it\'s'`        -> it's  | truncates to `it\` and the
+            //   `sslrootcert='C:\\a'`     -> C:\a  | trailing `s'` is then read
+            //   `password=a\ b`           -> "a b" | as a key -> hard error,
+            //                                      | on a conninfo psql accepts
+            //   -----------------------------------|---------------------------
+            //   no `''` rule at all; the quoted    | `''` is folded to a literal
+            //   branch ends on the first unescaped | quote, so this ACCEPTS
+            //   `'`. `password='it''s'` is         | input libpq refuses and
+            //   REJECTED:                          | silently produces a
+            //   `missing "=" after "'s'"`          | password no other client
+            //                                      | would generate
+            //   -----------------------------------|---------------------------
+            //   unterminated quote is an error:    | silently uses the partial
+            //   `unterminated quoted string in     | value -> a TRUNCATED
+            //    connection info string`           | password reaches the server
+            //
+            // All three matter more now that unknown keys hard-error rather than
+            // being ignored: a valid libpq conninfo can fail outright. Left as-is
+            // deliberately for now — fixing it is a behaviour change (`''` stops
+            // working) and belongs with the 0.9.0 semver bump, not a patch.
             let value = if chars.peek() == Some(&'\'') {
                 chars.next(); // skip opening quote
                 let mut v = String::new();
                 loop {
                     match chars.next() {
                         Some('\'') => {
-                            // Check for doubled quote (escaped literal)
+                            // Non-libpq: fold a doubled quote into a literal one.
                             if chars.peek() == Some(&'\'') {
                                 chars.next(); // consume second quote
                                 v.push('\'');
@@ -386,7 +426,7 @@ impl ConnInfo {
                             }
                         }
                         Some(c) => v.push(c),
-                        None => break, // unterminated quote — use what we have
+                        None => break, // non-libpq: silently accept a truncated value
                     }
                 }
                 v
@@ -401,7 +441,10 @@ impl ConnInfo {
                 "user" => user = value,
                 "password" => password = Some(value),
                 "dbname" | "database" => dbname = Some(value),
-                "sslmode" => sslmode = parse_sslmode(&value)?,
+                "sslmode" => {
+                    sslmode = parse_sslmode(&value)?;
+                    sslmode_explicit = true;
+                }
                 "sslrootcert" => sslrootcert = Some(value),
                 "sslnegotiation" => sslnegotiation = parse_ssl_negotiation(&value)?,
                 "replication" => replication = parse_replication_mode(&value)?,
@@ -421,7 +464,8 @@ impl ConnInfo {
                         SslMode::Require
                     } else {
                         SslMode::Prefer
-                    }
+                    };
+                    sslmode_explicit = true;
                 }
                 k => check_unhandled(k, &value)?,
             }
@@ -430,6 +474,9 @@ impl ConnInfo {
         let password = password.or_else(|| std::env::var("PGPASSWORD").ok());
 
         let dbname = dbname.unwrap_or_else(|| user.clone());
+
+        let sslmode =
+            resolve_sslrootcert_system(sslmode, sslmode_explicit, sslrootcert.as_deref())?;
 
         Ok(ConnInfo {
             host,
@@ -447,6 +494,64 @@ impl ConnInfo {
             keepalives_interval,
             keepalives_count,
         })
+    }
+}
+
+/// libpq's reserved `sslrootcert` value meaning "use the SSL implementation's
+/// own trusted CA roots" (PG16+), as opposed to a path to a CA bundle.
+pub(crate) const SSLROOTCERT_SYSTEM: &str = "system";
+
+/// Apply libpq's `sslrootcert=system` rule to the parsed `sslmode`.
+///
+/// In libpq, `sslrootcert=system` is not merely "where to find the roots" — it is
+/// a request for *full verification*. `pqConnectOptions2` (fe-connect.c) raises
+/// the effective default to `verify-full`, and explicitly refuses to pair it with
+/// a weaker mode:
+///
+/// ```text
+/// host=h sslrootcert=system                  ->  effective sslmode = verify-full
+/// host=h sslrootcert=system sslmode=require  ->  error: weak sslmode "require" may not
+///                                                be used with sslrootcert=system
+/// ```
+///
+/// Without this, `system` was stored as an ordinary file path and `sslmode` stayed
+/// at its `Prefer` default, which selects `NoVerification` (accepts any
+/// certificate) *and* falls back to plaintext if the handshake fails. Because
+/// `build_root_store` is only reached from the verifying modes, the bogus `system`
+/// path never even produced a file-open error — the downgrade was completely
+/// silent. `postgresql://u@host/db?sslrootcert=system` is the form cloud providers
+/// document for publicly-signed certificates, so this was the documented happy path
+/// connecting with verification disabled.
+fn resolve_sslrootcert_system(
+    sslmode: SslMode,
+    sslmode_explicit: bool,
+    sslrootcert: Option<&str>,
+) -> Result<SslMode, ReplicationError> {
+    if sslrootcert != Some(SSLROOTCERT_SYSTEM) {
+        return Ok(sslmode);
+    }
+    match sslmode {
+        // Not spelled out by the caller: `system` raises the default.
+        _ if !sslmode_explicit => Ok(SslMode::VerifyFull),
+        // Both actually verify the chain against the root store.
+        SslMode::VerifyCa | SslMode::VerifyFull => Ok(sslmode),
+        weak => Err(ReplicationError::config(format!(
+            "weak sslmode \"{}\" may not be used with sslrootcert=system \
+             (use verify-full)",
+            sslmode_name(weak)
+        ))),
+    }
+}
+
+/// Spelling of an [`SslMode`] as it appears in a connection string.
+fn sslmode_name(mode: SslMode) -> &'static str {
+    match mode {
+        SslMode::Disable => "disable",
+        SslMode::Allow => "allow",
+        SslMode::Prefer => "prefer",
+        SslMode::Require => "require",
+        SslMode::VerifyCa => "verify-ca",
+        SslMode::VerifyFull => "verify-full",
     }
 }
 
@@ -1009,6 +1114,100 @@ mod tests {
     /// Every fail-OPEN option must be refused in both syntaxes, and the message
     /// must not claim the option is invalid — it is a valid libpq option this
     /// backend cannot honour, which is a different thing to tell an operator.
+    /// `sslrootcert=system` is libpq's request for *full verification*, not a
+    /// file path. Storing it as a path left `sslmode` at `Prefer`, which selects
+    /// `NoVerification` **and** falls back to plaintext — and because
+    /// `build_root_store` is only reached from the verifying modes, the bogus
+    /// path never even produced a file-open error. Completely silent downgrade
+    /// on the exact URI cloud providers document.
+    #[test]
+    fn sslrootcert_system_raises_sslmode_to_verify_full() {
+        for dsn in [
+            "host=h sslrootcert=system",
+            "postgresql://u@h/db?sslrootcert=system",
+        ] {
+            let ci = ConnInfo::parse(dsn).unwrap();
+            assert_eq!(ci.sslmode, SslMode::VerifyFull, "{dsn}");
+            assert_eq!(ci.sslrootcert.as_deref(), Some("system"), "{dsn}");
+        }
+    }
+
+    /// libpq refuses the pairing rather than silently honouring the weaker mode:
+    /// `weak sslmode "require" may not be used with sslrootcert=system`.
+    #[test]
+    fn sslrootcert_system_rejects_weak_sslmode() {
+        for mode in ["disable", "allow", "prefer", "require"] {
+            let err = ConnInfo::parse(&format!("host=h sslrootcert=system sslmode={mode}"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("may not be used with sslrootcert=system"),
+                "{mode}: {err}"
+            );
+            assert!(err.contains(mode), "{mode}: {err}");
+            assert!(
+                ConnInfo::parse(&format!(
+                    "postgresql://u@h/db?sslrootcert=system&sslmode={mode}"
+                ))
+                .is_err(),
+                "URI accepted sslmode={mode}"
+            );
+        }
+        // The deprecated aliases are sslmode settings too, so they are caught.
+        assert!(ConnInfo::parse("host=h sslrootcert=system requiressl=0").is_err());
+    }
+
+    /// Both modes actually verify the chain against the root store, so both are
+    /// legal companions for `system`.
+    #[test]
+    fn sslrootcert_system_accepts_verifying_sslmodes() {
+        for (mode, want) in [
+            ("verify-ca", SslMode::VerifyCa),
+            ("verify-full", SslMode::VerifyFull),
+        ] {
+            let ci = ConnInfo::parse(&format!("host=h sslrootcert=system sslmode={mode}")).unwrap();
+            assert_eq!(ci.sslmode, want, "{mode}");
+        }
+    }
+
+    /// The rule is keyed on the reserved word only — an ordinary CA path must not
+    /// start silently overriding the caller's sslmode.
+    #[test]
+    fn ordinary_sslrootcert_path_does_not_change_sslmode() {
+        let ci = ConnInfo::parse("host=h sslrootcert=/etc/ssl/ca.pem").unwrap();
+        assert_eq!(ci.sslmode, SslMode::Prefer);
+        let ci = ConnInfo::parse("host=h sslrootcert=/etc/ssl/ca.pem sslmode=require").unwrap();
+        assert_eq!(ci.sslmode, SslMode::Require);
+    }
+
+    /// `sslmode_name` feeds the `sslrootcert=system` rejection message, so every
+    /// arm has to round-trip — a wrong spelling there sends an operator looking
+    /// for an option they did not set.
+    #[test]
+    fn sslmode_name_round_trips_every_variant() {
+        for name in [
+            "disable",
+            "allow",
+            "prefer",
+            "require",
+            "verify-ca",
+            "verify-full",
+        ] {
+            let mode = parse_sslmode(name).expect(name);
+            assert_eq!(sslmode_name(mode), name);
+        }
+    }
+
+    /// Known divergence from libpq, pinned so it is a deliberate state rather
+    /// than an accident: libpq rejects an unterminated quoted value with
+    /// `unterminated quoted string in connection info string`; this parser
+    /// silently accepts the truncated value. See the table at the value reader.
+    #[test]
+    fn unterminated_quote_is_accepted_truncated_unlike_libpq() {
+        let ci = ConnInfo::parse("host=h password='trunc").unwrap();
+        assert_eq!(ci.password.as_deref(), Some("trunc"));
+    }
+
     #[test]
     fn security_relevant_options_we_cannot_honour_are_refused() {
         for key in UNSUPPORTED_OPTIONS {
@@ -1116,13 +1315,19 @@ mod tests {
         assert_eq!(ci.password, Some("has spaces".to_string()));
     }
 
+    /// Pins the CURRENT behaviour, which is a known divergence from libpq —
+    /// **not** parity. libpq has no `''` rule and REJECTS this input with
+    /// `missing "=" after "'s' a test'"` (verified with `PQconninfoParse`,
+    /// libpq 18.6). See the divergence table at the value reader. When that is
+    /// fixed for 0.9.0 this test should flip to asserting an error.
     #[test]
     fn parse_key_value_escaped_quotes() {
-        // Doubled single quotes represent a literal quote (libpq behavior)
         let ci = ConnInfo::parse("host=localhost password='it''s a test'").unwrap();
         assert_eq!(ci.password, Some("it's a test".to_string()));
     }
 
+    /// Same known divergence as [`parse_key_value_escaped_quotes`]; libpq rejects
+    /// this too.
     #[test]
     fn parse_key_value_multiple_escaped_quotes() {
         let ci = ConnInfo::parse("host=localhost password='a''b''c'").unwrap();

@@ -7,7 +7,7 @@
 //! 4. Authentication delegation to `auth.rs`
 //! 5. Backend parameter processing until ReadyForQuery
 
-use super::conninfo::{ConnInfo, SslMode, SslNegotiation};
+use super::conninfo::{ConnInfo, SslMode, SslNegotiation, SSLROOTCERT_SYSTEM};
 use super::wire;
 use crate::error::ReplicationError;
 use bytes::BytesMut;
@@ -489,7 +489,15 @@ fn build_tls_config(info: &ConnInfo) -> Result<rustls::ClientConfig, Replication
 fn build_root_store(sslrootcert: Option<&str>) -> Result<rustls::RootCertStore, ReplicationError> {
     let mut store = rustls::RootCertStore::empty();
 
-    // 1. Custom CA file — if specified, use ONLY these CAs
+    // 1. `system` is libpq's reserved word for "the trusted CA roots from the SSL
+    //    implementation" (PG16+), not a file path. Opening it as one would look
+    //    for a file literally named `system`. Fall through to the bundled roots.
+    if sslrootcert == Some(SSLROOTCERT_SYSTEM) {
+        store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        return Ok(store);
+    }
+
+    // 2. Custom CA file — if specified, use ONLY these CAs
     if let Some(path) = sslrootcert {
         let file = std::fs::File::open(path).map_err(|e| {
             ReplicationError::permanent_connection(format!(
@@ -520,7 +528,7 @@ fn build_root_store(sslrootcert: Option<&str>) -> Result<rustls::RootCertStore, 
         return Ok(store);
     }
 
-    // 2. Mozilla CA bundle via webpki-roots
+    // 3. Mozilla CA bundle via webpki-roots
     store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
     Ok(store)
@@ -778,6 +786,38 @@ fn parse_server_version(version_str: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `sslrootcert=system` is libpq's reserved word for the platform trust
+    /// store, not a path. Treating it as a path was the silent-downgrade bug:
+    /// `build_root_store` is only reached from the verifying modes, so the bogus
+    /// path never even produced a file-open error.
+    #[test]
+    fn build_root_store_maps_system_to_bundled_roots() {
+        let store = build_root_store(Some(SSLROOTCERT_SYSTEM)).expect("system must resolve");
+        assert!(!store.is_empty(), "system must load real CA roots");
+        assert_eq!(
+            store.len(),
+            webpki_roots::TLS_SERVER_ROOTS.len(),
+            "system must be exactly the bundled Mozilla set"
+        );
+    }
+
+    /// No `sslrootcert` also uses the bundled roots — same outcome, different
+    /// branch, so pin both to keep them from drifting apart.
+    #[test]
+    fn build_root_store_defaults_to_bundled_roots() {
+        let store = build_root_store(None).expect("default must resolve");
+        assert_eq!(store.len(), webpki_roots::TLS_SERVER_ROOTS.len());
+    }
+
+    /// An ordinary path is still opened as a file; `system` must not have turned
+    /// every value into "use the bundled roots".
+    #[test]
+    fn build_root_store_still_reads_a_real_path() {
+        let err = build_root_store(Some("/nonexistent/ca.pem"))
+            .expect_err("a missing CA file must fail loudly");
+        assert!(err.to_string().contains("/nonexistent/ca.pem"), "{err}");
+    }
 
     /// Create a ConnInfo with test defaults, allowing override of specific fields.
     fn test_conninfo(sslmode: SslMode, sslrootcert: Option<String>) -> ConnInfo {

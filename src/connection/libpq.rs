@@ -159,6 +159,8 @@ pub struct PgReplicationConnection {
     read_buf: BytesMut,
     /// How the COPY stream ended, once it has. Surfaces only after `pending_messages` is drained, so a stream that ends in the same pass that queued messages still delivers them.
     copy_end: Option<CopyEnd>,
+    /// Set by [`PgReplicationConnection::mark_dead`]. Cleared by `start_replication`.
+    dead: bool,
 }
 
 impl PgReplicationConnection {
@@ -284,6 +286,7 @@ impl PgReplicationConnection {
             pending_messages: VecDeque::with_capacity(MAX_DRAIN_BATCH),
             read_buf: BytesMut::with_capacity(READ_BUF_INITIAL_CAPACITY),
             copy_end: None,
+            dead: false,
         })
     }
 
@@ -362,6 +365,7 @@ impl PgReplicationConnection {
 
         // A fresh COPY stream: drop any terminal state left by a previous one.
         self.copy_end = None;
+        self.dead = false;
 
         // Initialize the async socket first; mark the connection as being in replication mode only AFTER it succeeds, preserving the invariant `is_replication_conn == true ⇒ async_fd is Some`. Otherwise a failed socket setup would leave the flag true with no async_fd, and a later `end_copy`/Drop would reach the writable-wait path with `async_fd == None`.
         self.initialize_async_socket()?;
@@ -714,7 +718,7 @@ impl PgReplicationConnection {
 
     /// Check if the connection is still alive
     pub fn is_alive(&self) -> bool {
-        if self.conn.is_null() {
+        if self.conn.is_null() || self.dead {
             return false;
         }
 
@@ -741,6 +745,17 @@ impl PgReplicationConnection {
         }
 
         unsafe { PQstatus(self.conn) == ConnStatusType::CONNECTION_OK }
+    }
+
+    /// Force the connection to report dead.
+    ///
+    /// The COPY read paths latch `copy_end` themselves, but a failing *command*
+    /// does not: `start_replication` returns `Err` while `PQstatus` stays
+    /// `CONNECTION_OK`, so a half-initialised recovery — a live connection that
+    /// never entered COPY mode — still looked healthy. See the call site in
+    /// `LogicalReplicationStream::recover_connection`.
+    pub(crate) fn mark_dead(&mut self) {
+        self.dead = true;
     }
 
     /// Get the server version
@@ -1095,6 +1110,7 @@ impl PgReplicationConnection {
             pending_messages: VecDeque::new(),
             read_buf: BytesMut::new(),
             copy_end: None,
+            dead: false,
         }
     }
 
@@ -1243,6 +1259,26 @@ unsafe impl Send for PgResult {}
 /// complete, so results are only collected while `PQisBusy` says libpq has
 /// already parsed one. An `ErrorResponse` that ended the COPY is always
 /// available: libpq stores it before leaving copy mode.
+///
+/// A COPY-status result is terminal here, and must be, or this loop never ends.
+/// In `COPY_BOTH` — which is every logical and physical replication stream — a
+/// *server* CopyDone does not leave copy mode: `getCopyDataMessage` moves
+/// `asyncStatus` to `PGASYNC_COPY_IN` ("If we're in COPY_BOTH mode, return to
+/// COPY_IN mode", fe-protocol3.c) and returns -1. In that state `PQisBusy` is
+/// always 0 (it is `asyncStatus == PGASYNC_BUSY`, fe-exec.c), and `PQgetResult`
+/// dispatches to `getCopyResult`, which falls through to "Otherwise, invent a
+/// suitable PGresult" and hands back a fresh `PGRES_COPY_IN` *without* touching
+/// `asyncStatus`. So the result is never null, never `PGRES_FATAL_ERROR`, and
+/// `PQisBusy` never flips: a 100%-CPU livelock that allocates and frees a
+/// `PGresult` per iteration, with no cancellation point. A physical walsender
+/// sends exactly this unprompted CopyDone at a timeline switch.
+///
+/// `PQputCopyEnd` is what breaks it: on `COPY_IN` it sets
+/// `asyncStatus = PGASYNC_BUSY` ("Return to active duty", fe-exec.c), which is
+/// also what makes the loop condition false. It is only legal in
+/// `COPY_IN`/`COPY_BOTH` — in `COPY_OUT` it returns -1 and appends
+/// "no COPY in progress" to the connection's error message, so it is not called
+/// there.
 fn copy_end_status(conn: *mut PGconn) -> ReadResult {
     let mut end = ReadResult::CopyDone;
 
@@ -1253,15 +1289,24 @@ fn copy_end_status(conn: *mut PGconn) -> ReadResult {
         }
         // Wrapped so PQclear runs on drop; libpq needs every result reclaimed.
         let res = PgResult::new(raw);
-        if matches!(res.status(), ExecStatusType::PGRES_FATAL_ERROR)
-            && matches!(end, ReadResult::CopyDone)
-        {
-            let message = res
-                .error_message()
-                .unwrap_or_else(|| "Unknown error".to_string());
-            let sqlstate = res.error_sqlstate();
-            warn!("COPY stream terminated by server [{sqlstate}]: {message}");
-            end = ReadResult::CopyFailed(sqlstate, message);
+        match res.status() {
+            // Still in copy mode: close our half so libpq leaves it, then stop.
+            ExecStatusType::PGRES_COPY_IN | ExecStatusType::PGRES_COPY_BOTH => {
+                debug!("COPY stream ended by server; sending client CopyDone to leave copy mode");
+                unsafe { PQputCopyEnd(conn, ptr::null()) };
+                break;
+            }
+            // Same livelock shape, but PQputCopyEnd is illegal here.
+            ExecStatusType::PGRES_COPY_OUT => break,
+            ExecStatusType::PGRES_FATAL_ERROR if matches!(end, ReadResult::CopyDone) => {
+                let message = res
+                    .error_message()
+                    .unwrap_or_else(|| "Unknown error".to_string());
+                let sqlstate = res.error_sqlstate();
+                warn!("COPY stream terminated by server [{sqlstate}]: {message}");
+                end = ReadResult::CopyFailed(sqlstate, message);
+            }
+            _ => {}
         }
     }
 
@@ -1786,6 +1831,40 @@ mod tests {
         );
         assert!(!other.is_permanent());
         assert!(other.is_transient());
+    }
+
+    /// `copy_end_status` must always terminate. It cannot loop forever on a
+    /// COPY-status result, which is what a *server* CopyDone in `COPY_BOTH`
+    /// produces indefinitely: `PQisBusy` stays 0 in `PGASYNC_COPY_IN` and
+    /// `getCopyResult` invents a fresh `PGRES_COPY_IN` on every call.
+    ///
+    /// This only pins the null-connection path (`PQgetResult(NULL)` is NULL, so
+    /// the loop breaks). The real COPY_BOTH livelock needs a promoted server and
+    /// `START_REPLICATION ... TIMELINE <old>`; measured before the fix at 99% CPU
+    /// for 25 s with no termination, after it at 8.9 ms / 129 frames.
+    #[test]
+    fn copy_end_status_terminates() {
+        assert!(matches!(
+            copy_end_status(std::ptr::null_mut()),
+            ReadResult::CopyDone
+        ));
+    }
+
+    /// `mark_dead` exists so a failed `start_replication` cannot leave a live,
+    /// non-COPY connection looking healthy — that is what made the stream layer
+    /// skip recovery and busy-spin.
+    #[test]
+    fn mark_dead_forces_is_alive_false() {
+        let mut conn =
+            PgReplicationConnection::null_for_testing_with_frames(vec![Bytes::from_static(
+                b"frame",
+            )]);
+        conn.conn = std::ptr::null_mut();
+        // Null already reports dead; the point is that the flag is independent of
+        // the queue, unlike the `copy_end` latch.
+        conn.mark_dead();
+        assert!(!conn.is_alive());
+        assert!(conn.dead);
     }
 
     /// A `PQgetCopyData` transport failure (-2) is thrown straight up, not parked

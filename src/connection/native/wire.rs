@@ -173,6 +173,22 @@ pub fn build_copy_done() -> BytesMut {
     buf
 }
 
+/// Build a CopyFail message ('f') carrying an error message.
+///
+/// The client's way out of a CopyIn it cannot complete. The server answers with
+/// an ErrorResponse and then ReadyForQuery, which is what lets the connection be
+/// reused; abandoning the CopyIn without it leaves both sides waiting.
+/// Only [`super::query::simple_query`] needs it, so it stays module-local.
+pub(super) fn build_copy_fail(message: &str) -> BytesMut {
+    let body_len = 4 + message.len() + 1;
+    let mut buf = BytesMut::with_capacity(1 + body_len);
+    buf.put_u8(b'f');
+    buf.put_i32(body_len as i32);
+    buf.put_slice(message.as_bytes());
+    buf.put_u8(0);
+    buf
+}
+
 /// Build a Terminate message ('X').
 pub fn build_terminate() -> BytesMut {
     let mut buf = BytesMut::with_capacity(5);

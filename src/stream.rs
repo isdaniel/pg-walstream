@@ -1020,8 +1020,26 @@ impl LogicalReplicationStream {
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect::<Vec<_>>();
 
-        self.connection
-            .start_replication(&self.config.slot_name, last_lsn, &options_ref)?;
+        // On failure, mark the connection we just installed as dead.
+        //
+        // `start_replication` reports a server error without touching liveness, so
+        // the freshly-connected socket stays `is_alive() == true` while never
+        // having entered COPY mode. `next_event_with_retry` skips recovery when
+        // the connection looks alive, so every later read failed
+        // `ensure_replication_mode` with `Protocol(..)`, which the live-connection
+        // decode guard then treats as terminal *before* the backoff sleep — a
+        // zero-delay busy-spin for `futures::Stream` consumers, and a hard exit for
+        // `for_each_event`. The canonical trigger is 55006 "replication slot is
+        // already active for PID" after a network blip, which clears on its own
+        // once `wal_sender_timeout` (default 60 s) reaps the old walsender: a
+        // routine, self-healing condition that must not kill the stream.
+        if let Err(e) =
+            self.connection
+                .start_replication(&self.config.slot_name, last_lsn, &options_ref)
+        {
+            self.connection.mark_dead();
+            return Err(e);
+        }
 
         // The server resumes at a transaction boundary, so a StreamStart seen
         // before the disconnect has no matching StreamStop coming.
@@ -1182,10 +1200,24 @@ impl LogicalReplicationStream {
                     // Attempt connection recovery if connection is dead
                     if !self.connection.is_alive() {
                         if let Err(recovery_err) = self.recover_connection().await {
-                            error!("Failed to recover connection: {}", recovery_err);
-                            return Err(recovery_err);
+                            // Only a *permanent* recovery failure ends the stream.
+                            // Returning on a transient one skipped the backoff
+                            // below and handed the consumer an error it would
+                            // immediately retry, at zero delay. The connection is
+                            // marked dead on this path, so the next attempt
+                            // re-enters recovery rather than reading from a socket
+                            // that never entered COPY mode.
+                            if recovery_err.is_permanent() || attempt >= MAX_ATTEMPTS {
+                                error!("Failed to recover connection: {}", recovery_err);
+                                return Err(recovery_err);
+                            }
+                            warn!(
+                                "Connection recovery failed (attempt {}/{}), backing off: {}",
+                                attempt, MAX_ATTEMPTS, recovery_err
+                            );
+                        } else {
+                            info!("Connection recovered successfully");
                         }
-                        info!("Connection recovered successfully");
                     }
 
                     // Exponential backoff before retry
