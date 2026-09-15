@@ -356,102 +356,86 @@ The library supports all PostgreSQL logical replication message types:
 └──────────────────────────────────────────┘
 ```
 
-## Stress Test & System Threshold Analysis
+## Backend Comparison & Stress Test
 
-Progressive writer concurrency ramp (16 - 192 writers) to find the library's CPU saturation point and throughput ceiling.
+Progressive writer concurrency ramp (16 – 192 writers) plus a fixed scenario set, comparing the two connection backends.
 
-- **Backend A**: rustls-tls
-- **Backend B**: libpq
+- **Backend A**: rustls-tls (aws-lc-rs crypto)
+- **Backend B**: libpq (OpenSSL)
 
-**Test environment:** an 8-vCPU Linux VM (TCP-tuned per [Linux VM TCP Tuning](#linux-vm-tcp-tuning-for-production): 64 MB buffers, BBR) streaming from a **remote Azure PostgreSQL Flexible Server 18.4** over TLS (`sslmode=require`). Each scenario ran 10 s warmup + 30 s measure; every configuration was measured **3 times per backend** and the **median** is reported (cross-run CoV ≤ ~6%). Process CPU/RSS reflect **only the pg-walstream consumer** — the write generator runs as a separate OS process.
+**Test environment:** an 8-vCPU Linux VM (TCP-tuned per [Linux VM TCP Tuning](#linux-vm-tcp-tuning-for-production): 64 MB buffers, BBR) streaming from a **remote Azure PostgreSQL Flexible Server 18.6** across regions (~50 ms RTT). Each scenario ran 10 s warmup + 30 s measure. Process CPU/RSS reflect **only the pg-walstream consumer** — the write generator runs as a separate OS process.
 
-> **Reading these numbers:** Over a real network link the consumer spends most of its time parked in `epoll`/TLS I/O rather than parsing, so both backends are **network-I/O-bound and converge to within run-to-run noise** on CPU efficiency, CPU%, RSS, and latency. rustls-tls keeps a small (~8%) throughput edge on saturated single-stream ingest. If you are benchmarking over loopback/localhost you may see larger CPU gaps; those do not represent a realistic remote-DB deployment.
+> **The `sslmode` you measure under decides the result.** Without TLS the two
+> backends are a statistical tie. With TLS, rustls-tls uses **~2.2x less CPU**
+> for the same event rate. Always state the sslmode alongside any backend number.
 
 ## 1. CPU Efficiency (DML events/sec per 1% CPU)
 
-This is the primary efficiency metric: how many DML events each backend processes for every 1% of CPU it consumes. Higher is better.
+The primary efficiency metric: DML events processed per 1% of consumer CPU. Higher is better.
 
-| Scenario | rustls-tls | libpq | Delta | Winner |
-|----------|----------:|----------:|--------:|--------|
-| Baseline | 4,338 | 4,250 | +2.1% | ~tie |
-| Batch-100 | 2,459 | 2,575 | -4.5% | ~tie |
-| Batch-5000 | 4,105 | 4,122 | -0.4% | ~tie |
-| 4-Writers | 3,621 | 3,626 | -0.1% | ~tie |
-| Wide-20col | 1,856 | 1,960 | -5.3% | ~tie |
-| Payload-2KB | 1,212 | 1,218 | -0.5% | ~tie |
-| Mixed-DML | 3,293 | 3,301 | -0.2% | ~tie |
+| Scenario | rustls plain | libpq plain | rustls TLS | libpq TLS | libpq CPU vs rustls (TLS) |
+|----------|----------:|----------:|----------:|----------:|----------:|
+| Baseline | 6,670 | 7,135 | 3,759 | 1,739 | 2.13x |
+| Batch-100 | 2,080 | 1,940 | 1,633 | 996 | 1.61x |
+| Batch-5000 | 7,992 | 7,126 | 4,764 | 1,789 | 2.63x |
+| 4-Writers | 6,995 | 7,093 | 4,052 | 2,098 | 1.84x |
+| Wide-20col | 2,162 | 2,102 | 1,609 | 1,067 | 1.51x |
+| Payload-2KB | 2,279 | 2,165 | 1,611 | 1,104 | 1.46x |
+| Mixed-DML | 2,926 | 2,946 | 2,458 | 1,370 | 1.79x |
+| Stress-16w | 6,088 | 6,437 | 3,917 | 1,800 | 2.62x |
+| Stress-32w | 6,237 | 6,335 | 3,979 | 1,810 | 2.40x |
+| Stress-48w | 5,630 | 6,190 | 3,854 | 1,647 | 2.23x |
+| Stress-64w | 5,615 | 5,737 | 3,779 | 1,642 | 2.12x |
+| Stress-96w | 5,546 | 5,534 | 3,524 | 1,568 | 2.24x |
+| Stress-128w | 5,328 | 5,852 | 3,356 | 1,566 | 2.25x |
+| Stress-192w | 5,554 | 5,457 | 3,754 | 1,511 | 2.33x |
 
-Both backends land within ±5% across every scenario — a statistical tie.
+Median over CPU-bound scenarios:
 
-## 2. Throughput Comparison
+| `sslmode` | rustls-tls | libpq | Ratio |
+|---|---:|---:|---:|
+| `disable` (no TLS) | 5,859 | 6,262 | **0.98x — tie** |
+| `require` (TLS) | 3,817 | 1,693 | **2.22x rustls-tls** |
 
-| Scenario | rustls-tls ev/s | libpq ev/s | Delta | rustls-tls DML/s | libpq DML/s | Delta | Winner |
-|----------|----------:|----------:|--------:|----------:|----------:|--------:|--------|
-| Baseline | 178,812 | 164,585 | +8.6% | 177,414 | 163,299 | +8.6% | **rustls-tls** |
-| Batch-100 | 30,909 | 31,069 | -0.5% | 30,303 | 30,460 | -0.5% | ~tie |
-| Batch-5000 | 167,095 | 153,424 | +8.9% | 165,801 | 152,236 | +8.9% | **rustls-tls** |
-| 4-Writers | 147,377 | 146,476 | +0.6% | 145,273 | 144,404 | +0.6% | ~tie |
-| Wide-20col | 27,126 | 27,434 | -1.1% | 26,133 | 26,429 | -1.1% | ~tie |
-| Payload-2KB | 23,069 | 21,297 | +8.3% | 21,400 | 19,756 | +8.3% | **rustls-tls** |
-| Mixed-DML | 55,180 | 57,506 | -4.0% | 54,526 | 56,824 | -4.0% | **libpq** |
+Without TLS, per-scenario ratios scatter 0.90x – 1.12x with no directional lean — noise. TLS efficiency retained: **rustls-tls 66%, libpq 28%**.
 
-rustls-tls is ~8–9% faster on saturated single-stream ingest (Baseline, Batch-5000, Payload-2KB); everything else is within noise.
+## 2. Why: OpenSSL per-call overhead, not crypto
 
-## 3. Resource Utilization Comparison
+`perf` on the consumer during 4-Writers with TLS enabled:
 
-Process CPU and RSS reflect **only the pg-walstream consumer** (generator runs as a separate OS process).
+| | libpq | rustls-tls |
+|---|---:|---:|
+| TLS library share of process CPU | **20.79%** (libcrypto + libssl) | 12.48% (aws-lc-rs, static) |
+| ...of which is actual AES-GCM | **0.84%** | most of it |
 
-| Scenario | rustls-tls CPU% | libpq CPU% | Delta | rustls-tls RSS MB | libpq RSS MB | Delta | Winner |
-|----------|----------:|----------:|--------:|----------:|----------:|--------:|--------|
-| Baseline | 38.4 | 38.4 | -0.0% | 14.8 | 14.8 | -0.1% | ~tie |
-| Batch-100 | 12.3 | 12.1 | +1.7% | 16.1 | 15.9 | +1.3% | ~tie |
-| Batch-5000 | 38.9 | 37.2 | +4.6% | 16.3 | 16.3 | -0.2% | ~tie |
-| 4-Writers | 39.6 | 39.7 | -0.3% | 16.5 | 16.5 | +0.4% | ~tie |
-| Wide-20col | 14.1 | 14.4 | -2.4% | 16.6 | 16.6 | +0.2% | ~tie |
-| Payload-2KB | 17.9 | 16.2 | +10.5% | 16.5 | 16.7 | -0.9% | **libpq** |
-| Mixed-DML | 16.5 | 17.7 | -6.4% | 16.7 | 17.6 | -5.1% | **rustls-tls** |
+libpq spends ~20 points of CPU on TLS **bookkeeping** and under 1 point on real
+crypto. The hot OpenSSL symbols are all per-call setup — `ERR_clear_error`
+(1.67%, which libpq calls before every read), `BIO_ctrl`, `EVP_CIPHER_CTX_ctrl`.
+`libpq.so` itself is only 2.39%, so libpq's own code is cheap; the cost is the
+OpenSSL call sequence it performs per read. pg-walstream issues one
+`PQgetCopyData` per WAL message, so this **scales with message count, not bytes**.
 
-CPU% and RSS are effectively equal; the largest single-scenario deltas (~10%) sit inside the 3-run variance.
+Measured against libpq 18.6 / OpenSSL 3.0.2. A newer OpenSSL would likely narrow this gap but not close it, since the per-read error-stack clear is libpq's own code.
 
-## 4. Latency Comparison (inter-event, microseconds)
+## 3. Throughput and Resources
 
-| Scenario | rustls-tls P50 | libpq P50 | rustls-tls P99 | libpq P99 | Winner |
-|----------|----------:|----------:|----------:|----------:|--------|
-| Baseline | 1 | 1 | 72 | 66 | ~tie |
-| Batch-100 | 1 | 1 | 645 | 599 | ~tie |
-| Batch-5000 | 1 | 1 | 64 | 64 | ~tie |
-| 4-Writers | 1 | 1 | 150 | 149 | ~tie |
-| Wide-20col | 1 | 1 | 227 | 223 | ~tie |
-| Payload-2KB | 5 | 5 | 390 | 365 | ~tie |
-| Mixed-DML | 1 | 1 | 107 | 109 | ~tie |
-
-P50 is 1 µs for both; P99 tracks within ±10 µs — no backend advantage.
-
-## 5. Stress Ramp Comparison
-
-Progressive writer concurrency ramp — comparing throughput and CPU scaling.
-
-| Writers | rustls-tls DML/s | libpq DML/s | Delta | rustls-tls CPU% | libpq CPU% | rustls-tls eff | libpq eff |
-|--------:|----------:|----------:|--------:|----------:|----------:|----------:|----------:|
-| 16 | 127,226 | 125,729 | +1.2% | 42.9 | 43.4 | 2,975 | 2,969 |
-| 32 | 115,728 | 117,595 | -1.6% | 42.4 | 42.1 | 2,764 | 2,770 |
-| 48 | 103,432 | 105,136 | -1.6% | 40.6 | 40.0 | 2,591 | 2,671 |
-| 64 | 98,473 | 99,038 | -0.6% | 37.8 | 37.3 | 2,616 | 2,586 |
-| 96 | 87,361 | 87,592 | -0.3% | 34.0 | 35.5 | 2,550 | 2,468 |
-| 128 | 79,709 | 76,466 | +4.2% | 32.9 | 34.0 | 2,425 | 2,306 |
-| 192 | 72,291 | 72,186 | +0.1% | 33.1 | 32.9 | 2,193 | 2,194 |
-
-Throughput and efficiency scale essentially identically for both backends across the ramp.
-
-### Peak Numbers
+Throughput here is bounded by the write generator and the ~50 ms link, not by the consumer — so both backends land in the same range. The difference is the CPU spent getting there.
 
 | Metric | rustls-tls | libpq |
 |--------|------:|------:|
-| Peak DML events/sec | 177,414 | 163,299 |
-| Peak total events/sec | 178,812 | 164,585 |
-| Peak CPU efficiency (DML/s per 1% CPU) | 4,338 | 4,250 |
-| Peak process CPU% | 51 | 50 |
-| Peak RSS (MB) | 18 | 18 |
+| Peak DML events/sec (no TLS) | 213,392 | 202,347 |
+| Peak DML events/sec (TLS) | 161,151 | 156,813 |
+| CPU% at TLS peak | **38.9** | **80.9** |
+| Avg RSS (MB) | 15.7 | 17.0 |
+| P50 inter-event latency | 1 µs | 1 µs |
+
+RSS and latency show no backend advantage.
+
+## 4. Choosing a backend
+
+- **TLS link (any managed Postgres: Azure, RDS, Cloud SQL)** → prefer the default
+  **rustls-tls**; it needs roughly half the consumer CPU.
+- **TLS terminated elsewhere** (private network, sidecar/proxy) → the backends are a tie; choose on operational grounds (libpq needs `libpq-dev` at runtime; rustls-tls is pure Rust with native SCRAM).
 
 For a detailed comparison across PostgreSQL 16 and 18 with different optimizations (binary mode, direct TLS, COPY protocol), see the [Load Test Comparison Report](LOAD_TEST_COMPARISON.md).
 
