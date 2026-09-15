@@ -10,11 +10,11 @@ zero-copy, allocation-conscious hot path; a thin ergonomics layer sits on top.
 ## Build & Test
 
 ```bash
-cargo build                                              # default: libpq backend
-cargo build --no-default-features --features rustls-tls  # pure-Rust TLS backend
+cargo build                                              # default: rustls-tls backend
+cargo build --no-default-features --features libpq       # opt-in libpq FFI backend
 cargo test --lib                                         # unit tests (no PostgreSQL)
 cargo test --lib --features derive                       # + derive-macro layer
-cargo test --lib --no-default-features --features rustls-tls
+cargo test --lib --no-default-features --features libpq
 cargo bench --bench wal_pipeline                         # parsing pipeline benches
 cargo fmt --all -- --check                               # format check
 cargo clippy --all-targets                               # lint
@@ -38,7 +38,7 @@ src/
 ├── column_value.rs  # ColumnValue / RowData
 ├── types.rs         # EventType/ChangeEvent, Lsn, wire encode/decode
 ├── lsn.rs           # thread-safe SharedLsnFeedback (atomic CAS)
-└── connection/      # libpq FFI backend (default) + native/ rustls-tls backend
+└── connection/      # native/ rustls-tls backend (default) + libpq FFI backend (opt-in)
 macros/              # #[derive(WalTable)] (opt-in `derive` feature)
 ```
 

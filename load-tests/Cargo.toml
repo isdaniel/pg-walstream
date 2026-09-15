@@ -26,7 +26,10 @@ libpq = ["pg_walstream/libpq"]
 rustls-tls = ["pg_walstream/rustls-tls", "dep:rustls"]
 
 [dependencies]
-pg_walstream = { path = ".." }
+# default-features = false is load-bearing: the parent's default is rustls-tls and
+# connection/mod.rs gates libpq on `not(feature = "rustls-tls")`, so without this the
+# --features libpq build silently measures rustls. Both backend features pull in std.
+pg_walstream = { path = "..", default-features = false }
 rustls = { version = "0.23.39", default-features = false, features = ["aws_lc_rs"], optional = true }
 tokio = { version = "1.52.1", features = ["full"] }
 tokio-postgres = "0.7.17"
