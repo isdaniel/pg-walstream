@@ -277,7 +277,9 @@ pub async fn simple_query_copy_in<S: AsyncRead + AsyncWrite + Unpin>(
 ///
 /// Re-add a cap only if this client is ever pointed at something that is not
 /// stock PostgreSQL, and only together with a deadline — a cap alone buys nothing.
-async fn drain_to_ready<S: AsyncRead + AsyncWrite + Unpin>(
+/// Only `AsyncRead` is needed: the drain never writes. The wider bound would stop
+/// [`super::copy_out`] from reusing this on a read half.
+pub(super) async fn drain_to_ready<S: AsyncRead + Unpin>(
     stream: &mut S,
     buf: &mut BytesMut,
 ) -> Result<(), ReplicationError> {

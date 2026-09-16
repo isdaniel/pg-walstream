@@ -192,6 +192,54 @@ cd examples/raw-xlogdata
 cargo run
 ```
 
+### 10. initial-snapshot
+
+Copies the rows that **already exist** before streaming starts, then hands off to
+the live stream with no gap and no duplicate window.
+
+A CDC stream only reports what *changed*. Without a baseline a downstream sink
+can never reach a consistent state — it would be applying `UPDATE ... WHERE id=7`
+to a table with no row 7. Snapshotting first loses the changes made in between;
+streaming first duplicates rows the snapshot already had. The only correct answer
+is PostgreSQL's *exported snapshot*, taken at exactly the slot's
+`consistent_point`, and this example wraps that.
+
+**Features:**
+- `ReplicationStreamConfig::with_initial_snapshot(true)` — the only new knob
+- One `WalRouter` with **one** set of handlers drives both phases; snapshot rows
+  arrive as ordinary `ChangeEvent`s
+- Proves the handoff rather than claiming it: a row is inserted *after* the
+  snapshot is exported but *before* streaming starts — the exact window a naive
+  implementation gets wrong — and must arrive on the stream exactly once
+- Shows that calling `start()` mid-snapshot is a **compile error**, not a runtime
+  one (the stream is moved into the snapshot handle)
+
+**Run:**
+```bash
+cd examples/initial-snapshot
+export DATABASE_URL="postgresql://postgres:postgres@localhost:5432/postgres?replication=database"
+export DATABASE_URL_REGULAR="postgresql://postgres:postgres@localhost:5432/postgres"
+cargo run
+```
+
+The example creates and drops its own table, publication and slot, so it is safe
+to re-run. Expected output:
+
+```text
+seeded example_snapshot_users with 2 rows that exist BEFORE replication starts
+snapshot ready: 1 table(s) at LSN 0/1560818
+inserted 'carol' during the handoff window
+  [snapshot] id=1 name=alice
+  [snapshot] id=2 name=bob
+streaming from the snapshot's consistent point
+  [stream]   id=3 name=carol-inserted-mid-handoff
+snapshot delivered 2 row(s)  (expected 2: alice, bob)
+stream   delivered 1 row(s)  (expected 1: carol)
+OK — no gap, no duplicate: every row arrived exactly once
+```
+
+Requires PostgreSQL 15+.
+
 ## Prerequisites
 
 ### For Logical Replication Examples (basic_streaming, polling_example, safe_transaction_consumer)

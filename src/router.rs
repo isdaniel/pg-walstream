@@ -149,6 +149,20 @@ impl WalRouter {
 
     /// Drive an [`EventStream`]: dispatch each event, auto-advance applied LSN
     /// after each `Ok`, and exit gracefully on cancellation.
+    /// Drive a [`SnapshotEvents`](crate::snapshot::SnapshotEvents) with the same
+    /// handlers as [`run`](Self::run).
+    ///
+    /// The snapshot phase and the live phase share one set of handlers because
+    /// both go through the same `EventSource` seam; nothing on
+    /// [`ChangeEvent`] distinguishes them, and nothing
+    /// needs to.
+    pub async fn run_snapshot(
+        &mut self,
+        events: &mut crate::snapshot::SnapshotEvents,
+    ) -> Result<()> {
+        self.run_over(events).await
+    }
+
     pub async fn run(&mut self, es: &mut EventStream) -> Result<()> {
         self.run_over(es).await
     }

@@ -206,6 +206,13 @@ impl ReplicationConnectionRetry {
         }
     }
 
+    /// The connection string this retrier dials, reused verbatim by the
+    /// initial-snapshot helper so both connections share TLS and auth semantics.
+    #[inline]
+    pub(crate) fn connection_string(&self) -> &str {
+        &self.connection_string
+    }
+
     /// Retry connection establishment with exponential backoff
     ///
     /// Attempts to establish a PostgreSQL replication connection with automatic
@@ -718,5 +725,15 @@ mod tests {
         assert_eq!(d2, Duration::from_secs(60));
         let d3 = backoff.next_delay(); // still 60s (capped)
         assert_eq!(d3, Duration::from_secs(60));
+    }
+
+    /// The snapshot helper derives its reader conninfo from this string, so it
+    /// must be returned verbatim — any normalisation here would silently change
+    /// the TLS or auth settings of the second connection.
+    #[test]
+    fn connection_string_is_returned_verbatim() {
+        let conninfo = "postgresql://u:p@h:5432/db?replication=database&sslmode=verify-full";
+        let retry = ReplicationConnectionRetry::new(RetryConfig::default(), conninfo.to_string());
+        assert_eq!(retry.connection_string(), conninfo);
     }
 }

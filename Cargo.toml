@@ -98,6 +98,14 @@ name = "snapshot_export"
 path = "integration-tests/snapshot_export.rs"
 
 [[test]]
+name = "initial_snapshot"
+path = "integration-tests/initial_snapshot.rs"
+
+[[test]]
+name = "ssl_initial_snapshot"
+path = "integration-tests/ssl_initial_snapshot.rs"
+
+[[test]]
 name = "rate_limited_streaming"
 path = "integration-tests/rate_limited_streaming.rs"
 

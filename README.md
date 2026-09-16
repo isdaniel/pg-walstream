@@ -26,6 +26,7 @@ A high-performance Rust library for PostgreSQL logical and physical replication 
 - **Type-Safe API**: Strongly typed message parsing with comprehensive error handling
 - **Typed Row Deserialization**: Built-in `serde` deserializer maps WAL rows directly into user-defined Rust structs (numerics, `bool`, `String`, `Option<T>`, enums, bytes)
 - **High-Level Consumption Ergonomics**: `ReplicationStreamConfig::builder()`, an auto-acking `EventStream::for_each_event`, and a typed by-table `WalRouter` with an optional `#[derive(WalTable)]` layer (opt-in `derive` feature)
+- **Managed Initial Snapshot**: `LogicalReplicationStream::snapshot()` copies the published tables through the slot's exported snapshot and hands off to the stream with no gap and no duplicate window. The ordering invariant is enforced by the type system, and snapshot rows arrive as ordinary `ChangeEvent`s, so one set of handlers (or one `WalRouter`) serves both the snapshot and the live stream
 - **Bounded Replay**: `ReplicationStreamConfig::with_stop_at_lsn` streams to a target LSN, delivers the crossing transaction in full, then ends cleanly with `ReplicationError::StreamStopped`
 - **Raw XLogData Access**: `LogicalReplicationStream::next_raw_event` yields the undecoded pgoutput payload plus WAL positions (`RawXLogData`) for consumers that bring their own decoder — keepalives, feedback, and cancellation still handled, no auto-ack
 - **Replication Slot Management**: Create, alter, read, and drop slots with full option support
@@ -118,6 +119,7 @@ The [`examples/`](examples/) directory contains runnable examples demonstrating 
 | Example | Description |
 |---------|-------------|
 | [`basic-streaming`](examples/basic-streaming) | High-level `futures::Stream` API with stream combinators (`filter`, `take_while`) |
+| [`initial-snapshot`](examples/initial-snapshot) | Copy existing rows, then stream changes with no gap and no duplicate — `with_initial_snapshot(true)` |
 | [`polling`](examples/polling) | Manual polling loop using `next_event()` for custom integration scenarios |
 | [`safe-transaction-consumer`](examples/safe-transaction-consumer) | Production-grade transaction-aware CDC consumer with ordered commits and safe LSN feedback |
 | [`rate-limited-streaming`](examples/rate-limited-streaming) | Rate-limited consumption using `tokio_stream::StreamExt::throttle` |
@@ -125,6 +127,8 @@ The [`examples/`](examples/) directory contains runnable examples demonstrating 
 | [`typed-deserialization`](examples/typed-deserialization) | Map INSERT/UPDATE/DELETE events directly into user-defined Rust structs via `serde` |
 | [`derive-router`](examples/derive-router) | `#[derive(WalTable)]` + `WalRouter` table-inference (`on_*_of::<T>`) — the `derive` feature |
 | [`pg-basebackup`](examples/pg-basebackup) | Full physical backup tool using `BASE_BACKUP` with tar extraction and progress reporting |
+| [`binary-column-access`](examples/binary-column-access) | Lossless zero-copy `BYTEA` access via `PgResult::get_bytes`, contrasted with the lossy `get_value` |
+| [`raw-xlogdata`](examples/raw-xlogdata) | Undecoded pgoutput payload via `next_raw_event()` — bring your own decoder |
 | [`arbitrary-fuzzing`](examples/arbitrary-fuzzing) | Property-based fuzzing of all protocol types using the `arbitrary` crate |
 
 For more control, you can use the traditional polling approach:
@@ -226,6 +230,62 @@ let (flushed_lsn, applied_lsn) = feedback.get_feedback_lsn();
 feedback.update_applied_lsn(commit_lsn);
 ```
 
+## Initial Snapshot
+
+Streaming alone tells you what *changed*, never what was already there. Enable a managed initial snapshot and the library copies the published tables through the replication slot's exported snapshot, then hands off to the stream:
+
+```rust
+use pg_walstream::snapshot::SnapshotOutcome;
+
+let config = ReplicationStreamConfig::builder("my_slot", "my_publication")
+    .with_initial_snapshot(true);
+
+let stream = LogicalReplicationStream::new(conn_str, config).await?;
+
+let mut stream = match stream.snapshot().await? {
+    // The slot already existed, so there is nothing to copy — the normal
+    // "resume an existing subscription" path. Not an error.
+    SnapshotOutcome::Unavailable(stream) => stream,
+
+    SnapshotOutcome::Available(snapshot) => {
+        println!("copying {} table(s) at {}", snapshot.tables().len(), snapshot.consistent_point());
+        snapshot
+            .events()
+            .run(|event| async move { sink.apply(event).await })
+            .await?
+    }
+};
+
+// Resumes exactly at the snapshot's consistent point.
+stream.start(None).await?;
+```
+
+Snapshot rows arrive as ordinary `ChangeEvent::Insert`s carrying the slot's
+consistent point as their LSN, so an existing `WalRouter` works across both
+phases with the same handlers:
+
+```rust
+let mut router = WalRouter::new();
+router.on_insert_of::<User, _>(|user| async move { upsert(user).await });
+
+let mut stream = match stream.snapshot().await? {
+    SnapshotOutcome::Unavailable(stream) => stream,
+    SnapshotOutcome::Available(snapshot) => {
+        let mut events = snapshot.events();
+        router.run_snapshot(&mut events).await?;   // snapshot phase
+        events.finish().await?
+    }
+};
+
+stream.start(None).await?;
+router.run(&mut stream.into_stream(token)).await?;  // live phase, same handlers
+```
+
+> Use `snapshot.rows()` instead of `.events()` for raw `RowData` without the `ChangeEvent` wrapper, and `snapshot.retain_tables(..)` to copy a subset of a large publication.
+
+A complete, runnable version of the above — including a row inserted *during* the handoff window to prove it arrives exactly once — is in [`examples/initial-snapshot`](examples/initial-snapshot).
+> **A failed snapshot cannot be resumed.** The exported snapshot is `REPEATABLE READ`; continuing against an expired one would silently mix rows from two points in time. You own the retry policy; the library owns the retry *start point*, which is always the beginning.
+
 ## PostgreSQL Setup
 
 Before using this library, you need to configure PostgreSQL for replication:
@@ -325,7 +385,7 @@ The library supports all PostgreSQL logical replication message types:
 │    LogicalReplicationStream              │
 │  - Connection management & retry         │
 │  - Event processing & LSN feedback       │
-│  - Snapshot export support               │
+│  - Managed initial snapshot + handoff    │
 └──────────────┬───────────────────────────┘
                │
 ┌──────────────▼───────────────────────────┐

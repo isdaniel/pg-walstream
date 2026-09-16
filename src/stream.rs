@@ -42,6 +42,10 @@ pub struct LogicalReplicationStream {
     last_health_check: Instant,
     /// Shared LSN feedback for communication with consumer. This allows the consumer to update flushed/applied LSN after commits
     pub shared_lsn_feedback: Arc<SharedLsnFeedback>,
+    /// The LSN the exported snapshot is consistent at, captured when the slot was
+    /// created. This is also the position `START_REPLICATION` resumes from, so it
+    /// is the correct LSN to stamp on snapshot rows.
+    consistent_point: Option<Lsn>,
     /// The snapshot name exported when the replication slot was created with `EXPORT_SNAPSHOT`.
     exported_snapshot_name: Option<String>,
     /// `IDENTIFY_SYSTEM`'s identity from the first successful connection, re-checked on every reconnect. See [`ServerIdentity`].
@@ -392,6 +396,21 @@ impl ReplicationStreamConfig {
     /// Stop replication after the first committed transaction whose commit `end_lsn` reaches `lsn`. That transaction is delivered in full, then the stream ends cleanly (client CopyDone) and `next_event` returns [`crate::ReplicationError::StreamStopped`]. `None` (default) is unbounded.
     ///
     /// If `lsn` lies *beyond* the last commit the server has, no commit boundary can ever reach it, so the stream instead ends once a keepalive reports the server's send position past `lsn` — rather than blocking forever waiting for a transaction that may never be written. This mirrors pg_recvlogical's `--endpos` `STREAM_STOP_KEEPALIVE` exit and is safe for the same reason: a keepalive's `wal_end` is `sentPtr`, assigned only *after* the output plugin has run and queued its data on the same socket, so nothing committing at or below it can still be undelivered. The `StreamStopped` LSN is then that keepalive position, not a commit boundary.
+    /// Create the replication slot with `SNAPSHOT 'export'`, so
+    /// [`LogicalReplicationStream::snapshot`](crate::stream::LogicalReplicationStream)
+    /// can read a consistent initial copy of the published tables before
+    /// streaming starts.
+    ///
+    /// The default is `SNAPSHOT 'nothing'`. This rewrites
+    /// [`slot_options.snapshot`](crate::types::ReplicationSlotOptions::snapshot)
+    /// rather than adding state of its own, so it composes with
+    /// [`with_slot_options`](Self::with_slot_options) — call this one last.
+    #[inline]
+    pub fn with_initial_snapshot(mut self, enabled: bool) -> Self {
+        self.slot_options.snapshot = Some(if enabled { "export" } else { "nothing" }.to_string());
+        self
+    }
+
     #[inline]
     pub fn with_stop_at_lsn(mut self, lsn: impl Into<Lsn>) -> Self {
         self.stop_at_lsn = Some(lsn.into());
@@ -504,6 +523,7 @@ impl LogicalReplicationStream {
             retry_handler,
             last_health_check,
             shared_lsn_feedback,
+            consistent_point: None,
             exported_snapshot_name: None,
             identity: None,
             feedback_check_counter: 0,
@@ -579,8 +599,15 @@ impl LogicalReplicationStream {
             &self.config.slot_options,
         ) {
             Ok(result) => {
-                // Extract the exported snapshot name if available
                 // CREATE_REPLICATION_SLOT returns: slot_name(0), consistent_point(1), snapshot_name(2), output_plugin(3)
+                //
+                // The consistent point is the LSN the exported snapshot is taken
+                // at, and equals the slot's `confirmed_flush` — so it is both the
+                // LSN to stamp on snapshot rows and the position `start(None)`
+                // resumes from. A malformed value is not fatal: it only means the
+                // initial-snapshot helper is unavailable, not that replication is.
+                self.consistent_point = parse_consistent_point(&result);
+                // Extract the exported snapshot name if available
                 if let Some(snapshot_name) = result.get_value(0, 2) {
                     if !snapshot_name.is_empty() {
                         info!("Exported snapshot name: {}", snapshot_name);
@@ -1494,6 +1521,69 @@ impl LogicalReplicationStream {
         self.exported_snapshot_name.as_deref()
     }
 
+    /// Best-effort drop of the replication slot this stream created.
+    ///
+    /// Used by the initial-snapshot helper when an attempt fails part-way. A slot
+    /// created seconds ago retains no WAL worth keeping, and leaving it behind is
+    /// actively harmful: the next attempt would find it already present,
+    /// [`ensure_replication_slot`](Self::ensure_replication_slot) would swallow
+    /// the "already exists" error, no snapshot would be exported, and the caller
+    /// would silently stream with no baseline.
+    ///
+    /// Failure to drop is logged, not returned: this runs on an error path and
+    /// must not mask the error that got us here.
+    pub(crate) fn discard_replication_slot(&mut self) {
+        let slot_name = self.config.slot_name.clone();
+        match self.connection.drop_replication_slot(&slot_name, false) {
+            Ok(()) => {
+                info!("Dropped replication slot {slot_name} after a failed snapshot attempt");
+                self.slot_created = false;
+                self.exported_snapshot_name = None;
+                self.consistent_point = None;
+            }
+            Err(e) => {
+                warn!(
+                    "Could not drop replication slot {slot_name} after a failed snapshot                      attempt: {e}. Drop it manually, or the next snapshot attempt will                      find it present and silently proceed without a baseline."
+                );
+            }
+        }
+    }
+
+    /// The LSN the exported snapshot is consistent at.
+    ///
+    /// `None` when the slot was never created by this stream, or pre-existed (see
+    /// [`ensure_replication_slot`](Self::ensure_replication_slot), which treats
+    /// "already exists" as success).
+    ///
+    /// Crate-internal on purpose. Callers who need this value are holding a
+    /// [`Snapshot`](crate::snapshot::Snapshot), whose `consistent_point()` is not
+    /// an `Option` — and a caller holding the stream *directly* only gets here
+    /// down the `SnapshotOutcome::Unavailable` arm, where it is always `None`.
+    /// A public `Option` accessor would therefore be a trap: unwrappable exactly
+    /// when it is useless.
+    #[inline]
+    pub(crate) fn consistent_point(&self) -> Option<Lsn> {
+        self.consistent_point
+    }
+
+    /// The connection string this stream was built from.
+    #[inline]
+    pub(crate) fn conninfo(&self) -> &str {
+        self.retry_handler.connection_string()
+    }
+
+    /// The stream's configuration.
+    #[inline]
+    pub(crate) fn config(&self) -> &ReplicationStreamConfig {
+        &self.config
+    }
+
+    /// Server version number, e.g. 160001 for PG 16.1.
+    #[inline]
+    pub(crate) fn server_version(&self) -> i32 {
+        self.connection.server_version()
+    }
+
     /// Returns `true` if this stream's replication slot is configured as temporary.
     ///
     /// Temporary slots are automatically dropped when the replication connection
@@ -1755,6 +1845,30 @@ pub struct EventStream {
     >,
     /// Whether the stream has terminated (cancelled or permanent error).
     terminated: bool,
+}
+
+/// Extract the `consistent_point` from a `CREATE_REPLICATION_SLOT` result.
+///
+/// The command returns `slot_name(0), consistent_point(1), snapshot_name(2),
+/// output_plugin(3)`. Column 1 is the LSN the exported snapshot is taken at, and
+/// equals the slot's `confirmed_flush` — so it is both the LSN to stamp on
+/// snapshot rows and the position `start(None)` resumes from.
+///
+/// A missing or malformed value is **not** fatal: it only means the
+/// initial-snapshot helper is unavailable, not that replication is. Returning
+/// `None` lets `snapshot()` report `Unavailable` rather than failing a stream
+/// that would otherwise work.
+///
+/// Split out as a free function so it is testable without a live connection.
+pub(crate) fn parse_consistent_point(result: &crate::connection::PgResult) -> Option<Lsn> {
+    let raw = result.get_value(0, 1).filter(|v| !v.is_empty())?;
+    match crate::types::parse_lsn(&raw) {
+        Ok(lsn) => Some(Lsn::new(lsn)),
+        Err(e) => {
+            warn!("Ignoring unparsable consistent_point {raw:?}: {e}");
+            None
+        }
+    }
 }
 
 /// Crate-internal seam so the consume loop is unit-testable without a live
@@ -2177,7 +2291,7 @@ mod reached_stop_lsn_tests {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::column_value::{ColumnValue, RowData};
     use crate::protocol::TupleData;
@@ -4036,7 +4150,7 @@ mod tests {
 
     /// Helper to create a LogicalReplicationStream for testing without a DB connection.
     /// Only safe for testing methods that don't touch self.connection.
-    fn create_test_stream(config: ReplicationStreamConfig) -> LogicalReplicationStream {
+    pub(crate) fn create_test_stream(config: ReplicationStreamConfig) -> LogicalReplicationStream {
         use crate::lsn::SharedLsnFeedback;
         LogicalReplicationStream {
             connection: PgReplicationConnection::null_for_testing(),
@@ -4050,6 +4164,7 @@ mod tests {
             ),
             last_health_check: Instant::now(),
             shared_lsn_feedback: SharedLsnFeedback::new_shared(),
+            consistent_point: None,
             exported_snapshot_name: None,
             identity: None,
             feedback_check_counter: 0,
@@ -4069,6 +4184,81 @@ mod tests {
             .map(|v| v.map(|v| v.as_bytes().to_vec()))
             .collect()];
         r
+    }
+
+    /// `CREATE_REPLICATION_SLOT` returns slot_name(0), consistent_point(1),
+    /// snapshot_name(2), output_plugin(3). Reading the wrong column would stamp
+    /// every snapshot row with a bogus LSN, which `update_applied_lsn`'s
+    /// `fetch_max` would then make permanent.
+    #[cfg(feature = "rustls-tls")]
+    #[test]
+    fn parse_consistent_point_reads_column_one() {
+        let r = identify_system_result(
+            &[
+                "slot_name",
+                "consistent_point",
+                "snapshot_name",
+                "output_plugin",
+            ],
+            &[
+                Some("my_slot"),
+                Some("0/30001A0"),
+                Some("00000003-0000001B-1"),
+                Some("pgoutput"),
+            ],
+        );
+        assert_eq!(parse_consistent_point(&r), Some(Lsn::new(0x30001A0)));
+    }
+
+    /// A malformed or absent consistent point disables the snapshot helper; it
+    /// must not fail a replication stream that would otherwise work.
+    #[cfg(feature = "rustls-tls")]
+    #[test]
+    fn parse_consistent_point_tolerates_bad_input() {
+        let cols = &[
+            "slot_name",
+            "consistent_point",
+            "snapshot_name",
+            "output_plugin",
+        ];
+        for bad in [Some(""), Some("not-an-lsn"), Some("0/"), Some("/5"), None] {
+            let r = identify_system_result(cols, &[Some("s"), bad, Some("snap"), Some("pgoutput")]);
+            assert_eq!(
+                parse_consistent_point(&r),
+                None,
+                "a bad consistent_point ({bad:?}) must degrade to None, never a wrong LSN"
+            );
+        }
+    }
+
+    #[cfg(feature = "rustls-tls")]
+    #[test]
+    fn parse_consistent_point_on_an_empty_result() {
+        let mut r = crate::connection::PgResult::new();
+        r.columns = vec!["slot_name".to_string(), "consistent_point".to_string()];
+        assert_eq!(parse_consistent_point(&r), None);
+    }
+
+    /// The slot-discard path runs only on error, so it must never propagate a
+    /// failure of its own — doing so would mask the error that got us there.
+    #[cfg(feature = "rustls-tls")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn discard_replication_slot_is_best_effort() {
+        let mut stream = create_test_stream(create_test_config());
+        stream.slot_created = true;
+        stream.exported_snapshot_name = Some("snap".to_string());
+        stream.consistent_point = Some(Lsn::new(42));
+
+        // The null connection cannot execute DROP_REPLICATION_SLOT, so this
+        // exercises the failure arm.
+        stream.discard_replication_slot();
+
+        // State is deliberately left alone when the drop did not happen: claiming
+        // the slot is gone when it is not would be worse than leaving it.
+        assert!(
+            stream.slot_created,
+            "a failed drop must not pretend the slot was removed"
+        );
     }
 
     /// Pins the column order of `IDENTIFY_SYSTEM`: systemid is column 0 and

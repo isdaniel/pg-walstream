@@ -14,7 +14,7 @@ use tracing::{debug, info};
 
 use super::conninfo::ConnInfo;
 use super::startup::{self, Transport};
-use super::{copy, query, wire};
+use super::{copy, copy_out, query, wire};
 use super::{NativePgResult, NativeResultStatus};
 
 use crate::error::{ReplicationError, Result};
@@ -58,6 +58,15 @@ enum Command {
         data: Bytes,
         reply: oneshot::Sender<Result<()>>,
     },
+    /// Drain a `COPY ... TO STDOUT` stream, pushing each payload down `chunk_tx`.
+    ///
+    /// The terminal is explicit rather than a closed channel: `Ok(Some(bytes))`
+    /// is a payload, `Ok(None)` is a clean end with the `CommandComplete` /
+    /// `ReadyForQuery` epilogue already consumed, and `Err` is a failure. A
+    /// channel that closes with no terminal means the worker died.
+    CopyOutStream {
+        chunk_tx: mpsc::Sender<Result<Option<Bytes>>>,
+    },
     /// Best-effort graceful shutdown, then stop the worker loop.
     Close {
         in_copy_mode: bool,
@@ -97,6 +106,31 @@ impl Worker {
     async fn query_copy_in(&mut self, sql: &str, payload: &[u8]) -> Result<NativePgResult> {
         copy::clear_latched_terminal(&mut self.read_buf);
         query::simple_query_copy_in(&mut self.transport, &mut self.read_buf, sql, payload).await
+    }
+
+    /// Pump a `COPY ... TO STDOUT` stream into `chunk_tx` until it ends.
+    ///
+    /// Always sends exactly one terminal (`Ok(None)` or `Err`) unless the
+    /// receiver has already gone away, so the consumer can distinguish a clean
+    /// end from a dead worker.
+    async fn drain_copy_out(&mut self, chunk_tx: mpsc::Sender<Result<Option<Bytes>>>) {
+        loop {
+            let (message, stop) =
+                match copy_out::next_copy_out(&mut self.transport, &mut self.read_buf).await {
+                    Ok(copy_out::CopyOutItem::Data(payload)) => (Ok(Some(payload)), false),
+                    Ok(copy_out::CopyOutItem::Done) => (Ok(None), true),
+                    Err(e) => {
+                        // A failed COPY leaves the transport in an unknown state.
+                        self.alive.store(false, Ordering::Relaxed);
+                        (Err(e), true)
+                    }
+                };
+
+            // A dropped receiver means the consumer abandoned the snapshot.
+            if chunk_tx.send(message).await.is_err() || stop {
+                break;
+            }
+        }
     }
 
     /// Streaming push loop. Continuously reads CopyData batches and pushes them to `batch_tx`, while still servicing interleaved commands (feedback `PutCopyData`, `Close`) on `cmd_rx`. Returns `true` if a `Close` was  handled (the worker should stop), `false` if streaming ended for any other reason (cancel, read error, or the consumer dropped the receiver).
@@ -223,6 +257,18 @@ impl Worker {
             Some(Command::StreamCopy { batch_tx, .. }) => {
                 // Already streaming; reject a duplicate request rather than nest.
                 let _ = batch_tx.try_send(Err(ReplicationError::backend("already streaming")));
+                StreamCmd::Continue
+            }
+            Some(Command::CopyOutStream { chunk_tx }) => {
+                // A connection is either replication-streaming or running a COPY
+                // OUT, never both: the snapshot helper uses a second connection
+                // precisely because this one is pinned in COPY BOTH. Reaching
+                // here means a caller mixed them up, so fail loudly instead of
+                // interleaving two COPY sub-protocols on one transport.
+                let _ = chunk_tx.try_send(Err(ReplicationError::protocol(
+                    "cannot start a COPY OUT on a connection that is streaming replication"
+                        .to_string(),
+                )));
                 StreamCmd::Continue
             }
             None => StreamCmd::WorkerGone,
@@ -366,6 +412,9 @@ fn run_worker(
                 Command::PutCopyData { data, reply } => {
                     let _ = reply.send(worker.put_copy_data(&data).await);
                 }
+                Command::CopyOutStream { chunk_tx } => {
+                    worker.drain_copy_out(chunk_tx).await;
+                }
                 Command::Close {
                     in_copy_mode,
                     reply,
@@ -425,8 +474,24 @@ pub struct NativeConnection {
     server_ver: i32,
     /// Whether we are in COPY (replication) mode. Gates the streaming methods and tells the worker whether to send CopyDone on shutdown.
     in_copy_mode: bool,
+    /// Active `COPY ... TO STDOUT` stream, if any.
+    ///
+    /// Deliberately **not** `in_copy_mode`: that flag means *replication* COPY
+    /// BOTH, and it makes the worker send a client `CopyDone` on shutdown. In
+    /// COPY OUT the client must never send `CopyDone` — libpq documents the same
+    /// asymmetry, `PQputCopyEnd` being illegal in `PGRES_COPY_OUT` — so the two
+    /// modes cannot share a flag.
+    copy_out: Option<CopyOutState>,
     /// Liveness flag shared with the worker, which clears it on a transient read error.
     alive: Arc<AtomicBool>,
+}
+
+/// Per-stream state for an in-flight `COPY ... TO STDOUT`.
+#[derive(Debug, Default)]
+struct CopyOutState {
+    /// Threaded driver only: the worker's push channel, started lazily on the
+    /// first [`NativeConnection::copy_out_next`] call.
+    rx: Option<mpsc::Receiver<Result<Option<Bytes>>>>,
 }
 
 impl NativeConnection {
@@ -488,6 +553,7 @@ impl NativeConnection {
             },
             server_ver,
             in_copy_mode: false,
+            copy_out: None,
             alive,
         })
     }
@@ -529,6 +595,7 @@ impl NativeConnection {
                     },
                     server_ver,
                     in_copy_mode: false,
+                    copy_out: None,
                     alive,
                 })
             }
@@ -1070,6 +1137,132 @@ impl NativeConnection {
         Ok(result)
     }
 
+    /// Blocking, like every other command on this type ([`exec`](Self::exec),
+    /// `run_query`). Only the data loop ([`copy_out_next`](Self::copy_out_next))
+    /// is async, and that is the part that can run for minutes.
+    ///
+    /// On success the transport is parked at the first `CopyData` frame:
+    /// `simple_query` consumes the `CopyOutResponse` and stops *without* reading
+    /// `ReadyForQuery`.
+    pub(crate) fn copy_out_begin(&mut self, sql: &str) -> Result<()> {
+        if self.copy_out.is_some() {
+            return Err(ReplicationError::protocol(
+                "a COPY OUT stream is already in progress on this connection".to_string(),
+            ));
+        }
+
+        let result = self.exec(sql)?;
+        if result.status() != &NativeResultStatus::CopyOut {
+            return Err(ReplicationError::protocol(format!(
+                "{sql} did not enter COPY OUT mode (status {:?})",
+                result.status()
+            )));
+        }
+
+        self.copy_out = Some(CopyOutState::default());
+        Ok(())
+    }
+
+    /// The next `CopyData` payload, or `Ok(None)` once the stream has ended
+    /// cleanly and its epilogue has been consumed.
+    ///
+    /// After `Ok(None)` or any `Err` the stream is closed and a further call is
+    /// an error; a failure additionally marks the connection dead, since a COPY
+    /// interrupted mid-stream leaves the transport in an unknown state.
+    pub(crate) async fn copy_out_next(
+        &mut self,
+        cancellation_token: &CancellationToken,
+    ) -> Result<Option<Bytes>> {
+        if self.copy_out.is_none() {
+            return Err(ReplicationError::protocol(
+                "no COPY OUT stream is in progress on this connection".to_string(),
+            ));
+        }
+
+        let result = self.copy_out_next_inner(cancellation_token).await;
+
+        match &result {
+            // Clean end: release the stream, keep the connection usable.
+            Ok(None) => self.copy_out = None,
+            Ok(Some(_)) => {}
+            Err(e) => {
+                self.copy_out = None;
+                if !e.is_cancelled() {
+                    self.alive.store(false, Ordering::Relaxed);
+                }
+            }
+        }
+
+        result
+    }
+
+    async fn copy_out_next_inner(
+        &mut self,
+        cancellation_token: &CancellationToken,
+    ) -> Result<Option<Bytes>> {
+        match &mut self.driver {
+            // Inline: read directly on the caller's runtime, mirroring
+            // `get_copy_data_async`'s Inline arm.
+            Driver::Inline { worker, .. } => {
+                tokio::select! {
+                    biased;
+                    _ = cancellation_token.cancelled() => {
+                        Err(ReplicationError::Cancelled("COPY OUT cancelled".to_string()))
+                    }
+                    item = copy_out::next_copy_out(&mut worker.transport, &mut worker.read_buf) => {
+                        match item? {
+                            copy_out::CopyOutItem::Data(payload) => Ok(Some(payload)),
+                            copy_out::CopyOutItem::Done => Ok(None),
+                        }
+                    }
+                }
+            }
+            // Threaded: start the worker's drain loop lazily, then pull from it.
+            Driver::Threaded { cmd_tx, .. } => {
+                let state = self
+                    .copy_out
+                    .as_mut()
+                    .expect("presence checked by copy_out_next");
+
+                if state.rx.is_none() {
+                    let (chunk_tx, rx) = mpsc::channel(BATCH_CHANNEL_CAP);
+                    if cmd_tx.send(Command::CopyOutStream { chunk_tx }).is_err() {
+                        return Err(Self::worker_gone());
+                    }
+                    state.rx = Some(rx);
+                }
+
+                let rx = state.rx.as_mut().expect("just populated");
+                tokio::select! {
+                    biased;
+                    _ = cancellation_token.cancelled() => {
+                        Err(ReplicationError::Cancelled("COPY OUT cancelled".to_string()))
+                    }
+                    received = rx.recv() => match received {
+                        Some(item) => item,
+                        // Closed with no terminal: the worker died.
+                        None => Err(Self::worker_gone()),
+                    },
+                }
+            }
+        }
+    }
+
+    /// Abandon an in-flight `COPY ... TO STDOUT`.
+    ///
+    /// There is no protocol-level early exit from a COPY OUT: the client sends
+    /// nothing, and `CopyDone` is the server's to send. So the only ways to stop
+    /// early are to read the whole relation or to hang up. This marks the
+    /// connection dead; the caller is expected to drop it, which sends
+    /// `Terminate` and lets the server abort the COPY and its transaction.
+    ///
+    /// A no-op when no stream is in progress.
+    pub(crate) fn copy_out_abort(&mut self) {
+        if self.copy_out.take().is_some() {
+            self.mark_dead();
+        }
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────
 
     #[inline]
@@ -1081,7 +1274,6 @@ impl NativeConnection {
         }
         Ok(())
     }
-
     /// Gracefully close the replication connection.
     ///
     /// Sends a `Close` command so the worker does a best-effort shutdown
@@ -1205,6 +1397,7 @@ impl NativeConnection {
             },
             server_ver,
             in_copy_mode: false,
+            copy_out: None,
             alive,
         }
     }
@@ -1241,6 +1434,7 @@ impl NativeConnection {
             },
             server_ver,
             in_copy_mode: false,
+            copy_out: None,
             alive,
         }
     }
@@ -1660,6 +1854,7 @@ mod tests {
             },
             server_ver: 160000,
             in_copy_mode: true, // skip the replication-mode gate
+            copy_out: None,
             alive: Arc::new(AtomicBool::new(true)),
         };
 
@@ -1697,6 +1892,216 @@ mod tests {
             alive: Arc::new(AtomicBool::new(true)),
         };
         (worker, server)
+    }
+
+    // ── COPY OUT ─────────────────────────────────────────────────────────
+
+    fn tagged_frame(tag: u8, payload: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(5 + payload.len());
+        frame.push(tag);
+        frame.extend_from_slice(&((4 + payload.len()) as i32).to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    /// A complete, successful COPY OUT wire script carrying `rows`.
+    fn copy_out_script(rows: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for row in rows {
+            out.extend_from_slice(&copy_data_frame(row));
+        }
+        out.extend_from_slice(&tagged_frame(b'c', b""));
+        out.extend_from_slice(&tagged_frame(b'C', b"COPY 1\0"));
+        out.extend_from_slice(&tagged_frame(b'Z', b"I"));
+        out
+    }
+
+    /// An inline-driver connection over a loopback socket, already marked as
+    /// having a COPY OUT in flight (i.e. as if `copy_out_begin` had succeeded).
+    async fn inline_conn_in_copy_out() -> (NativeConnection, tokio::net::TcpStream) {
+        let (worker, server) = worker_with_loopback().await;
+        let conn = NativeConnection {
+            driver: Driver::Inline {
+                worker,
+                pending: VecDeque::new(),
+                handle: tokio::runtime::Handle::current(),
+            },
+            server_ver: 160000,
+            in_copy_mode: false,
+            copy_out: Some(CopyOutState::default()),
+            alive: Arc::new(AtomicBool::new(true)),
+        };
+        (conn, server)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn copy_out_next_yields_rows_then_none() {
+        use tokio::io::AsyncWriteExt;
+        let (mut conn, mut server) = inline_conn_in_copy_out().await;
+        server
+            .write_all(&copy_out_script(&[b"1\tAlice\n", b"2\tBob\n"]))
+            .await
+            .unwrap();
+
+        let token = CancellationToken::new();
+        let first = conn.copy_out_next(&token).await.unwrap().unwrap();
+        assert_eq!(&first[..], b"1\tAlice\n");
+        let second = conn.copy_out_next(&token).await.unwrap().unwrap();
+        assert_eq!(&second[..], b"2\tBob\n");
+        assert!(conn.copy_out_next(&token).await.unwrap().is_none());
+
+        // A clean end releases the stream but leaves the connection usable.
+        assert!(conn.is_alive());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn copy_out_next_after_clean_end_is_an_error() {
+        use tokio::io::AsyncWriteExt;
+        let (mut conn, mut server) = inline_conn_in_copy_out().await;
+        server.write_all(&copy_out_script(&[])).await.unwrap();
+
+        let token = CancellationToken::new();
+        assert!(conn.copy_out_next(&token).await.unwrap().is_none());
+
+        let err = conn.copy_out_next(&token).await.unwrap_err();
+        assert!(format!("{err}").contains("no COPY OUT stream"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn copy_out_next_without_begin_errors() {
+        let mut conn = NativeConnection::null_for_testing_inline();
+        let err = conn
+            .copy_out_next(&CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("no COPY OUT stream"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn copy_out_error_marks_connection_dead() {
+        use tokio::io::AsyncWriteExt;
+        let (mut conn, mut server) = inline_conn_in_copy_out().await;
+
+        let mut script = tagged_frame(b'E', b"C42501\0Mpermission denied\0\0");
+        script.extend_from_slice(&tagged_frame(b'Z', b"I"));
+        server.write_all(&script).await.unwrap();
+
+        let err = conn
+            .copy_out_next(&CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("42501"), "{err}");
+        assert!(
+            !conn.is_alive(),
+            "a failed COPY must mark the connection dead"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn copy_out_cancellation_returns_cancelled_and_keeps_connection_alive() {
+        let (mut conn, _server) = inline_conn_in_copy_out().await;
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let err = conn.copy_out_next(&token).await.unwrap_err();
+        assert!(err.is_cancelled(), "{err:?}");
+        // Cancellation is the caller's choice, not a transport failure.
+        assert!(conn.is_alive());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn copy_out_begin_rejects_a_second_stream() {
+        let (mut conn, _server) = inline_conn_in_copy_out().await;
+        let err = conn.copy_out_begin("COPY t TO STDOUT").unwrap_err();
+        assert!(format!("{err}").contains("already in progress"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn copy_out_abort_marks_dead_and_clears_the_stream() {
+        let (mut conn, _server) = inline_conn_in_copy_out().await;
+        assert!(conn.is_alive());
+
+        conn.copy_out_abort();
+        assert!(
+            !conn.is_alive(),
+            "abort must hang up: COPY OUT has no early exit"
+        );
+
+        // Idempotent: a second abort on a connection with no stream is a no-op.
+        conn.copy_out_abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worker_drain_copy_out_pushes_frames_then_terminal() {
+        use tokio::io::AsyncWriteExt;
+        let (mut worker, mut server) = worker_with_loopback().await;
+        server
+            .write_all(&copy_out_script(&[b"a\n", b"b\n"]))
+            .await
+            .unwrap();
+
+        let (chunk_tx, mut rx) = mpsc::channel(BATCH_CHANNEL_CAP);
+        worker.drain_copy_out(chunk_tx).await;
+
+        assert_eq!(&rx.recv().await.unwrap().unwrap().unwrap()[..], b"a\n");
+        assert_eq!(&rx.recv().await.unwrap().unwrap().unwrap()[..], b"b\n");
+        assert!(
+            rx.recv().await.unwrap().unwrap().is_none(),
+            "clean end must be an explicit Ok(None) terminal"
+        );
+        assert!(
+            rx.recv().await.is_none(),
+            "channel closes after the terminal"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worker_drain_copy_out_forwards_error_terminal() {
+        use tokio::io::AsyncWriteExt;
+        let (mut worker, mut server) = worker_with_loopback().await;
+
+        let mut script = tagged_frame(b'E', b"C57P01\0Mshutting down\0\0");
+        script.extend_from_slice(&tagged_frame(b'Z', b"I"));
+        server.write_all(&script).await.unwrap();
+
+        let (chunk_tx, mut rx) = mpsc::channel(BATCH_CHANNEL_CAP);
+        worker.drain_copy_out(chunk_tx).await;
+
+        let err = rx.recv().await.unwrap().unwrap_err();
+        assert!(err.is_transient(), "{err:?}");
+        assert!(!worker.alive.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worker_drain_copy_out_stops_when_receiver_dropped() {
+        use tokio::io::AsyncWriteExt;
+        let (mut worker, mut server) = worker_with_loopback().await;
+        server
+            .write_all(&copy_out_script(&[b"row\n"]))
+            .await
+            .unwrap();
+
+        let (chunk_tx, rx) = mpsc::channel(BATCH_CHANNEL_CAP);
+        drop(rx);
+
+        // Must return rather than spin forever against a dead receiver.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            worker.drain_copy_out(chunk_tx),
+        )
+        .await
+        .expect("drain_copy_out must exit when the consumer goes away");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn threaded_copy_out_next_reports_dead_worker() {
+        // `null_for_testing` has a live worker thread but a dropped peer, so the
+        // lazily-started drain loop terminates and closes the channel.
+        let mut conn = NativeConnection::null_for_testing();
+        conn.copy_out = Some(CopyOutState::default());
+
+        let result = conn.copy_out_next(&CancellationToken::new()).await;
+        assert!(result.is_err(), "a dead peer must surface as an error");
     }
 
     /// F4: a full batch channel must not swallow the terminal error.
