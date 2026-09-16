@@ -17,9 +17,21 @@ cargo test --lib --features derive                       # + derive-macro layer
 cargo test --lib --no-default-features --features libpq
 cargo bench --bench wal_pipeline                         # parsing pipeline benches
 cargo fmt --all -- --check                               # format check
-cargo clippy --all-targets                               # lint
-make before-git-push                                     # check+build+fmt+audit+test+doc-check
+
+# Lint — CI runs all three; `--all-targets` alone does NOT match it.
+cargo clippy --workspace --all-targets --features derive -- -D warnings
+cargo clippy --no-default-features --features libpq --all-targets -- -D warnings
+cargo clippy --no-default-features --lib -- -D warnings          # no_std
+
+# Coverage — `--features derive` is required or your number won't match CI.
+cargo llvm-cov --lib --features derive --summary-only
 ```
+
+`make before-git-push` does **not** match CI: its clippy line is commented out
+and it has no coverage or bench target. Use the commands above.
+
+Check results by **exit code**, not by grepping for `error` — cargo indents
+diagnostics, so `grep '^error'` silently reports success on a failing run.
 
 Integration tests (`integration-tests/`) are `#[ignore]` and need a live
 PostgreSQL 15+ with `wal_level = logical`; they only run in CI (`--ignored`).
@@ -38,9 +50,41 @@ src/
 ├── column_value.rs  # ColumnValue / RowData
 ├── types.rs         # EventType/ChangeEvent, Lsn, wire encode/decode
 ├── lsn.rs           # thread-safe SharedLsnFeedback (atomic CAS)
+├── copy_text.rs     # COPY TEXT decoder (crate-private; snapshot only)
+├── snapshot/        # managed initial snapshot — see below
+│   ├── plan.rs      #   catalog query, COPY SQL, reader conninfo (all pure)
+│   ├── rows.rs      #   SnapshotRows: the one implementation
+│   └── events.rs    #   SnapshotEvents: ChangeEvent adapter + EventSource impl
 └── connection/      # native/ rustls-tls backend (default) + libpq FFI backend (opt-in)
+    └── native/copy_out.rs   # CopyOut state machine (NOT copy.rs — see below)
 macros/              # #[derive(WalTable)] (opt-in `derive` feature)
 ```
+
+## Initial snapshot
+
+`LogicalReplicationStream::snapshot()` copies the published tables through the
+slot's exported snapshot, then hands off to the stream. Three invariants an
+agent must not "simplify" away:
+
+- **The stream is moved into the handle.** Every replication command runs
+  `SnapBuildClearExportedSnapshot` server-side, so `start()` mid-snapshot would
+  destroy the snapshot being read. Taking `self` by value makes that
+  unrepresentable.
+- **Failure consumes the handle.** The exported snapshot is `REPEATABLE READ`;
+  resuming against an expired one silently mixes two points in time. `run()`
+  returns the stream only on `Ok`; the pull API latches a poison flag.
+- **COPY TEXT, not BINARY.** `ColumnValue::Binary` is rejected by every scalar
+  path in `deserializer.rs`. Only TEXT yields bytes identical to pgoutput's, which
+  is what lets one handler serve both phases.
+
+`connection/native/copy.rs` is **not** reusable for this: it reports `CopyDone`
+as `TransientConnection` (for a COPY that means *success*) and its catch-all arm
+discards the trailing `CommandComplete`/`ReadyForQuery`, desyncing the
+connection. Hence the separate `copy_out.rs`.
+
+Snapshot events are plain `ChangeEvent::insert`s stamped with the slot's
+consistent point; nothing on `ChangeEvent` marks them. Which phase you are in is
+told by the call site, because the type-state already forces the phases apart.
 
 ## Hot Path
 
@@ -56,7 +100,8 @@ Critical path: `get_copy_data_async` → `process_wal_message` →
   zero-copy variant was benchmarked against Azure PG and reverted — no measurable
   throughput/CPU win outside noise; see git history.)
 - `SmallVec<[ColumnData; 16]>` avoids heap alloc for ≤16 columns.
-- Identity hasher for the OID-keyed RelationMap (no SipHash).
+- `RelationMap` is a `BTreeMap<Oid, RelationInfo>` — small, cache-friendly, and
+  hit once per relation, not once per row.
 - Cache-padded atomics in `SharedLsnFeedback`; `update_applied_lsn` folds the
   implicit-flush bump into one `fetch_max` (with a Relaxed CAS seed load).
 - `WalRouter.default` is `Option<Handler>`: with no `on_default`, unhandled events
@@ -79,11 +124,37 @@ Critical path: `get_copy_data_async` → `process_wal_message` →
 
 ## Public API stability
 
-Changing public types (e.g. `EventType` fields, `ChangeEvent` accessors) or the
-binary event wire format (`ChangeEvent::encode`/`decode`) is a breaking change —
-bump the minor version (0.x) and add a README "Upgrading" note.
+`EventType`, `ChangeEvent`, `ReplicationError` and `ReplicationStreamConfig` all
+have public fields and **no `#[non_exhaustive]`**, so adding a field or a variant
+is source-breaking for downstream struct literals and exhaustive matches. Prefer
+an approach that avoids it; when unavoidable, bump the minor version (0.x) and add
+a README "Upgrading" note.
+
+`ChangeEvent::encode`/`decode` are deprecated since 0.9.0 in favour of a binary
+serde codec; do not extend them.
+
+## Benchmarks and the perf gate
+
+CodSpeed runs on every PR in `simulation` mode, building with
+`cargo codspeed build --no-default-features --features std`. Under that cfg
+`lib.rs` excludes `stream`, `router`, `connection`, `retry`, `snapshot` and
+`copy_text` entirely — only the parser and deserializer are benchmarked.
+
+**Never add a `[profile]` section to `Cargo.toml`.** Pinning
+`[profile.bench] codegen-units = 1` previously slowed `parse_*` by up to 130% and
+read as a CodSpeed regression. If a `parse_*` regression appears, check
+`git diff Cargo.toml` before investigating the parser.
 
 ## CI Requirements
 
-`cargo fmt` clean · `cargo clippy` clean · `cargo test --lib` passes · coverage
-≥ 90% · `make before-git-push` green.
+`cargo fmt` clean · all three clippy configurations clean · `cargo test --lib`
+passes on default, `derive` and `libpq` · coverage ≥ 90% total lines
+(`cargo llvm-cov --lib --features derive`) · `cargo doc` warning-free.
+
+`src/connection/libpq.rs` is **not compiled** during the coverage run
+(`connection/mod.rs` gates it on `libpq` *without* `rustls-tls`), so code added
+there is invisible to the gate — it still has to pass the libpq clippy run and be
+covered by integration tests.
+
+A new file under `integration-tests/` needs a matching `[[test]]` stanza in
+`Cargo.toml`; CI enumerates the directory and fails without it.

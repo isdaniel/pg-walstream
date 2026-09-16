@@ -620,18 +620,19 @@ pub fn build_base_backup_sql(options: &BaseBackupOptions) -> Result<String> {
     Ok(format!("BASE_BACKUP{}", build_sql_options(&opts)))
 }
 
+#[cfg(any(feature = "libpq", feature = "rustls-tls"))]
+pub(crate) const PG15: i32 = 150000;
+/// PostgreSQL 17.0 on the `server_version` scale. See [`PG15`].
+#[cfg(any(feature = "libpq", feature = "rustls-tls"))]
+pub(crate) const PG17: i32 = 170000;
+/// PostgreSQL 18.0 on the `server_version` scale. See [`PG15`].
+#[cfg(any(feature = "libpq", feature = "rustls-tls"))]
+pub(crate) const PG18: i32 = 180000;
+
 // The builders above are pure and hold no server-version state by design. The preflight below is the separate, equally-pure gate a *connection* applies (with  its known `server_version()`) before issuing a version-gated command, so an unsupported option fails with an actionable client-side error instead of an opaque server-side `syntax error`. Only the `libpq` / `rustls-tls` backends call these, so the whole group lives in a feature-gated module: the parser-only / no_std (`--no-default-features`) build compiles it out entirely — no callers, no `dead_code`, no per-item `allow`.
 #[cfg(any(feature = "libpq", feature = "rustls-tls"))]
 mod version_preflight {
     use super::*;
-
-    /// PostgreSQL 15.0 on the `server_version` (`PQserverVersion`) scale
-    /// (major * 10000 + minor, e.g. 14.23 → 140023). `server_version == 0` (unknown) passes.
-    const PG15: i32 = 150000;
-    /// PostgreSQL 17.0 on the `server_version` scale.
-    const PG17: i32 = 170000;
-    /// PostgreSQL 18.0 on the `server_version` scale.
-    const PG18: i32 = 180000;
 
     /// Format a `PQserverVersion`-scale integer as `major.minor` for error messages.
     fn format_server_version(v: i32) -> String {

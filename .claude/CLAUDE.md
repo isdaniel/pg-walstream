@@ -21,12 +21,19 @@ cargo bench --bench wal_pipeline
 # Format check
 cargo fmt --all -- --check
 
-# Lint
-cargo clippy --all-targets
+# Lint — CI runs all three; `--all-targets` alone does NOT match it
+cargo clippy --workspace --all-targets --features derive -- -D warnings
+cargo clippy --no-default-features --features libpq --all-targets -- -D warnings
+cargo clippy --no-default-features --lib -- -D warnings          # no_std
 
 # Coverage (requires cargo-llvm-cov)
-cargo llvm-cov --lib --lcov --output-path lcov.info
+# `--features derive` is required, or the number won't match CI's gate.
+cargo llvm-cov --lib --features derive --summary-only
+cargo llvm-cov --lib --features derive --lcov --output-path lcov.info
 ```
+
+Check results by **exit code**, not by grepping for `error`: cargo indents
+diagnostics, so `grep '^error'` silently reports success on a failing run.
 
 ## Architecture
 
@@ -44,12 +51,15 @@ src/
 ├── types.rs         # Type aliases, CachePadded, ChangeEvent, Lsn
 ├── error.rs         # ReplicationError enum
 ├── lsn.rs           # Thread-safe SharedLsnFeedback (atomic CAS)
+├── copy_text.rs     # COPY TEXT decoder (crate-private, snapshot only)
+├── snapshot/        # Managed initial snapshot (plan.rs / rows.rs / events.rs)
 ├── sql_builder.rs   # SQL statement builders (CREATE SLOT, etc.)
 ├── retry.rs         # Exponential backoff retry logic
 └── connection/      # PostgreSQL connection backends
     ├── mod.rs
     ├── libpq.rs     # libpq FFI backend (opt-in)
     └── native/      # Pure-Rust rustls-tls backend (default)
+        └── copy_out.rs  # CopyOut state machine (separate from copy.rs)
 
 macros/              # pg-walstream-macros proc-macro crate (opt-in `derive` feature)
 └── src/lib.rs       #   #[derive(WalTable)] → impl WalTable { const TABLE }
@@ -85,7 +95,7 @@ Key optimizations in place:
   cache-hot memory, bounded peak RSS). A `from_owner` zero-copy variant was
   benchmarked and reverted — no measurable win outside noise.
 - `SmallVec<[ColumnData; 16]>` avoids heap alloc for ≤16 columns
-- Identity hasher for OID-keyed RelationMap (no SipHash)
+- `RelationMap` is a `BTreeMap<Oid, RelationInfo>` — hit once per relation, not per row
 - Cache-padded atomics in SharedLsnFeedback (no false sharing); `update_applied_lsn`
   folds the implicit-flush bump into a single `fetch_max` (Relaxed CAS seed)
 - SIMD-accelerated `memchr` for null-terminated string scanning
@@ -103,13 +113,43 @@ Key optimizations in place:
 - No `debug!` logging in DML hot-path parsers (BEGIN/INSERT/UPDATE/DELETE/COMMIT)
 - `BufferWriter` write methods are infallible (return `()`, not `Result`)
 
+## Initial Snapshot
+
+`LogicalReplicationStream::snapshot()` copies published tables through the slot's
+exported snapshot, then hands off to the stream. Three invariants:
+
+- **The stream is moved into the handle** — every replication command clears the
+  exported snapshot server-side, so `start()` mid-snapshot must be unrepresentable.
+- **Failure consumes the handle** — the snapshot is `REPEATABLE READ`; resuming
+  against an expired one silently mixes two points in time.
+- **COPY TEXT, not BINARY** — `ColumnValue::Binary` is rejected by every scalar
+  path in `deserializer.rs`; only TEXT matches pgoutput byte-for-byte.
+
+`connection/native/copy.rs` cannot be reused: it treats `CopyDone` (a COPY's
+*success* signal) as `TransientConnection` and discards the trailing
+`CommandComplete`/`ReadyForQuery`, desyncing the connection. Hence `copy_out.rs`.
+
+## Benchmarks
+
+CodSpeed builds with `--no-default-features --features std`, under which
+`lib.rs` excludes `stream`, `router`, `connection`, `retry`, `snapshot` and
+`copy_text` — only the parser and deserializer are benchmarked.
+
+**Never add a `[profile]` section to `Cargo.toml`.** Pinning
+`[profile.bench] codegen-units = 1` previously slowed `parse_*` by up to 130% and
+read as a CodSpeed regression.
+
 ## CI Requirements
 
 - `cargo fmt` clean
-- `cargo clippy` clean
-- All unit tests pass (`cargo test --lib`)
-- Code coverage ≥ 90% (checked in CI)
+- All three clippy configurations clean (default+derive, libpq, no_std)
+- Unit tests pass on default, `derive` and `libpq`
+- Code coverage ≥ 90% total lines, via `cargo llvm-cov --lib --features derive`
+- `cargo doc --no-deps --all-features` warning-free
 - Integration tests require PostgreSQL 15+ with logical replication enabled
+- `src/connection/libpq.rs` is not compiled during the coverage run, so code
+  there is invisible to the gate — cover it with integration tests
+- A new `integration-tests/*.rs` file needs a `[[test]]` stanza in `Cargo.toml`
 
 ## Integration Tests
 

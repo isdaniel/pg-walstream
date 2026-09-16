@@ -7,6 +7,7 @@ pub(crate) mod auth;
 pub(crate) mod connection;
 pub(crate) mod conninfo;
 pub(crate) mod copy;
+pub(crate) mod copy_out;
 pub(crate) mod error;
 pub(crate) mod md5;
 pub(crate) mod query;

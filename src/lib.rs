@@ -159,9 +159,17 @@ pub mod lsn;
 pub mod pgoutput_encode;
 pub mod protocol;
 
+/// COPY TEXT decoding for the initial-snapshot helper. Crate-internal: the
+/// snapshot API is the supported surface, not the decoder underneath it.
+#[cfg(any(feature = "libpq", feature = "rustls-tls"))]
+pub(crate) mod copy_text;
+
 // High-level stream management
 #[cfg(any(feature = "libpq", feature = "rustls-tls"))]
 pub mod stream;
+
+#[cfg(any(feature = "libpq", feature = "rustls-tls"))]
+pub mod snapshot;
 
 #[cfg(any(feature = "libpq", feature = "rustls-tls"))]
 pub mod router;
