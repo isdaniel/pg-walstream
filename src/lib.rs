@@ -244,6 +244,12 @@ pub use stream::{
 #[cfg(any(feature = "libpq", feature = "rustls-tls"))]
 pub use router::WalRouter;
 
+// Re-export snapshot types, so the managed initial snapshot is reachable from the crate root like every other layer.
+#[cfg(any(feature = "libpq", feature = "rustls-tls"))]
+pub use snapshot::{
+    Snapshot, SnapshotEvents, SnapshotOutcome, SnapshotRow, SnapshotRows, SnapshotTable,
+};
+
 #[cfg(feature = "derive")]
 pub use pg_walstream_macros::{wal_table, WalTable};
 

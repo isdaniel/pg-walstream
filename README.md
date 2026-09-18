@@ -119,7 +119,7 @@ The [`examples/`](examples/) directory contains runnable examples demonstrating 
 | Example | Description |
 |---------|-------------|
 | [`basic-streaming`](examples/basic-streaming) | High-level `futures::Stream` API with stream combinators (`filter`, `take_while`) |
-| [`initial-snapshot`](examples/initial-snapshot) | Copy existing rows, then stream changes with no gap and no duplicate — `with_initial_snapshot(true)` |
+| [`initial-snapshot`](examples/initial-snapshot) | Copy existing rows, then stream changes with no gap and no duplicate — `stream.snapshot()` |
 | [`polling`](examples/polling) | Manual polling loop using `next_event()` for custom integration scenarios |
 | [`safe-transaction-consumer`](examples/safe-transaction-consumer) | Production-grade transaction-aware CDC consumer with ordered commits and safe LSN feedback |
 | [`rate-limited-streaming`](examples/rate-limited-streaming) | Rate-limited consumption using `tokio_stream::StreamExt::throttle` |
@@ -235,12 +235,13 @@ feedback.update_applied_lsn(commit_lsn);
 Streaming alone tells you what *changed*, never what was already there. Enable a managed initial snapshot and the library copies the published tables through the replication slot's exported snapshot, then hands off to the stream:
 
 ```rust
-use pg_walstream::snapshot::SnapshotOutcome;
+use pg_walstream::SnapshotOutcome;
+use std::sync::Arc;
 
-let config = ReplicationStreamConfig::builder("my_slot", "my_publication")
-    .with_initial_snapshot(true);
+let config = ReplicationStreamConfig::builder("my_slot", "my_publication");
 
 let stream = LogicalReplicationStream::new(conn_str, config).await?;
+let sink = Arc::new(sink);
 
 let mut stream = match stream.snapshot().await? {
     // The slot already existed, so there is nothing to copy — the normal
@@ -251,7 +252,10 @@ let mut stream = match stream.snapshot().await? {
         println!("copying {} table(s) at {}", snapshot.tables().len(), snapshot.consistent_point());
         snapshot
             .events()
-            .run(|event| async move { sink.apply(event).await })
+            .run(|event| {
+                let sink = Arc::clone(&sink);
+                async move { sink.apply(event).await }
+            })
             .await?
     }
 };
@@ -259,6 +263,8 @@ let mut stream = match stream.snapshot().await? {
 // Resumes exactly at the snapshot's consistent point.
 stream.start(None).await?;
 ```
+
+`snapshot()` sets `SNAPSHOT 'export'` on the slot itself — there is no flag to remember and no builder-ordering rule to get wrong.
 
 Snapshot rows arrive as ordinary `ChangeEvent::Insert`s carrying the slot's
 consistent point as their LSN, so an existing `WalRouter` works across both
@@ -281,10 +287,12 @@ stream.start(None).await?;
 router.run(&mut stream.into_stream(token)).await?;  // live phase, same handlers
 ```
 
-> Use `snapshot.rows()` instead of `.events()` for raw `RowData` without the `ChangeEvent` wrapper, and `snapshot.retain_tables(..)` to copy a subset of a large publication.
+> Use `snapshot.rows()` instead of `.events()` to iterate `SnapshotRow`s (`.data`, `.relation`, `.lsn`) without the `ChangeEvent` wrapper. To copy only part of a large publication, bind the snapshot as `mut` and call `snapshot.retain_tables(..)` before `.events()`/`.rows()`.
 
 A complete, runnable version of the above — including a row inserted *during* the handoff window to prove it arrives exactly once — is in [`examples/initial-snapshot`](examples/initial-snapshot).
-> **A failed snapshot cannot be resumed.** The exported snapshot is `REPEATABLE READ`; continuing against an expired one would silently mix rows from two points in time. You own the retry policy; the library owns the retry *start point*, which is always the beginning.
+> **A failed snapshot cannot be resumed.** The exported snapshot is `REPEATABLE READ`; continuing against an expired one would silently mix rows from two points in time. You own the retry policy; the library owns the retry *start point*, which is always the beginning. A failed or dropped snapshot handle makes a best-effort attempt to drop its slot — a failure to drop is logged, not returned — so a retry normally gets a fresh export instead of finding the slot present and silently proceeding with no baseline.
+
+> **Holding a snapshot handle blocks `VACUUM`.** The handle keeps a `REPEATABLE READ` transaction open, pinning the database's `xmin` — no dead tuple newer than the snapshot can be reclaimed, across the whole database, for as long as you hold it. Copy promptly.
 
 ## PostgreSQL Setup
 

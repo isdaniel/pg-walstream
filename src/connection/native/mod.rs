@@ -3,17 +3,18 @@
 //! Drop-in replacement for the libpq backend. Exposes the same public API
 //! so that `stream.rs` works unchanged.
 
-pub(crate) mod auth;
-pub(crate) mod connection;
+mod auth;
+mod connection;
 pub(crate) mod conninfo;
-pub(crate) mod copy;
-pub(crate) mod copy_out;
-pub(crate) mod error;
-pub(crate) mod md5;
-pub(crate) mod query;
-pub(crate) mod result;
-pub(crate) mod startup;
-pub(crate) mod wire;
+mod copy;
+mod copy_out;
+mod error;
+mod md5;
+mod query;
+mod result;
+mod startup;
+mod wire;
 
 pub use connection::NativeConnection;
-pub use result::{NativePgResult, NativeResultStatus};
+pub use result::NativePgResult;
+pub(crate) use result::NativeResultStatus;

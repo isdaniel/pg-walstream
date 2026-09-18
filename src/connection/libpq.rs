@@ -67,6 +67,79 @@ enum DrainResult {
     WouldBlock,
 }
 
+/// State of an in-flight COPY, in either direction.
+///
+/// Lives inside [`CopyMode`] rather than on the connection, so these fields only
+/// exist while a COPY actually does. `read_buf` deliberately stays on the
+/// connection: it is a reusable scratch buffer allocated once at connect and
+/// reused for the connection's life, not per-COPY state.
+#[derive(Debug)]
+struct CopyStream {
+    /// Pre-drained messages waiting to be consumed (drain-loop optimization).
+    pending: VecDeque<Bytes>,
+    /// `None` while streaming; `Some` once the stream has ended, and sticky
+    /// thereafter. See [`CopyEnd`].
+    end: Option<CopyEnd>,
+}
+
+/// Preallocated to [`MAX_DRAIN_BATCH`], which is what one `drain_buffered_messages`
+/// pass can queue.
+///
+/// This was the allocation `PgReplicationConnection::connect` used to make once,
+/// before the queue moved in here; a derived `Default` would start at capacity 0
+/// and make the WAL hot path grow the deque a dozen times during warmup. One
+/// allocation per COPY, amortized to nothing, and the peak is unchanged.
+impl Default for CopyStream {
+    fn default() -> Self {
+        Self {
+            pending: VecDeque::with_capacity(MAX_DRAIN_BATCH),
+            end: None,
+        }
+    }
+}
+
+/// Which COPY sub-protocol the connection is currently inside.
+///
+/// Replaces a pair of booleans (`is_replication_conn` / `copy_out_active`) that
+/// between them could represent a fourth, invalid state — both true at once —
+/// with nothing in the code checking they stayed mutually exclusive.
+///
+/// The distinction is not cosmetic: in `Replication` (CopyBoth) the client may
+/// send `CopyDone`, and the shutdown path does. In `Out` it must never, because
+/// `PQputCopyEnd` returns -1 in `PGRES_COPY_OUT`. Making the two modes separate
+/// variants is what stops a future edit from reusing the wrong one.
+#[derive(Debug, Default)]
+enum CopyMode {
+    /// No COPY in progress; the connection accepts ordinary commands.
+    #[default]
+    Idle,
+    /// `START_REPLICATION` / `BASE_BACKUP` — CopyBoth, bidirectional.
+    Replication(CopyStream),
+    /// `COPY ... TO STDOUT` — CopyOut, server-to-client only.
+    Out(CopyStream),
+}
+
+impl CopyMode {
+    /// The in-flight stream, whichever direction it runs in.
+    #[inline]
+    fn stream_mut(&mut self) -> Option<&mut CopyStream> {
+        match self {
+            CopyMode::Idle => None,
+            CopyMode::Replication(s) | CopyMode::Out(s) => Some(s),
+        }
+    }
+
+    #[inline]
+    fn is_replication(&self) -> bool {
+        matches!(self, CopyMode::Replication(_))
+    }
+
+    #[inline]
+    fn is_out(&self) -> bool {
+        matches!(self, CopyMode::Out(_))
+    }
+}
+
 /// How the COPY stream ended, latched on the connection.
 ///
 /// `PQgetCopyData` reports the end of the stream only once, and it can do so in
@@ -83,6 +156,13 @@ enum CopyEnd {
 }
 
 impl CopyEnd {
+    /// Both COPY sub-protocols share this wording, so a snapshot
+    /// `COPY ... TO STDOUT` that fails mid-stream is reported as "replication
+    /// stream terminated by server" although no replication is involved — the
+    /// SQLSTATE is right, the prose is not. The native backend words the same
+    /// server error "server error during COPY OUT", so the message text is
+    /// backend-dependent even where the classification is not; match on the
+    /// error, never on its text.
     fn to_error(&self) -> ReplicationError {
         match self {
             CopyEnd::Done => ReplicationError::transient_connection(
@@ -151,23 +231,16 @@ const COPY_IN_CHUNK: usize = 64 * 1024;
 /// ```
 pub struct PgReplicationConnection {
     conn: *mut PGconn,
-    is_replication_conn: bool,
     async_fd: Option<AsyncFd<RawFd>>,
-    /// Pre-drained messages waiting to be consumed (drain-loop optimization).
-    pending_messages: VecDeque<Bytes>,
     /// Reusable buffer for copying data from libpq (avoids per-message heap alloc).
+    ///
+    /// Connection-scoped, not COPY-scoped: allocated once at connect and reused
+    /// for the connection's life, which is why it is not part of [`CopyStream`].
     read_buf: BytesMut,
-    /// How the COPY stream ended, once it has. Surfaces only after `pending_messages` is drained, so a stream that ends in the same pass that queued messages still delivers them.
-    copy_end: Option<CopyEnd>,
+    /// Which COPY sub-protocol is in flight, and its buffered state.
+    copy: CopyMode,
     /// Set by [`PgReplicationConnection::mark_dead`]. Cleared by `start_replication`.
     dead: bool,
-    /// Whether a `COPY ... TO STDOUT` is in flight.
-    ///
-    /// Deliberately not `is_replication_conn`: that gates the replication
-    /// streaming methods, and a COPY OUT client must never send `CopyDone`
-    /// (`PQputCopyEnd` returns -1 in `PGRES_COPY_OUT`), so the two cannot share a
-    /// flag. Mirrors the native backend's `copy_out` field.
-    copy_out_active: bool,
 }
 
 impl PgReplicationConnection {
@@ -288,13 +361,11 @@ impl PgReplicationConnection {
 
         Ok(Self {
             conn,
-            is_replication_conn: false,
+
             async_fd: None,
-            pending_messages: VecDeque::with_capacity(MAX_DRAIN_BATCH),
+            copy: CopyMode::Idle,
             read_buf: BytesMut::with_capacity(READ_BUF_INITIAL_CAPACITY),
-            copy_end: None,
             dead: false,
-            copy_out_active: false,
         })
     }
 
@@ -372,12 +443,11 @@ impl PgReplicationConnection {
         let _result = self.exec(&sql)?;
 
         // A fresh COPY stream: drop any terminal state left by a previous one.
-        self.copy_end = None;
         self.dead = false;
 
-        // Initialize the async socket first; mark the connection as being in replication mode only AFTER it succeeds, preserving the invariant `is_replication_conn == true ⇒ async_fd is Some`. Otherwise a failed socket setup would leave the flag true with no async_fd, and a later `end_copy`/Drop would reach the writable-wait path with `async_fd == None`.
+        // Initialize the async socket first; enter `CopyMode::Replication` only AFTER it succeeds, preserving the invariant `copy.is_replication() ⇒ async_fd is Some`. Otherwise a failed socket setup would leave the mode set with no async_fd, and a later `end_copy`/Drop would reach the writable-wait path with `async_fd == None`.
         self.initialize_async_socket()?;
-        self.is_replication_conn = true;
+        self.copy = CopyMode::Replication(CopyStream::default());
 
         debug!("Replication started successfully");
         Ok(())
@@ -419,9 +489,35 @@ impl PgReplicationConnection {
     /// `start_replication`: `PQsetnonblocking` must not precede the blocking
     /// `PQexec`.
     pub(crate) fn copy_out_begin(&mut self, sql: &str) -> Result<()> {
-        if self.copy_out_active {
+        // Must be fully idle, not merely "not already in a COPY OUT": `PQexec`
+        // on a connection pinned in CopyBoth is a protocol violation. The old
+        // two-boolean shape could not express this check, because the
+        // replication flag was a separate field this guard never read.
+        match self.copy {
+            CopyMode::Idle => {}
+            CopyMode::Out(_) => {
+                return Err(ReplicationError::protocol(
+                    "a COPY OUT stream is already in progress on this connection".to_string(),
+                ))
+            }
+            CopyMode::Replication(_) => {
+                return Err(ReplicationError::protocol(
+                    "cannot start a COPY OUT on a connection that is streaming replication"
+                        .to_string(),
+                ))
+            }
+        }
+
+        // Idle is not enough on its own. A failed `copy_out_next` returns the
+        // mode to Idle *and* marks the connection dead, because the rest of the
+        // relation is still queued — so without this check the `PQexec` below
+        // would be answered by the previous COPY's leftovers and fail against
+        // the wrong statement. `start_replication` resets `dead`; this path
+        // deliberately does not, because nothing here re-establishes the
+        // connection.
+        if !self.is_alive() {
             return Err(ReplicationError::protocol(
-                "a COPY OUT stream is already in progress on this connection".to_string(),
+                "cannot start a COPY OUT on a connection that is no longer usable".to_string(),
             ));
         }
 
@@ -433,10 +529,9 @@ impl PgReplicationConnection {
             )));
         }
 
-        self.copy_end = None;
         // Idempotent: a multi-table snapshot reaches this once per table.
         self.initialize_async_socket()?;
-        self.copy_out_active = true;
+        self.copy = CopyMode::Out(CopyStream::default());
         Ok(())
     }
 
@@ -446,11 +541,20 @@ impl PgReplicationConnection {
     /// Unlike [`get_copy_data_async`](Self::get_copy_data_async) this does **not**
     /// go through `ensure_replication_mode`: the snapshot reader is an ordinary
     /// SQL connection.
+    ///
+    /// Two behaviours diverge from the native backend. Cancellation drains
+    /// before it stops — `pump_copy` pops the pre-drained queue ahead of the
+    /// token and `handle_cancellation` makes one last drain pass — so rows libpq
+    /// had already buffered are still delivered one call at a time and
+    /// `Cancelled` surfaces only once nothing is left; the native backend checks
+    /// the token first and drops them. And nothing here caps a frame's size, so a
+    /// frame that the native backend rejects for exceeding its 128 MiB message
+    /// ceiling is read here without complaint.
     pub(crate) async fn copy_out_next(
         &mut self,
         cancellation_token: &CancellationToken,
     ) -> Result<Option<Bytes>> {
-        if !self.copy_out_active {
+        if !self.copy.is_out() {
             return Err(ReplicationError::protocol(
                 "no COPY OUT stream is in progress on this connection".to_string(),
             ));
@@ -461,16 +565,107 @@ impl PgReplicationConnection {
         match &result {
             Ok(Some(_)) => {}
             // Clean end or failure: the stream is over either way.
-            Ok(None) => self.copy_out_active = false,
-            Err(e) => {
-                self.copy_out_active = false;
-                if !e.is_cancelled() {
-                    self.mark_dead();
-                }
+            Ok(None) => self.copy = CopyMode::Idle,
+            Err(_) => {
+                self.copy = CopyMode::Idle;
+                self.mark_dead();
+            }
+        }
+
+        // A clean end still owes libpq its final `PGresult`s. Done after the mode
+        // is back to Idle so a failure here leaves the connection consistently
+        // dead rather than half in COPY.
+        if matches!(result, Ok(None)) {
+            if let Err(e) = self.copy_out_drain_epilogue(cancellation_token).await {
+                self.mark_dead();
+                return Err(e);
             }
         }
 
         result
+    }
+
+    /// Consume the `COPY`'s trailing `PGresult`s after a clean end.
+    ///
+    /// libpq's documented contract: *"After `PQgetCopyData` returns -1, call
+    /// `PQgetResult` to obtain the final result status of the `COPY` command."*
+    ///
+    /// [`copy_end_status`] cannot discharge it for a plain `COPY OUT`. It only
+    /// collects results while `PQisBusy` is *already* 0, and for `COPY OUT` the
+    /// `-1` leaves `asyncStatus` at `PGASYNC_BUSY` (`getCopyDataMessage`,
+    /// fe-protocol3.c: the `PGASYNC_COPY_BOTH` branch is the only one that does
+    /// otherwise). So if the epilogue bytes have not yet arrived, `PQisBusy`
+    /// returns 1, the loop body never runs, and the COPY reports success without
+    /// its status ever being read — deferring the drain into whatever blocking
+    /// `PQexec` comes next, and silently giving the libpq backend a weaker
+    /// guarantee than the native one's `drain_epilogue`.
+    ///
+    /// The `PQisBusy` gate in `copy_end_status` itself must stay: see its docs for
+    /// the `COPY_BOTH` livelock it prevents. This waits for readability instead of
+    /// calling `PQgetResult` unconditionally, which would block the executor.
+    async fn copy_out_drain_epilogue(
+        &mut self,
+        cancellation_token: &CancellationToken,
+    ) -> Result<()> {
+        loop {
+            while unsafe { PQisBusy(self.conn) } == 0 {
+                let raw = unsafe { PQgetResult(self.conn) };
+                if raw.is_null() {
+                    return Ok(());
+                }
+                // Wrapped so PQclear runs on drop; libpq needs every result reclaimed.
+                let res = PgResult::new(raw);
+                match res.status() {
+                    ExecStatusType::PGRES_FATAL_ERROR => {
+                        let message = res
+                            .error_message()
+                            .unwrap_or_else(|| "Unknown error".to_string());
+                        let sqlstate = res.error_sqlstate();
+                        warn!("COPY OUT failed after CopyDone [{sqlstate}]: {message}");
+                        return Err(ReplicationError::from_sqlstate(
+                            &sqlstate,
+                            format!("COPY OUT failed after CopyDone: {message}"),
+                        ));
+                    }
+                    // Defensive: a COPY-status result would never clear
+                    // `PQisBusy`, so bailing out is what keeps this from
+                    // spinning. Not reachable by the analysis above.
+                    ExecStatusType::PGRES_COPY_IN
+                    | ExecStatusType::PGRES_COPY_OUT
+                    | ExecStatusType::PGRES_COPY_BOTH => return Ok(()),
+                    _ => {}
+                }
+            }
+
+            let async_fd = self
+                .async_fd
+                .as_ref()
+                .ok_or_else(|| ReplicationError::protocol("AsyncFd not initialized".to_string()))?;
+
+            tokio::select! {
+                biased;
+                _ = cancellation_token.cancelled() => {
+                    return Err(ReplicationError::Cancelled(
+                        "COPY OUT cancelled while draining the epilogue".to_string(),
+                    ));
+                }
+                guard_result = async_fd.readable() => {
+                    let mut guard = guard_result.map_err(|e| {
+                        ReplicationError::protocol(format!(
+                            "Failed to wait for socket readability: {e}"
+                        ))
+                    })?;
+
+                    if unsafe { PQconsumeInput(self.conn) } == 0 {
+                        let error_msg = self.last_error_message();
+                        return Err(ReplicationError::transient_connection(format!(
+                            "PQconsumeInput failed while draining the COPY epilogue: {error_msg}"
+                        )));
+                    }
+                    guard.clear_ready();
+                }
+            }
+        }
     }
 
     /// Abandon an in-flight `COPY ... TO STDOUT`.
@@ -481,8 +676,8 @@ impl PgReplicationConnection {
     /// the connection dead; the caller drops it, `PQfinish` sends Terminate, and
     /// the server aborts the COPY and its transaction.
     pub(crate) fn copy_out_abort(&mut self) {
-        if self.copy_out_active {
-            self.copy_out_active = false;
+        if self.copy.is_out() {
+            self.copy = CopyMode::Idle;
             self.mark_dead();
         }
     }
@@ -574,12 +769,12 @@ impl PgReplicationConnection {
     async fn pump_copy(&mut self, cancellation_token: &CancellationToken) -> Result<Option<Bytes>> {
         loop {
             // ── Fast path: return from pre-drained queue ──
-            if let Some(msg) = self.pending_messages.pop_front() {
+            if let Some(msg) = self.pop_pending() {
                 return Ok(Some(msg));
             }
 
             // Queue empty: a latched end of stream now takes effect.
-            if let Some(end) = &self.copy_end {
+            if let Some(end) = self.copy_end() {
                 return match end {
                     CopyEnd::Done => Ok(None),
                     failed => Err(failed.to_error()),
@@ -587,12 +782,7 @@ impl PgReplicationConnection {
             }
 
             // ── Try to drain any messages already buffered inside libpq ──
-            match drain_buffered_messages(
-                self.conn,
-                &mut self.pending_messages,
-                &mut self.read_buf,
-                &mut self.copy_end,
-            )? {
+            match Self::drain_fields(self.conn, &mut self.copy, &mut self.read_buf)? {
                 // Messages queued and/or the stream ended: loop to pop, then latch.
                 DrainResult::Progressed => continue,
                 DrainResult::WouldBlock => {} // need to wait for socket
@@ -624,7 +814,7 @@ impl PgReplicationConnection {
                     }
 
                     // Drain all available messages
-                    match drain_buffered_messages(self.conn, &mut self.pending_messages, &mut self.read_buf, &mut self.copy_end)? {
+                    match Self::drain_fields(self.conn, &mut self.copy, &mut self.read_buf)? {
                         DrainResult::Progressed => {
                             // Messages queued and/or the stream ended; the next
                             // loop iteration pops the queue, then the latch.
@@ -640,11 +830,50 @@ impl PgReplicationConnection {
         }
     }
 
+    /// One drain pass over whatever libpq has already buffered.
+    ///
+    /// Takes disjoint field borrows instead of `&mut self` so it can also be called from inside the `select!` in [`pump_copy`](Self::pump_copy), where`async_fd` is borrowed for the whole block. A `&mut self` signature would erase the field granularity the borrow checker needs there: it can see that `conn`, `copy` and `read_buf` are disjoint from `async_fd`, but only through direct field access, never through a method. Hence an associated function rather than a method.
+    #[inline]
+    fn drain_fields(
+        conn: *mut PGconn,
+        copy: &mut CopyMode,
+        read_buf: &mut BytesMut,
+    ) -> Result<DrainResult> {
+        let stream = copy
+            .stream_mut()
+            .ok_or_else(|| ReplicationError::protocol("no COPY in progress".to_string()))?;
+        drain_buffered_messages(conn, &mut stream.pending, read_buf, &mut stream.end)
+    }
+
+    /// Pop the next pre-drained message, if any.
+    #[inline]
+    fn pop_pending(&mut self) -> Option<Bytes> {
+        self.copy.stream_mut()?.pending.pop_front()
+    }
+
+    /// Whether any pre-drained message is still queued.
+    #[inline]
+    fn has_pending(&self) -> bool {
+        match &self.copy {
+            CopyMode::Idle => false,
+            CopyMode::Replication(s) | CopyMode::Out(s) => !s.pending.is_empty(),
+        }
+    }
+
+    /// The latched terminal, if the stream has ended.
+    #[inline]
+    fn copy_end(&self) -> Option<&CopyEnd> {
+        match &self.copy {
+            CopyMode::Idle => None,
+            CopyMode::Replication(s) | CopyMode::Out(s) => s.end.as_ref(),
+        }
+    }
+
     /// Handle cancellation: check for remaining buffered data before returning.
     fn handle_cancellation(&mut self) -> Result<Option<Bytes>> {
         debug!("Cancellation detected in get_copy_data_async");
         // Return any queued message first
-        if let Some(msg) = self.pending_messages.pop_front() {
+        if let Some(msg) = self.pop_pending() {
             info!("Found queued data after cancellation, returning it");
             return Ok(Some(msg));
         }
@@ -656,19 +885,20 @@ impl PgReplicationConnection {
         // every cancel-on-a-dying-socket look like a failure. The streaming path
         // (`get_copy_data_async`) still throws it — that is where the silent stall
         // was.
-        let drained = drain_buffered_messages(
-            self.conn,
-            &mut self.pending_messages,
-            &mut self.read_buf,
-            &mut self.copy_end,
-        );
+        // No COPY in flight is not an error here: the caller already asked to
+        // stop, so "nothing was buffered" is the answer, not a protocol fault.
+        let drained = if matches!(self.copy, CopyMode::Idle) {
+            Ok(DrainResult::WouldBlock)
+        } else {
+            Self::drain_fields(self.conn, &mut self.copy, &mut self.read_buf)
+        };
         match drained {
             Ok(DrainResult::Progressed) => {
-                if let Some(msg) = self.pending_messages.pop_front() {
+                if let Some(msg) = self.pop_pending() {
                     info!("Found buffered data after cancellation, returning it");
                     return Ok(Some(msg));
                 }
-                if let Some(end) = &self.copy_end {
+                if let Some(end) = self.copy_end() {
                     info!("COPY stream ended during cancellation check");
                     return match end {
                         CopyEnd::Done => Ok(None),
@@ -687,7 +917,7 @@ impl PgReplicationConnection {
                 // `Progressed` arm delivers — dropping them here would make this
                 // function treat already-received data two different ways
                 // depending on which frame the failure landed on.
-                if let Some(msg) = self.pending_messages.pop_front() {
+                if let Some(msg) = self.pop_pending() {
                     info!("Delivering data queued before the cancellation drain failed");
                     return Ok(Some(msg));
                 }
@@ -714,7 +944,7 @@ impl PgReplicationConnection {
     /// Helper: Check if connection is in replication mode
     #[inline]
     fn ensure_replication_mode(&self) -> Result<()> {
-        if !self.is_replication_conn {
+        if !self.copy.is_replication() {
             return Err(ReplicationError::protocol(
                 "Connection is not in replication mode".to_string(),
             ));
@@ -773,11 +1003,11 @@ impl PgReplicationConnection {
     ///
     /// Idempotent: a no-op when not in replication mode. The non-blocking flush loop mirrors `put_copy_data_and_flush`. Trailing results are reclaimed by `PQfinish` on drop (matching `close_replication_connection`), so we do not drain `PQgetResult` here.
     pub(crate) async fn end_copy(&mut self) -> Result<()> {
-        if !self.is_replication_conn {
+        if !self.copy.is_replication() {
             return Ok(());
         }
         // Mark the copy ended up front: even if a flush below errors out, this keeps `close_replication_connection` on drop from redundantly re-sending CopyEnd on an already-half-closed connection.
-        self.is_replication_conn = false;
+        self.copy = CopyMode::Idle;
         // PQputCopyEnd: 1 = queued, 0 = would block (nonblocking mode), -1 = err.
         loop {
             let r = unsafe { PQputCopyEnd(self.conn, ptr::null()) };
@@ -841,7 +1071,7 @@ impl PgReplicationConnection {
     }
 
     /// Check if the connection is still alive
-    pub fn is_alive(&self) -> bool {
+    pub(crate) fn is_alive(&self) -> bool {
         if self.conn.is_null() || self.dead {
             return false;
         }
@@ -864,7 +1094,7 @@ impl PgReplicationConnection {
         // popped *before* the latch is honoured. Reporting "dead" while they are
         // still pending lets a health check swap the connection out from under
         // them, discarding received WAL that has not been handed to the consumer.
-        if self.copy_end.is_some() && self.pending_messages.is_empty() {
+        if self.copy_end().is_some() && !self.has_pending() {
             return false;
         }
 
@@ -1025,7 +1255,7 @@ impl PgReplicationConnection {
         let _result = self.exec(&sql)?;
 
         self.initialize_async_socket()?;
-        self.is_replication_conn = true;
+        self.copy = CopyMode::Replication(CopyStream::default());
 
         debug!("Physical replication started successfully");
         Ok(())
@@ -1167,7 +1397,7 @@ impl PgReplicationConnection {
         let result = self.exec(&base_backup_sql)?;
 
         self.initialize_async_socket()?;
-        self.is_replication_conn = true;
+        self.copy = CopyMode::Replication(CopyStream::default());
 
         debug!("Base backup started successfully");
         Ok(result)
@@ -1178,7 +1408,7 @@ impl PgReplicationConnection {
             info!("Closing PostgreSQL replication connection");
 
             // If we're in replication mode, try to end the copy gracefully
-            if self.is_replication_conn {
+            if self.copy.is_replication() {
                 debug!("Ending COPY mode before closing connection");
                 unsafe {
                     // Try to end the copy operation gracefully, This is important to properly close the replication stream
@@ -1192,7 +1422,7 @@ impl PgReplicationConnection {
                         debug!("COPY mode ended gracefully");
                     }
                 }
-                self.is_replication_conn = false;
+                self.copy = CopyMode::Idle;
             }
 
             // Close the connection, deregister from the tokio reactor FIRST: `PQfinish` closes the socket, and `AsyncFd`'s drop then issues `epoll_ctl(EPOLL_CTL_DEL, fd)` on a closed descriptor. If another thread opened something that reused that fd number in between, that would tear down *their* registration.
@@ -1204,7 +1434,9 @@ impl PgReplicationConnection {
 
             // Clear the connection pointer and reset state
             self.conn = std::ptr::null_mut();
-            self.pending_messages.clear();
+            if let Some(stream) = self.copy.stream_mut() {
+                stream.pending.clear();
+            }
 
             info!("PostgreSQL replication connection closed and cleaned up");
         } else {
@@ -1229,24 +1461,31 @@ impl PgReplicationConnection {
     pub(crate) fn null_for_testing() -> Self {
         Self {
             conn: std::ptr::null_mut(),
-            is_replication_conn: false,
+
             async_fd: None,
-            pending_messages: VecDeque::new(),
+            copy: CopyMode::Idle,
             read_buf: BytesMut::new(),
-            copy_end: None,
             dead: false,
-            copy_out_active: false,
         }
     }
 
     /// Push a message into the pending queue for testing
     fn push_pending_message_for_testing(&mut self, msg: Bytes) {
-        self.pending_messages.push_back(msg);
+        // Seeding implies a COPY: create one if the test has not entered a mode
+        // yet, so this keeps working on a bare `null_for_testing()`.
+        if self.copy.stream_mut().is_none() {
+            self.copy = CopyMode::Replication(CopyStream::default());
+        }
+        self.copy
+            .stream_mut()
+            .expect("just set above")
+            .pending
+            .push_back(msg);
     }
 
     /// Test-only: a null connection pre-seeded with COPY-data frames that
     /// `get_copy_data_async` serves in order from `pending_messages` before any
-    /// FFI. `is_replication_conn` is set so the replication-mode gate passes.
+    /// FFI. The mode is set to `Replication` so the gate passes.
     ///
     /// Mirrors the native backend's `null_for_testing_with_frames`, giving the
     /// shared stream pump one frame-injection seam across both adapters. The
@@ -1254,8 +1493,12 @@ impl PgReplicationConnection {
     /// to drive here — those stay backend-specific and integration-tested.
     pub(crate) fn null_for_testing_with_frames(frames: Vec<Bytes>) -> Self {
         let mut conn = Self::null_for_testing();
-        conn.is_replication_conn = true;
-        conn.pending_messages.extend(frames);
+        conn.copy = CopyMode::Replication(CopyStream::default());
+        conn.copy
+            .stream_mut()
+            .expect("null_for_testing_with_frames sets Replication mode above")
+            .pending
+            .extend(frames);
         conn
     }
 }
@@ -1554,6 +1797,16 @@ fn drain_buffered_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Latch a terminal on a connection that has no COPY in flight yet, which is
+    /// what several tests need in order to drive the latch logic directly.
+    fn set_copy_end(conn: &mut PgReplicationConnection, end: CopyEnd) {
+        if conn.copy.stream_mut().is_none() {
+            conn.copy = CopyMode::Replication(CopyStream::default());
+        }
+        conn.copy.stream_mut().expect("just set").end = Some(end);
+    }
+
     use crate::sql_builder::quote_literal;
 
     fn sanitize_sql_string_value(value: &str) -> String {
@@ -2059,7 +2312,7 @@ mod tests {
         let mut conn = PgReplicationConnection::null_for_testing();
         conn.push_pending_message_for_testing(Bytes::from_static(b"first"));
         conn.push_pending_message_for_testing(Bytes::from_static(b"second"));
-        conn.copy_end = Some(CopyEnd::Done);
+        set_copy_end(&mut conn, CopyEnd::Done);
 
         // handle_cancellation drains the queue before honouring the latch.
         assert_eq!(conn.handle_cancellation().unwrap().unwrap(), &b"first"[..]);
@@ -2085,7 +2338,7 @@ mod tests {
     #[test]
     fn test_latched_copy_done_is_a_clean_terminal_for_copy_out() {
         let mut conn = PgReplicationConnection::null_for_testing();
-        conn.copy_end = Some(CopyEnd::Done);
+        set_copy_end(&mut conn, CopyEnd::Done);
 
         assert!(
             block_on(conn.pump_copy(&CancellationToken::new()))
@@ -2099,8 +2352,8 @@ mod tests {
     #[test]
     fn test_latched_copy_done_is_still_an_error_for_replication() {
         let mut conn = PgReplicationConnection::null_for_testing();
-        conn.is_replication_conn = true;
-        conn.copy_end = Some(CopyEnd::Done);
+        conn.copy = CopyMode::Replication(CopyStream::default());
+        set_copy_end(&mut conn, CopyEnd::Done);
 
         let err = block_on(conn.get_copy_data_async(&CancellationToken::new())).unwrap_err();
         assert!(format!("{err}").contains("CopyDone"), "{err}");
@@ -2110,7 +2363,10 @@ mod tests {
     #[test]
     fn test_latched_copy_failure_still_errors() {
         let mut conn = PgReplicationConnection::null_for_testing();
-        conn.copy_end = Some(CopyEnd::Failed("57P01".to_string(), "gone".to_string()));
+        set_copy_end(
+            &mut conn,
+            CopyEnd::Failed("57P01".to_string(), "gone".to_string()),
+        );
 
         let err = block_on(conn.pump_copy(&CancellationToken::new())).unwrap_err();
         assert!(err.is_transient(), "{err:?}");
@@ -2122,7 +2378,7 @@ mod tests {
     fn test_pump_copy_drains_queue_before_the_latch() {
         let mut conn = PgReplicationConnection::null_for_testing();
         conn.push_pending_message_for_testing(Bytes::from_static(b"first"));
-        conn.copy_end = Some(CopyEnd::Done);
+        set_copy_end(&mut conn, CopyEnd::Done);
 
         let token = CancellationToken::new();
         assert_eq!(
@@ -2132,12 +2388,37 @@ mod tests {
         assert!(block_on(conn.pump_copy(&token)).unwrap().is_none());
     }
 
-    /// The `copy_out_*` gate is independent of `is_replication_conn`.
+    /// The `copy_out_*` gate is keyed on `CopyMode::Out`, so an idle connection
+    /// is rejected just as a replication one is.
     #[test]
     fn test_copy_out_next_without_begin_errors() {
         let mut conn = PgReplicationConnection::null_for_testing();
         let err = block_on(conn.copy_out_next(&CancellationToken::new())).unwrap_err();
         assert!(format!("{err}").contains("no COPY OUT stream"), "{err}");
+    }
+
+    /// A replication connection is pinned in CopyBoth, so `PQexec`-ing the
+    /// `COPY` query is already a protocol violation. The old two-boolean shape
+    /// could not express this guard: it read only the COPY OUT flag, so a
+    /// replication connection went straight through to `exec`.
+    ///
+    /// The null connection has a null `PGconn`, so reaching `exec` would be a
+    /// segfault rather than a wrong answer — the test passing at all is what
+    /// proves the guard returns first.
+    #[test]
+    fn test_copy_out_begin_rejects_a_replication_connection() {
+        let mut conn = PgReplicationConnection::null_for_testing();
+        conn.copy = CopyMode::Replication(CopyStream::default());
+
+        let err = conn.copy_out_begin("COPY t TO STDOUT").unwrap_err();
+        assert!(
+            format!("{err}").contains("streaming replication"),
+            "expected the replication-mode rejection, got: {err}"
+        );
+        assert!(
+            conn.copy.is_replication(),
+            "a rejected COPY OUT must leave replication mode intact"
+        );
     }
 
     /// `initialize_async_socket` must be idempotent. `AsyncFd::new` on an
@@ -2182,11 +2463,11 @@ mod tests {
     #[test]
     fn test_copy_out_abort_marks_dead_and_is_idempotent() {
         let mut conn = PgReplicationConnection::null_for_testing();
-        conn.copy_out_active = true;
+        conn.copy = CopyMode::Out(CopyStream::default());
 
         conn.copy_out_abort();
         assert!(!conn.is_alive());
-        assert!(!conn.copy_out_active);
+        assert!(!conn.copy.is_out());
 
         conn.copy_out_abort(); // no-op
     }
@@ -2227,7 +2508,14 @@ mod tests {
         assert_eq!(result.unwrap().unwrap(), msg1);
 
         // Second message should still be in the queue
-        assert_eq!(conn.pending_messages.len(), 1);
+        assert_eq!(
+            conn.copy
+                .stream_mut()
+                .expect("a COPY is in flight")
+                .pending
+                .len(),
+            1
+        );
     }
 
     #[test]

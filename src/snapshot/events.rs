@@ -139,7 +139,7 @@ mod tests {
     const POINT: u64 = 0x1234_5678;
 
     fn events(outcomes: Vec<Result<()>>) -> SnapshotEvents {
-        let config = ReplicationStreamConfig::builder("s", "p").with_initial_snapshot(true);
+        let config = ReplicationStreamConfig::builder("s", "p");
         SnapshotEvents::new(SnapshotRows::mock(
             create_test_stream(config),
             outcomes,

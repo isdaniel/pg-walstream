@@ -216,7 +216,7 @@ fn column_count_err(expected: usize, got: usize) -> ReplicationError {
 /// `\\N` and therefore decodes to the two-character *text* `\N`. A zero-length
 /// field is the empty *string*, never NULL.
 #[inline]
-pub(crate) fn decode_field(raw: Bytes) -> ColumnData {
+fn decode_field(raw: Bytes) -> ColumnData {
     if raw == NULL_MARKER {
         ColumnData::null()
     } else {
@@ -226,7 +226,8 @@ pub(crate) fn decode_field(raw: Bytes) -> ColumnData {
 
 /// Reverse PostgreSQL's COPY TEXT escaping.
 ///
-/// Mirrors `CopyReadAttributesText` in `src/backend/commands/copyfromparse.c`:
+/// Follows `CopyReadAttributesText` in `src/backend/commands/copyfromparse.c` for
+/// every escape sequence, with one deliberate divergence on the last row:
 ///
 /// | input | output |
 /// |---|---|
@@ -236,11 +237,22 @@ pub(crate) fn decode_field(raw: Bytes) -> ColumnData {
 /// | `\x` + 1–2 hex digits | that byte |
 /// | `\x` not followed by a hex digit | literal `x` |
 /// | `\` + any other character | that character verbatim |
-/// | trailing lone `\` | `\` (defensive; `COPY TO` never emits one) |
+/// | lone `\` at end of line | `\` — PostgreSQL **drops** it (see below) |
+///
+/// `CopyReadAttributesText` leaves its scan loop as soon as a backslash is the
+/// final byte of the *line*, which happens before the loop appends the pending
+/// byte to the output, so the backslash is discarded. This decoder emits it
+/// literally rather than silently losing a byte. Mid-line the two differ in kind
+/// rather than in degree: this decoder splits on raw delimiters before
+/// unescaping, so a backslash before a delimiter ends a field here, whereas
+/// PostgreSQL reads the delimiter as escaped and merges the two fields. Both
+/// differences are unreachable for well-formed server output:
+/// `CopyAttributeOutText` escapes every backslash in the data as `\\`, so
+/// `COPY ... TO STDOUT` never emits a lone one.
 ///
 /// Returns `raw` **unchanged** — no allocation, no copy — when it contains no
 /// backslash.
-pub(crate) fn unescape_field(raw: Bytes) -> Bytes {
+fn unescape_field(raw: Bytes) -> Bytes {
     let Some(first) = memchr::memchr(b'\\', &raw) else {
         // Fast path: nothing to unescape.
         return raw;
@@ -260,7 +272,8 @@ pub(crate) fn unescape_field(raw: Bytes) -> Bytes {
 
         pos += 1;
         if pos >= src.len() {
-            // Trailing lone backslash: emit it literally.
+            // Trailing lone backslash: emit it literally rather than dropping it
+            // the way `CopyReadAttributesText` does — see this function's docs.
             out.put_u8(b'\\');
             break;
         }
@@ -290,11 +303,12 @@ pub(crate) fn unescape_field(raw: Bytes) -> Bytes {
                 out.put_u8(value);
             }
             b'x' => {
-                if pos < src.len() && src[pos].is_ascii_hexdigit() {
-                    let mut value = hex_value(src[pos]);
+                // `hex_value` *is* the digit test, so there is no separate classification step that could drift out of sync with it.
+                if let Some(hi) = src.get(pos).copied().and_then(hex_value) {
                     pos += 1;
-                    if pos < src.len() && src[pos].is_ascii_hexdigit() {
-                        value = value.wrapping_mul(16).wrapping_add(hex_value(src[pos]));
+                    let mut value = hi;
+                    if let Some(lo) = src.get(pos).copied().and_then(hex_value) {
+                        value = value.wrapping_mul(16).wrapping_add(lo);
                         pos += 1;
                     }
                     out.put_u8(value);
@@ -311,12 +325,18 @@ pub(crate) fn unescape_field(raw: Bytes) -> Bytes {
     out.freeze()
 }
 
+/// Value of one ASCII hex digit, or `None` if `byte` is not one.
+///
+/// Returning `Option` keeps the range check and the subtraction in the same
+/// `match`: every arm subtracts a bound it has just tested, so no caller can make
+/// this underflow by forgetting to classify the byte first.
 #[inline]
-fn hex_value(byte: u8) -> u8 {
+fn hex_value(byte: u8) -> Option<u8> {
     match byte {
-        b'0'..=b'9' => byte - b'0',
-        b'a'..=b'f' => byte - b'a' + 10,
-        _ => byte - b'A' + 10,
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -416,7 +436,23 @@ mod tests {
     }
 
     #[test]
+    fn hex_value_accepts_both_cases_and_rejects_the_rest() {
+        assert_eq!(hex_value(b'0'), Some(0));
+        assert_eq!(hex_value(b'9'), Some(9));
+        assert_eq!(hex_value(b'a'), Some(10));
+        assert_eq!(hex_value(b'F'), Some(15));
+        // Not a regression test: the call site already classified the byte, so
+        // these were unreachable. They pin the contract for any future caller.
+        assert_eq!(hex_value(b'/'), None);
+        assert_eq!(hex_value(0x00), None);
+        assert_eq!(hex_value(b'g'), None);
+        assert_eq!(hex_value(b'Z'), None);
+    }
+
+    #[test]
     fn unescape_trailing_lone_backslash() {
+        // Deliberate divergence from `CopyReadAttributesText`, which drops it.
+        // Unreachable for real server output, which escapes backslashes as `\\`.
         assert_eq!(&unescape_field(bytes(r"abc\"))[..], b"abc\\");
     }
 

@@ -537,7 +537,7 @@ mod tests {
     #[test]
     fn test_drain_exceeds_max_message_len() {
         let mut buf = BytesMut::new();
-        // body_len exceeding MAX_MESSAGE_LEN (64 MiB)
+        // body_len exceeding MAX_MESSAGE_LEN (128 MiB)
         let huge_len: i32 = (MAX_MESSAGE_LEN as i32) + 1;
         buf.put_u8(b'd');
         buf.put_i32(huge_len);

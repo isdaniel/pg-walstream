@@ -108,6 +108,60 @@ jobs:
     - name: Unit tests (libpq / pq-sys)
       run: cargo test --lib --no-default-features --features libpq --verbose
 
+  examples:
+    name: Examples build
+    runs-on: ubuntu-latest
+    # Examples are workspace-excluded, so nothing else in CI compiles them: a
+    # signature change in the crate leaves them broken and silent until a user
+    # copies one. Enumerated from the filesystem so a new example is picked up
+    # without touching this file.
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libpq-dev libssl-dev pkg-config cmake
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+        key: ${{ runner.os }}-cargo-examples-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-examples-
+
+    - name: Check every example
+      run: |
+        set -uo pipefail
+        failed=()
+        ran=0
+        for manifest in examples/*/Cargo.toml; do
+          name=$(basename "$(dirname "$manifest")")
+          ran=$((ran + 1))
+          echo "::group::$name"
+          cargo check --manifest-path "$manifest" --all-targets || failed+=("$name")
+          echo "::endgroup::"
+        done
+
+        if [ "$ran" -eq 0 ]; then
+          echo "::error::no examples/*/Cargo.toml found - examples would be silently skipped"
+          exit 1
+        fi
+
+        if [ ${#failed[@]} -gt 0 ]; then
+          printf '::error::%d example(s) failed to build:\n' "${#failed[@]}"
+          printf '  - %s\n' "${failed[@]}"
+          exit 1
+        fi
+        echo "All $ran example(s) built."
+
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
@@ -173,6 +227,11 @@ jobs:
   integration:
     name: Integration Tests (PG ${{ matrix.pg_version }})
     runs-on: ubuntu-latest
+    # The suite deliberately kills backends and drops connections mid-COPY, so a
+    # hang is a plausible failure mode — and most tests carry no timeout of their
+    # own. Without this a wedged read burns GitHub's 6h default on every cell of
+    # the matrix.
+    timeout-minutes: 45
     needs: test
     strategy:
       fail-fast: false
@@ -332,6 +391,8 @@ jobs:
   integration-ssl:
     name: SSL Integration Tests (PG ${{ matrix.pg_version }})
     runs-on: ubuntu-latest
+    # See the `integration` job.
+    timeout-minutes: 45
     needs: test
     strategy:
       fail-fast: false

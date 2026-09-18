@@ -118,8 +118,15 @@ Key optimizations in place:
 `LogicalReplicationStream::snapshot()` copies published tables through the slot's
 exported snapshot, then hands off to the stream. Three invariants:
 
-- **The stream is moved into the handle** — every replication command clears the
-  exported snapshot server-side, so `start()` mid-snapshot must be unrepresentable.
+- **The stream is moved into the handle** — not because `start()` would clear the
+  exported snapshot (the reader imports it into its own `REPEATABLE READ READ ONLY`
+  transaction before any handle exists), but because `START_REPLICATION` pins the
+  replication connection in CopyBoth and the handoff owns the LSN bookkeeping:
+  `finish()` demands a fully consumed snapshot so the following `start(None)`
+  resumes at `consistent_point` with no gap. Taking `self` by value makes a
+  mid-snapshot `start()` unrepresentable. (The manual `exported_snapshot_name()`
+  path *is* still exposed to the server-side clearing — nothing has imported the
+  export there.)
 - **Failure consumes the handle** — the snapshot is `REPEATABLE READ`; resuming
   against an expired one silently mixes two points in time.
 - **COPY TEXT, not BINARY** — `ColumnValue::Binary` is rejected by every scalar

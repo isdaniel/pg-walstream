@@ -35,27 +35,144 @@ use tracing::{debug, error, info, warn};
 pub struct LogicalReplicationStream {
     connection: PgReplicationConnection,
     parser: LogicalReplicationParser,
-    pub state: ReplicationState,
+    state: ReplicationState,
     config: ReplicationStreamConfig,
-    slot_created: bool,
+    /// What this stream knows about its replication slot. See [`SlotState`].
+    slot: SlotState,
     retry_handler: ReplicationConnectionRetry,
     last_health_check: Instant,
     /// Shared LSN feedback for communication with consumer. This allows the consumer to update flushed/applied LSN after commits
     pub shared_lsn_feedback: Arc<SharedLsnFeedback>,
-    /// The LSN the exported snapshot is consistent at, captured when the slot was
-    /// created. This is also the position `START_REPLICATION` resumes from, so it
-    /// is the correct LSN to stamp on snapshot rows.
-    consistent_point: Option<Lsn>,
-    /// The snapshot name exported when the replication slot was created with `EXPORT_SNAPSHOT`.
-    exported_snapshot_name: Option<String>,
     /// `IDENTIFY_SYSTEM`'s identity from the first successful connection, re-checked on every reconnect. See [`ServerIdentity`].
     identity: Option<ServerIdentity>,
     /// Counter that throttles per-event time checks inside `next_event`. We only consult `Instant::now()` once every `FEEDBACK_CHECK_EVENT_INTERVAL` events so the hot path avoids a syscall on every message.
     feedback_check_counter: u32,
-    /// Bounded replay: set once the terminal is armed; the next `next_event` sends CopyDone and returns `StreamStopped`. `None` when bounded replay is off or not yet reached. Holds the crossing commit's `end_lsn` on the typed path, a keepalive's `wal_end` when the target is past the last commit, and the transport-level `wal_end` on the raw path.
-    stop_at_reached: Option<Lsn>,
-    /// One-shot guard so the bounded-replay CopyDone is sent at most once.
-    copy_done_sent: bool,
+    /// Bounded replay terminal. See [`ReplayStop`].
+    replay_stop: ReplayStop,
+}
+
+/// What this stream knows about the replication slot it is using.
+///
+/// Replaces a `slot_created: bool` plus two loose `Option` fields. The bool
+/// could not carry the distinction that matters: it was set to `true` both when
+/// *we* created the slot and when `CREATE_REPLICATION_SLOT` failed with "already
+/// exists", so nothing downstream could tell whose slot it was. That is the
+/// difference between dropping our own failed attempt and destroying a slot the
+/// operator created — `discard_replication_slot` now asks the type instead of
+/// trusting the caller to have checked an unrelated field first.
+///
+/// Snapshot state is deliberately *nested inside* ownership rather than sitting
+/// beside it: an exported snapshot exists only because we created the slot, and
+/// modelling it as a sibling field made "both or neither" an unchecked
+/// convention.
+#[derive(Debug, Default)]
+enum SlotState {
+    /// No slot yet, or ours was discarded after a failed snapshot.
+    #[default]
+    Absent,
+    /// A slot with this name already existed. We did not create it, so we must never drop it, and it exported no snapshot — that is the ordinary "resume an existing subscription" path.
+    PreExisting,
+    /// We created it in this session.
+    Ours {
+        /// The LSN the exported snapshot is consistent at. Also the position
+        /// `START_REPLICATION` resumes from, so it is the LSN stamped on
+        /// snapshot rows.
+        ///
+        /// `None` only when the server returned an unparsable value, which is deliberately non-fatal: it makes the snapshot helper unavailable, notreplication.
+        consistent_point: Option<Lsn>,
+        /// The name exported by `EXPORT_SNAPSHOT`.
+        ///
+        /// Cleared on a successful `START_REPLICATION`, which destroys the snapshot server-side — *independently* of `consistent_point`, which outlives it and stays valid as the resume position. Those differing lifetimes are why this is an inner `Option` rather than a second variant.
+        exported_snapshot: Option<String>,
+    },
+}
+
+impl SlotState {
+    /// True once a usable slot exists, however it got there. This is the old
+    /// `slot_created` predicate, and the only question `ensure_replication_slot`
+    /// needs to answer.
+    #[inline]
+    fn is_present(&self) -> bool {
+        !matches!(self, SlotState::Absent)
+    }
+
+    /// The consistent point, if this stream created the slot.
+    #[inline]
+    fn consistent_point(&self) -> Option<Lsn> {
+        match self {
+            SlotState::Ours {
+                consistent_point, ..
+            } => *consistent_point,
+            _ => None,
+        }
+    }
+
+    /// The exported snapshot name, while it is still alive server-side.
+    #[inline]
+    fn exported_snapshot(&self) -> Option<&str> {
+        match self {
+            SlotState::Ours {
+                exported_snapshot, ..
+            } => exported_snapshot.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Forget the exported snapshot name, keeping everything else.
+    ///
+    /// Called after a successful `START_REPLICATION`: the server has run
+    /// `SnapBuildClearExportedSnapshot`, so the name is a handle to nothing.
+    #[inline]
+    fn clear_exported_snapshot(&mut self) {
+        if let SlotState::Ours {
+            exported_snapshot, ..
+        } = self
+        {
+            *exported_snapshot = None;
+        }
+    }
+}
+
+/// How far bounded replay (`stop_at_lsn`) has progressed.
+///
+/// Replaces `stop_at_reached: Option<Lsn>` + `copy_done_sent: bool`, which
+/// between them could spell `(None, true)` — "CopyDone already sent for a
+/// terminal that was never armed". Nothing rejected it: `copy_done_sent` was
+/// read at exactly one site, nested inside the `Some` check, so the pairing was
+/// an unstated rule spread across three arming sites.
+///
+/// As an enum the one-shot guard *is* the transition: `Armed -> Stopped` can
+/// happen only once, because `Stopped` no longer matches `Armed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayStop {
+    /// Bounded replay is off, or the target has not been reached yet.
+    Running,
+    /// The terminal has been reached; the next `next_event` owes the server a
+    /// CopyDone. Holds the crossing commit's `end_lsn` on the typed path, a
+    /// keepalive's `wal_end` when the target is past the last commit, and the
+    /// transport-level `wal_end` on the raw path.
+    Armed(Lsn),
+    /// CopyDone has been sent. Every later call reports `StreamStopped` again.
+    Stopped(Lsn),
+}
+
+impl ReplayStop {
+    /// The LSN the terminal was armed at, once it has been reached.
+    #[inline]
+    fn reached(self) -> Option<Lsn> {
+        match self {
+            ReplayStop::Running => None,
+            ReplayStop::Armed(lsn) | ReplayStop::Stopped(lsn) => Some(lsn),
+        }
+    }
+
+    /// Arm the terminal, unless it is already armed or stopped.
+    #[inline]
+    fn arm(&mut self, lsn: Lsn) {
+        if matches!(self, ReplayStop::Running) {
+            *self = ReplayStop::Armed(lsn);
+        }
+    }
 }
 
 /// A raw XLogData (`'w'`) message: the undecoded pgoutput payload plus its WAL
@@ -110,7 +227,13 @@ impl ServerIdentity {
 }
 
 /// Configuration for the replication stream
+///
+/// `#[non_exhaustive]`: build one with [`builder`](Self::builder) or
+/// [`new`](Self::new) plus the `with_*` setters, not with a struct literal.
+/// Closing literal construction is what makes adding a field a non-breaking
+/// change — otherwise every new field breaks every downstream literal again.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ReplicationStreamConfig {
     pub slot_name: String,
     /// Publication to replicate from.
@@ -256,9 +379,19 @@ impl ReplicationStreamConfig {
     }
 
     /// Enable or disable two-phase commit decoding (protocol v3+)
+    ///
+    /// Two-phase decoding is **two** wire options, not one: `TWO_PHASE` on
+    /// `CREATE_REPLICATION_SLOT` and `two_phase 'on'` on `START_REPLICATION`.
+    /// The server accepts the latter on a slot created without the former
+    /// *without an error* — it simply never decodes `PREPARE`, so the failure is
+    /// silent. This setter therefore sets both.
+    ///
+    /// Call it **after** [`with_slot_options`](Self::with_slot_options), which
+    /// replaces the whole options struct and would otherwise clobber the flag.
     #[inline]
     pub fn with_two_phase(mut self, enabled: bool) -> Self {
         self.two_phase = enabled;
+        self.slot_options.two_phase = enabled;
         self
     }
 
@@ -283,6 +416,19 @@ impl ReplicationStreamConfig {
     /// - `snapshot`: Control snapshot export behavior (`"export"`, `"use"`, `"nothing"`)
     /// - `two_phase`: Enable two-phase commit support for the slot
     /// - `failover`: Enable failover synchronization
+    ///
+    /// # Replaces, does not merge
+    ///
+    /// This assigns the whole struct, so it **clobbers
+    /// [`with_two_phase`](Self::with_two_phase)** if called afterwards — that
+    /// setter writes `slot_options.two_phase`, and the failure is silent (the
+    /// slot is simply created without `TWO_PHASE`, and `PREPARE` is never
+    /// decoded). Call `with_two_phase` last, or set `two_phase` in the struct
+    /// here.
+    ///
+    /// The `snapshot` field is the exception: `snapshot()` sets `"export"` itself
+    /// immediately before creating the slot, so whatever is written here cannot
+    /// stop an initial snapshot from working.
     ///
     /// # Example: Temporary slot with exported snapshot
     ///
@@ -396,21 +542,6 @@ impl ReplicationStreamConfig {
     /// Stop replication after the first committed transaction whose commit `end_lsn` reaches `lsn`. That transaction is delivered in full, then the stream ends cleanly (client CopyDone) and `next_event` returns [`crate::ReplicationError::StreamStopped`]. `None` (default) is unbounded.
     ///
     /// If `lsn` lies *beyond* the last commit the server has, no commit boundary can ever reach it, so the stream instead ends once a keepalive reports the server's send position past `lsn` — rather than blocking forever waiting for a transaction that may never be written. This mirrors pg_recvlogical's `--endpos` `STREAM_STOP_KEEPALIVE` exit and is safe for the same reason: a keepalive's `wal_end` is `sentPtr`, assigned only *after* the output plugin has run and queued its data on the same socket, so nothing committing at or below it can still be undelivered. The `StreamStopped` LSN is then that keepalive position, not a commit boundary.
-    /// Create the replication slot with `SNAPSHOT 'export'`, so
-    /// [`LogicalReplicationStream::snapshot`](crate::stream::LogicalReplicationStream)
-    /// can read a consistent initial copy of the published tables before
-    /// streaming starts.
-    ///
-    /// The default is `SNAPSHOT 'nothing'`. This rewrites
-    /// [`slot_options.snapshot`](crate::types::ReplicationSlotOptions::snapshot)
-    /// rather than adding state of its own, so it composes with
-    /// [`with_slot_options`](Self::with_slot_options) — call this one last.
-    #[inline]
-    pub fn with_initial_snapshot(mut self, enabled: bool) -> Self {
-        self.slot_options.snapshot = Some(if enabled { "export" } else { "nothing" }.to_string());
-        self
-    }
-
     #[inline]
     pub fn with_stop_at_lsn(mut self, lsn: impl Into<Lsn>) -> Self {
         self.stop_at_lsn = Some(lsn.into());
@@ -519,16 +650,13 @@ impl LogicalReplicationStream {
             parser,
             state,
             config,
-            slot_created: false,
+            slot: SlotState::Absent,
             retry_handler,
             last_health_check,
             shared_lsn_feedback,
-            consistent_point: None,
-            exported_snapshot_name: None,
             identity: None,
             feedback_check_counter: 0,
-            stop_at_reached: None,
-            copy_done_sent: false,
+            replay_stop: ReplayStop::Running,
         })
     }
 
@@ -581,7 +709,7 @@ impl LogicalReplicationStream {
     /// start(None)
     ///   → START_REPLICATION ...
     pub async fn ensure_replication_slot(&mut self) -> Result<()> {
-        if self.slot_created {
+        if self.slot.is_present() {
             return Ok(());
         }
 
@@ -606,22 +734,22 @@ impl LogicalReplicationStream {
                 // LSN to stamp on snapshot rows and the position `start(None)`
                 // resumes from. A malformed value is not fatal: it only means the
                 // initial-snapshot helper is unavailable, not that replication is.
-                self.consistent_point = parse_consistent_point(&result);
-                // Extract the exported snapshot name if available
-                if let Some(snapshot_name) = result.get_value(0, 2) {
-                    if !snapshot_name.is_empty() {
-                        info!("Exported snapshot name: {}", snapshot_name);
-                        self.exported_snapshot_name = Some(snapshot_name);
-                    }
-                }
+                let exported_snapshot = result
+                    .get_value(0, 2)
+                    .filter(|name| !name.is_empty())
+                    .inspect(|name| info!("Exported snapshot name: {}", name));
                 info!("Replication slot created successfully");
-                self.slot_created = true;
+                self.slot = SlotState::Ours {
+                    consistent_point: parse_consistent_point(&result),
+                    exported_snapshot,
+                };
             }
             Err(e) => {
                 let error_msg = e.to_string();
                 if error_msg.contains("already exists") {
                     warn!("Replication slot already exists, continuing");
-                    self.slot_created = true;
+                    // NOT `Ours`: we did not create it, so it exported no snapshot and we must never drop it.
+                    self.slot = SlotState::PreExisting;
                 } else {
                     return Err(e);
                 }
@@ -701,6 +829,8 @@ impl LogicalReplicationStream {
         self.connection
             .start_replication(&self.config.slot_name, start_lsn, &options_ref)?;
 
+        self.slot.clear_exported_snapshot();
+
         info!(
             "Logical replication started with LSN: {}",
             format_lsn(start_lsn)
@@ -722,14 +852,20 @@ impl LogicalReplicationStream {
             }
 
             // Bounded replay terminal: once a stop boundary has been delivered, end the COPY stream cleanly (once) and report StreamStopped on this and every subsequent call. Runs before any socket read so no further WAL is consumed past the target.
-            if let Some(reached) = self.stop_at_reached {
-                if !self.copy_done_sent {
-                    self.copy_done_sent = true;
+            match self.replay_stop {
+                ReplayStop::Running => {}
+                ReplayStop::Armed(reached) => {
+                    // The `Armed -> Stopped` transition IS the one-shot guard:
+                    debug!("Bounded replay: reached stop_at_lsn at {reached}, sending CopyDone");
+                    self.replay_stop = ReplayStop::Stopped(reached);
                     if let Err(e) = self.connection.end_copy().await {
                         warn!("Failed to send CopyDone at stop_at_lsn: {e}");
                     }
+                    return Err(ReplicationError::stream_stopped(reached));
                 }
-                return Err(ReplicationError::stream_stopped(reached));
+                ReplayStop::Stopped(reached) => {
+                    return Err(ReplicationError::stream_stopped(reached));
+                }
             }
 
             // Throttle feedback checks: only consult `Instant::now()` and the
@@ -827,7 +963,7 @@ impl LogicalReplicationStream {
                 // stop_at_lsn, remember it — the full crossing transaction is
                 // still delivered now; the NEXT call terminates.
                 if let Some(reached) = reached_stop_lsn(self.config.stop_at_lsn, &event) {
-                    self.stop_at_reached = Some(reached);
+                    self.replay_stop.arm(reached);
                 }
                 return Ok(event);
             }
@@ -891,7 +1027,7 @@ impl LogicalReplicationStream {
         // Transport-level bounded replay: arm the terminal when this message's wal_end reaches the configured stop LSN. The next `next_wal_frame` call sends CopyDone once and returns StreamStopped. Armed here (not in the decoder) so the decoder stays policy-free and the typed path can reuse it; mirrors how `next_event` arms the commit-boundary stop.
         if let Some(stop) = self.config.stop_at_lsn {
             if raw.wal_end >= stop {
-                self.stop_at_reached = Some(raw.wal_end);
+                self.replay_stop.arm(raw.wal_end);
             }
         }
 
@@ -1005,7 +1141,7 @@ impl LogicalReplicationStream {
         // Temporary slots are dropped when the connection dies, so we must
         // recreate them on recovery.
         if self.config.slot_options.temporary {
-            self.slot_created = false;
+            self.slot = SlotState::Absent;
         }
 
         // Ensure replication slot still exists (recreate if temporary)
@@ -1142,7 +1278,7 @@ impl LogicalReplicationStream {
         // returns StreamStopped) and skip the health check below. Otherwise a dead
         // connection could be reconnected by `recover_connection` and the COPY
         // stream resurrected past `stop_at_lsn`.
-        if self.stop_at_reached.is_some() {
+        if self.replay_stop.reached().is_some() {
             return self.next_event(cancellation_token).await;
         }
 
@@ -1378,19 +1514,14 @@ impl LogicalReplicationStream {
         // argument. (The "--endpos may truncate partway through a transaction"
         // caveat in the docs is about its *per-record* endpos check, not this one.)
         if let Some(stop) = self.config.stop_at_lsn {
-            if keepalive.wal_end >= stop.value() && self.stop_at_reached.is_none() {
-                debug!(
-                    "Bounded replay: keepalive wal_end={} reached stop_at_lsn={}",
-                    format_lsn(keepalive.wal_end),
-                    stop
-                );
-                self.stop_at_reached = Some(Lsn::new(keepalive.wal_end));
+            if keepalive.wal_end >= stop.value() {
+                self.replay_stop.arm(Lsn::new(keepalive.wal_end));
             }
         }
 
         // pg_recvlogical also flushes feedback when endpos is reached, so the
         // server records final progress before the stream is torn down.
-        if keepalive.reply_requested || self.stop_at_reached.is_some() {
+        if keepalive.reply_requested || self.replay_stop.reached().is_some() {
             self.send_feedback().await?;
         }
 
@@ -1513,12 +1644,22 @@ impl LogicalReplicationStream {
     /// [`ensure_replication_slot()`](Self::ensure_replication_slot) and
     /// [`start()`](Self::start). Once `START_REPLICATION` is issued, PostgreSQL
     /// destroys the snapshot. You must read the snapshot on a separate connection
-    /// **before** calling `start()`.
+    /// **before** calling `start()`; after a *successful* `start()` this returns
+    /// `None` rather than a name the server has already discarded.
+    ///
+    /// Any `start()` that **fails** deliberately leaves the name in place. The
+    /// caller still owns the stream and may go on to call
+    /// [`snapshot()`](Self::snapshot), which reads this to choose `Available` vs
+    /// `Unavailable`; reporting `None` there would give `Unavailable`, which the
+    /// documented usage reads as "nothing to copy" and streams with no baseline.
+    /// Keeping it means a failure that never reached the server (the snapshot is
+    /// intact) still works, and one that did destroy the snapshot fails loudly at
+    /// `SET TRANSACTION SNAPSHOT` instead of silently.
     ///
     /// Returns `None` if no snapshot was exported (e.g. `NOEXPORT_SNAPSHOT`) or if
     /// the slot has not yet been created.
     pub fn exported_snapshot_name(&self) -> Option<&str> {
-        self.exported_snapshot_name.as_deref()
+        self.slot.exported_snapshot()
     }
 
     /// Best-effort drop of the replication slot this stream created.
@@ -1533,17 +1674,35 @@ impl LogicalReplicationStream {
     /// Failure to drop is logged, not returned: this runs on an error path and
     /// must not mask the error that got us here.
     pub(crate) fn discard_replication_slot(&mut self) {
+        // Only ever drop a slot this stream created. A pre-existing slot belongs
+        // to whoever made it, and dropping one would destroy their subscription's
+        // position — the caller's own WAL retention along with it.
+        //
+        // This check is the reason `SlotState` exists. The `slot_created: bool`
+        // it replaced was set to `true` on *both* the create and the
+        // "already exists" branch, so it could not distinguish the two: guarding
+        // on it would have passed here and dropped the operator's slot anyway.
+        // Until now the guarantee lived at the single call site, which happened
+        // to check an unrelated field first.
+        if !matches!(self.slot, SlotState::Ours { .. }) {
+            debug!(
+                "Not dropping replication slot {}: this stream did not create it",
+                self.config.slot_name
+            );
+            return;
+        }
+
         let slot_name = self.config.slot_name.clone();
         match self.connection.drop_replication_slot(&slot_name, false) {
             Ok(()) => {
                 info!("Dropped replication slot {slot_name} after a failed snapshot attempt");
-                self.slot_created = false;
-                self.exported_snapshot_name = None;
-                self.consistent_point = None;
+                self.slot = SlotState::Absent;
             }
             Err(e) => {
                 warn!(
-                    "Could not drop replication slot {slot_name} after a failed snapshot                      attempt: {e}. Drop it manually, or the next snapshot attempt will                      find it present and silently proceed without a baseline."
+                    "Could not drop replication slot {slot_name} after a failed snapshot \
+                     attempt: {e}. Drop it manually, or the next snapshot attempt will \
+                     find it present and silently proceed without a baseline."
                 );
             }
         }
@@ -1563,7 +1722,7 @@ impl LogicalReplicationStream {
     /// when it is useless.
     #[inline]
     pub(crate) fn consistent_point(&self) -> Option<Lsn> {
-        self.consistent_point
+        self.slot.consistent_point()
     }
 
     /// The connection string this stream was built from.
@@ -1576,6 +1735,17 @@ impl LogicalReplicationStream {
     #[inline]
     pub(crate) fn config(&self) -> &ReplicationStreamConfig {
         &self.config
+    }
+
+    /// Require the slot to be created with `SNAPSHOT 'export'`.
+    ///
+    /// Called by [`snapshot`](Self::snapshot) so the entry point sets its own
+    /// precondition, instead of a builder call the caller has to remember — and
+    /// that [`ReplicationStreamConfig::with_slot_options`] could silently undo.
+    /// A no-op once the slot exists, which is the `Unavailable` path.
+    #[inline]
+    pub(crate) fn require_exported_snapshot(&mut self) {
+        self.config.slot_options.snapshot = Some("export".to_string());
     }
 
     /// Server version number, e.g. 160001 for PG 16.1.
@@ -1653,11 +1823,12 @@ impl LogicalReplicationStream {
     pub fn into_stream(self, cancellation_token: CancellationToken) -> EventStream {
         let shared_feedback = Arc::clone(&self.shared_lsn_feedback);
         EventStream {
-            inner: Some(self),
+            state: StreamState::Ready {
+                stream: Box::new(self),
+                terminated: false,
+            },
             cancellation_token,
             shared_feedback,
-            inflight: None,
-            terminated: false,
         }
     }
 
@@ -1829,22 +2000,135 @@ impl LogicalReplicationStream {
 /// # }
 /// ```
 pub struct EventStream {
-    /// The inner replication stream. Temporarily `None` while an async poll
-    /// future is in flight; always `Some` between calls to `poll_next`.
-    inner: Option<LogicalReplicationStream>,
+    /// Where the replication stream currently lives. See [`StreamState`].
+    state: StreamState,
     cancellation_token: CancellationToken,
     /// Cached reference to the shared LSN feedback so callers can always
-    /// update/read LSN values even if `inner` is temporarily taken.
+    /// update/read LSN values even while the stream is parked in a poll.
     shared_feedback: Arc<SharedLsnFeedback>,
-    /// In-flight future for `Stream::poll_next`. Created lazily when polled.
-    #[allow(clippy::type_complexity)]
-    inflight: Option<
-        std::pin::Pin<
-            Box<dyn Future<Output = (LogicalReplicationStream, Result<ChangeEvent>)> + Send>,
-        >,
-    >,
-    /// Whether the stream has terminated (cancelled or permanent error).
-    terminated: bool,
+}
+
+/// The future a `poll_next` parks the replication stream inside.
+///
+/// It **owns** the stream for the duration of the poll and hands it back
+/// alongside the result — which is why "polling" and "holding the stream" are
+/// mutually exclusive, and why dropping this future drops the connection.
+type PollFuture =
+    std::pin::Pin<Box<dyn Future<Output = (LogicalReplicationStream, Result<ChangeEvent>)> + Send>>;
+
+/// Where an [`EventStream`]'s replication stream is, and whether it is done.
+///
+/// Replaces `inner: Option<_>` + `inflight: Option<_>` + `terminated: bool`,
+/// which spelled three legal states across eight representable ones. The pair
+/// `(inner: None, inflight: None)` was reachable: `shutdown()` landed there
+/// whenever a poll was in flight, dropping the future that owned the connection
+/// and skipping the final LSN feedback while still returning `Ok(())`. Nothing
+/// checked the invariant — the `expect`s only asserted it.
+///
+/// `terminated` stays a field rather than becoming a third variant because the
+/// stream is still *there* after termination: `inner()` must keep working once
+/// `shutdown()` has run. Inside `Ready` it is an independent binary fact, and
+/// `Polling` cannot contradict it, so exactly the three legal states are
+/// representable.
+enum StreamState {
+    /// The stream is in hand. `terminated` distinguishes "pollable" from
+    /// "finished, but still readable through `inner()`".
+    Ready {
+        stream: Box<LogicalReplicationStream>,
+        terminated: bool,
+    },
+    /// The stream has been moved into an in-flight poll future.
+    Polling(PollFuture),
+}
+
+impl StreamState {
+    /// The stream, unless it is currently parked inside a poll future.
+    #[inline]
+    fn stream(&self) -> Option<&LogicalReplicationStream> {
+        match self {
+            StreamState::Ready { stream, .. } => Some(stream),
+            StreamState::Polling(_) => None,
+        }
+    }
+
+    #[inline]
+    fn stream_mut(&mut self) -> Option<&mut LogicalReplicationStream> {
+        match self {
+            StreamState::Ready { stream, .. } => Some(stream),
+            StreamState::Polling(_) => None,
+        }
+    }
+
+    #[inline]
+    fn is_terminated(&self) -> bool {
+        matches!(
+            self,
+            StreamState::Ready {
+                terminated: true,
+                ..
+            }
+        )
+    }
+
+    /// Whether a poll future currently holds the stream.
+    #[cfg(test)]
+    fn is_polling(&self) -> bool {
+        matches!(self, StreamState::Polling(_))
+    }
+
+    /// Take the stream out, leaving a poll future that resolves to `result`.
+    ///
+    /// Test-only: reproduces the state a `Poll::Pending` leaves behind, without
+    /// needing a real server to stall on.
+    #[cfg(test)]
+    fn park_with_result(&mut self, result: Result<ChangeEvent>) {
+        let placeholder: PollFuture = Box::pin(core::future::pending());
+        let StreamState::Ready { stream, .. } =
+            core::mem::replace(self, StreamState::Polling(placeholder))
+        else {
+            panic!("park_with_result expects a stream in hand");
+        };
+        let stream = *stream;
+        *self = StreamState::Polling(Box::pin(async move { (stream, result) }));
+    }
+
+    /// Flip the terminal flag without going through a poll.
+    #[cfg(test)]
+    fn mark_terminated(&mut self) {
+        match self {
+            StreamState::Ready { terminated, .. } => *terminated = true,
+            StreamState::Polling(_) => panic!("cannot terminate a parked stream"),
+        }
+    }
+
+    /// Park the stream in a fresh poll future. A no-op unless idle.
+    fn start_poll(&mut self, cancellation_token: &CancellationToken) {
+        if !matches!(
+            self,
+            StreamState::Ready {
+                terminated: false,
+                ..
+            }
+        ) {
+            return;
+        }
+
+        // Moving the stream out of `Ready` needs something to leave behind.
+        // `pending()` is zero-sized, so boxing it does not allocate, and it
+        // occupies `self` only until the real future is built two lines down —
+        // the guard above is what stops it ever displacing a live poll.
+        let placeholder: PollFuture = Box::pin(core::future::pending());
+        if let StreamState::Ready { stream, .. } =
+            core::mem::replace(self, StreamState::Polling(placeholder))
+        {
+            let mut stream = *stream;
+            let cancellation_token = cancellation_token.clone();
+            *self = StreamState::Polling(Box::pin(async move {
+                let result = stream.next_event_with_retry(&cancellation_token).await;
+                (stream, result)
+            }));
+        }
+    }
 }
 
 /// Extract the `consistent_point` from a `CREATE_REPLICATION_SLOT` result.
@@ -1860,7 +2144,7 @@ pub struct EventStream {
 /// that would otherwise work.
 ///
 /// Split out as a free function so it is testable without a live connection.
-pub(crate) fn parse_consistent_point(result: &crate::connection::PgResult) -> Option<Lsn> {
+fn parse_consistent_point(result: &crate::connection::PgResult) -> Option<Lsn> {
     let raw = result.get_value(0, 1).filter(|v| !v.is_empty())?;
     match crate::types::parse_lsn(&raw) {
         Ok(lsn) => Some(Lsn::new(lsn)),
@@ -1917,11 +2201,14 @@ impl EventStream {
     ///
     /// # Panics
     ///
-    /// Panics if called while a `Stream::poll_next` future is in flight
-    /// (this never happens in normal usage).
+    /// Panics if called while a `Stream::poll_next` future is in flight — which
+    /// includes the ordinary case of a poll that was *abandoned*, such as
+    /// `tokio::time::timeout(d, stream.next())` expiring or a `select!` arm
+    /// losing. Call [`next_event`](Self::next_event) first: it reclaims the
+    /// parked stream. These accessors are synchronous and cannot.
     pub fn inner(&self) -> &LogicalReplicationStream {
-        self.inner
-            .as_ref()
+        self.state
+            .stream()
             .expect("inner stream is temporarily taken during poll")
     }
 
@@ -1929,14 +2216,27 @@ impl EventStream {
     ///
     /// # Panics
     ///
-    /// Panics if called while a `Stream::poll_next` future is in flight.
+    /// Same as [`inner`](Self::inner): panics while a poll is in flight,
+    /// abandoned polls included. Call [`next_event`](Self::next_event) first.
     pub fn inner_mut(&mut self) -> &mut LogicalReplicationStream {
-        self.inner
-            .as_mut()
+        self.state
+            .stream_mut()
             .expect("inner stream is temporarily taken during poll")
     }
 
     /// Get the current LSN position
+    ///
+    /// This is the **received** LSN (the last WAL byte read off the wire), which
+    /// is a different value from the flushed/applied pair
+    /// [`get_feedback_lsn`](Self::get_feedback_lsn) reports.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called while a `Stream::poll_next` future is in flight — it
+    /// reads through [`inner`](Self::inner). Unlike the `*_lsn` feedback methods,
+    /// this value lives only on the inner stream, so it cannot be served while
+    /// that stream is parked. Call [`next_event`](Self::next_event) first: it
+    /// reclaims the parked stream.
     pub fn current_lsn(&self) -> XLogRecPtr {
         self.inner().current_lsn()
     }
@@ -1985,7 +2285,7 @@ impl EventStream {
     /// - `shutdown()` is called
     #[inline]
     pub fn is_terminated(&self) -> bool {
-        self.terminated
+        self.state.is_terminated()
     }
 
     /// Get the next event from the stream (native async API)
@@ -1998,10 +2298,24 @@ impl EventStream {
     /// `StreamExt::next()` instead to avoid confusion. This method is named `next_event()`
     /// to avoid conflict with `StreamExt::next()`.
     pub async fn next_event(&mut self) -> Result<ChangeEvent> {
+        // A `poll_next` that returned `Pending` parked the stream inside
+        // `inflight`, and dropping the `Next`/`select!` future that drove it does
+        // not clear that field. Resume the parked future rather than asserting it
+        // cannot exist: abandoning a poll is ordinary use (`tokio::time::timeout`
+        // around `StreamExt::next`), and its event is still owed to the caller.
+        if let StreamState::Polling(fut) = &mut self.state {
+            let (stream, result) = fut.as_mut().await;
+            self.state = StreamState::Ready {
+                stream: Box::new(stream),
+                terminated: false,
+            };
+            return result;
+        }
+
         let inner = self
-            .inner
-            .as_mut()
-            .expect("inner stream is temporarily taken during poll");
+            .state
+            .stream_mut()
+            .expect("Polling was handled above, so the stream is in hand");
         inner.next_event_with_retry(&self.cancellation_token).await
     }
 
@@ -2032,13 +2346,25 @@ impl EventStream {
     /// After calling this, `next_event()` and `Stream::poll_next` will return `None`.
     pub async fn shutdown(&mut self) -> Result<()> {
         self.cancellation_token.cancel();
-        let result = if let Some(inner) = self.inner.as_mut() {
-            inner.stop().await
-        } else {
-            Ok(())
+        // Reclaim the stream from an abandoned poll before stopping it. The
+        // parked future *owns* the stream, so dropping it here would skip step 2
+        // entirely and tear the COPY down without a CopyDone — while still
+        // returning `Ok(())`. Cancelling first is what makes this await prompt:
+        // the parked `next_event_with_retry` honours the token.
+        if let StreamState::Polling(fut) = &mut self.state {
+            let (stream, _) = fut.as_mut().await;
+            self.state = StreamState::Ready {
+                stream: Box::new(stream),
+                terminated: false,
+            };
+        }
+
+        let StreamState::Ready { stream, terminated } = &mut self.state else {
+            // Unreachable: the block above converted Polling to Ready.
+            return Ok(());
         };
-        self.terminated = true;
-        self.inflight = None;
+        let result = stream.stop().await;
+        *terminated = true;
         result
     }
 }
@@ -2050,45 +2376,65 @@ impl futures_core::Stream for EventStream {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        if self.terminated {
+        if self.state.is_terminated() {
             return std::task::Poll::Ready(None);
         }
 
-        // If no future is in flight, create one by taking the inner stream
-        if self.inflight.is_none() {
-            let mut stream = self
-                .inner
-                .take()
-                .expect("inner stream missing without inflight future");
-            let cancel_token = self.cancellation_token.clone();
+        // Park the stream in a poll future if it is not already parked.
+        //
+        // Destructured rather than cloning the token: `poll_next` runs on every
+        // wakeup, and `start_poll` is a no-op on all but the first, so an
+        // unconditional `Arc` clone would put an atomic increment/decrement pair
+        // on every wakeup to serve a branch that rarely runs. `start_poll` clones
+        // only on the branch that actually parks.
+        let Self {
+            state,
+            cancellation_token,
+            ..
+        } = &mut *self;
+        state.start_poll(cancellation_token);
 
-            self.inflight = Some(Box::pin(async move {
-                let result = stream.next_event_with_retry(&cancel_token).await;
-                (stream, result)
-            }));
-        }
+        let StreamState::Polling(fut) = &mut self.state else {
+            // Unreachable: `start_poll` parks anything that is Ready and not
+            // terminated, and the terminated case returned above.
+            return std::task::Poll::Ready(None);
+        };
 
-        // Poll the in-flight future
-        let fut = self.inflight.as_mut().unwrap();
         match fut.as_mut().poll(cx) {
             std::task::Poll::Pending => std::task::Poll::Pending,
             std::task::Poll::Ready((stream, result)) => {
-                // Restore the inner stream
-                self.inner = Some(stream);
-                self.inflight = None;
-
+                // Take the stream back out of the resolved future. Whether this
+                // was the last event decides `terminated`, so the state
+                // transition is part of each arm rather than a separate step.
+                let stream = Box::new(stream);
                 match result {
-                    Ok(event) => std::task::Poll::Ready(Some(Ok(event))),
+                    Ok(event) => {
+                        self.state = StreamState::Ready {
+                            stream,
+                            terminated: false,
+                        };
+                        std::task::Poll::Ready(Some(Ok(event)))
+                    }
                     Err(ref e) if e.is_cancelled() || e.is_stream_stopped() => {
-                        self.terminated = true;
+                        self.state = StreamState::Ready {
+                            stream,
+                            terminated: true,
+                        };
                         std::task::Poll::Ready(None)
                     }
                     Err(ref e) if e.is_permanent() => {
-                        self.terminated = true;
+                        self.state = StreamState::Ready {
+                            stream,
+                            terminated: true,
+                        };
                         std::task::Poll::Ready(Some(Err(result.unwrap_err())))
                     }
                     Err(e) => {
                         // Transient error — yield it but keep the stream alive
+                        self.state = StreamState::Ready {
+                            stream,
+                            terminated: false,
+                        };
                         std::task::Poll::Ready(Some(Err(e)))
                     }
                 }
@@ -2099,7 +2445,7 @@ impl futures_core::Stream for EventStream {
 
 impl futures_core::FusedStream for EventStream {
     fn is_terminated(&self) -> bool {
-        self.terminated
+        self.state.is_terminated()
     }
 }
 
@@ -4157,19 +4503,16 @@ pub(crate) mod tests {
             parser: LogicalReplicationParser::with_protocol_version(config.protocol_version),
             state: ReplicationState::new(),
             config: config.clone(),
-            slot_created: false,
+            slot: SlotState::Absent,
             retry_handler: ReplicationConnectionRetry::new(
                 config.retry_config,
                 "postgresql://test@localhost/test?replication=database".to_string(),
             ),
             last_health_check: Instant::now(),
             shared_lsn_feedback: SharedLsnFeedback::new_shared(),
-            consistent_point: None,
-            exported_snapshot_name: None,
             identity: None,
             feedback_check_counter: 0,
-            stop_at_reached: None,
-            copy_done_sent: false,
+            replay_stop: ReplayStop::Running,
         }
     }
 
@@ -4245,9 +4588,10 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn discard_replication_slot_is_best_effort() {
         let mut stream = create_test_stream(create_test_config());
-        stream.slot_created = true;
-        stream.exported_snapshot_name = Some("snap".to_string());
-        stream.consistent_point = Some(Lsn::new(42));
+        stream.slot = SlotState::Ours {
+            consistent_point: Some(Lsn::new(42)),
+            exported_snapshot: Some("snap".to_string()),
+        };
 
         // The null connection cannot execute DROP_REPLICATION_SLOT, so this
         // exercises the failure arm.
@@ -4256,9 +4600,72 @@ pub(crate) mod tests {
         // State is deliberately left alone when the drop did not happen: claiming
         // the slot is gone when it is not would be worse than leaving it.
         assert!(
-            stream.slot_created,
+            matches!(stream.slot, SlotState::Ours { .. }),
             "a failed drop must not pretend the slot was removed"
         );
+        assert_eq!(stream.exported_snapshot_name(), Some("snap"));
+        assert_eq!(stream.consistent_point(), Some(Lsn::new(42)));
+    }
+
+    /// The asymmetry the nested `Option` exists for: `START_REPLICATION` destroys
+    /// the exported snapshot server-side, but the consistent point survives it as
+    /// the resume position. Collapsing the two into one `Option` — or into a
+    /// fourth enum variant — would lose exactly this.
+    #[test]
+    fn clearing_the_exported_snapshot_keeps_the_consistent_point() {
+        let mut slot = SlotState::Ours {
+            consistent_point: Some(Lsn::new(0x2A)),
+            exported_snapshot: Some("00000004-00000391-1".to_string()),
+        };
+
+        slot.clear_exported_snapshot();
+
+        assert_eq!(
+            slot.exported_snapshot(),
+            None,
+            "the name is dead after START_REPLICATION"
+        );
+        assert_eq!(
+            slot.consistent_point(),
+            Some(Lsn::new(0x2A)),
+            "the resume position outlives the snapshot name"
+        );
+        assert!(slot.is_present(), "the slot itself is still there");
+    }
+
+    /// A slot we did not create offers no baseline — and, critically, is a
+    /// *different state* from one we did create. The `slot_created: bool` this
+    /// replaced was `true` for both, which is why a guard on it could not have
+    /// protected an operator's slot from `discard_replication_slot`.
+    #[test]
+    fn a_pre_existing_slot_is_present_but_exposes_no_baseline() {
+        let slot = SlotState::PreExisting;
+
+        assert!(
+            slot.is_present(),
+            "ensure_replication_slot must not try again"
+        );
+        assert_eq!(slot.consistent_point(), None);
+        assert_eq!(slot.exported_snapshot(), None);
+        assert!(
+            !matches!(slot, SlotState::Ours { .. }),
+            "this is the distinction discard_replication_slot guards on"
+        );
+
+        // Absent must stay distinguishable from both.
+        assert!(!SlotState::Absent.is_present());
+    }
+
+    /// `clear_exported_snapshot` is a no-op on the states that never had one, so
+    /// a successful `start()` on a pre-existing slot cannot corrupt anything.
+    #[test]
+    fn clearing_the_exported_snapshot_is_a_no_op_when_there_is_none() {
+        for mut slot in [SlotState::Absent, SlotState::PreExisting] {
+            let was_present = slot.is_present();
+            slot.clear_exported_snapshot();
+            assert_eq!(slot.is_present(), was_present);
+            assert_eq!(slot.exported_snapshot(), None);
+        }
     }
 
     /// Pins the column order of `IDENTIFY_SYSTEM`: systemid is column 0 and
@@ -4379,6 +4786,43 @@ pub(crate) mod tests {
         assert!(msg.contains("different cluster"), "{msg}");
     }
 
+    /// `START_REPLICATION` runs `SnapBuildClearExportedSnapshot` server-side, so
+    /// a name surviving a *successful* `start()` is a handle to something the
+    /// server already destroyed — `SET TRANSACTION SNAPSHOT` would reject it.
+    ///
+    /// The converse matters just as much, and is what this pins: a `start()` that
+    /// failed before reaching the server has **not** destroyed anything, so the
+    /// name must survive. Clearing it there would send a later `snapshot()` down
+    /// the `Unavailable` path, which the documented usage reads as "nothing to
+    /// copy" — a stream with no baseline, failing silently.
+    ///
+    /// The null connection fails inside `initialize()` (at `identify_system`),
+    /// which is exactly that case. The success side needs a live server: see
+    /// `a_direct_start_clears_the_exported_snapshot_name` in
+    /// `integration-tests/initial_snapshot.rs`.
+    #[tokio::test]
+    async fn a_failed_start_keeps_the_exported_snapshot_name() {
+        let cfg = ReplicationStreamConfig::builder("slot", "pub");
+        let mut stream = create_test_stream(cfg);
+        stream.slot = SlotState::Ours {
+            consistent_point: None,
+            exported_snapshot: Some("00000004-00000391-1".to_string()),
+        };
+
+        let outcome = stream.start(None).await;
+        assert!(
+            outcome.is_err(),
+            "premise: the null connection must fail the attempt, or this tests nothing"
+        );
+
+        assert_eq!(
+            stream.exported_snapshot_name(),
+            Some("00000004-00000391-1"),
+            "the attempt never reached the server, so the snapshot is still alive \
+             and must stay reachable"
+        );
+    }
+
     #[tokio::test]
     async fn next_event_terminates_after_stop_boundary_reached() {
         // Simulate a crossing commit already delivered: the terminal guard must
@@ -4386,7 +4830,7 @@ pub(crate) mod tests {
         // StreamStopped on this and every subsequent call, without reading WAL.
         let cfg = ReplicationStreamConfig::builder("slot", "pub").with_stop_at_lsn(0x100u64);
         let mut stream = create_test_stream(cfg);
-        stream.stop_at_reached = Some(Lsn::new(0x100));
+        stream.replay_stop = ReplayStop::Armed(Lsn::new(0x100));
         let token = CancellationToken::new();
 
         let err = stream.next_event(&token).await.unwrap_err();
@@ -4394,9 +4838,10 @@ pub(crate) mod tests {
             matches!(err, ReplicationError::StreamStopped(l) if l == Lsn::new(0x100)),
             "expected StreamStopped(0x100), got {err:?}"
         );
-        assert!(
-            stream.copy_done_sent,
-            "CopyDone must be sent once on termination"
+        assert_eq!(
+            stream.replay_stop,
+            ReplayStop::Stopped(Lsn::new(0x100)),
+            "the Armed -> Stopped transition is the one-shot CopyDone guard"
         );
 
         // Idempotent: a second call still reports StreamStopped without resending.
@@ -4409,7 +4854,7 @@ pub(crate) mod tests {
         // StreamStopped is terminal — returned immediately, never retried.
         let cfg = ReplicationStreamConfig::builder("slot", "pub").with_stop_at_lsn(0x200u64);
         let mut stream = create_test_stream(cfg);
-        stream.stop_at_reached = Some(Lsn::new(0x200));
+        stream.replay_stop = ReplayStop::Armed(Lsn::new(0x200));
         let token = CancellationToken::new();
 
         let err = stream.next_event_with_retry(&token).await.unwrap_err();
@@ -4425,7 +4870,7 @@ pub(crate) mod tests {
         // poll_next maps StreamStopped to a graceful end-of-stream (None + terminated).
         let cfg = ReplicationStreamConfig::builder("slot", "pub").with_stop_at_lsn(0x300u64);
         let mut stream = create_test_stream(cfg);
-        stream.stop_at_reached = Some(Lsn::new(0x300));
+        stream.replay_stop = ReplayStop::Armed(Lsn::new(0x300));
         let token = CancellationToken::new();
         let mut es = stream.into_stream(token);
 
@@ -5934,7 +6379,10 @@ pub(crate) mod tests {
     fn test_exported_snapshot_name_some() {
         let config = create_test_config();
         let mut stream = create_test_stream(config);
-        stream.exported_snapshot_name = Some("00000001-00000001-1".to_string());
+        stream.slot = SlotState::Ours {
+            consistent_point: None,
+            exported_snapshot: Some("00000001-00000001-1".to_string()),
+        };
         assert_eq!(stream.exported_snapshot_name(), Some("00000001-00000001-1"));
     }
 
@@ -6097,7 +6545,10 @@ pub(crate) mod tests {
 
         let config = create_test_config();
         let mut stream = create_test_stream(config);
-        stream.exported_snapshot_name = Some("snap-123".to_string());
+        stream.slot = SlotState::Ours {
+            consistent_point: None,
+            exported_snapshot: Some("snap-123".to_string()),
+        };
 
         let cancel_token = CancellationToken::new();
         let event_stream = stream.into_stream(cancel_token);
@@ -6228,9 +6679,9 @@ pub(crate) mod tests {
         let stream = create_test_stream(config);
 
         // slot_created must be false initially
-        assert!(!stream.slot_created);
+        assert!(!stream.slot.is_present());
         // exported_snapshot_name must be None initially
-        assert!(stream.exported_snapshot_name.is_none());
+        assert!(stream.exported_snapshot_name().is_none());
         // State should be default (wire position at 0)
         assert_eq!(stream.state.last_received_lsn, 0);
         // SharedLsnFeedback should be zeroed
@@ -6265,13 +6716,16 @@ pub(crate) mod tests {
     async fn test_ensure_replication_slot_already_created() {
         let config = create_test_config();
         let mut stream = create_test_stream(config);
-        stream.slot_created = true;
+        stream.slot = SlotState::Ours {
+            consistent_point: None,
+            exported_snapshot: None,
+        };
 
         // This should succeed immediately because slot_created is true,
         // even though the connection is null.
         let result = stream.ensure_replication_slot().await;
         assert!(result.is_ok());
-        assert!(stream.slot_created);
+        assert!(stream.slot.is_present());
     }
 
     /// Verify that calling `ensure_replication_slot()` twice when already created
@@ -6280,11 +6734,14 @@ pub(crate) mod tests {
     async fn test_ensure_replication_slot_idempotent() {
         let config = create_test_config();
         let mut stream = create_test_stream(config);
-        stream.slot_created = true;
+        stream.slot = SlotState::Ours {
+            consistent_point: None,
+            exported_snapshot: None,
+        };
 
         assert!(stream.ensure_replication_slot().await.is_ok());
         assert!(stream.ensure_replication_slot().await.is_ok());
-        assert!(stream.slot_created);
+        assert!(stream.slot.is_present());
     }
 
     /// Verify that the output plugin is set to "pgoutput" for Logical
@@ -6313,7 +6770,10 @@ pub(crate) mod tests {
     fn test_exported_snapshot_name_set_and_get() {
         let config = create_test_config();
         let mut stream = create_test_stream(config);
-        stream.exported_snapshot_name = Some("00000003-00000028-1".to_string());
+        stream.slot = SlotState::Ours {
+            consistent_point: None,
+            exported_snapshot: Some("00000003-00000028-1".to_string()),
+        };
         assert_eq!(stream.exported_snapshot_name(), Some("00000003-00000028-1"));
     }
 
@@ -6330,14 +6790,17 @@ pub(crate) mod tests {
             ..Default::default()
         });
         let mut stream = create_test_stream(config);
-        stream.slot_created = true;
+        stream.slot = SlotState::Ours {
+            consistent_point: None,
+            exported_snapshot: None,
+        };
 
         // Simulate the temporary-slot reset logic from recover_connection()
         if stream.config.slot_options.temporary {
-            stream.slot_created = false;
+            stream.slot = SlotState::Absent;
         }
 
-        assert!(!stream.slot_created);
+        assert!(!stream.slot.is_present());
     }
 
     /// When `slot_options.temporary` is false, `recover_connection()` should NOT
@@ -6349,14 +6812,17 @@ pub(crate) mod tests {
             ..Default::default()
         });
         let mut stream = create_test_stream(config);
-        stream.slot_created = true;
+        stream.slot = SlotState::Ours {
+            consistent_point: None,
+            exported_snapshot: None,
+        };
 
         // Simulate the temporary-slot reset logic from recover_connection()
         if stream.config.slot_options.temporary {
-            stream.slot_created = false;
+            stream.slot = SlotState::Absent;
         }
 
-        assert!(stream.slot_created);
+        assert!(stream.slot.is_present());
     }
 
     /// Verify that recover_connection restarts replication from last_received_lsn.
@@ -6799,7 +7265,10 @@ pub(crate) mod tests {
         let mut stream = create_test_stream(config);
 
         // Manually mark slot as created
-        stream.slot_created = true;
+        stream.slot = SlotState::Ours {
+            consistent_point: None,
+            exported_snapshot: None,
+        };
 
         // ensure_replication_slot should succeed immediately
         assert!(stream.ensure_replication_slot().await.is_ok());
@@ -7592,14 +8061,14 @@ pub(crate) mod tests {
         let below = bytes::Bytes::from(build_wal_message(0x1000, 0x1FFF, b"x"));
         let mut stream = create_test_stream_with_frames(cfg, vec![below]);
         stream.next_raw_event(&token).await.unwrap();
-        assert!(stream.stop_at_reached.is_none());
+        assert_eq!(stream.replay_stop, ReplayStop::Running);
 
         // At/past the stop LSN: armed with this message's wal_end.
         let cfg2 = ReplicationStreamConfig::builder("slot", "pub").with_stop_at_lsn(0x2000u64);
         let at = bytes::Bytes::from(build_wal_message(0x1000, 0x2000, b"x"));
         let mut stream2 = create_test_stream_with_frames(cfg2, vec![at]);
         stream2.next_raw_event(&token).await.unwrap();
-        assert_eq!(stream2.stop_at_reached, Some(Lsn::new(0x2000)));
+        assert_eq!(stream2.replay_stop, ReplayStop::Armed(Lsn::new(0x2000)));
     }
 
     // These drive the shared raw pump through a null connection pre-seeded with CopyData frames. Both backends now expose the frame-seeding seam (`null_for_testing_with_frames`), so these run on libpq and rustls-tls alike — the pump serves each frame from the pending queue before any FFI.
@@ -7725,12 +8194,12 @@ pub(crate) mod tests {
         // First call delivers the crossing frame and arms the terminal.
         let raw = stream.next_raw_event(&token).await.unwrap();
         assert_eq!(raw.wal_end, Lsn::new(0x2000));
-        assert_eq!(stream.stop_at_reached, Some(Lsn::new(0x2000)));
+        assert_eq!(stream.replay_stop, ReplayStop::Armed(Lsn::new(0x2000)));
 
         // Second call terminates cleanly (CopyDone sent once, StreamStopped).
         let err = stream.next_raw_event(&token).await.unwrap_err();
         assert!(matches!(err, ReplicationError::StreamStopped(l) if l == Lsn::new(0x2000)));
-        assert!(stream.copy_done_sent);
+        assert_eq!(stream.replay_stop, ReplayStop::Stopped(Lsn::new(0x2000)));
     }
 
     #[tokio::test]
@@ -7763,7 +8232,7 @@ pub(crate) mod tests {
         let event = stream.next_event(&token).await.unwrap();
         assert!(matches!(event.event_type, EventType::Commit { .. }));
         // reached_stop_lsn returns the commit's end_lsn (0x2100 >= 0x2000).
-        assert_eq!(stream.stop_at_reached, Some(Lsn::new(0x2100)));
+        assert_eq!(stream.replay_stop, ReplayStop::Armed(Lsn::new(0x2100)));
     }
     // into_stream() and EventStream construction coverage
     // ========================================
@@ -7776,9 +8245,9 @@ pub(crate) mod tests {
         let event_stream = stream.into_stream(cancel_token.clone());
 
         // Verify all fields are properly initialized
-        assert!(event_stream.inner.is_some());
-        assert!(!event_stream.terminated);
-        assert!(event_stream.inflight.is_none());
+        assert!(event_stream.state.stream().is_some());
+        assert!(!event_stream.is_terminated());
+        assert!(!event_stream.state.is_polling());
         assert!(!event_stream.is_terminated());
 
         // Shared feedback should work
@@ -7840,7 +8309,7 @@ pub(crate) mod tests {
         let mut event_stream = stream.into_stream(cancel_token);
 
         // Manually set terminated
-        event_stream.terminated = true;
+        event_stream.state.mark_terminated();
 
         // poll_next should return None immediately
         let result = event_stream.next().await;
@@ -7920,8 +8389,8 @@ pub(crate) mod tests {
 
         // After poll completes, inner should be restored (even though terminated)
         // The inner is restored on Ready, so it should be Some
-        assert!(event_stream.inner.is_some());
-        assert!(event_stream.inflight.is_none());
+        assert!(event_stream.state.stream().is_some());
+        assert!(!event_stream.state.is_polling());
     }
 
     // ========================================
@@ -7937,27 +8406,36 @@ pub(crate) mod tests {
 
         event_stream.shutdown().await.ok();
 
-        assert!(event_stream.inflight.is_none());
-        assert!(event_stream.terminated);
-        assert!(event_stream.inner.is_some()); // inner remains available
+        assert!(!event_stream.state.is_polling());
+        assert!(event_stream.is_terminated());
+        assert!(event_stream.state.stream().is_some()); // inner remains available
     }
 
+    /// Replaces `test_event_stream_shutdown_with_inner_none`, which built
+    /// `(inner: None, inflight: None)` by hand and asserted that `shutdown`
+    /// "handles None gracefully". That state is exactly where the old `shutdown`
+    /// landed when a poll was in flight — dropping the future that owned the
+    /// connection and skipping the final feedback — so the test pinned the bug
+    /// as correct. `StreamState` makes the state unrepresentable; what is left
+    /// to check is that a parked stream gets reclaimed, not abandoned.
     #[tokio::test]
-    async fn test_event_stream_shutdown_with_inner_none() {
+    async fn test_event_stream_shutdown_reclaims_a_parked_stream() {
         let config = create_test_config();
         let stream = create_test_stream(config);
         let cancel_token = CancellationToken::new();
         let mut event_stream = stream.into_stream(cancel_token);
-
-        // Simulate inner being None (as if taken during polling)
-        let taken = event_stream.inner.take();
+        event_stream
+            .state
+            .park_with_result(Err(ReplicationError::Protocol("parked".to_string())));
 
         let result = event_stream.shutdown().await;
-        assert!(result.is_ok()); // shutdown handles None gracefully
-        assert!(event_stream.terminated);
 
-        // Restore for cleanup
-        event_stream.inner = taken;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(event_stream.is_terminated());
+        assert!(
+            event_stream.state.stream().is_some(),
+            "the stream must be reclaimed from the parked future, not dropped"
+        );
     }
 
     // ========================================
@@ -8077,12 +8555,74 @@ pub(crate) mod tests {
         let stream = create_test_stream(config);
         let cancel_token = CancellationToken::new();
         let mut event_stream = stream.into_stream(cancel_token);
-
-        // Take the inner stream and wrap it in a ready future with the desired result
-        let inner = event_stream.inner.take().unwrap();
-        event_stream.inflight = Some(Box::pin(async move { (inner, result) }));
-
+        event_stream.state.park_with_result(result);
         event_stream
+    }
+
+    /// A `poll_next` that returned `Pending` parks the stream in `inflight`;
+    /// dropping the driving future (`tokio::time::timeout`, a losing `select!`
+    /// arm) does not clear it. `next_event` must resume that future — it used to
+    /// `.expect()` against a state ordinary use can reach, and panicked.
+    #[tokio::test]
+    async fn next_event_resumes_an_abandoned_poll_instead_of_panicking() {
+        let event = ChangeEvent {
+            event_type: EventType::Begin {
+                final_lsn: crate::types::Lsn::new(0x1000),
+                commit_timestamp: chrono::Utc::now(),
+                transaction_id: 7,
+            },
+            lsn: crate::types::Lsn::new(0x1000),
+            metadata: None,
+        };
+        let mut es = create_event_stream_with_inflight(Ok(event));
+
+        let got = es
+            .next_event()
+            .await
+            .expect("the parked event is still owed");
+        assert_eq!(got.lsn, crate::types::Lsn::new(0x1000));
+        assert!(es.state.stream().is_some(), "the stream must be reclaimed");
+        assert!(!es.state.is_polling(), "the parked future must be cleared");
+
+        // Reclaiming heals the state, so the inner-only accessors work again.
+        let _ = es.current_lsn();
+    }
+
+    /// `shutdown`'s documented step 2 is "Sends a final LSN feedback". With a
+    /// poll parked, the stream lives inside `inflight`, so the old code took the
+    /// `else` arm, skipped the feedback, returned `Ok(())`, and then dropped the
+    /// future that owned the connection — tearing down the COPY with no CopyDone.
+    #[tokio::test]
+    async fn shutdown_reclaims_the_stream_from_an_abandoned_poll() {
+        let mut es = create_event_stream_with_inflight(Err(ReplicationError::protocol(
+            "poll was abandoned".to_string(),
+        )));
+
+        es.shutdown().await.ok();
+
+        assert!(
+            es.state.stream().is_some(),
+            "shutdown must reclaim the stream so the final feedback can be sent"
+        );
+        assert!(es.is_terminated());
+    }
+
+    /// Two wire options, one user intent. The server accepts `two_phase 'on'` on
+    /// a slot created without `TWO_PHASE` and then silently never decodes
+    /// PREPARE, so setting only one of the pair fails quietly.
+    #[test]
+    fn with_two_phase_sets_both_wire_options() {
+        let config = ReplicationStreamConfig::builder("s", "p").with_two_phase(true);
+        assert!(config.two_phase, "START_REPLICATION option");
+        assert!(
+            config.slot_options.two_phase,
+            "CREATE_REPLICATION_SLOT option — without this the slot is not \
+             two-phase capable and PREPARE is never decoded"
+        );
+
+        let off = ReplicationStreamConfig::builder("s", "p").with_two_phase(false);
+        assert!(!off.two_phase);
+        assert!(!off.slot_options.two_phase);
     }
 
     #[tokio::test]
@@ -8115,8 +8655,8 @@ pub(crate) mod tests {
         // Stream should NOT be terminated after a successful event
         assert!(!event_stream.is_terminated());
         // Inner should be restored
-        assert!(event_stream.inner.is_some());
-        assert!(event_stream.inflight.is_none());
+        assert!(event_stream.state.stream().is_some());
+        assert!(!event_stream.state.is_polling());
     }
 
     #[tokio::test]
@@ -8138,7 +8678,7 @@ pub(crate) mod tests {
         // Stream SHOULD be terminated after a permanent error
         assert!(event_stream.is_terminated());
         // Inner should be restored
-        assert!(event_stream.inner.is_some());
+        assert!(event_stream.state.stream().is_some());
 
         // Subsequent poll should return None (terminated)
         let result2 = event_stream.next().await;
@@ -8166,7 +8706,7 @@ pub(crate) mod tests {
         // Stream should NOT be terminated — it's a transient error
         assert!(!event_stream.is_terminated());
         // Inner should be restored
-        assert!(event_stream.inner.is_some());
+        assert!(event_stream.state.stream().is_some());
     }
 
     #[tokio::test]
@@ -8181,7 +8721,7 @@ pub(crate) mod tests {
         assert!(result.is_none());
 
         assert!(event_stream.is_terminated());
-        assert!(event_stream.inner.is_some());
+        assert!(event_stream.state.stream().is_some());
     }
 
     #[tokio::test]
@@ -8239,9 +8779,9 @@ pub(crate) mod tests {
         let mut event_stream = stream.into_stream(cancel_token);
 
         // Inject first transient error
-        let inner = event_stream.inner.take().unwrap();
-        let err1 = ReplicationError::Protocol("error 1".to_string());
-        event_stream.inflight = Some(Box::pin(async move { (inner, Err(err1)) }));
+        event_stream
+            .state
+            .park_with_result(Err(ReplicationError::Protocol("error 1".to_string())));
 
         let result1 = event_stream.next().await;
         assert!(result1.is_some());
@@ -8249,9 +8789,9 @@ pub(crate) mod tests {
         assert!(!event_stream.is_terminated());
 
         // Inject second transient error
-        let inner = event_stream.inner.take().unwrap();
-        let err2 = ReplicationError::Buffer("error 2".to_string());
-        event_stream.inflight = Some(Box::pin(async move { (inner, Err(err2)) }));
+        event_stream
+            .state
+            .park_with_result(Err(ReplicationError::Buffer("error 2".to_string())));
 
         let result2 = event_stream.next().await;
         assert!(result2.is_some());
@@ -8259,9 +8799,11 @@ pub(crate) mod tests {
         assert!(!event_stream.is_terminated()); // Still alive after multiple transient errors
 
         // Now inject a permanent error
-        let inner = event_stream.inner.take().unwrap();
-        let err3 = ReplicationError::PermanentConnection("done".to_string());
-        event_stream.inflight = Some(Box::pin(async move { (inner, Err(err3)) }));
+        event_stream
+            .state
+            .park_with_result(Err(ReplicationError::PermanentConnection(
+                "done".to_string(),
+            )));
 
         let result3 = event_stream.next().await;
         assert!(result3.is_some());
@@ -8279,7 +8821,6 @@ pub(crate) mod tests {
         let mut event_stream = stream.into_stream(cancel_token);
 
         // Inject a successful event
-        let inner = event_stream.inner.take().unwrap();
         let event = ChangeEvent {
             event_type: EventType::Commit {
                 commit_lsn: crate::types::Lsn::new(0x2000),
@@ -8289,7 +8830,7 @@ pub(crate) mod tests {
             lsn: crate::types::Lsn::new(0x2000),
             metadata: None,
         };
-        event_stream.inflight = Some(Box::pin(async move { (inner, Ok(event)) }));
+        event_stream.state.park_with_result(Ok(event));
 
         let result1 = event_stream.next().await;
         assert!(result1.is_some());
@@ -8297,9 +8838,11 @@ pub(crate) mod tests {
         assert!(!event_stream.is_terminated());
 
         // Now inject a cancellation
-        let inner = event_stream.inner.take().unwrap();
-        let cancel_err = ReplicationError::Cancelled("shutting down".to_string());
-        event_stream.inflight = Some(Box::pin(async move { (inner, Err(cancel_err)) }));
+        event_stream
+            .state
+            .park_with_result(Err(ReplicationError::Cancelled(
+                "shutting down".to_string(),
+            )));
 
         let result2 = event_stream.next().await;
         assert!(result2.is_none());

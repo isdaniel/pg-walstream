@@ -11,6 +11,11 @@ use crate::stream::LogicalReplicationStream;
 use crate::types::Lsn;
 use tokio_util::sync::CancellationToken;
 
+/// Why [`SnapshotRows::stream`] can be `None`, for the two `expect`s that read
+/// it. Unreachable: the only writers are the by-value handoffs, after which the
+/// value is dropped without another method call.
+const STREAM_TAKEN: &str = "the stream is moved out only by run/finish/abandon, which consume self";
+
 /// Decode the next complete row out of `decoder`, if one is buffered.
 ///
 /// The pure half of the copy loop: everything between "bytes have arrived" and
@@ -37,7 +42,13 @@ fn next_buffered_row(
 }
 
 /// One row copied from a table, before it is turned into an event.
+///
+/// `#[non_exhaustive]`: read the fields, never build one with a struct literal.
+/// Only the library produces these, so closing literal construction costs a
+/// caller nothing and is what makes adding a field a non-breaking change —
+/// otherwise every new field breaks every downstream literal again.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SnapshotRow {
     /// The table this row came from, shared across every row of that table.
     pub relation: Arc<crate::protocol::RelationInfo>,
@@ -109,10 +120,13 @@ fn synthetic_row(index: usize, lsn: Lsn) -> SnapshotRow {
 
 /// A snapshot in progress, yielding [`SnapshotRow`]s.
 ///
-/// The replication stream is held *inside* this value: any replication command
-/// on it would run `SnapBuildClearExportedSnapshot` server-side and destroy the
-/// snapshot mid-copy, so there is deliberately no `&mut` accessor and no way to
-/// call `start()` until the snapshot is finished or abandoned.
+/// The replication stream is held *inside* this value: `start()` would put the
+/// replication connection into `CopyBoth` mid-copy and begin streaming from the
+/// slot's consistent point before the copy that has to precede it is done. (Not
+/// because it would destroy the snapshot being read — that was imported into the
+/// reader's own `REPEATABLE READ` transaction back in `snapshot()`.) So there is
+/// deliberately no `&mut` accessor and no way to call `start()` until the
+/// snapshot is finished or abandoned.
 ///
 /// # Failure consumes the handle
 ///
@@ -130,7 +144,14 @@ fn synthetic_row(index: usize, lsn: Lsn) -> SnapshotRow {
 #[must_use = "the replication stream is inside this value; consume it with \
               run/finish/abandon to get it back"]
 pub struct SnapshotRows {
-    stream: LogicalReplicationStream,
+    /// `None` only once a handoff has moved it out.
+    ///
+    /// Every handoff ([`run`](Self::run) / [`finish`](Self::finish) /
+    /// [`abandon`](Self::abandon)) takes `self` by value, so no `&self` method
+    /// can observe the `None`. That makes the `Some`/`None` distinction the
+    /// record of whether the caller ever got the stream back, which is exactly
+    /// what [`Drop`] needs to decide the slot's fate.
+    stream: Option<LogicalReplicationStream>,
     source: RowSource,
     consistent_point: Lsn,
     cancellation_token: CancellationToken,
@@ -151,7 +172,7 @@ impl SnapshotRows {
         let mut remaining = tables;
         remaining.reverse();
         Self {
-            stream,
+            stream: Some(stream),
             source: RowSource::Copy {
                 reader,
                 decoder: TextRowDecoder::new(),
@@ -168,7 +189,7 @@ impl SnapshotRows {
     /// Read-only view of the parked replication stream.
     #[inline]
     pub fn stream(&self) -> &LogicalReplicationStream {
-        &self.stream
+        self.stream.as_ref().expect(STREAM_TAKEN)
     }
 
     /// The next row, or `Ok(None)` once every table has been copied.
@@ -232,6 +253,12 @@ impl SnapshotRows {
                     }
 
                     // Start the next table, or report the snapshot complete.
+
+                    if !remaining.is_empty() && self.cancellation_token.is_cancelled() {
+                        return Err(ReplicationError::Cancelled(
+                            "snapshot cancelled".to_string(),
+                        ));
+                    }
                     match remaining.pop() {
                         Some(table) => {
                             reader.copy_out_begin(&table.copy_sql)?;
@@ -254,27 +281,19 @@ impl SnapshotRows {
     ///
     /// A failure also drops the replication slot this snapshot created, so the
     /// retry gets a fresh export instead of finding the slot present and
-    /// silently proceeding with no baseline.
+    /// silently proceeding with no baseline. That cleanup lives in [`Drop`], so
+    /// it covers the `?`-on-the-caller's-side shape too, not just this loop.
     pub async fn run<F, Fut>(mut self, mut handler: F) -> Result<LogicalReplicationStream>
     where
         F: FnMut(SnapshotRow) -> Fut,
         Fut: core::future::Future<Output = Result<()>>,
     {
-        loop {
-            match self.next_row().await {
-                Ok(Some(row)) => {
-                    if let Err(e) = handler(row).await {
-                        self.poisoned = true;
-                        self.discard_slot();
-                        return Err(e);
-                    }
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    self.discard_slot();
-                    return Err(e);
-                }
-            }
+        // Every `?` here drops `self`, and `Drop` discards the slot. There is
+        // deliberately no explicit cleanup call: two mechanisms would mean two
+        // `DROP_REPLICATION_SLOT` attempts, the second failing and logging a
+        // warning that contradicts the first.
+        while let Some(row) = self.next_row().await? {
+            handler(row).await?;
         }
         self.finish().await
     }
@@ -284,23 +303,29 @@ impl SnapshotRows {
     /// Errors if the snapshot was not run to completion: a half-copied snapshot
     /// followed by `start()` is exactly the silent gap this API exists to make
     /// unrepresentable.
+    ///
+    /// Either error path consumes the handle, so [`Drop`] discards the slot — an
+    /// incomplete snapshot therefore restarts from a fresh export rather than
+    /// resuming. That is why the message points at `abandon()` as a *different
+    /// call to make instead*, not as something still available afterwards.
     pub async fn finish(mut self) -> Result<LogicalReplicationStream> {
         if self.poisoned {
             // Reached via the pull API: `next_row` failed, and the caller is now
-            // trying to salvage the stream. Drop the slot so their retry cannot
-            // silently come back with no baseline.
-            self.discard_slot();
+            // trying to salvage the stream. Returning `Err` drops `self`, and
+            // `Drop` discards the slot, so their retry cannot silently come back
+            // with no baseline.
             return Err(Self::poisoned_err());
         }
         if !self.completed {
             return Err(ReplicationError::protocol(
                 "snapshot was not fully consumed; finish() would leave a gap between \
-                 the snapshot and the stream. Consume every row, or call abandon()."
+                 the snapshot and the stream. Consume every row, or use abandon() \
+                 instead of finish()."
                     .to_string(),
             ));
         }
         self.close_reader();
-        Ok(self.stream)
+        Ok(self.take_stream())
     }
 
     /// Give up on the snapshot and hand back the replication stream.
@@ -314,19 +339,39 @@ impl SnapshotRows {
     /// consistent point is exactly where `start(None)` will resume — so there is
     /// no gap in the *changes*, only an absent initial copy the caller asked to
     /// skip.
+    ///
+    /// A *poisoned* snapshot is rejected rather than abandoned. Abandoning is a
+    /// deliberate choice; a poisoned handle means the copy already failed, and
+    /// the two must not look alike at the call site. This closes the one path
+    /// where `for_each_event(...).await?` followed by `abandon()` handed back the
+    /// stream after a partial snapshot with no error anywhere — `run_snapshot`
+    /// and `for_each_event` both return `Ok(())` on cancellation, so the failure
+    /// has to surface here.
     pub async fn abandon(mut self) -> Result<LogicalReplicationStream> {
+        if self.poisoned {
+            return Err(Self::poisoned_err());
+        }
         self.close_reader();
-        Ok(self.stream)
+        Ok(self.take_stream())
+    }
+
+    /// Move the stream out, which also defuses [`Drop`]'s slot cleanup: the
+    /// caller owns the stream now, so the slot is theirs to keep.
+    #[inline]
+    fn take_stream(&mut self) -> LogicalReplicationStream {
+        self.stream.take().expect(STREAM_TAKEN)
     }
 
     /// Drop the slot this snapshot created, so a retry gets a fresh export.
     ///
-    /// Never called from [`abandon`](Self::abandon) or a successful
-    /// [`finish`](Self::finish): reaching either of those means the caller got
-    /// what they asked for.
+    /// Never reached from [`abandon`](Self::abandon) or a successful
+    /// [`finish`](Self::finish): both take the stream out first, and [`Drop`]
+    /// only calls this while it is still here.
     fn discard_slot(&mut self) {
         self.close_reader();
-        self.stream.discard_replication_slot();
+        if let Some(stream) = self.stream.as_mut() {
+            stream.discard_replication_slot();
+        }
     }
 
     fn close_reader(&mut self) {
@@ -360,7 +405,7 @@ impl SnapshotRows {
         consistent_point: Lsn,
     ) -> Self {
         Self {
-            stream,
+            stream: Some(stream),
             source: RowSource::Mock {
                 outcomes: outcomes.into_iter().collect(),
                 delivered: 0,
@@ -370,6 +415,23 @@ impl SnapshotRows {
             completed: false,
             poisoned: false,
         }
+    }
+}
+
+impl Drop for SnapshotRows {
+    /// Discard the slot unless the stream was handed back.
+    ///
+    /// Reaching here with the stream still inside means no handoff happened:
+    /// `run`/`finish`/`abandon` all take `self` by value and move it out. So this is a failed snapshot — or one dropped by a `?` on the caller's side, which is the shape the module's own example has, since `router.run_snapshot(&mut events).await?` drops `events` on error.
+    ///
+    /// The slot must not survive that. A retry would find it present, `ensure_replication_slot` swallows the "already exists", so nothing is exported and the caller gets `SnapshotOutcome::Unavailable` — which reads as "resuming an existing subscription" and streams with no baseline. A transient failure would become a silent, unbounded data gap, which is the exact outcome this module exists to prevent.
+    ///
+    /// Only then can the *blocking* `DROP_REPLICATION_SLOT` round-trip below run without queueing behind a COPY that will never drain. Any refactor that moves this cleanup into a separate guard field hands that ordering to field-declaration order and can silently re-create the COPY OUT drop deadlock.
+    fn drop(&mut self) {
+        if self.stream.is_none() {
+            return;
+        }
+        self.discard_slot();
     }
 }
 
@@ -391,7 +453,7 @@ mod tests {
     }
 
     fn mock(outcomes: Vec<Result<()>>) -> SnapshotRows {
-        let config = ReplicationStreamConfig::builder("s", "p").with_initial_snapshot(true);
+        let config = ReplicationStreamConfig::builder("s", "p");
         SnapshotRows::mock(create_test_stream(config), outcomes, Lsn::new(0x1234))
     }
 
@@ -554,6 +616,35 @@ mod tests {
         );
     }
 
+    /// `abandon()` is the "I choose to skip the baseline" path, so it must not
+    /// double as a way to launder a snapshot that already failed. Without this,
+    /// `run_snapshot(...).await?` — which returns `Ok(())` on cancellation —
+    /// followed by `abandon()` handed back the stream after a *partial* copy with
+    /// no error anywhere.
+    #[tokio::test]
+    async fn abandon_rejects_a_poisoned_handle() {
+        let mut rows = mock(vec![
+            Ok(()),
+            Err(ReplicationError::protocol("boom".to_string())),
+        ]);
+        assert!(rows.next_row().await.unwrap().is_some());
+        assert!(rows.next_row().await.is_err());
+
+        let err = expect_err(rows.abandon().await);
+        assert!(
+            format!("{err}").contains("poisoned"),
+            "abandoning a failed snapshot must not look like a deliberate skip: {err}"
+        );
+    }
+
+    /// The converse: an untouched handle abandons cleanly, which is what
+    /// `SnapshotOutcome::skip` relies on.
+    #[tokio::test]
+    async fn abandon_returns_the_stream_when_not_poisoned() {
+        let rows = mock(vec![Ok(()), Ok(())]);
+        rows.abandon().await.expect("a clean handle must abandon");
+    }
+
     #[tokio::test]
     async fn run_consumes_everything_and_returns_the_stream() {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -599,11 +690,11 @@ mod tests {
     /// subscription" and streams with no baseline. A transient setup failure
     /// would become a silent, unbounded data gap.
     ///
-    /// The mock stream has a null connection, so the drop itself cannot succeed
-    /// here; what this pins is that the cleanup path is *reached*, and that it
-    /// does not mask the original error.
+    /// The mock stream's slot is `SlotState::Absent`, so `discard_replication_slot`
+    /// returns at its guard without reaching the connection; what this pins is that
+    /// the cleanup path is *reached*, and that it does not mask the original error.
     #[tokio::test]
-    async fn a_failed_run_does_not_leave_the_slot_behind() {
+    async fn run_propagates_a_source_error() {
         let err = mock(vec![Err(ReplicationError::protocol(
             "read failed".to_string(),
         ))])
@@ -614,36 +705,6 @@ mod tests {
             format!("{err}").contains("read failed"),
             "slot cleanup must not mask the original error: {err}"
         );
-    }
-
-    #[tokio::test]
-    async fn a_failed_handler_does_not_leave_the_slot_behind() {
-        let err = mock(vec![Ok(())])
-            .run(|_| async { Err(ReplicationError::protocol("handler failed".to_string())) })
-            .await;
-        let err = expect_err(err);
-        assert!(format!("{err}").contains("handler failed"), "{err}");
-    }
-
-    /// Abandoning is a deliberate choice to stream without a baseline, so the
-    /// slot is kept: its consistent point is exactly where `start(None)` resumes,
-    /// meaning no change is missed — only the initial copy the caller skipped.
-    #[tokio::test]
-    async fn abandon_keeps_the_slot() {
-        let mut rows = mock(vec![Ok(())]);
-        rows.next_row().await.unwrap();
-        rows.abandon().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn run_propagates_a_source_error() {
-        let err = mock(vec![Err(ReplicationError::protocol(
-            "read failed".to_string(),
-        ))])
-        .run(|_| async { Ok(()) })
-        .await;
-        let err = expect_err(err);
-        assert!(format!("{err}").contains("read failed"), "{err}");
     }
 
     #[tokio::test]
