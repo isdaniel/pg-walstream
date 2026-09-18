@@ -60,15 +60,44 @@ fn snapshot_config(slot: &str, publication: &str) -> ReplicationStreamConfig {
         Duration::from_secs(60),
         RetryConfig::default(),
     )
-    .with_initial_snapshot(true)
 }
 
+/// Drop `slot` if it exists, including when a stream still holds it.
+///
+/// `pg_drop_replication_slot` fails with "replication slot is active for PID"
+/// while a walsender holds it, and swallowing that error leaks the slot for the
+/// whole run — a leaked slot pins WAL. `reader_and_replication_negotiate_the_same_tls`
+/// ends with `abandon()` (which deliberately keeps the slot) immediately
+/// followed by this call, so it hits that race directly. Mirrors the helper in
+/// `initial_snapshot.rs`.
 fn drop_slot(slot: &str) {
-    if let Ok(mut conn) = PgReplicationConnection::connect(&replication_conn_string()) {
+    let Ok(mut conn) = PgReplicationConnection::connect(&replication_conn_string()) else {
+        return;
+    };
+    for attempt in 0..50 {
+        let _ = conn.exec(&format!(
+            "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots \
+             WHERE slot_name = '{slot}' AND active_pid IS NOT NULL"
+        ));
         let _ = conn.exec(&format!(
             "SELECT pg_drop_replication_slot('{slot}') WHERE EXISTS \
              (SELECT 1 FROM pg_replication_slots WHERE slot_name = '{slot}')"
         ));
+        let gone = conn
+            .exec(&format!(
+                "SELECT count(*) FROM pg_replication_slots WHERE slot_name = '{slot}'"
+            ))
+            .ok()
+            .and_then(|r| r.get_value(0, 0).map(|v| v == "0"))
+            .unwrap_or(false);
+        if gone {
+            return;
+        }
+        assert!(
+            attempt < 49,
+            "could not drop replication slot {slot}; it would pin WAL for the whole run"
+        );
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -192,25 +221,44 @@ async fn reader_and_replication_negotiate_the_same_tls() {
 
     let mut probe =
         PgReplicationConnection::connect(&regular_conn_string()).expect("probe connection");
+    // `AND s.ssl` in the WHERE clause made this unfalsifiable: a reader that
+    // silently fell back to plaintext has `ssl = false`, so its row was filtered
+    // out, only the walsender remained, and `count(DISTINCT ...) = 1` passed —
+    // the exact downgrade the assertion claims to catch. (`version`/`cipher` are
+    // NULL when `ssl` is false, and `count(DISTINCT)` skips NULLs, so the filter
+    // was doubly self-defeating.) Count the unencrypted backends instead.
     let result = probe
         .exec(
-            "SELECT count(DISTINCT s.version || '/' || s.cipher)
+            "SELECT count(*),
+                    count(DISTINCT s.version || '/' || s.cipher),
+                    count(*) FILTER (WHERE NOT s.ssl)
                FROM pg_stat_activity a
                JOIN pg_stat_ssl s USING (pid)
               WHERE a.datname = current_database()
-                AND (a.backend_type = 'walsender' OR a.query LIKE 'COPY %')
-                AND s.ssl",
+                AND (a.backend_type = 'walsender' OR a.query LIKE 'COPY %')",
         )
         .expect("probe");
-    let distinct: i64 = result
-        .get_value(0, 0)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(-1);
+    let column = |i| -> i64 {
+        result
+            .get_value(0, i)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(-1)
+    };
+    let (total, distinct, unencrypted) = (column(0), column(1), column(2));
 
+    assert!(
+        total >= 2,
+        "premise: both the walsender and the reader's COPY must be visible, saw {total}"
+    );
+    assert_eq!(
+        unencrypted, 0,
+        "every connection the snapshot uses must be encrypted; {unencrypted} were not — \
+         this is the silent downgrade"
+    );
     assert_eq!(
         distinct, 1,
         "the reader and the replication connection must negotiate identical TLS \
-         parameters; more than one (version, cipher) pair means a silent downgrade"
+         parameters; more than one (version, cipher) pair means they diverged"
     );
 
     drop(rows.abandon().await.expect("abandon"));

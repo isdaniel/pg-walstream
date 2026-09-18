@@ -128,10 +128,10 @@ impl WalRouter {
 
     /// Dispatch a single event to its handler (or the default).
     ///
-    /// Crate-internal: [`run`](Self::run) is the public entry point. Kept
-    /// `pub(crate)` (not `pub`) to minimize the exposed surface — no external
-    /// consumer drives dispatch directly.
-    pub(crate) async fn dispatch(&mut self, ev: &ChangeEvent) -> Result<()> {
+    /// Module-private: [`run`](Self::run) / [`run_snapshot`](Self::run_snapshot)
+    /// are the public entry points, and both live in this file, so nothing
+    /// outside it — in or out of the crate — drives dispatch directly.
+    async fn dispatch(&mut self, ev: &ChangeEvent) -> Result<()> {
         let key = match &ev.event_type {
             EventType::Insert { table, .. } => Some((table.clone(), Kind::Insert)),
             EventType::Update { table, .. } => Some((table.clone(), Kind::Update)),
@@ -147,8 +147,6 @@ impl WalRouter {
         }
     }
 
-    /// Drive an [`EventStream`]: dispatch each event, auto-advance applied LSN
-    /// after each `Ok`, and exit gracefully on cancellation.
     /// Drive a [`SnapshotEvents`](crate::snapshot::SnapshotEvents) with the same
     /// handlers as [`run`](Self::run).
     ///
@@ -156,6 +154,8 @@ impl WalRouter {
     /// both go through the same `EventSource` seam; nothing on
     /// [`ChangeEvent`] distinguishes them, and nothing
     /// needs to.
+    ///
+    /// `Ok(())` means the event source is exhausted — which covers **both** a completed snapshot and one cut short by cancellation. The two are indistinguishable here by design; `SnapshotEvents::finish` is what tells them apart, and it rejects the cancelled case. Always follow this with `finish()`, never with `abandon()`.
     pub async fn run_snapshot(
         &mut self,
         events: &mut crate::snapshot::SnapshotEvents,
@@ -163,12 +163,14 @@ impl WalRouter {
         self.run_over(events).await
     }
 
+    /// Drive an [`EventStream`]: dispatch each event, auto-advance applied LSN
+    /// after each `Ok`, and exit gracefully on cancellation.
     pub async fn run(&mut self, es: &mut EventStream) -> Result<()> {
         self.run_over(es).await
     }
 
     /// Generic driver over any [`EventSource`] (unit-testable seam).
-    pub(crate) async fn run_over<S: EventSource>(&mut self, source: &mut S) -> Result<()> {
+    async fn run_over<S: EventSource>(&mut self, source: &mut S) -> Result<()> {
         loop {
             match source.recv().await {
                 Ok(ev) => {

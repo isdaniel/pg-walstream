@@ -1,4 +1,4 @@
-.PHONY: check build format audit test doc-check before-git-push deps-check deps-bump deps-bump-dry
+.PHONY: check lint coverage build format audit test doc-check examples before-git-push deps-check deps-bump deps-bump-dry
 
 deps-check:
 	@echo "=== Checking for outdated dependencies ==="
@@ -30,6 +30,10 @@ lint:
 	cargo clippy --no-default-features --lib -- -D warnings
 
 # `--features derive` matters: without it the number will not match CI's gate.
+#
+# Deliberately NOT in `before-git-push`: llvm-cov re-instruments and re-runs the
+# whole suite, which is minutes rather than seconds. Run it by hand when the
+# change adds or removes `src/` lines.
 coverage:
 	cargo llvm-cov --lib --features derive --summary-only
 
@@ -45,7 +49,16 @@ audit:
 test:
 	cargo test
 
+# RUSTDOCFLAGS must match CI (`ci.yml` sets `-D warnings`), or this passes while
+# the doc job fails.
 doc-check:
-	cargo doc --no-deps --all-features
+	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 
-before-git-push: check lint build format audit test doc-check
+# Examples are workspace-excluded, so `cargo check` above never sees them.
+examples:
+	@for manifest in examples/*/Cargo.toml; do \
+		echo "=== $$manifest ==="; \
+		cargo check --manifest-path "$$manifest" --all-targets || exit 1; \
+	done
+
+before-git-push: check lint build format audit test doc-check examples

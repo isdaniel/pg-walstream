@@ -29,8 +29,7 @@
 //!   care which phase produced them.
 //! - The replication stream is *moved into* the snapshot handle. `start()` during
 //!   the snapshot would destroy the very snapshot being read, so the API makes it
-//!   impossible to write — try uncommenting the marked line and it will not
-//!   compile.
+//!   impossible to write — uncomment the marked `start()` line in phase 1 and it will not compile.
 //!
 //! ## Prerequisites
 //!
@@ -106,6 +105,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Setup: a table with two rows already in it ──────────────────────────
     let mut admin = PgReplicationConnection::connect(&regular_url())?;
+
+    let _cleanup = CleanupOnExit;
+
     let _ = admin.exec(&format!("DROP PUBLICATION IF EXISTS {PUBLICATION}"));
     let _ = admin.exec(&format!("DROP TABLE IF EXISTS {TABLE} CASCADE"));
     sql(
@@ -152,14 +154,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // ── Connect with the snapshot enabled ───────────────────────────────────
+    // No snapshot flag: `snapshot()` sets SNAPSHOT 'export' on the slot itself.
     let config = ReplicationStreamConfig::builder(SLOT, PUBLICATION)
         .with_protocol_version(2)
         .with_streaming_mode(StreamingMode::On)
         .with_connection_timeout(Duration::from_secs(30))
-        .with_retry_config(RetryConfig::default())
-        // The only new knob: create the slot with SNAPSHOT 'export'.
-        .with_initial_snapshot(true);
+        .with_retry_config(RetryConfig::default());
 
     let stream = LogicalReplicationStream::new(&replication_url(), config).await?;
 
@@ -188,13 +188,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             info!("inserted 'carol' during the handoff window");
 
-            let mut events = snapshot.events();
+            // The stream is inside `snapshot` now: `Snapshot::stream()` hands back only `&LogicalReplicationStream`, and `start()` takes `&mut self`. Uncomment the next line and the example stops compiling — the mistake never reaches the server.
+            // snapshot.stream().start(None).await?;
 
-            // The stream lives INSIDE `events`. Uncommenting the next line does
-            // not compile, which is the point — `start()` here would run a
-            // replication command and destroy the snapshot being read:
-            //
-            //     stream.start(None).await?;
+            let mut events = snapshot.events();
 
             router.run_snapshot(&mut events).await?;
             events.finish().await?
@@ -229,21 +226,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if snapshot_count == 2 && live_count == 1 {
         info!("OK — no gap, no duplicate: every row arrived exactly once");
+        Ok(())
     } else {
-        info!("UNEXPECTED — see above");
+        // The example's whole claim is that the counts are exactly this. Exiting
+        // 0 after printing "UNEXPECTED" would make a broken build look fine to
+        // anything that checks the exit status — CI included.
+        Err(format!(
+            "expected 2 snapshot rows and 1 live row, got {snapshot_count} and {live_count}"
+        )
+        .into())
     }
-
-    cleanup();
-    Ok(())
 }
 
+/// Tears down the table, publication and slot however `main` exits.
+struct CleanupOnExit;
+
+impl Drop for CleanupOnExit {
+    fn drop(&mut self) {
+        cleanup();
+    }
+}
+
+/// Drop the slot, retrying while the server still reports it active.
+///
+/// The walsender's socket closes as this process tears down, but PostgreSQL
+/// clears `active_pid` asynchronously afterwards. A single attempt loses that
+/// race and fails with "replication slot is active for PID" — and this slot is
+/// **not** temporary, so one left behind pins WAL until someone drops it by
+/// hand.
 fn drop_slot() {
-    if let Ok(mut conn) = PgReplicationConnection::connect(&replication_url()) {
+    let Ok(mut conn) = PgReplicationConnection::connect(&replication_url()) else {
+        return;
+    };
+    for _ in 0..50 {
         let _ = conn.exec(&format!(
             "SELECT pg_drop_replication_slot('{SLOT}') WHERE EXISTS \
              (SELECT 1 FROM pg_replication_slots WHERE slot_name = '{SLOT}')"
         ));
+        match conn.exec(&format!(
+            "SELECT count(*) FROM pg_replication_slots WHERE slot_name = '{SLOT}'"
+        )) {
+            Ok(r) if r.get_value(0, 0).is_some_and(|v| v == "0") => return,
+            _ => {}
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
+    tracing::warn!("could not drop replication slot {SLOT}; drop it manually or it will pin WAL");
 }
 
 fn cleanup() {

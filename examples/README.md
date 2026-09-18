@@ -205,14 +205,16 @@ is PostgreSQL's *exported snapshot*, taken at exactly the slot's
 `consistent_point`, and this example wraps that.
 
 **Features:**
-- `ReplicationStreamConfig::with_initial_snapshot(true)` — the only new knob
+- `stream.snapshot()` — no builder flag needed; it sets `SNAPSHOT 'export'` on the slot itself
 - One `WalRouter` with **one** set of handlers drives both phases; snapshot rows
   arrive as ordinary `ChangeEvent`s
 - Proves the handoff rather than claiming it: a row is inserted *after* the
   snapshot is exported but *before* streaming starts — the exact window a naive
   implementation gets wrong — and must arrive on the stream exactly once
-- Shows that calling `start()` mid-snapshot is a **compile error**, not a runtime
-  one (the stream is moved into the snapshot handle)
+- Carries a commented-out `snapshot.stream().start(None)` line: uncomment it and
+  the example stops compiling, because while the snapshot is alive the stream is
+  only reachable by shared reference — ownership comes back from
+  `finish()`/`abandon()`
 
 **Run:**
 ```bash
@@ -223,7 +225,9 @@ cargo run
 ```
 
 The example creates and drops its own table, publication and slot, so it is safe
-to re-run. Expected output:
+to re-run. Abridged output — every line is really prefixed by a timestamp and
+`INFO`, the library's own INFO logs (connection, slot creation, feedback) are
+interleaved, and the LSN differs per run:
 
 ```text
 seeded example_snapshot_users with 2 rows that exist BEFORE replication starts
@@ -233,6 +237,7 @@ inserted 'carol' during the handoff window
   [snapshot] id=2 name=bob
 streaming from the snapshot's consistent point
   [stream]   id=3 name=carol-inserted-mid-handoff
+──────────────────────────────────────────────
 snapshot delivered 2 row(s)  (expected 2: alice, bob)
 stream   delivered 1 row(s)  (expected 1: carol)
 OK — no gap, no duplicate: every row arrived exactly once

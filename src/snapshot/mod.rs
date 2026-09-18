@@ -15,15 +15,47 @@
 //! multi-worker sync, no progress persistence. A failure means starting over;
 //! the caller owns retry policy, the library owns the retry *start point*.
 //!
+//! # Cost of holding a handle
+//!
+//! A [`Snapshot`] or [`SnapshotRows`] holds an open `REPEATABLE READ`
+//! transaction on the reader connection, for as long as the handle lives. That
+//! transaction pins the database's `xmin`, so **`VACUUM` cannot reclaim any dead
+//! tuple newer than the snapshot — across the whole database, not just the
+//! copied tables.** Table bloat and index bloat accrue for the duration.
+//!
+//! The API deliberately lets a caller hold the handle across arbitrary async
+//! work (that is what makes `for_each_event` and `run_snapshot` possible), so
+//! this is a cost the caller has to budget. Copy promptly, and prefer
+//! `retain_tables` over holding a handle open while doing slow per-row work
+//! elsewhere.
+//!
+//! # Why a failed snapshot cannot be resumed
+//!
+//! Resuming would mean opening a *new* `REPEATABLE READ` transaction, and its
+//! snapshot is a different point in time from the slot's `consistent_point`.
+//! Rows written between the two points would appear both in the resumed copy and
+//! in the WAL the slot replays from `consistent_point` — so the overlap
+//! duplicates, and the exactly-once guarantee this module exists to provide is
+//! gone. Slicing by primary key does not help: the problem is the second
+//! snapshot's timestamp, not the row range.
+//!
+//! The sound version of resumability is a watermark-based incremental snapshot
+//! (chunk the table, interleave the chunks with the live stream, and dedupe
+//! against watermarks). That is a different feature with its own state machine,
+//! not a flag on this one. Until it exists, a failed snapshot starts over — and
+//! the handle is consumed so that "start over" is the only thing expressible.
+//!
 //! # Example
 //!
 //! ```ignore
-//! let config = ReplicationStreamConfig::builder("my_slot", "my_pub")
-//!     .with_initial_snapshot(true);
+//! let config = ReplicationStreamConfig::builder("my_slot", "my_pub");
 //! let stream = LogicalReplicationStream::new(url, config).await?;
 //!
 //! let mut stream = match stream.snapshot().await? {
-//!     SnapshotOutcome::Unavailable(s) => s,      // slot pre-existed: nothing to copy
+//!     // Slot pre-existed: nothing to copy. Resuming is right for a long-lived
+//!     // subscription — but if you are bootstrapping, fail here instead. See
+//!     // SnapshotOutcome::Unavailable.
+//!     SnapshotOutcome::Unavailable(s) => s,
 //!     SnapshotOutcome::Available(snap) => {
 //!         let mut events = snap.events();
 //!         router.run_snapshot(&mut events).await?;   // the SAME handlers
@@ -49,6 +81,11 @@ use crate::stream::LogicalReplicationStream;
 use crate::types::Lsn;
 use tokio_util::sync::CancellationToken;
 
+/// Why [`Snapshot::stream`] and `reader` can be `None`, for the `expect`s that
+/// read them. Unreachable: the only writer is `rows()`, which consumes `self`.
+const SNAPSHOT_TAKEN: &str =
+    "the stream and reader are moved out only by rows(), which consumes self";
+
 pub use events::SnapshotEvents;
 pub use plan::SnapshotTable;
 pub use rows::{SnapshotRow, SnapshotRows};
@@ -67,12 +104,47 @@ use plan::CatalogRow;
 /// size. Boxing is not worth it: one of these exists per snapshot, it is
 /// destructured immediately, and boxing would push an allocation onto an API
 /// whose whole job is to be hard to misuse.
+///
+/// Deliberately **not** `#[non_exhaustive]`, against the usual advice for a new
+/// public enum. Every variant owns the replication stream, and getting it back
+/// is the only reason this type exists — so a forced `_ =>` arm would have
+/// nothing correct to do with a variant it cannot name, and `unreachable!()` in
+/// every caller's match is worse than the theoretical break. The binary
+/// "exported or not" has no third case to add; callers who do not want to match
+/// at all have [`skip`](Self::skip).
 #[allow(clippy::large_enum_variant)]
 #[must_use = "the replication stream is inside this value; consume it to get it back"]
 pub enum SnapshotOutcome {
     /// The slot was created and a snapshot exported.
     Available(Snapshot),
     /// No snapshot exists — the slot already existed.
+    ///
+    /// # This arm is where a silent data gap gets in
+    ///
+    /// Normally this is the ordinary "resume an existing subscription" path, so
+    /// handing the stream back and calling `start()` is exactly right.
+    ///
+    /// But it **cannot distinguish that from a slot left behind by an attempt
+    /// that failed seconds ago.** A failed snapshot discards its slot, yet
+    /// `DROP_REPLICATION_SLOT` is best-effort — and the failure most likely to
+    /// kill a snapshot, losing the connection, is also the one that stops the
+    /// cleanup from reaching the server. The slot survives, the retry lands
+    /// here, and a caller who writes
+    ///
+    /// ```ignore
+    /// SnapshotOutcome::Unavailable(stream) => stream,   // resume
+    /// ```
+    ///
+    /// streams with **no baseline at all**, with no error anywhere.
+    ///
+    /// If you are bootstrapping and "resume" is never a correct answer, fail in
+    /// this arm instead:
+    ///
+    /// ```ignore
+    /// SnapshotOutcome::Unavailable(_) => {
+    ///     return Err("bootstrap requires a fresh slot; drop the existing one".into())
+    /// }
+    /// ```
     Unavailable(LogicalReplicationStream),
 }
 
@@ -95,16 +167,20 @@ impl SnapshotOutcome {
 /// A resolved snapshot: the reader connection is open and pinned to the exported
 /// snapshot, and the table list has been read from the catalog.
 ///
-/// The replication stream is held inside this value. That is deliberate: any
-/// replication command on it runs `SnapBuildClearExportedSnapshot` server-side
-/// and destroys the snapshot mid-copy — and `start()` is such a command, via
-/// `identify_system`. Moving the stream in makes that unrepresentable rather
-/// than merely documented.
+/// The replication stream is held inside this value. Not because `start()`
+/// would destroy the snapshot being read — by the time this value exists the
+/// reader has already imported it into its own `REPEATABLE READ` transaction,
+/// so the copy no longer depends on the export surviving. It is held because
+/// `start()` would put the replication connection into `CopyBoth` mid-copy and
+/// begin streaming before the copy that has to precede it is done, which is the
+/// ordered handoff this module exists to guarantee. Moving the stream in makes
+/// that unrepresentable rather than merely documented.
 #[must_use = "the replication stream is inside this value; consume it with \
               rows/events/abandon to get it back"]
 pub struct Snapshot {
-    stream: LogicalReplicationStream,
-    reader: PgReplicationConnection,
+    /// `None` only after [`rows`](Self::rows) has moved it out, which is the same "did the caller take ownership?" record [`SnapshotRows`] keeps — and for the same reason. See this type's [`Drop`].
+    stream: Option<LogicalReplicationStream>,
+    reader: Option<PgReplicationConnection>,
     tables: Vec<SnapshotTable>,
     consistent_point: Lsn,
     cancellation_token: CancellationToken,
@@ -133,11 +209,10 @@ impl Snapshot {
 
     /// Read-only view of the parked replication stream.
     ///
-    /// Deliberately no `&mut` accessor: `start()` here would destroy the very
-    /// snapshot this handle is reading.
+    /// Deliberately no `&mut` accessor: `start()` here would begin streaming before the copy that has to precede it is done.
     #[inline]
     pub fn stream(&self) -> &LogicalReplicationStream {
-        &self.stream
+        self.stream.as_ref().expect(SNAPSHOT_TAKEN)
     }
 
     /// Bind a cancellation token to the copy loop.
@@ -148,13 +223,15 @@ impl Snapshot {
     }
 
     /// Consume the snapshot as raw [`SnapshotRow`]s.
-    pub fn rows(self) -> SnapshotRows {
+    ///
+    /// Taking the stream out here transfers the slot's fate to [`SnapshotRows`], whose `Drop` applies the same rule one level down.
+    pub fn rows(mut self) -> SnapshotRows {
         SnapshotRows::new(
-            self.stream,
-            self.reader,
-            self.tables,
+            self.stream.take().expect(SNAPSHOT_TAKEN),
+            self.reader.take().expect(SNAPSHOT_TAKEN),
+            core::mem::take(&mut self.tables),
             self.consistent_point,
-            self.cancellation_token,
+            self.cancellation_token.clone(),
         )
     }
 
@@ -176,17 +253,29 @@ impl Snapshot {
     /// connection. This seam makes them testable without one; the reader is never
     /// driven, so no I/O is attempted.
     #[cfg(test)]
-    pub(crate) fn for_testing(
+    fn for_testing(
         stream: LogicalReplicationStream,
         tables: Vec<SnapshotTable>,
         consistent_point: Lsn,
     ) -> Self {
         Self {
-            stream,
-            reader: PgReplicationConnection::null_for_testing(),
+            stream: Some(stream),
+            reader: Some(PgReplicationConnection::null_for_testing()),
             tables,
             consistent_point,
             cancellation_token: CancellationToken::new(),
+        }
+    }
+}
+
+impl Drop for Snapshot {
+    /// Same rule as [`SnapshotRows`]: reaching here with the stream still inside means nothing took ownership, so the slot must not survive.
+    ///
+    /// The window is narrower than `SnapshotRows`' — between `snapshot()`
+    /// returning and `rows()`/`events()`/`abandon()` being called — but a `?` on any fallible line in between drops this value, and the leaked slot then makes the retry return `SnapshotOutcome::Unavailable`, which streams with no baseline and no error.
+    fn drop(&mut self) {
+        if let Some(stream) = self.stream.as_mut() {
+            stream.discard_replication_slot();
         }
     }
 }
@@ -196,21 +285,30 @@ impl LogicalReplicationStream {
     /// connection pinned to it.
     ///
     /// Takes `self` **by value**: for as long as the snapshot is in flight the
-    /// replication connection must not receive another command, because every
-    /// replication command clears the exported snapshot server-side.
-    ///
-    /// The reader connection string is derived from this stream's own by
-    /// appending `replication=false`, so TLS, SCRAM and keepalive settings are
-    /// identical on both connections by construction. Use
-    /// [`snapshot_with_reader`](Self::snapshot_with_reader) to supply it
-    /// explicitly.
+    /// replication connection must not receive another command. Until the
+    /// reader has imported the export, a replication command clears the
+    /// exported snapshot server-side and the import can no longer succeed;
+    /// once it *has* been imported the reason becomes the ordered handoff —
+    /// see [`Snapshot`].
     ///
     /// # Blocking
     ///
-    /// Setup issues a handful of short, blocking round-trips (`BEGIN`,
-    /// `SET TRANSACTION SNAPSHOT`, one catalog query, then one `COPY` per table),
-    /// exactly as [`ensure_replication_slot`](Self::ensure_replication_slot) and
-    /// [`start`](Self::start) already do. The row loop is fully async.
+    /// Setup opens the reader connection (a blocking connect; on the native
+    /// backend only the TCP connect is bounded by `connect_timeout` — TLS
+    /// negotiation and startup/auth are not, whereas libpq bounds the whole
+    /// attempt), then issues three short, blocking round-trips on it (`BEGIN`,
+    /// `SET TRANSACTION SNAPSHOT`, one catalog query), exactly as
+    /// [`ensure_replication_slot`](Self::ensure_replication_slot) and
+    /// [`start`](Self::start) already do on the replication connection.
+    ///
+    /// The per-table `COPY` is **not** part of setup. `copy_out_begin` is
+    /// blocking too, and the row loop issues it once per table as it reaches
+    /// that table, so those round-trips are spread through consumption rather
+    /// than paid up front; only the data loop (`copy_out_next`) is async and
+    /// cancellable. That is this crate's usual split — every control-plane
+    /// command is blocking — but it means that on a current-thread runtime each
+    /// `COPY` start occupies the runtime's only thread until the server answers,
+    /// with no timeout.
     pub async fn snapshot(self) -> Result<SnapshotOutcome> {
         let reader_conninfo = plan::derive_reader_conninfo(self.conninfo());
         self.snapshot_with_reader(&reader_conninfo).await
@@ -218,15 +316,27 @@ impl LogicalReplicationStream {
 
     /// [`snapshot`](Self::snapshot) with an explicit reader connection string.
     ///
-    /// Must address the same database and must **not** be a replication
-    /// connection.
-    pub async fn snapshot_with_reader(mut self, reader_conninfo: &str) -> Result<SnapshotOutcome> {
+    /// Must address the same database and must **not** be a replication connection.
+    async fn snapshot_with_reader(mut self, reader_conninfo: &str) -> Result<SnapshotOutcome> {
         validate_snapshot_config(self.config())?;
 
+        // Force the precondition rather than asking the caller to have set it.
+        //
+        // This used to be `with_initial_snapshot(true)`, a builder call with no
+        // visible connection to `snapshot()`: forgetting it — or calling
+        // `with_slot_options` *after* it and silently overwriting it — surfaced
+        // as a runtime `Config` error, and the ordering rule had to be documented
+        // on three separate setters. Setting it here needs no flag, no ordering
+        // rule, and no error.
+        //
+        // A no-op when the slot already exists: `ensure_replication_slot`
+        // short-circuits on `slot_created`, which is the `Unavailable` path
+        // below.
+        self.require_exported_snapshot();
         self.ensure_replication_slot().await?;
 
-        // A pre-existing slot exported no snapshot. Not an error: it is the
-        // ordinary "resume an existing subscription" path.
+        // A pre-existing slot exported no snapshot. Not an error by default: it is
+        // the ordinary "resume an existing subscription" path.
         let (Some(snapshot_name), Some(consistent_point)) = (
             self.exported_snapshot_name().map(|s| s.to_string()),
             self.consistent_point(),
@@ -265,8 +375,8 @@ impl LogicalReplicationStream {
         );
 
         Ok(SnapshotOutcome::Available(Snapshot {
-            stream: self,
-            reader,
+            stream: Some(self),
+            reader: Some(reader),
             tables,
             consistent_point,
             cancellation_token: CancellationToken::new(),
@@ -331,6 +441,19 @@ fn catalog_rows_from_result(result: &crate::connection::PgResult) -> Result<Vec<
             })?,
             // NULL for an unfiltered table, and always before PG15.
             row_filter: result.get_value(index, 8).filter(|v| !v.is_empty()),
+            // Only ever true on PG18+ with `publish_generated_columns = stored`;
+            // every other version keeps generated columns out of the result set
+            // entirely. Forces the subselect form of COPY.
+            //
+            // Both spellings are accepted because they are NOT interchangeable
+            // in PostgreSQL: boolean's output function gives `t`/`f`, but a
+            // `::text` cast goes through `booltext` and gives `true`/`false`.
+            // The catalog query casts, so it is the latter — matching only "t"
+            // reported every column as non-generated, silently.
+            generated: matches!(
+                result.get_value(index, 9).as_deref(),
+                Some("t") | Some("true")
+            ),
         });
     }
 
@@ -351,13 +474,6 @@ fn validate_snapshot_config(config: &crate::stream::ReplicationStreamConfig) -> 
     if config.slot_type != crate::types::SlotType::Logical {
         return Err(ReplicationError::config(
             "initial snapshot requires a logical replication slot",
-        ));
-    }
-
-    if config.slot_options.snapshot.as_deref() != Some("export") {
-        return Err(ReplicationError::config(
-            "initial snapshot requires the slot to be created with SNAPSHOT 'export'; \
-             call ReplicationStreamConfig::with_initial_snapshot(true)",
         ));
     }
 
@@ -389,35 +505,23 @@ mod tests {
     use crate::types::{ReplicationSlotOptions, SlotType};
 
     fn snapshot_config() -> ReplicationStreamConfig {
-        ReplicationStreamConfig::builder("slot", "pub").with_initial_snapshot(true)
+        ReplicationStreamConfig::builder("slot", "pub")
     }
 
     #[test]
-    fn with_initial_snapshot_toggles_the_slot_option() {
-        assert_eq!(
-            snapshot_config().slot_options.snapshot.as_deref(),
-            Some("export")
-        );
-        assert_eq!(
-            ReplicationStreamConfig::builder("s", "p")
-                .with_initial_snapshot(false)
-                .slot_options
-                .snapshot
-                .as_deref(),
-            Some("nothing")
-        );
+    fn validate_accepts_a_logical_slot() {
+        validate_snapshot_config(&snapshot_config()).unwrap();
     }
 
+    /// `snapshot()` sets `SNAPSHOT 'export'` itself, so the default config — which
+    /// exports nothing — must still validate. Requiring the caller to have set it
+    /// was the old behavior, and it made the primary entry point inert unless an
+    /// unrelated builder call had been made first.
     #[test]
-    fn default_config_does_not_export_a_snapshot() {
+    fn a_default_config_is_accepted_and_exports_nothing_until_snapshot_runs() {
         let config = ReplicationStreamConfig::builder("s", "p");
         assert_ne!(config.slot_options.snapshot.as_deref(), Some("export"));
-        assert!(validate_snapshot_config(&config).is_err());
-    }
-
-    #[test]
-    fn validate_accepts_an_exporting_logical_slot() {
-        validate_snapshot_config(&snapshot_config()).unwrap();
+        validate_snapshot_config(&config).unwrap();
     }
 
     #[test]
@@ -427,20 +531,12 @@ mod tests {
         assert!(format!("{err}").contains("logical"), "{err}");
     }
 
-    #[test]
-    fn validate_rejects_a_non_exporting_slot() {
-        let err =
-            validate_snapshot_config(&ReplicationStreamConfig::builder("s", "p")).unwrap_err();
-        assert!(format!("{err}").contains("SNAPSHOT 'export'"), "{err}");
-    }
-
     /// A temporary slot plus a reconnect silently re-creates the slot at a later
     /// consistent point, losing everything in between.
     #[test]
     fn validate_rejects_a_temporary_slot() {
         let config = snapshot_config().with_slot_options(ReplicationSlotOptions {
             temporary: true,
-            snapshot: Some("export".to_string()),
             ..Default::default()
         });
         let err = validate_snapshot_config(&config).unwrap_err();
@@ -449,19 +545,23 @@ mod tests {
 
     #[test]
     fn validate_rejects_an_empty_publication() {
-        let config = ReplicationStreamConfig::builder("s", "  ").with_initial_snapshot(true);
+        let config = ReplicationStreamConfig::builder("s", "  ");
         let err = validate_snapshot_config(&config).unwrap_err();
         assert!(format!("{err}").contains("publication"), "{err}");
     }
 
+    /// The ordering trap that removing the flag dissolves: `with_slot_options`
+    /// replaces the whole struct, so under the old API it silently undid a
+    /// preceding `with_initial_snapshot(true)`. Now nothing a caller writes here
+    /// can stop `snapshot()` from exporting.
     #[test]
-    fn with_initial_snapshot_composes_with_with_slot_options() {
-        let config = ReplicationStreamConfig::builder("s", "p")
-            .with_slot_options(ReplicationSlotOptions {
+    fn with_slot_options_cannot_suppress_the_export() {
+        let config =
+            ReplicationStreamConfig::builder("s", "p").with_slot_options(ReplicationSlotOptions {
                 two_phase: true,
+                snapshot: Some("nothing".to_string()),
                 ..Default::default()
-            })
-            .with_initial_snapshot(true);
+            });
         assert!(config.slot_options.two_phase);
         validate_snapshot_config(&config).unwrap();
     }
@@ -481,6 +581,7 @@ mod tests {
             "atttypid",
             "atttypmod",
             "rowfilter",
+            "generated",
         ]
         .iter()
         .map(|c| c.to_string())
@@ -498,6 +599,15 @@ mod tests {
 
     #[cfg(feature = "rustls-tls")]
     fn row(attname: &str, rowfilter: Option<&'static str>) -> Vec<Option<&'static str>> {
+        generated_row(attname, rowfilter, false)
+    }
+
+    #[cfg(feature = "rustls-tls")]
+    fn generated_row(
+        attname: &str,
+        rowfilter: Option<&'static str>,
+        generated: bool,
+    ) -> Vec<Option<&'static str>> {
         vec![
             Some("16384"),
             Some("public"),
@@ -508,6 +618,7 @@ mod tests {
             Some("23"),
             Some("-1"),
             rowfilter,
+            Some(if generated { "t" } else { "f" }),
         ]
     }
 
@@ -537,6 +648,22 @@ mod tests {
         let refs: Vec<&[Option<&str>]> = binding.iter().map(|r| r.as_slice()).collect();
         let rows = catalog_rows_from_result(&catalog_result(&refs)).unwrap();
         assert_eq!(rows[0].row_filter.as_deref(), Some("(id > 5)"));
+    }
+
+    /// Only PG18+ with `publish_generated_columns = stored` ever reports `t` here,
+    /// and when it does the column must be copied through the subselect form of
+    /// `COPY` rather than dropped.
+    #[cfg(feature = "rustls-tls")]
+    #[test]
+    fn catalog_rows_carry_the_generated_flag() {
+        let binding = [
+            generated_row("id", None, false),
+            generated_row("g", None, true),
+        ];
+        let refs: Vec<&[Option<&str>]> = binding.iter().map(|r| r.as_slice()).collect();
+        let rows = catalog_rows_from_result(&catalog_result(&refs)).unwrap();
+        assert!(!rows[0].generated);
+        assert!(rows[1].generated);
     }
 
     /// The COPY statement always names its columns, so a publication column list
@@ -638,8 +765,12 @@ mod tests {
         assert_eq!(snap.tables()[0].qualified_name(), "public.a");
         assert_eq!(snap.consistent_point(), Lsn::new(0xABCD));
         // A read-only view of the parked stream, and deliberately no &mut:
-        // `start()` here would destroy the snapshot being read.
-        assert!(snap.stream().current_lsn() == 0 || true);
+        // `start()` here would begin streaming before the copy finished.
+        assert_eq!(
+            snap.stream().current_lsn(),
+            0,
+            "a parked stream has not started, so it has no position yet"
+        );
     }
 
     #[test]
@@ -650,15 +781,24 @@ mod tests {
         assert_eq!(snap.tables()[0].qualified_name(), "public.keep");
     }
 
+    /// The token has to reach the copy loop, not merely be stored: a token that
+    /// never arrives is indistinguishable from `with_cancellation` being a
+    /// no-op. Cancelling before the first `next_row` stops the loop at the
+    /// pre-`COPY` check, which is reached before the reader is ever touched —
+    /// so the null reader here is never driven.
     #[test]
     fn with_cancellation_is_carried_into_the_row_stream() {
         let token = CancellationToken::new();
-        let snap = test_snapshot(vec![test_table("a")]).with_cancellation(token.clone());
+        let mut rows = test_snapshot(vec![test_table("a")])
+            .with_cancellation(token.clone())
+            .rows();
         token.cancel();
-        // The token is moved into SnapshotRows; cancelling it before any I/O
-        // means the first read would observe the cancellation.
-        let _rows = snap.rows();
-        assert!(token.is_cancelled());
+
+        let err = match block_on(rows.next_row()) {
+            Ok(_) => panic!("a cancelled snapshot must not start a COPY"),
+            Err(e) => e,
+        };
+        assert!(err.is_cancelled(), "{err:?}");
     }
 
     /// The single public accessor lives on `Snapshot`, before any row exists.
@@ -695,6 +835,95 @@ mod tests {
         ));
         assert!(!outcome.is_available());
         block_on(outcome.skip()).unwrap();
+    }
+
+    // ---- snapshot() entry point ---------------------------------------------
+
+    /// The validation gate runs before anything reaches the wire. The stream
+    /// here has a null connection, so if the check had moved below
+    /// `ensure_replication_slot` the error would be a connection-class one
+    /// instead — and the variant is the contract, not decoration: `Config` is
+    /// permanent, while a connection error is what the retry layer reconnects
+    /// on. A physical slot reported as transient would be sent round the
+    /// reconnect loop instead of failing, and no amount of reconnecting makes a
+    /// physical slot export a snapshot.
+    #[test]
+    fn snapshot_rejects_an_invalid_config_before_touching_the_connection() {
+        let stream = crate::stream::tests::create_test_stream(
+            snapshot_config().with_slot_type(SlotType::Physical),
+        );
+        // `SnapshotOutcome` is deliberately not `Debug` (it owns the stream),
+        // so the error has to be matched out rather than `unwrap_err`ed.
+        let err = match block_on(stream.snapshot()) {
+            Ok(_) => panic!("a physical slot cannot produce a snapshot"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, ReplicationError::Config(_)), "{err:?}");
+        assert!(err.is_permanent(), "{err:?}");
+    }
+
+    /// The other half of the gate: a config that passes validation must go on to
+    /// `ensure_replication_slot` and fail *there*. Without this, a
+    /// `validate_snapshot_config` that rejected everything would still satisfy
+    /// the test above.
+    ///
+    /// Native-only, matching `discard_replication_slot_is_best_effort`: the
+    /// libpq `null_for_testing` is a null `PGconn` pointer, and this drives a
+    /// command down it.
+    #[cfg(feature = "rustls-tls")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_valid_config_fails_at_the_connection_rather_than_at_validation() {
+        let stream = crate::stream::tests::create_test_stream(snapshot_config());
+        let err = match stream.snapshot().await {
+            Ok(_) => panic!("a null connection cannot create a replication slot"),
+            Err(e) => e,
+        };
+        assert!(
+            !matches!(err, ReplicationError::Config(_)),
+            "a valid config must reach CREATE_REPLICATION_SLOT: {err:?}"
+        );
+    }
+
+    /// A reader that cannot execute must fail the snapshot. The failure mode
+    /// being guarded against is not a panic but a *quiet* one: this function's
+    /// own `Config` error is "publication(s) ... contain no tables to
+    /// snapshot", and reporting a dead reader that way would blame the
+    /// publication for an I/O failure — and `Config` is permanent, so the retry
+    /// that would have fixed it never happens. The exact non-`Config` variant
+    /// is left to the connection layer to classify; pinning it here would tie
+    /// this test to one backend's reading of a closed socket.
+    #[cfg(feature = "rustls-tls")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_tables_blames_the_reader_not_the_publication() {
+        let mut reader = PgReplicationConnection::null_for_testing();
+        let err = resolve_tables(
+            &mut reader,
+            "00000003-0000001B-1",
+            crate::sql_builder::PG15,
+            &["p".to_string()],
+        )
+        .unwrap_err();
+        assert!(!matches!(err, ReplicationError::Config(_)), "{err:?}");
+    }
+
+    /// `events()` must be built *through* `rows()`, so the plan and the
+    /// cancellation token travel with it; a `SnapshotEvents` constructed from a
+    /// fresh row stream would silently drop the token and run to completion
+    /// after a cancel. Cancelling first stops the loop at the pre-`COPY` check,
+    /// which is reached before the reader is ever touched.
+    #[test]
+    fn events_are_built_over_the_same_cancellable_row_stream() {
+        let token = CancellationToken::new();
+        let mut events = test_snapshot(vec![test_table("a")])
+            .with_cancellation(token.clone())
+            .events();
+        token.cancel();
+
+        let err = match block_on(events.next_event()) {
+            Ok(_) => panic!("a cancelled snapshot must not start a COPY"),
+            Err(e) => e,
+        };
+        assert!(err.is_cancelled(), "{err:?}");
     }
 
     #[test]

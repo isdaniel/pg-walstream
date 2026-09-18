@@ -22,7 +22,7 @@ use crate::error::ReplicationError;
 /// For `START_REPLICATION`, the response ends with `CopyBothResponse ('W')`
 /// instead of `CommandComplete + ReadyForQuery`, which signals that the
 /// connection has entered COPY mode.
-pub async fn simple_query<S: AsyncRead + AsyncWrite + Unpin>(
+pub(super) async fn simple_query<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     buf: &mut BytesMut,
     sql: &str,
@@ -159,7 +159,7 @@ const COPY_IN_CHUNK: usize = 64 * 1024;
 /// ReadyForQuery`, with `ErrorResponse` possible at either stage: the server
 /// rejects a malformed manifest only after the whole CopyIn completes, so the
 /// payload is always sent before the verdict is read.
-pub async fn simple_query_copy_in<S: AsyncRead + AsyncWrite + Unpin>(
+pub(super) async fn simple_query_copy_in<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     buf: &mut BytesMut,
     sql: &str,
@@ -277,8 +277,9 @@ pub async fn simple_query_copy_in<S: AsyncRead + AsyncWrite + Unpin>(
 ///
 /// Re-add a cap only if this client is ever pointed at something that is not
 /// stock PostgreSQL, and only together with a deadline — a cap alone buys nothing.
-/// Only `AsyncRead` is needed: the drain never writes. The wider bound would stop
-/// [`super::copy_out`] from reusing this on a read half.
+/// Only `AsyncRead` is needed: the drain never writes. [`super::copy_out`] calls
+/// it on the same `&mut S` it reads the COPY from, so an `AsyncRead + AsyncWrite`
+/// bound here would force that bound onto the whole COPY OUT path for no reason.
 pub(super) async fn drain_to_ready<S: AsyncRead + Unpin>(
     stream: &mut S,
     buf: &mut BytesMut,

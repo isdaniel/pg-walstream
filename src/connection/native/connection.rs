@@ -69,7 +69,9 @@ enum Command {
     },
     /// Best-effort graceful shutdown, then stop the worker loop.
     Close {
-        in_copy_mode: bool,
+        /// Whether the worker still owes the server a client `CopyDone` — true
+        /// only for CopyBoth, never for COPY OUT.
+        send_copy_done: bool,
         reply: std_mpsc::Sender<()>,
     },
 }
@@ -78,6 +80,38 @@ enum Command {
 /// memory and applies backpressure when the consumer falls behind; a handful of
 /// batches is enough to let the worker's next read overlap the consumer's parse.
 const BATCH_CHANNEL_CAP: usize = 16;
+
+/// Fail a command that cannot legally run while a COPY OUT is in flight.
+///
+/// Mirrors what the `StreamCopy` / `CopyOutStream` arms of [`Worker::handle_stream_cmd`] already do for their own illegal cases: answer the caller rather than touching the pinned transport.
+#[cold]
+#[inline(never)]
+fn reject_during_copy_out(cmd: Command) {
+    let err = || {
+        ReplicationError::protocol(
+            "this connection is draining a COPY OUT; no other command may run on it until it ends"
+                .to_string(),
+        )
+    };
+    match cmd {
+        Command::Query { reply, .. } | Command::QueryCopyIn { reply, .. } => {
+            let _ = reply.send(Err(err()));
+        }
+        Command::PutCopyData { reply, .. } => {
+            let _ = reply.send(Err(err()));
+        }
+        Command::StreamCopy { batch_tx, .. } => {
+            let _ = batch_tx.try_send(Err(err()));
+        }
+        Command::CopyOutStream { chunk_tx } => {
+            let _ = chunk_tx.try_send(Err(err()));
+        }
+        // Handled by the caller, which owns the shutdown sequence.
+        Command::Close { reply, .. } => {
+            let _ = reply.send(());
+        }
+    }
+}
 
 /// What to do after the streaming loop services an interleaved command.
 enum StreamCmd {
@@ -113,22 +147,82 @@ impl Worker {
     /// Always sends exactly one terminal (`Ok(None)` or `Err`) unless the
     /// receiver has already gone away, so the consumer can distinguish a clean
     /// end from a dead worker.
-    async fn drain_copy_out(&mut self, chunk_tx: mpsc::Sender<Result<Option<Bytes>>>) {
+    ///
+    /// Services `cmd_rx` throughout, exactly as [`Worker::stream_copy`] does, and
+    /// for the same reason: without it a `Close` waits for the whole relation to
+    /// be read, and against a stalled server — or a consumer that stopped reading
+    /// — it never arrives at all. Returns `true` if a `Close` was handled.
+    async fn drain_copy_out(
+        &mut self,
+        chunk_tx: mpsc::Sender<Result<Option<Bytes>>>,
+        cmd_rx: &mut mpsc::UnboundedReceiver<Command>,
+    ) -> bool {
+        // A message waiting for room in `chunk_tx`, with the flag saying it is the stream's terminal. Held across iterations instead of being passed to `send()`, so a command winning the race cannot drop the future that owns it — the same reason `stream_copy` reserves rather than sends.
+        let mut held: Option<(Result<Option<Bytes>>, bool)> = None;
         loop {
-            let (message, stop) =
-                match copy_out::next_copy_out(&mut self.transport, &mut self.read_buf).await {
-                    Ok(copy_out::CopyOutItem::Data(payload)) => (Ok(Some(payload)), false),
-                    Ok(copy_out::CopyOutItem::Done) => (Ok(None), true),
-                    Err(e) => {
-                        // A failed COPY leaves the transport in an unknown state.
-                        self.alive.store(false, Ordering::Relaxed);
-                        (Err(e), true)
+            if let Some((message, stop)) = held.take() {
+                tokio::select! {
+                    biased;
+                    cmd = cmd_rx.recv() => {
+                        held = Some((message, stop));
+                        match self.handle_copy_out_cmd(cmd).await {
+                            StreamCmd::Continue => continue,
+                            StreamCmd::Close => return true,
+                            StreamCmd::WorkerGone => return false,
+                        }
                     }
-                };
-
-            // A dropped receiver means the consumer abandoned the snapshot.
-            if chunk_tx.send(message).await.is_err() || stop {
-                break;
+                    permit = chunk_tx.reserve() => {
+                        match permit {
+                            Ok(permit) => permit.send(message),
+                            // The consumer abandoned the snapshot.
+                            Err(_) => return false,
+                        }
+                        if stop {
+                            return false;
+                        }
+                    }
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    cmd = cmd_rx.recv() => {
+                        match self.handle_copy_out_cmd(cmd).await {
+                            // `Continue` here means a command was rejected — and
+                            // its arrival has already dropped the in-flight
+                            // `next_copy_out` future. That future splits the
+                            // `'c'` off `read_buf` before awaiting
+                            // `drain_epilogue`, so a drop in there has consumed
+                            // the `CopyDone` and no restart can recover it: the
+                            // retry would meet the epilogue's `CommandComplete`
+                            // instead of a data frame. End the COPY with a real
+                            // error rather than reading on blind.
+                            StreamCmd::Continue => {
+                                self.alive.store(false, Ordering::Relaxed);
+                                held = Some((
+                                    Err(ReplicationError::protocol(
+                                        "COPY OUT aborted: another command was issued on this \
+                                         connection while it was streaming".to_string(),
+                                    )),
+                                    true,
+                                ));
+                                continue;
+                            }
+                            StreamCmd::Close => return true,
+                            StreamCmd::WorkerGone => return false,
+                        }
+                    }
+                    read = copy_out::next_copy_out(&mut self.transport, &mut self.read_buf) => {
+                        held = Some(match read {
+                            Ok(copy_out::CopyOutItem::Data(payload)) => (Ok(Some(payload)), false),
+                            Ok(copy_out::CopyOutItem::Done) => (Ok(None), true),
+                            Err(e) => {
+                                // A failed COPY leaves the transport in an unknown state.
+                                self.alive.store(false, Ordering::Relaxed);
+                                (Err(e), true)
+                            }
+                        });
+                    }
+                }
             }
         }
     }
@@ -227,6 +321,39 @@ impl Worker {
         }
     }
 
+    /// Service a command that arrived while a COPY OUT is draining.
+    ///
+    /// Deliberately stricter than [`handle_stream_cmd`](Self::handle_stream_cmd):
+    /// only `Close` may run here. The transport is pinned mid-COPY, so a `Query`
+    /// would write a `'Q'` onto it and then read `CopyData` frames as if they
+    /// were that query's reply — and [`query`](Self::query) first calls
+    /// `copy::clear_latched_terminal`, which drops a leading `'c'` and so
+    /// silently eats the `CopyDone`. A hard desync with no error.
+    ///
+    /// Rejecting does **not** by itself save the in-flight read: by the time this
+    /// runs, the `select!` has already dropped the `next_copy_out` future. That
+    /// future splits the `'c'` off `read_buf` before awaiting `drain_epilogue`,
+    /// so a drop in there has already consumed the `CopyDone` and a restart would
+    /// meet the epilogue instead of a data frame. [`drain_copy_out`] therefore
+    /// ends the stream with an error rather than restarting the read.
+    async fn handle_copy_out_cmd(&mut self, cmd: Option<Command>) -> StreamCmd {
+        match cmd {
+            Some(Command::Close {
+                send_copy_done,
+                reply,
+            }) => {
+                self.close(send_copy_done).await;
+                let _ = reply.send(());
+                StreamCmd::Close
+            }
+            None => StreamCmd::WorkerGone,
+            Some(other) => {
+                reject_during_copy_out(other);
+                StreamCmd::Continue
+            }
+        }
+    }
+
     /// Service a command that arrived mid-stream.
     async fn handle_stream_cmd(&mut self, cmd: Option<Command>) -> StreamCmd {
         match cmd {
@@ -247,10 +374,10 @@ impl Worker {
                 StreamCmd::Continue
             }
             Some(Command::Close {
-                in_copy_mode,
+                send_copy_done,
                 reply,
             }) => {
-                self.close(in_copy_mode).await;
+                self.close(send_copy_done).await;
                 let _ = reply.send(());
                 StreamCmd::Close
             }
@@ -279,9 +406,10 @@ impl Worker {
         copy::put_copy_data(&mut self.transport, data).await
     }
 
-    /// Best-effort graceful shutdown: CopyDone if streaming, then Terminate.
-    async fn close(&mut self, in_copy_mode: bool) {
-        if in_copy_mode {
+    /// Best-effort graceful shutdown: CopyDone if the client owes one, then
+    /// Terminate.
+    async fn close(&mut self, send_copy_done: bool) {
+        if send_copy_done {
             let _ = copy::send_copy_done(&mut self.transport).await;
         }
         let terminate = wire::build_terminate();
@@ -413,13 +541,17 @@ fn run_worker(
                     let _ = reply.send(worker.put_copy_data(&data).await);
                 }
                 Command::CopyOutStream { chunk_tx } => {
-                    worker.drain_copy_out(chunk_tx).await;
+                    // Same contract as `StreamCopy` above: runs its own loop,
+                    // services interleaved commands, and reports a handled Close.
+                    if worker.drain_copy_out(chunk_tx, &mut cmd_rx).await {
+                        break;
+                    }
                 }
                 Command::Close {
-                    in_copy_mode,
+                    send_copy_done,
                     reply,
                 } => {
-                    worker.close(in_copy_mode).await;
+                    worker.close(send_copy_done).await;
                     let _ = reply.send(());
                     break;
                 }
@@ -432,14 +564,32 @@ fn run_worker(
 /// runtime. Used only by the inline driver.
 ///
 /// `handle` is the multi-thread runtime the connection's socket was created on (captured at `connect`). We always drive the future on *that* runtime so the socket stays registered on its original reactor — regardless of the caller's context. This matters most on `Drop`: a connection can be dropped after the ambient runtime context is gone (e.g. moved out of the `block_on` scope it was created in), and resolving the runtime via `Handle::try_current()` at that point would build a throwaway runtime whose reactor never owned the socket, orphaning it and risking a silent hang.
-fn run_sync<F: std::future::Future>(handle: &tokio::runtime::Handle, fut: F) -> F::Output {
+fn run_sync<F>(handle: &tokio::runtime::Handle, fut: F) -> F::Output
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
     match tokio::runtime::Handle::try_current() {
         // Nested inside a multi-thread runtime worker: we must not block it directly. `block_in_place` offloads this worker; the inner `block_on` then drives `fut` on the stored handle's reactor. In the common case the stored handle *is* the current runtime (the canonical pattern).
         Ok(cur) if cur.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
             tokio::task::block_in_place(|| handle.block_on(fut))
         }
+        // Inside a *current-thread* runtime, both of the other arms are illegal:
+        // `block_in_place` requires a multi-thread runtime, and `block_on` panics
+        // with "Cannot start a runtime from within a runtime". Drive it on a
+        // scratch OS thread, which has no ambient runtime; `fut` still runs on the
+        // stored handle's reactor, so the socket stays where it was registered.
+        //
+        // Reachable when an `Inline` connection (born on a multi-thread runtime)
+        // is dropped under a current-thread one — including while unwinding, where
+        // the old panic would have aborted the process.
+        Ok(_) => std::thread::scope(|s| {
+            s.spawn(|| handle.block_on(fut))
+                .join()
+                .unwrap_or_else(|e| std::panic::resume_unwind(e))
+        }),
         // No ambient runtime (e.g. `Drop` on a plain thread): block on the stored handle directly. The runtime's own worker threads service the reactor.
-        _ => handle.block_on(fut),
+        Err(_) => handle.block_on(fut),
     }
 }
 
@@ -472,26 +622,56 @@ pub struct NativeConnection {
     driver: Driver,
     /// Server version number (e.g. 160001 for PG 16.1), cached at connect time.
     server_ver: i32,
-    /// Whether we are in COPY (replication) mode. Gates the streaming methods and tells the worker whether to send CopyDone on shutdown.
-    in_copy_mode: bool,
-    /// Active `COPY ... TO STDOUT` stream, if any.
-    ///
-    /// Deliberately **not** `in_copy_mode`: that flag means *replication* COPY
-    /// BOTH, and it makes the worker send a client `CopyDone` on shutdown. In
-    /// COPY OUT the client must never send `CopyDone` — libpq documents the same
-    /// asymmetry, `PQputCopyEnd` being illegal in `PGRES_COPY_OUT` — so the two
-    /// modes cannot share a flag.
-    copy_out: Option<CopyOutState>,
+    /// Which COPY sub-protocol the transport is currently inside.
+    copy: CopyMode,
     /// Liveness flag shared with the worker, which clears it on a transient read error.
     alive: Arc<AtomicBool>,
 }
 
-/// Per-stream state for an in-flight `COPY ... TO STDOUT`.
+/// Which COPY sub-protocol the transport is inside, and that mode's state.
+///
+/// A connection is in **at most one** of these at a time, which is the whole
+/// reason this is an enum rather than the `in_copy_mode: bool` +
+/// `copy_out: Option<_>` pair it replaces: those two fields could both be set,
+/// a state no code rejected and the protocol cannot represent.
+///
+/// The modes are not interchangeable — they disagree on who ends the stream.
+/// In CopyBoth the *client* sends `CopyDone`, so shutdown must send one; in
+/// COPY OUT only the server may, and a client `CopyDone` is a protocol
+/// violation. libpq documents the same asymmetry: `PQputCopyEnd` is illegal in
+/// `PGRES_COPY_OUT`. The libpq backend models this the same way, so the two
+/// backends stay legible side by side.
 #[derive(Debug, Default)]
-struct CopyOutState {
-    /// Threaded driver only: the worker's push channel, started lazily on the
-    /// first [`NativeConnection::copy_out_next`] call.
-    rx: Option<mpsc::Receiver<Result<Option<Bytes>>>>,
+enum CopyMode {
+    /// Not in a COPY; ordinary queries are allowed.
+    #[default]
+    Idle,
+    /// A server-push stream whose batches are owned by [`Driver`]: `CopyBoth` from `START_REPLICATION`, or the COPY OUT that `BASE_BACKUP` answers with.
+    ///
+    /// `BASE_BACKUP` is the exception to the asymmetry described above — it is genuinely a COPY OUT, so the client `CopyDone` that shutdown writes is not legal for it. Harmless in practice, because `Terminate` follows immediately and the server is discarding the connection either way, andunchanged from the `in_copy_mode: bool` this enum replaced. Named here rather than fixed with a third variant, which would buy nothing beyond suppressing one doomed write.
+    Replication,
+    /// `COPY ... TO STDOUT`, from the snapshot helper. Read directly rather than through [`Driver`]'s batch channel.
+    Out {
+        /// Threaded driver only: the worker's push channel, started lazily on
+        /// the first [`NativeConnection::copy_out_next`] call. `None` on the
+        /// inline driver, which reads the transport directly.
+        rx: Option<mpsc::Receiver<Result<Option<Bytes>>>>,
+    },
+}
+
+impl CopyMode {
+    /// True while a CopyBoth stream is open. Gates the streaming methods and
+    /// decides whether shutdown owes the server a client `CopyDone`.
+    #[inline]
+    fn is_replication(&self) -> bool {
+        matches!(self, Self::Replication)
+    }
+
+    /// True while a `COPY ... TO STDOUT` is open.
+    #[inline]
+    fn is_out(&self) -> bool {
+        matches!(self, Self::Out { .. })
+    }
 }
 
 impl NativeConnection {
@@ -552,8 +732,7 @@ impl NativeConnection {
                 handle,
             },
             server_ver,
-            in_copy_mode: false,
-            copy_out: None,
+            copy: CopyMode::Idle,
             alive,
         })
     }
@@ -594,8 +773,7 @@ impl NativeConnection {
                         batch_rx: None,
                     },
                     server_ver,
-                    in_copy_mode: false,
-                    copy_out: None,
+                    copy: CopyMode::Idle,
                     alive,
                 })
             }
@@ -678,7 +856,34 @@ impl NativeConnection {
     }
 
     /// Execute a replication command (like IDENTIFY_SYSTEM).
+    ///
+    /// Rejected unless the transport is idle. Writing a `Query` onto a connection
+    /// that is mid-COPY is a protocol violation, and on the inline driver it does
+    /// not even fail loudly: `simple_query` skips the queued `CopyData` frames as
+    /// unknown tags, reads the COPY's own `CommandComplete`/`ReadyForQuery`, and
+    /// returns a bogus `CommandOk` — a silent wrong answer plus a permanent
+    /// one-message offset for every later command. This is the hazard the
+    /// internal `CopyMode` enum exists to make unrepresentable; the check belongs
+    /// here too, not only in `copy_out_begin`.
+    ///
+    /// Every internal caller issues its command while idle and only then records
+    /// the new mode, so none of them are affected.
     pub fn exec(&mut self, sql: &str) -> Result<NativePgResult> {
+        match self.copy {
+            CopyMode::Idle => {}
+            CopyMode::Out { .. } => {
+                return Err(ReplicationError::protocol(
+                    "cannot run a query while a COPY OUT is in progress on this connection"
+                        .to_string(),
+                ))
+            }
+            CopyMode::Replication => {
+                return Err(ReplicationError::protocol(
+                    "cannot run a query while this connection is streaming replication".to_string(),
+                ))
+            }
+        }
+
         let result = self.run_query(sql)?;
 
         let status_str = format!("{:?}", result.status());
@@ -741,7 +946,7 @@ impl NativeConnection {
             ));
         }
 
-        self.in_copy_mode = true;
+        self.copy = CopyMode::Replication;
         debug!("Replication started successfully");
         Ok(())
     }
@@ -876,31 +1081,31 @@ impl NativeConnection {
     /// `Drop`'s `close_connection` still joins the worker, guaranteeing the
     /// frames flush before teardown completes.
     pub(crate) async fn end_copy(&mut self) -> Result<()> {
-        if !self.in_copy_mode {
+        if !self.copy.is_replication() {
             return Ok(());
         }
         match &mut self.driver {
             Driver::Inline { worker, .. } => {
-                // Write the CopyDone, then mark the copy ended ONLY after it is fully flushed. If this errors or the future is cancelled mid-write, `in_copy_mode` stays true so Drop's `close(true)` resends a well-formed CopyDone rather than leaving a torn frame.
+                // Write the CopyDone, then leave COPY mode ONLY after it is fully flushed. If this errors or the future is cancelled mid-write, the mode stays `Replication` so Drop's `close(true)` resends a well-formed CopyDone rather than leaving a torn frame.
                 if let Err(e) = copy::send_copy_done(&mut worker.transport).await {
                     self.alive.store(false, Ordering::Relaxed);
                     return Err(e);
                 }
-                self.in_copy_mode = false;
+                self.copy = CopyMode::Idle;
             }
             Driver::Threaded {
                 cmd_tx, batch_rx, ..
             } => {
-                // The worker (not this task) writes the frame, so clearing the
-                // flag up front is safe and keeps Drop from re-sending CopyDone.
-                self.in_copy_mode = false;
+                // The worker (not this task) writes the frame, so leaving COPY
+                // mode up front is safe and keeps Drop from re-sending CopyDone.
+                self.copy = CopyMode::Idle;
                 // Dropping the batch receiver lets a back-pressured worker
                 // (parked on `reserve()`) resolve and service the command.
                 *batch_rx = None;
                 let (reply_tx, reply_rx) = std_mpsc::channel();
                 if cmd_tx
                     .send(Command::Close {
-                        in_copy_mode: true,
+                        send_copy_done: true,
                         reply: reply_tx,
                     })
                     .is_ok()
@@ -956,7 +1161,7 @@ impl NativeConnection {
     // ── Connection info ─────────────────────────────────────────────────
 
     /// Check if the connection is still alive.
-    pub fn is_alive(&self) -> bool {
+    pub(crate) fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
     }
 
@@ -1097,7 +1302,7 @@ impl NativeConnection {
             }
         }
 
-        self.in_copy_mode = true;
+        self.copy = CopyMode::Replication;
         debug!("Physical replication started successfully");
         Ok(())
     }
@@ -1132,7 +1337,7 @@ impl NativeConnection {
         debug!("Starting base backup: {}", sql);
         let result = self.exec(&sql)?;
 
-        self.in_copy_mode = true;
+        self.copy = CopyMode::Replication;
         debug!("Base backup started successfully");
         Ok(result)
     }
@@ -1145,9 +1350,35 @@ impl NativeConnection {
     /// `simple_query` consumes the `CopyOutResponse` and stops *without* reading
     /// `ReadyForQuery`.
     pub(crate) fn copy_out_begin(&mut self, sql: &str) -> Result<()> {
-        if self.copy_out.is_some() {
+        // Must be fully idle, not merely "not already in a COPY OUT": issuing a
+        // Query while the transport sits in CopyBoth is a protocol violation,
+        // and the old two-flag shape let that through because the replication
+        // flag was a separate field this check never looked at.
+        match self.copy {
+            CopyMode::Idle => {}
+            CopyMode::Out { .. } => {
+                return Err(ReplicationError::protocol(
+                    "a COPY OUT stream is already in progress on this connection".to_string(),
+                ))
+            }
+            CopyMode::Replication => {
+                return Err(ReplicationError::protocol(
+                    "cannot start a COPY OUT on a connection that is streaming replication"
+                        .to_string(),
+                ))
+            }
+        }
+
+        // Idle is not enough on its own. A failed `copy_out_next` returns the
+        // mode to Idle *and* marks the connection dead, precisely because the
+        // rest of the relation is still queued on the transport — so without this
+        // check the Query below would be answered by the previous COPY's
+        // epilogue, and the failure would surface as
+        // `did not enter COPY OUT mode (status CommandOk)` against the wrong
+        // statement.
+        if !self.is_alive() {
             return Err(ReplicationError::protocol(
-                "a COPY OUT stream is already in progress on this connection".to_string(),
+                "cannot start a COPY OUT on a connection that is no longer usable".to_string(),
             ));
         }
 
@@ -1159,7 +1390,7 @@ impl NativeConnection {
             )));
         }
 
-        self.copy_out = Some(CopyOutState::default());
+        self.copy = CopyMode::Out { rx: None };
         Ok(())
     }
 
@@ -1169,11 +1400,17 @@ impl NativeConnection {
     /// After `Ok(None)` or any `Err` the stream is closed and a further call is
     /// an error; a failure additionally marks the connection dead, since a COPY
     /// interrupted mid-stream leaves the transport in an unknown state.
+    ///
+    /// Cancellation is checked ahead of the transport (a `biased` `select!`), so
+    /// a cancelled read reports `Cancelled` on the very next poll and any rows
+    /// already buffered go away with the connection. The libpq backend does the
+    /// opposite: it keeps handing back rows it had already drained and reports
+    /// `Cancelled` only once its queue is empty.
     pub(crate) async fn copy_out_next(
         &mut self,
         cancellation_token: &CancellationToken,
     ) -> Result<Option<Bytes>> {
-        if self.copy_out.is_none() {
+        if !self.copy.is_out() {
             return Err(ReplicationError::protocol(
                 "no COPY OUT stream is in progress on this connection".to_string(),
             ));
@@ -1183,13 +1420,18 @@ impl NativeConnection {
 
         match &result {
             // Clean end: release the stream, keep the connection usable.
-            Ok(None) => self.copy_out = None,
+            Ok(None) => self.copy = CopyMode::Idle,
             Ok(Some(_)) => {}
-            Err(e) => {
-                self.copy_out = None;
-                if !e.is_cancelled() {
-                    self.alive.store(false, Ordering::Relaxed);
-                }
+            // Any early exit, cancellation included. COPY OUT has no
+            // protocol-level early exit (see `copy_out_abort`), so the only way
+            // to stop before the last row is to hang up — a cancelled read
+            // leaves the rest of the relation queued on the transport. Returning
+            // to Idle-and-alive would advertise that connection as reusable, and
+            // the next `copy_out_begin` would read the *previous* COPY's
+            // completion and fail with a misleading status.
+            Err(_) => {
+                self.copy = CopyMode::Idle;
+                self.alive.store(false, Ordering::Relaxed);
             }
         }
 
@@ -1219,20 +1461,19 @@ impl NativeConnection {
             }
             // Threaded: start the worker's drain loop lazily, then pull from it.
             Driver::Threaded { cmd_tx, .. } => {
-                let state = self
-                    .copy_out
-                    .as_mut()
-                    .expect("presence checked by copy_out_next");
+                let CopyMode::Out { rx } = &mut self.copy else {
+                    unreachable!("presence checked by copy_out_next");
+                };
 
-                if state.rx.is_none() {
-                    let (chunk_tx, rx) = mpsc::channel(BATCH_CHANNEL_CAP);
+                if rx.is_none() {
+                    let (chunk_tx, chan) = mpsc::channel(BATCH_CHANNEL_CAP);
                     if cmd_tx.send(Command::CopyOutStream { chunk_tx }).is_err() {
                         return Err(Self::worker_gone());
                     }
-                    state.rx = Some(rx);
+                    *rx = Some(chan);
                 }
 
-                let rx = state.rx.as_mut().expect("just populated");
+                let rx = rx.as_mut().expect("just populated");
                 tokio::select! {
                     biased;
                     _ = cancellation_token.cancelled() => {
@@ -1258,7 +1499,8 @@ impl NativeConnection {
     ///
     /// A no-op when no stream is in progress.
     pub(crate) fn copy_out_abort(&mut self) {
-        if self.copy_out.take().is_some() {
+        if self.copy.is_out() {
+            self.copy = CopyMode::Idle;
             self.mark_dead();
         }
     }
@@ -1267,7 +1509,7 @@ impl NativeConnection {
 
     #[inline]
     fn ensure_replication_mode(&self) -> Result<()> {
-        if !self.in_copy_mode {
+        if !self.copy.is_replication() {
             return Err(ReplicationError::protocol(
                 "Connection is not in replication mode".to_string(),
             ));
@@ -1279,7 +1521,17 @@ impl NativeConnection {
     /// Sends a `Close` command so the worker does a best-effort shutdown
     /// (CopyDone if streaming, then Terminate), then joins the worker thread.
     fn close_connection(&mut self) {
-        let in_copy_mode = self.in_copy_mode;
+        let send_copy_done = self.copy.is_replication();
+        // Drop the COPY OUT receiver before anything below can block, for the
+        // same reason `*batch_rx = None` precedes the wait on the replication
+        // path: while the worker is parked on `chunk_tx.send()` under
+        // backpressure, a live receiver keeps that send pending forever, so the
+        // worker never reaches the `Close` and the `reply_rx.recv()` below waits
+        // on a reply that can never come. Clearing it here closes the channel and
+        // lets the send resolve.
+        //
+        // This used to run *after* the match, which is exactly the deadlock.
+        self.copy = CopyMode::Idle;
         match &mut self.driver {
             Driver::Inline {
                 worker,
@@ -1298,9 +1550,11 @@ impl NativeConnection {
                     Ok(cur)
                         if cur.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
                     {
-                        tokio::task::block_in_place(|| handle.block_on(worker.close(in_copy_mode)));
+                        tokio::task::block_in_place(|| {
+                            handle.block_on(worker.close(send_copy_done))
+                        });
                     }
-                    Err(_) => handle.block_on(worker.close(in_copy_mode)),
+                    Err(_) => handle.block_on(worker.close(send_copy_done)),
                     Ok(_) => { /* current-thread runtime: cannot block safely; skip */ }
                 }
                 pending.clear();
@@ -1319,7 +1573,7 @@ impl NativeConnection {
                     let (reply_tx, reply_rx) = std_mpsc::channel();
                     if cmd_tx
                         .send(Command::Close {
-                            in_copy_mode,
+                            send_copy_done,
                             reply: reply_tx,
                         })
                         .is_ok()
@@ -1337,7 +1591,6 @@ impl NativeConnection {
             }
         }
 
-        self.in_copy_mode = false;
         self.alive.store(false, Ordering::Relaxed);
     }
 }
@@ -1396,8 +1649,7 @@ impl NativeConnection {
                 batch_rx: None,
             },
             server_ver,
-            in_copy_mode: false,
-            copy_out: None,
+            copy: CopyMode::Idle,
             alive,
         }
     }
@@ -1405,7 +1657,7 @@ impl NativeConnection {
     /// Create a null **inline-driver** connection for testing. Must be called on
     /// a multi-thread runtime so the connect-time `Handle` can be captured and
     /// `run_sync` is safe.
-    pub(crate) fn null_for_testing_inline() -> Self {
+    fn null_for_testing_inline() -> Self {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let std_tcp = std::net::TcpStream::connect(addr).unwrap();
@@ -1433,20 +1685,19 @@ impl NativeConnection {
                 handle,
             },
             server_ver,
-            in_copy_mode: false,
-            copy_out: None,
+            copy: CopyMode::Idle,
             alive,
         }
     }
 
     /// Test-only: a null (Threaded-driver) connection pre-seeded with COPY-data
     /// frames that `get_copy_data_async` serves in order from `pending` before
-    /// any socket I/O. `in_copy_mode` is set so the replication-mode gate passes.
+    /// any socket I/O. The mode is set to `Replication` so the gate passes.
     /// Once the seeded frames are exhausted the next read hits the dead test
     /// socket and errors — a test consumes exactly what it seeds.
     pub(crate) fn null_for_testing_with_frames(frames: Vec<Bytes>) -> Self {
         let mut conn = Self::null_for_testing();
-        conn.in_copy_mode = true;
+        conn.copy = CopyMode::Replication;
         if let Driver::Threaded { pending, .. } = &mut conn.driver {
             pending.extend(frames);
         }
@@ -1454,7 +1705,7 @@ impl NativeConnection {
     }
 
     /// Test-only: whether this connection uses the inline driver.
-    pub(crate) fn driver_is_inline(&self) -> bool {
+    fn driver_is_inline(&self) -> bool {
         matches!(self.driver, Driver::Inline { .. })
     }
 }
@@ -1853,8 +2104,7 @@ mod tests {
                 handle: tokio::runtime::Handle::current(),
             },
             server_ver: 160000,
-            in_copy_mode: true, // skip the replication-mode gate
-            copy_out: None,
+            copy: CopyMode::Replication, // skip the replication-mode gate
             alive: Arc::new(AtomicBool::new(true)),
         };
 
@@ -1927,8 +2177,7 @@ mod tests {
                 handle: tokio::runtime::Handle::current(),
             },
             server_ver: 160000,
-            in_copy_mode: false,
-            copy_out: Some(CopyOutState::default()),
+            copy: CopyMode::Out { rx: None },
             alive: Arc::new(AtomicBool::new(true)),
         };
         (conn, server)
@@ -1997,16 +2246,33 @@ mod tests {
         );
     }
 
+    /// Cancelling is still a *cancellation* — the error variant stays
+    /// `Cancelled`, so the stream layer treats it as a clean stop — but the
+    /// connection does not survive it.
+    ///
+    /// COPY OUT has no protocol-level early exit, so a cancelled read leaves the
+    /// rest of the relation queued on the transport. This used to reset the mode
+    /// to `Idle` and leave `alive` true, which had two consequences: the
+    /// connection advertised itself as reusable when reusing it would read the
+    /// *previous* COPY's completion, and `copy_out_abort` — the one thing that
+    /// would have hung up — became a no-op because the mode was already `Idle`.
+    /// libpq's backend self-heals that leftover inside `PQexec`, so the two
+    /// backends also disagreed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn copy_out_cancellation_returns_cancelled_and_keeps_connection_alive() {
+    async fn copy_out_cancellation_returns_cancelled_and_hangs_up() {
         let (mut conn, _server) = inline_conn_in_copy_out().await;
         let token = CancellationToken::new();
         token.cancel();
 
         let err = conn.copy_out_next(&token).await.unwrap_err();
-        assert!(err.is_cancelled(), "{err:?}");
-        // Cancellation is the caller's choice, not a transport failure.
-        assert!(conn.is_alive());
+        assert!(
+            err.is_cancelled(),
+            "the caller asked to stop; this is not a transport failure: {err:?}"
+        );
+        assert!(
+            !conn.is_alive(),
+            "a half-read COPY OUT cannot be reused, so the connection must hang up"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2014,6 +2280,41 @@ mod tests {
         let (mut conn, _server) = inline_conn_in_copy_out().await;
         let err = conn.copy_out_begin("COPY t TO STDOUT").unwrap_err();
         assert!(format!("{err}").contains("already in progress"), "{err}");
+    }
+
+    /// A replication connection is pinned in CopyBoth, so issuing the `COPY`
+    /// *query* would already be a protocol violation. The old two-flag shape
+    /// missed this: the guard only inspected the COPY OUT field, so a
+    /// replication connection sailed past it into `exec`.
+    ///
+    /// The timeout is as much the point as the assertion: `copy_out_begin` is
+    /// blocking, so a regressed guard does not return a wrong answer — it
+    /// *hangs*, writing a Query the walsender will never read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn copy_out_begin_rejects_a_replication_connection() {
+        let (mut conn, _server) = inline_conn_in_copy_out().await;
+        conn.copy = CopyMode::Replication;
+
+        let (conn, result) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || {
+                let result = conn.copy_out_begin("COPY t TO STDOUT");
+                (conn, result)
+            }),
+        )
+        .await
+        .expect("the guard must reject before any I/O; a hang means it fell through to exec")
+        .unwrap();
+
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err}").contains("streaming replication"),
+            "expected the replication-mode rejection, got: {err}"
+        );
+        assert!(
+            conn.copy.is_replication(),
+            "a rejected COPY OUT must leave replication mode intact"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2041,7 +2342,10 @@ mod tests {
             .unwrap();
 
         let (chunk_tx, mut rx) = mpsc::channel(BATCH_CHANNEL_CAP);
-        worker.drain_copy_out(chunk_tx).await;
+        // The sender must outlive the call: a closed command channel reads as
+        // "worker gone" and would exit the drain before it reads a frame.
+        let (_cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        worker.drain_copy_out(chunk_tx, &mut cmd_rx).await;
 
         assert_eq!(&rx.recv().await.unwrap().unwrap().unwrap()[..], b"a\n");
         assert_eq!(&rx.recv().await.unwrap().unwrap().unwrap()[..], b"b\n");
@@ -2065,7 +2369,8 @@ mod tests {
         server.write_all(&script).await.unwrap();
 
         let (chunk_tx, mut rx) = mpsc::channel(BATCH_CHANNEL_CAP);
-        worker.drain_copy_out(chunk_tx).await;
+        let (_cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        worker.drain_copy_out(chunk_tx, &mut cmd_rx).await;
 
         let err = rx.recv().await.unwrap().unwrap_err();
         assert!(err.is_transient(), "{err:?}");
@@ -2083,14 +2388,128 @@ mod tests {
 
         let (chunk_tx, rx) = mpsc::channel(BATCH_CHANNEL_CAP);
         drop(rx);
+        let (_cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
 
         // Must return rather than spin forever against a dead receiver.
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            worker.drain_copy_out(chunk_tx),
+            worker.drain_copy_out(chunk_tx, &mut cmd_rx),
         )
         .await
         .expect("drain_copy_out must exit when the consumer goes away");
+    }
+
+    /// The deadlock this closes: a `Close` arriving while the chunk channel is
+    /// full must be serviced, not queued behind a consumer that stopped reading.
+    ///
+    /// Before `drain_copy_out` took `cmd_rx`, the worker parked in
+    /// `chunk_tx.send()` forever while `close_connection` parked in
+    /// `reply_rx.recv()` waiting for a reply that could never come — a hard hang
+    /// with no timeout on either side, reachable from safe code by dropping a
+    /// `SnapshotRows` mid-iteration.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worker_drain_copy_out_handles_close_while_the_channel_is_full() {
+        use tokio::io::AsyncWriteExt;
+        let (worker, mut server) = worker_with_loopback().await;
+
+        // More frames than the channel holds, and `_rx` is never read, so the
+        // drain is guaranteed to end up parked on `reserve()`.
+        let rows: Vec<&[u8]> = vec![b"row\n"; BATCH_CHANNEL_CAP + 8];
+        server.write_all(&copy_out_script(&rows)).await.unwrap();
+
+        let (chunk_tx, _rx) = mpsc::channel(BATCH_CHANNEL_CAP);
+        let probe = chunk_tx.clone();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+
+        let mut worker = worker;
+        let drain = tokio::spawn(async move { worker.drain_copy_out(chunk_tx, &mut cmd_rx).await });
+
+        // Wait for the park rather than sleeping a fixed amount: a sleep that is
+        // too short would silently downgrade this into "Close is handled from an
+        // idle drain", which the pre-fix code also passed.
+        let mut parked = false;
+        for _ in 0..500 {
+            if probe.capacity() == 0 {
+                parked = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            parked,
+            "premise: the drain must be parked on a full channel before Close is sent"
+        );
+
+        let (reply_tx, reply_rx) = std_mpsc::channel();
+        cmd_tx
+            .send(Command::Close {
+                send_copy_done: false,
+                reply: reply_tx,
+            })
+            .expect("worker is still running");
+
+        let handled = tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+            .await
+            .expect("a Close must interrupt the drain, not wait for the consumer")
+            .unwrap();
+
+        assert!(handled, "a handled Close must stop the worker loop");
+        assert!(
+            reply_rx.recv().is_ok(),
+            "close_connection blocks on this reply; without it, Drop hangs forever"
+        );
+    }
+
+    /// A command arriving mid-drain has already dropped the in-flight
+    /// `next_copy_out` future. If that drop landed inside `drain_epilogue` the
+    /// `CopyDone` is gone, so restarting the read cannot recover the stream —
+    /// the consumer must be told, not left waiting on a socket with nothing
+    /// left to send.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worker_drain_copy_out_aborts_when_another_command_arrives() {
+        use tokio::io::AsyncWriteExt;
+        let (worker, mut server) = worker_with_loopback().await;
+
+        // One data frame and *no* terminator, so the drain delivers the row and
+        // then parks on the next read — which is where an interleaved command
+        // races it, and the only place the dropped-future hazard exists.
+        server.write_all(&copy_data_frame(b"row\n")).await.unwrap();
+
+        let (chunk_tx, mut rx) = mpsc::channel(BATCH_CHANNEL_CAP);
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+
+        let mut worker = worker;
+        let drain = tokio::spawn(async move { worker.drain_copy_out(chunk_tx, &mut cmd_rx).await });
+
+        // Receiving the row proves the drain got past it and is now parked on the
+        // read, rather than the command racing a loop that never started.
+        let first = rx.recv().await.expect("the row must arrive");
+        assert_eq!(first.unwrap(), Some(Bytes::from_static(b"row\n")));
+
+        let (reply_tx, _reply_rx) = std_mpsc::channel();
+        cmd_tx
+            .send(Command::Query {
+                sql: "SELECT 1".to_string(),
+                reply: reply_tx,
+            })
+            .expect("worker is still running");
+
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the consumer must be told, not left waiting on a dead stream")
+            .expect("a terminal must be delivered, not a closed channel");
+
+        let err = terminal.expect_err("an interleaved command must end the COPY with an error");
+        assert!(
+            format!("{err}").contains("another command was issued"),
+            "{err}"
+        );
+
+        let handled = tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+            .await
+            .expect("the drain must stop rather than read on blind")
+            .unwrap();
+        assert!(!handled, "a rejected command is not a Close");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2098,7 +2517,7 @@ mod tests {
         // `null_for_testing` has a live worker thread but a dropped peer, so the
         // lazily-started drain loop terminates and closes the channel.
         let mut conn = NativeConnection::null_for_testing();
-        conn.copy_out = Some(CopyOutState::default());
+        conn.copy = CopyMode::Out { rx: None };
 
         let result = conn.copy_out_next(&CancellationToken::new()).await;
         assert!(result.is_err(), "a dead peer must surface as an error");
@@ -2248,7 +2667,7 @@ mod tests {
         let (reply_tx, reply_rx) = std_mpsc::channel();
         cmd_tx
             .send(Command::Close {
-                in_copy_mode: true,
+                send_copy_done: true,
                 reply: reply_tx,
             })
             .unwrap();
@@ -2291,7 +2710,7 @@ mod tests {
         let (reply_tx, reply_rx) = std_mpsc::channel();
         cmd_tx
             .send(Command::Close {
-                in_copy_mode: true,
+                send_copy_done: true,
                 reply: reply_tx,
             })
             .unwrap();
@@ -2331,7 +2750,7 @@ mod tests {
         // worker's socket is closed, so the CopyDone/Terminate best-effort I/O
         // fails silently and the worker exits — end_copy still returns Ok.
         let mut conn = NativeConnection::null_for_testing();
-        conn.in_copy_mode = true;
+        conn.copy = CopyMode::Replication;
         assert!(conn.end_copy().await.is_ok());
         // Flag cleared → a second call takes the no-op guard path.
         assert!(conn.end_copy().await.is_ok());

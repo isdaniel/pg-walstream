@@ -53,6 +53,12 @@ pub(super) enum CopyOutItem {
 ///
 /// `stream` must be parked immediately after the `CopyOutResponse ('H')` that
 /// [`super::query::simple_query`] consumed.
+///
+/// A mid-stream `ErrorResponse` is surfaced as "server error during COPY OUT"
+/// carrying the server's SQLSTATE. The libpq backend routes the same failure
+/// through the terminal it shares with replication and words it "replication
+/// stream terminated by server", so the prose is backend-dependent even though
+/// the classification is not.
 pub(super) async fn next_copy_out<S: AsyncRead + Unpin>(
     stream: &mut S,
     buf: &mut BytesMut,
@@ -72,13 +78,12 @@ pub(super) async fn next_copy_out<S: AsyncRead + Unpin>(
 
             Some(b'E') => {
                 let fields = super::error::parse_error_fields(&msg[wire::HEADER_LEN..]);
-                // Leave the connection on a message boundary so the caller can
-                // decide whether to reuse or drop it.
-                super::query::drain_to_ready(stream, buf).await?;
-                return Err(ReplicationError::from_sqlstate(
+                let err = ReplicationError::from_sqlstate(
                     &fields.code,
                     format!("server error during COPY OUT: {fields}"),
-                ));
+                );
+                let _ = super::query::drain_to_ready(stream, buf).await;
+                return Err(err);
             }
 
             Some(b'N') => {
@@ -88,20 +93,21 @@ pub(super) async fn next_copy_out<S: AsyncRead + Unpin>(
                 );
             }
 
-            // Entering a different COPY sub-protocol mid-stream is a protocol
-            // violation, not something to skip.
-            Some(tag @ (b'G' | b'W' | b'H')) => {
+            // ParameterStatus and NotificationResponse are the only messages
+            // PostgreSQL sanctions between CopyData frames: "It is possible for NoticeResponse and ParameterStatus messages to be interspersed between CopyData messages … Otherwise, any message type other than CopyData or CopyDone may be treated as  terminating copy-out mode."
+            //
+            // ('N' is handled above.) Everything else is a protocol violation, including `G`/`W`/`H` — entering a different COPY sub-protocol mid-stream — and `C`/`Z`, which would mean a second statement's response. Skipping those would silently swallow that statement's `CopyOutResponse` *and all of its rows*; the callers only ever issue single statements, so it is unreachable today, but silent data loss is not the failure mode to leave armed.
+            Some(b'S' | b'A') => {}
+
+            Some(tag) => {
                 return Err(ReplicationError::protocol(format!(
                     "unexpected '{}' message inside COPY OUT",
                     tag as char
                 )));
             }
 
-            Some(tag) => {
-                tracing::debug!("Skipping message type '{}' during COPY OUT", tag as char);
-            }
-
-            None => {}
+            // Unreachable: `read_message` rejects `body_len < 4`, so every message it returns is at least 5 bytes. Erroring rather than looping keeps a future framing change from spinning here without consuming input.
+            None => return Err(ReplicationError::protocol("empty message during COPY OUT")),
         }
     }
 }
@@ -115,6 +121,11 @@ pub(super) async fn next_copy_out<S: AsyncRead + Unpin>(
 /// already delivered (a mid-scan I/O or permission failure, for example). The
 /// first such error is remembered and returned only once `ReadyForQuery` has been
 /// reached, so the connection is still left on a message boundary.
+///
+/// If the read fails before `ReadyForQuery` arrives — a FATAL closes the socket
+/// instead of sending one — the deferred error still wins over the read error, for
+/// the same reason it does in [`next_copy_out`]: its SQLSTATE is what decides
+/// whether the stream reconnects.
 async fn drain_epilogue<S: AsyncRead + Unpin>(
     stream: &mut S,
     buf: &mut BytesMut,
@@ -122,7 +133,10 @@ async fn drain_epilogue<S: AsyncRead + Unpin>(
     let mut deferred: Option<ReplicationError> = None;
 
     loop {
-        let msg = wire::read_message(stream, buf).await?;
+        let msg = match wire::read_message(stream, buf).await {
+            Ok(msg) => msg,
+            Err(e) => return Err(deferred.unwrap_or(e)),
+        };
 
         match msg.first().copied() {
             Some(b'Z') => break,
@@ -142,10 +156,17 @@ async fn drain_epilogue<S: AsyncRead + Unpin>(
                     )
                 });
             }
+            // Same reasoning as the data loop: after `CopyDone` the only things
+            // due are `CommandComplete`, `ReadyForQuery`, and the asynchronous
+            // `N`/`S`/`A` trio. Anything else means the framing is off.
+            Some(b'S' | b'A') => {}
             Some(tag) => {
-                tracing::debug!("Skipping message type '{}' after COPY OUT", tag as char);
+                return Err(ReplicationError::protocol(format!(
+                    "unexpected '{}' message after COPY OUT",
+                    tag as char
+                )))
             }
-            None => {}
+            None => return Err(ReplicationError::protocol("empty message after COPY OUT")),
         }
     }
 
@@ -353,11 +374,14 @@ mod tests {
         assert_eq!(rows.len(), 1);
     }
 
+    /// `ParameterStatus` is one of the two tags PostgreSQL may intersperse
+    /// between `CopyData` frames, so it is skipped rather than rejected.
     #[tokio::test]
-    async fn unknown_tag_is_skipped() {
+    async fn parameter_status_between_frames_is_skipped() {
         let script = [
             frame(b'S', b"param\0value\0"),
             copy_data(b"row\n"),
+            frame(b'A', b"\0\0\0\0chan\0payload\0"),
             copy_done(),
             command_complete(),
             ready_for_query(),
@@ -367,6 +391,26 @@ mod tests {
         let (rows, result) = drive(script).await;
         result.unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    /// Everything else terminates copy-out mode per the protocol spec, so
+    /// skipping it would swallow a second statement's `CopyOutResponse` *and all
+    /// of its rows*. Unreachable through the crate's own single-statement
+    /// callers; rejected so it stays that way.
+    #[tokio::test]
+    async fn an_unsanctioned_tag_between_frames_is_rejected() {
+        for tag in *b"CZTD" {
+            let script = [copy_data(b"row\n"), frame(tag, b"x\0"), copy_done()].concat();
+
+            let (rows, result) = drive(script).await;
+            assert_eq!(rows.len(), 1);
+            let err = result.unwrap_err();
+            assert!(
+                matches!(err, ReplicationError::Protocol(_)),
+                "'{}' must not be silently skipped, got {err:?}",
+                tag as char
+            );
+        }
     }
 
     #[tokio::test]
@@ -386,7 +430,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_tag_in_epilogue_is_skipped() {
+    async fn parameter_status_in_epilogue_is_skipped() {
         let script = [
             copy_done(),
             frame(b'S', b"k\0v\0"),
@@ -397,6 +441,15 @@ mod tests {
 
         let (_, result) = drive(script).await;
         result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unsanctioned_tag_in_the_epilogue_is_rejected() {
+        let script = [copy_done(), frame(b'd', b"row\n"), ready_for_query()].concat();
+
+        let (_, result) = drive(script).await;
+        let err = result.unwrap_err();
+        assert!(matches!(err, ReplicationError::Protocol(_)), "{err:?}");
     }
 
     #[tokio::test]
@@ -514,5 +567,91 @@ mod tests {
         result.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(&rows[0][..], b"1\n2\n3\n");
+    }
+
+    /// A FATAL is followed by the server *closing*, not by `ReadyForQuery`, so the
+    /// resync read fails. The SQLSTATE must survive that — it is what decides
+    /// whether the stream reconnects, and `42501` is permanent while the read
+    /// error ("connection closed by server") is transient. Letting the read error
+    /// win would put a permanent failure into an endless reconnect loop.
+    #[tokio::test]
+    async fn a_fatal_without_ready_for_query_keeps_its_sqlstate() {
+        let (mut client, server) = tokio::io::duplex(1024);
+        {
+            let mut server = server;
+            server
+                .write_all(
+                    &[
+                        copy_data(b"row\n"),
+                        error_response("42501", "must be superuser"),
+                    ]
+                    .concat(),
+                )
+                .await
+                .unwrap();
+            server.flush().await.unwrap();
+        } // dropped -> EOF instead of ReadyForQuery
+
+        let mut buf = BytesMut::new();
+        assert!(matches!(
+            next_copy_out(&mut client, &mut buf).await.unwrap(),
+            CopyOutItem::Data(_)
+        ));
+
+        let err = next_copy_out(&mut client, &mut buf).await.unwrap_err();
+        assert!(format!("{err}").contains("42501"), "{err}");
+        assert!(
+            err.is_permanent(),
+            "a permanent SQLSTATE must not be laundered into a retryable error: {err:?}"
+        );
+        assert!(!err.is_transient(), "{err:?}");
+    }
+
+    /// The same rule one phase later: an error after `CopyDone` is deferred until
+    /// `ReadyForQuery`, and if the socket closes first the deferred error still
+    /// wins over the EOF.
+    #[tokio::test]
+    async fn a_deferred_epilogue_error_survives_a_truncated_epilogue() {
+        let (mut client, server) = tokio::io::duplex(1024);
+        {
+            let mut server = server;
+            server
+                .write_all(&[copy_done(), error_response("42501", "must be superuser")].concat())
+                .await
+                .unwrap();
+            server.flush().await.unwrap();
+        }
+
+        let mut buf = BytesMut::new();
+        let err = next_copy_out(&mut client, &mut buf).await.unwrap_err();
+        assert!(format!("{err}").contains("42501"), "{err}");
+        assert!(err.is_permanent(), "{err:?}");
+    }
+
+    /// A non-fatal error mid-COPY still resyncs to `ReadyForQuery`, so the
+    /// connection is left on a message boundary and stays reusable.
+    #[tokio::test]
+    async fn an_error_with_ready_for_query_still_resyncs() {
+        let sentinel = frame(b'T', b"next query");
+        let script = [
+            copy_data(b"row\n"),
+            error_response("57014", "canceling statement"),
+            ready_for_query(),
+            sentinel,
+        ]
+        .concat();
+
+        let (mut stream, _server) = scripted(script).await;
+        let mut buf = BytesMut::new();
+
+        assert!(matches!(
+            next_copy_out(&mut stream, &mut buf).await.unwrap(),
+            CopyOutItem::Data(_)
+        ));
+        let err = next_copy_out(&mut stream, &mut buf).await.unwrap_err();
+        assert!(format!("{err}").contains("57014"), "{err}");
+
+        let next = wire::read_message(&mut stream, &mut buf).await.unwrap();
+        assert_eq!(next[0], b'T', "the epilogue must have been consumed");
     }
 }

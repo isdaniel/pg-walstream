@@ -17,6 +17,12 @@ pub(crate) const HEADER_LEN: usize = 5;
 /// `body_len` close to `i32::MAX` (2 GiB). PostgreSQL's own max message size
 /// is 1 GiB, but 128 MiB is more than sufficient for any replication message
 /// and provides a safety margin for large TOAST values.
+///
+/// It is also where the two backends part company: [`read_message`] rejects an
+/// oversized frame with a `Protocol` error ("message length N exceeds maximum
+/// allowed …"), so a `COPY` frame above the cap aborts the snapshot here while the
+/// libpq backend, which applies no ceiling of its own to what `PQgetCopyData`
+/// hands back, streams it.
 pub(crate) const MAX_MESSAGE_LEN: usize = 128 * 1024 * 1024;
 
 /// Read a single complete PostgreSQL backend message from the transport.

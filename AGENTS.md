@@ -27,8 +27,10 @@ cargo clippy --no-default-features --lib -- -D warnings          # no_std
 cargo llvm-cov --lib --features derive --summary-only
 ```
 
-`make before-git-push` does **not** match CI: its clippy line is commented out
-and it has no coverage or bench target. Use the commands above.
+`make before-git-push` runs check + `make lint` (all three clippy configurations)
++ build + fmt + audit + test + doc-check. It does **not** run coverage
+(`make coverage`) or the benchmarks — run those separately before relying on the
+numbers.
 
 Check results by **exit code**, not by grepping for `error` — cargo indents
 diagnostics, so `grep '^error'` silently reports success on a failing run.
@@ -66,10 +68,15 @@ macros/              # #[derive(WalTable)] (opt-in `derive` feature)
 slot's exported snapshot, then hands off to the stream. Three invariants an
 agent must not "simplify" away:
 
-- **The stream is moved into the handle.** Every replication command runs
-  `SnapBuildClearExportedSnapshot` server-side, so `start()` mid-snapshot would
-  destroy the snapshot being read. Taking `self` by value makes that
-  unrepresentable.
+- **The stream is moved into the handle.** Not because `start()` would clear the
+  exported snapshot: the reader imports it into its own `REPEATABLE READ READ
+  ONLY` transaction before any handle exists, so the copy no longer depends on
+  the exporting transaction. It is moved because `START_REPLICATION` pins the
+  replication connection in CopyBoth, and because the handoff owns the LSN
+  bookkeeping — `finish()` demands a fully consumed snapshot so the following
+  `start(None)` resumes at `consistent_point` with no gap. Taking `self` by value
+  makes a mid-snapshot `start()` unrepresentable. (The manual
+  `exported_snapshot_name()` path *is* exposed to the server-side clearing.)
 - **Failure consumes the handle.** The exported snapshot is `REPEATABLE READ`;
   resuming against an expired one silently mixes two points in time. `run()`
   returns the stream only on `Ok`; the pull API latches a poison flag.
@@ -124,11 +131,20 @@ Critical path: `get_copy_data_async` → `process_wal_message` →
 
 ## Public API stability
 
-`EventType`, `ChangeEvent`, `ReplicationError` and `ReplicationStreamConfig` all
-have public fields and **no `#[non_exhaustive]`**, so adding a field or a variant
-is source-breaking for downstream struct literals and exhaustive matches. Prefer
-an approach that avoids it; when unavoidable, bump the minor version (0.x) and add
-a README "Upgrading" note.
+`EventType`, `ChangeEvent` and `ReplicationError` have public fields/variants and
+**no `#[non_exhaustive]`**, so adding a field or a variant is source-breaking for
+downstream struct literals and exhaustive matches. Prefer an approach that avoids
+it; when unavoidable, bump the minor version (0.x) and add a README "Upgrading"
+note.
+
+`ReplicationStreamConfig` is **`#[non_exhaustive]`** (fields still public, so
+reads and `with_*` mutation work; literal construction does not). Adding a field
+to it is therefore not source-breaking — do not "fix" the attribute away for
+consistency with the three above. New public structs get the same treatment —
+`SnapshotRow` is `#[non_exhaustive]` for this reason. The documented exception is
+`SnapshotOutcome`, an enum that deliberately omits it; the reasoning is on the
+type itself in `src/snapshot/mod.rs`, so do not add it there for consistency
+either.
 
 `ChangeEvent::encode`/`decode` are deprecated since 0.9.0 in favour of a binary
 serde codec; do not extend them.
