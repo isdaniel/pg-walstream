@@ -28,6 +28,18 @@ pub struct ConnInfo {
     pub keepalives_interval: u64,
     /// Maximum number of keepalive probes before declaring dead. Maps to `keepalives_count`.
     pub keepalives_count: u32,
+    /// Milliseconds transmitted data may go unacknowledged before the kernel
+    /// forcibly closes the connection (0 = disabled). Maps to libpq's
+    /// `tcp_user_timeout`; Linux-family only.
+    ///
+    /// **Milliseconds**, unlike `connect_timeout` and the `keepalives_*` options
+    /// beside it, which are seconds. That is libpq's unit, not a choice here.
+    ///
+    /// This is the only option that bounds a *blocking control-plane round-trip*
+    /// — including the `DROP_REPLICATION_SLOT` that snapshot cleanup runs from
+    /// `Drop`. Keepalives do not: they fire only when the connection is idle,
+    /// and a round-trip waiting for a reply is not idle.
+    pub tcp_user_timeout: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -89,6 +101,7 @@ impl std::fmt::Debug for ConnInfo {
             .field("keepalives_idle", &self.keepalives_idle)
             .field("keepalives_interval", &self.keepalives_interval)
             .field("keepalives_count", &self.keepalives_count)
+            .field("tcp_user_timeout", &self.tcp_user_timeout)
             .finish()
     }
 }
@@ -224,6 +237,7 @@ impl ConnInfo {
         let mut keepalives_idle: u64 = 120;
         let mut keepalives_interval: u64 = 10;
         let mut keepalives_count: u32 = 3;
+        let mut tcp_user_timeout: u64 = 0;
 
         for param in params_str.split('&') {
             if param.is_empty() {
@@ -256,6 +270,13 @@ impl ConnInfo {
                     }
                     "keepalives_count" => {
                         keepalives_count = parse_num("keepalives_count", val)?;
+                    }
+                    // Milliseconds, and clamped like `connect_timeout` rather than
+                    // rejected: libpq's `setTCPUserTimeout` takes a negative as 0,
+                    // and a `Config` error here is permanent, so rejecting one
+                    // would hard fail a string psql accepts.
+                    "tcp_user_timeout" => {
+                        tcp_user_timeout = parse_connect_timeout("tcp_user_timeout", val)?;
                     }
                     // libpq docs 32.1.1.2: "Values that would normally appear in
                     // the hierarchical part of the URI can alternatively be given
@@ -336,6 +357,7 @@ impl ConnInfo {
             keepalives_idle,
             keepalives_interval,
             keepalives_count,
+            tcp_user_timeout,
         })
     }
 
@@ -355,6 +377,7 @@ impl ConnInfo {
         let mut keepalives_idle: u64 = 120;
         let mut keepalives_interval: u64 = 10;
         let mut keepalives_count: u32 = 3;
+        let mut tcp_user_timeout: u64 = 0;
 
         // Simple key=value parser (handles single-quoted values)
         let mut chars = input.chars().peekable();
@@ -457,6 +480,13 @@ impl ConnInfo {
                     keepalives_interval = parse_num("keepalives_interval", &value)?
                 }
                 "keepalives_count" => keepalives_count = parse_num("keepalives_count", &value)?,
+                // Milliseconds, and clamped like `connect_timeout` rather than
+                // rejected: libpq's `setTCPUserTimeout` takes a negative as 0, and
+                // a `Config` error here is permanent, so rejecting one would hard
+                // fail a string psql accepts.
+                "tcp_user_timeout" => {
+                    tcp_user_timeout = parse_connect_timeout("tcp_user_timeout", &value)?
+                }
                 // libpq translates this to sslmode in `conninfo_storeval`, so it
                 // works in both syntaxes. Dropping it is a silent downgrade.
                 "requiressl" => {
@@ -493,6 +523,7 @@ impl ConnInfo {
             keepalives_idle,
             keepalives_interval,
             keepalives_count,
+            tcp_user_timeout,
         })
     }
 }
@@ -598,6 +629,14 @@ fn parse_sslmode(s: &str) -> Result<SslMode, ReplicationError> {
 /// they fail **closed**: the server rejects the authentication loudly. Contrast
 /// `sslcrl`, which fails **open** — a revoked certificate would be silently
 /// accepted — so that one is in [`UNSUPPORTED_OPTIONS`].
+///
+/// That fail-open/fail-closed split is a *security* audit, and it is the only
+/// one this list has ever had. It says nothing about liveness, which is how
+/// `tcp_user_timeout` sat here being parsed and discarded while the libpq
+/// backend — which hands the conninfo to `PQconnectdb` verbatim — honoured it:
+/// the same string bounded a dead round-trip on one backend and not the other,
+/// with no diagnostic. When adding a keyword here, ask whether ignoring it
+/// changes *behaviour*, not just whether it is safe to ignore.
 const IGNORED_OPTIONS: &[&str] = &[
     "application_name",
     // `require` only: `auth.rs` DOES negotiate SCRAM-SHA-256-PLUS with
@@ -627,7 +666,6 @@ const IGNORED_OPTIONS: &[&str] = &[
     "sslpassword",
     "sslsni",
     "target_session_attrs",
-    "tcp_user_timeout",
 ];
 
 /// libpq keywords whose whole purpose is to tighten authentication or transport
@@ -1075,7 +1113,6 @@ mod tests {
             "client_encoding=UTF8",
             "target_session_attrs=read-write",
             "passfile=/x/.pgpass",
-            "tcp_user_timeout=5000",
             "sslsni=1",
             "sslcompression=0",
             // Unhonourable but fail-CLOSED: the server rejects the auth loudly.
@@ -1646,6 +1683,42 @@ mod tests {
     fn test_parse_uri_keepalives_disabled() {
         let ci = ConnInfo::parse("postgresql://user:pass@host/db?keepalives=0").unwrap();
         assert!(!ci.keepalives);
+    }
+
+    /// `tcp_user_timeout` used to sit in `IGNORED_OPTIONS`: parsed, logged and
+    /// thrown away on this backend while libpq honoured it, so the same string
+    /// bounded a dead round-trip on one backend and not the other, silently.
+    #[test]
+    fn tcp_user_timeout_is_honoured_not_discarded() {
+        // Both syntaxes, because the two parsers are independent.
+        let uri = ConnInfo::parse("postgresql://user:pass@host/db?tcp_user_timeout=15000").unwrap();
+        assert_eq!(uri.tcp_user_timeout, 15000);
+
+        let kv = ConnInfo::parse("host=h user=u dbname=d tcp_user_timeout=15000").unwrap();
+        assert_eq!(kv.tcp_user_timeout, 15000);
+
+        // Absent means disabled, so wiring it up changed nothing for anyone who
+        // never set it.
+        assert_eq!(
+            ConnInfo::parse("host=h user=u dbname=d")
+                .unwrap()
+                .tcp_user_timeout,
+            0
+        );
+    }
+
+    /// Clamped, not rejected — libpq's `setTCPUserTimeout` takes a negative as 0,
+    /// and a `Config` error here is permanent, so rejecting would hard fail a
+    /// string psql accepts. Non-numeric is still an error, as it is in libpq.
+    #[test]
+    fn tcp_user_timeout_clamps_negative_and_rejects_garbage() {
+        assert_eq!(
+            ConnInfo::parse("host=h user=u dbname=d tcp_user_timeout=-1")
+                .unwrap()
+                .tcp_user_timeout,
+            0
+        );
+        assert!(ConnInfo::parse("host=h user=u dbname=d tcp_user_timeout=abc").is_err());
     }
 
     #[test]
