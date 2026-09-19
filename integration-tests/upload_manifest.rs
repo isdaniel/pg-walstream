@@ -117,9 +117,17 @@ async fn real_manifest_enables_incremental_base_backup() {
     // incremental backup must run on this same connection. Entering the COPY
     // stream is the assertion — the payload is not drained; the connection is
     // dropped immediately after, which aborts the backup server-side.
+    // `CHECKPOINT 'fast'` is not incidental. `BASE_BACKUP` forces a checkpoint,
+    // and the server's default is a *spread* one, deliberately paced over
+    // `checkpoint_timeout * checkpoint_completion_target` — 300s * 0.9 = 270s on
+    // a stock server. This test runs late in the suite with the buffer cache
+    // dirty, so it paid that full 270s, twice (once per backend), for a
+    // checkpoint whose contents it never looks at. Asking for the immediate
+    // checkpoint costs nothing here and takes the suite from ~12 minutes to ~3.
     let opts = BaseBackupOptions {
         incremental: true,
         label: Some("it_upload_manifest".to_string()),
+        checkpoint: Some("fast".to_string()),
         ..Default::default()
     };
     repl.base_backup(&opts)

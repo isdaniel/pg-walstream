@@ -309,6 +309,18 @@ impl LogicalReplicationStream {
     /// command is blocking — but it means that on a current-thread runtime each
     /// `COPY` start occupies the runtime's only thread until the server answers,
     /// with no timeout.
+    ///
+    /// No control-plane round-trip has a statement deadline on either backend,
+    /// and that includes the `DROP_REPLICATION_SLOT` this module's `Drop` impls
+    /// run to clean up after a failed snapshot — the case most likely to meet a
+    /// connection that has already gone away.
+    ///
+    /// The knob that bounds them is `tcp_user_timeout=<milliseconds>` in the
+    /// connection string (Linux-family only; honoured by both backends).
+    /// Keepalives are *not* that knob, however aggressively they are tuned: they
+    /// fire only when the connection is idle, and a round-trip still waiting for
+    /// its reply is not idle. `tcp_user_timeout` puts a deadline on the
+    /// unacknowledged write itself, which is the situation here.
     pub async fn snapshot(self) -> Result<SnapshotOutcome> {
         let reader_conninfo = plan::derive_reader_conninfo(self.conninfo());
         self.snapshot_with_reader(&reader_conninfo).await
