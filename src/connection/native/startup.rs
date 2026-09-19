@@ -258,6 +258,10 @@ async fn tcp_connect(addr: &str, info: &ConnInfo) -> Result<TcpStream, Replicati
         configure_tcp_keepalive(&tcp, info);
     }
 
+    if info.tcp_user_timeout > 0 {
+        configure_tcp_user_timeout(&tcp, info);
+    }
+
     Ok(tcp)
 }
 
@@ -292,6 +296,53 @@ fn configure_tcp_keepalive(tcp: &TcpStream, info: &ConnInfo) {
             info.keepalives_interval
         );
     }
+}
+
+/// Configure `TCP_USER_TIMEOUT` on the socket using socket2.
+///
+/// The only knob that bounds a blocking control-plane round-trip. Keepalives
+/// bound the *idle* case; they never fire while a reply is outstanding, because
+/// the connection is not idle. So a `DROP_REPLICATION_SLOT` issued from snapshot
+/// cleanup in `Drop` against a peer that has silently gone away waits for the
+/// keepalive cycle only because the socket eventually goes idle — this sets a
+/// deadline on the unacknowledged write itself.
+///
+/// Best-effort on purpose: a sandbox that refuses the `setsockopt` must not fail
+/// an otherwise-healthy connection, so this warns rather than returning `Err`.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "fuchsia",
+    target_os = "cygwin",
+))]
+fn configure_tcp_user_timeout(tcp: &TcpStream, info: &ConnInfo) {
+    use socket2::SockRef;
+
+    let sock = SockRef::from(tcp);
+    // Milliseconds — libpq's unit for this option, unlike every other timeout
+    // in `ConnInfo`, which is seconds.
+    if let Err(e) = sock.set_tcp_user_timeout(Some(Duration::from_millis(info.tcp_user_timeout))) {
+        tracing::warn!("Failed to set TCP_USER_TIMEOUT: {e}");
+    } else {
+        tracing::debug!("TCP_USER_TIMEOUT configured: {}ms", info.tcp_user_timeout);
+    }
+}
+
+/// No-op fallback: `TCP_USER_TIMEOUT` is Linux-family only.
+///
+/// Warns rather than staying silent — the whole reason this option was wired up
+/// is that it used to be accepted and then discarded with no diagnostic.
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "fuchsia",
+    target_os = "cygwin",
+)))]
+fn configure_tcp_user_timeout(_tcp: &TcpStream, info: &ConnInfo) {
+    tracing::warn!(
+        "tcp_user_timeout={}ms ignored: TCP_USER_TIMEOUT is not available on this platform",
+        info.tcp_user_timeout
+    );
 }
 
 /// Perform TLS negotiation: send SSLRequest, check response, do handshake.
@@ -836,7 +887,43 @@ mod tests {
             keepalives_idle: 120,
             keepalives_interval: 10,
             keepalives_count: 3,
+            tcp_user_timeout: 0,
         }
+    }
+
+    /// Reads the option back off a real socket, so it fails on the two traps the
+    /// implementation actually has: treating the value as seconds (libpq's unit
+    /// is milliseconds, unlike every other timeout in `ConnInfo`), and nesting
+    /// the call inside the `keepalives` branch, which would make
+    /// `keepalives=0 tcp_user_timeout=..` a silent no-op.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "cygwin",
+    ))]
+    #[tokio::test]
+    async fn tcp_user_timeout_reaches_the_socket_in_milliseconds() {
+        use socket2::SockRef;
+        use std::net::{TcpListener, TcpStream as StdTcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let std_stream = StdTcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        std_stream.set_nonblocking(true).unwrap();
+        let tcp = TcpStream::from_std(std_stream).unwrap();
+
+        let mut info = test_conninfo(SslMode::Disable, None);
+        info.tcp_user_timeout = 15000;
+        // Off, to prove the setting does not ride on the keepalive branch.
+        info.keepalives = false;
+
+        configure_tcp_user_timeout(&tcp, &info);
+
+        assert_eq!(
+            SockRef::from(&tcp).tcp_user_timeout().unwrap(),
+            Some(Duration::from_millis(15000)),
+            "15000 must land as 15s, not 15000s — libpq's unit here is milliseconds"
+        );
     }
 
     #[test]

@@ -294,6 +294,20 @@ A complete, runnable version of the above — including a row inserted *during* 
 
 > **Holding a snapshot handle blocks `VACUUM`.** The handle keeps a `REPEATABLE READ` transaction open, pinning the database's `xmin` — no dead tuple newer than the snapshot can be reclaimed, across the whole database, for as long as you hold it. Copy promptly.
 
+## Connection Timeouts
+
+Three conninfo options bound three different things, and they are easy to mistake for one another:
+
+| Option | Unit | Bounds |
+|---|---|---|
+| `connect_timeout` | seconds | Only the TCP connect. On the native backend TLS negotiation and startup/auth are **not** covered; libpq bounds the whole attempt. |
+| `keepalives_idle` / `_interval` / `_count` | seconds | An **idle** connection. Defaults `120`/`10`/`3` — roughly 150 s to notice a peer that vanished while nothing was in flight. |
+| `tcp_user_timeout` | **milliseconds** | An unacknowledged **write**. This is the only one that bounds a blocking round-trip — including the `DROP_REPLICATION_SLOT` that snapshot cleanup runs from `Drop`. Linux-family only; `0` (the default) disables it. |
+
+If a stuck destructor or a wedged control-plane command matters to you, `tcp_user_timeout` is the knob — keepalives will not do it, because a connection waiting for a reply is not idle.
+
+> Set it deliberately. An aggressive `tcp_user_timeout` tears down healthy long-lived replication connections during ordinary transient stalls, which is usually worse than the delay it prevents.
+
 ## PostgreSQL Setup
 
 Before using this library, you need to configure PostgreSQL for replication:
