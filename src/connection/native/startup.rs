@@ -203,7 +203,36 @@ impl AsyncWrite for Transport {
 /// PostgreSQL startup + authentication handshake.
 ///
 /// Returns the established transport and server version.
+///
+/// `connect_timeout` bounds the **whole** establishment, not just the TCP handshake.
+/// libpq documents it as "Maximum time to wait while connecting" — i.e. through
+/// `CONNECTION_OK` — and the phases after the SYN are where a connection actually
+/// parks: a stalled proxy, a half-dead load balancer or a `DROP`-after-accept
+/// firewall completes the TCP handshake and then goes silent, leaving the TLS
+/// negotiation or the auth exchange waiting on a read that never arrives.
+/// `tcp_user_timeout` does not rescue that case — it is Linux-only and only fires on
+/// *unacknowledged* writes, so a peer that ACKs and says nothing defeats it.
+///
+/// [`tcp_connect`] keeps its own inner timeout: it fires first for the common
+/// SYN-timeout case and names the address, which is a better diagnostic than the
+/// generic deadline below. The outer budget covers the phases that have none.
 pub async fn connect(info: &ConnInfo) -> Result<(Transport, i32, BytesMut), ReplicationError> {
+    if info.connect_timeout == 0 {
+        return connect_inner(info).await;
+    }
+
+    let budget = Duration::from_secs(info.connect_timeout);
+    tokio::time::timeout(budget, connect_inner(info))
+        .await
+        .map_err(|_| {
+            ReplicationError::transient_connection(format!(
+                "Connection to {}:{} timed out after {}s before the startup handshake completed",
+                info.host, info.port, info.connect_timeout
+            ))
+        })?
+}
+
+async fn connect_inner(info: &ConnInfo) -> Result<(Transport, i32, BytesMut), ReplicationError> {
     let addr = format!("{}:{}", info.host, info.port);
 
     let tcp = tcp_connect(&addr, info).await?;
@@ -923,6 +952,51 @@ mod tests {
             SockRef::from(&tcp).tcp_user_timeout().unwrap(),
             Some(Duration::from_millis(15000)),
             "15000 must land as 15s, not 15000s — libpq's unit here is milliseconds"
+        );
+    }
+
+    /// The exact gap the outer deadline closes: the peer completes the TCP
+    /// handshake and then says nothing. `connect_timeout` used to wrap only
+    /// `TcpStream::connect`, so the auth exchange below waited forever — on the
+    /// caller's thread, because `connect()` is reached through a blocking
+    /// `ready_rx.recv()`. A stalled proxy or `DROP`-after-accept firewall is the
+    /// real-world shape.
+    #[tokio::test]
+    async fn connect_timeout_bounds_the_handshake_not_just_the_syn() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Accept, hold the socket open, and never answer the StartupMessage.
+        let _silent_peer = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let mut info = test_conninfo(SslMode::Disable, None);
+        info.host = addr.ip().to_string();
+        info.port = addr.port();
+        info.connect_timeout = 1;
+
+        let started = std::time::Instant::now();
+        // `Transport` is not `Debug`, so `expect_err` is unavailable here.
+        let err = match connect(&info).await {
+            Ok(_) => panic!("a silent peer must not hang the connect"),
+            Err(e) => e,
+        };
+
+        assert!(
+            err.to_string().contains("timed out"),
+            "expected a timeout, got: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "deadline did not fire promptly: {:?}",
+            started.elapsed()
+        );
+        // Transient: the peer may well be healthy on the next attempt.
+        assert!(
+            !err.is_permanent(),
+            "a handshake timeout must stay retryable"
         );
     }
 

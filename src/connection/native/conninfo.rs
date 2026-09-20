@@ -564,8 +564,16 @@ fn resolve_sslrootcert_system(
     match sslmode {
         // Not spelled out by the caller: `system` raises the default.
         _ if !sslmode_explicit => Ok(SslMode::VerifyFull),
-        // Both actually verify the chain against the root store.
-        SslMode::VerifyCa | SslMode::VerifyFull => Ok(sslmode),
+        // `verify-full` only, exactly as libpq (`strcmp(sslmode, "verify-full") != 0`).
+        //
+        // `verify-ca` is NOT good enough here, even though it does validate the
+        // chain: `system` loads the whole public root store, and `VerifyCa`
+        // installs `NoHostnameVerifier`. Chain validation against *every public
+        // CA* with no name binding authenticates nothing — any certificate a
+        // public CA will issue for any domain the attacker controls passes. With
+        // a pinned `sslrootcert=/path/ca.pem` the same mode is meaningful, which
+        // is why this rule is keyed on the `system` keyword and nothing else.
+        SslMode::VerifyFull => Ok(sslmode),
         weak => Err(ReplicationError::config(format!(
             "weak sslmode \"{}\" may not be used with sslrootcert=system \
              (use verify-full)",
@@ -702,8 +710,10 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
 /// That is the same downgrade [`parse_sslmode`] exists to prevent, through a
 /// one-character-different door.
 fn check_unhandled(key: &str, value: &str) -> Result<(), ReplicationError> {
-    // Options we can honour in their loose form but not in their strict one.
-    let unhonourable = match key {
+    // Unhonourable only in their strict form. The *value* is what makes these
+    // unhonourable — `channel_binding=prefer` is fine — so it belongs in the
+    // message, and none of these four carry a secret.
+    let strict_form = match key {
         // libpq validates these three with strcmp, so an exact match is correct.
         "channel_binding" | "gssencmode" | "sslcertmode" => value == "require",
         // rustls is built with the `tls12` feature, so the floor is already
@@ -711,11 +721,25 @@ fn check_unhandled(key: &str, value: &str) -> Result<(), ReplicationError> {
         // something we cannot promise. libpq compares with `pg_strcasecmp`
         // (`sslVerifyProtocolVersion`), so we must be case-insensitive too.
         "ssl_min_protocol_version" => value.eq_ignore_ascii_case("TLSv1.3"),
-        other => UNSUPPORTED_OPTIONS.contains(&other),
+        _ => false,
     };
-    if unhonourable {
+    if strict_form {
         return Err(ReplicationError::config(format!(
             "connection option \"{key}={value}\" is not supported by the native backend; \
+             ignoring it would silently weaken the connection \
+             (use the `libpq` backend, or remove it)"
+        )));
+    }
+    // Unhonourable whatever the value is, so the value adds no diagnostic — and
+    // echoing it would leak a credential. `UNSUPPORTED_OPTIONS` holds
+    // `scram_client_key`, `scram_server_key` and `oauth_client_secret`; a
+    // `scram_client_key` is authentication-equivalent (it computes `ClientProof`).
+    // This is a `Config` error, which is permanent and goes straight to a caller
+    // who will log it, and the secret never becomes a `ConnInfo` field, so the
+    // hand-written `Debug` redaction below cannot help here. Key only.
+    if UNSUPPORTED_OPTIONS.contains(&key) {
+        return Err(ReplicationError::config(format!(
+            "connection option \"{key}\" is not supported by the native backend; \
              ignoring it would silently weaken the connection \
              (use the `libpq` backend, or remove it)"
         )));
@@ -832,12 +856,7 @@ fn parse_ssl_negotiation(s: &str) -> Result<SslNegotiation, ReplicationError> {
 /// value %00 in percent-encoded value`). This passes both through, which keeps
 /// the function infallible.
 ///
-/// Known gap, not currently guarded anywhere: `%00` decodes to a real NUL, and
-/// NUL is the field separator in the StartupMessage — so
-/// `postgresql://u%00replication%00false@h/db` injects startup parameters the
-/// caller never asked for. It needs an operator to paste a hostile URI, which
-/// is already game over, but if that assumption ever weakens the fix is a
-/// rejection either here or in `wire::build_startup_message`.
+/// `%00` therefore still decodes to a real NUL here, but it no longer reaches the wire: `wire::build_startup_message` rejects a NUL in any key or value, so `postgresql://u%00replication%00database@h/db` fails with a `Config` error instead of injecting startup parameters. Guarding there rather than here covers the key-value syntax too, which has no escape sequence to intercept.
 fn url_decode(s: &str) -> String {
     #[inline]
     fn hex_val(b: u8) -> Option<u8> {
@@ -1194,17 +1213,36 @@ mod tests {
         assert!(ConnInfo::parse("host=h sslrootcert=system requiressl=0").is_err());
     }
 
-    /// Both modes actually verify the chain against the root store, so both are
-    /// legal companions for `system`.
+    /// `verify-full` is the ONLY legal companion for `system`, exactly as libpq
+    /// (`strcmp(sslmode, "verify-full") != 0` is the rejection condition).
+    ///
+    /// `verify-ca` looks safe — it validates the chain — but paired with
+    /// `system` it authenticates nothing: the root store is every public CA
+    /// (`build_root_store`) and `VerifyCa` installs `NoHostnameVerifier`, so any
+    /// certificate a public CA issues for any domain the attacker controls is
+    /// accepted for *this* host. Accepting it here was a live MITM path.
     #[test]
-    fn sslrootcert_system_accepts_verifying_sslmodes() {
-        for (mode, want) in [
-            ("verify-ca", SslMode::VerifyCa),
-            ("verify-full", SslMode::VerifyFull),
+    fn sslrootcert_system_accepts_only_verify_full() {
+        let ci = ConnInfo::parse("host=h sslrootcert=system sslmode=verify-full").unwrap();
+        assert_eq!(ci.sslmode, SslMode::VerifyFull);
+
+        for dsn in [
+            "host=h sslrootcert=system sslmode=verify-ca",
+            "postgresql://u@h/db?sslrootcert=system&sslmode=verify-ca",
         ] {
-            let ci = ConnInfo::parse(&format!("host=h sslrootcert=system sslmode={mode}")).unwrap();
-            assert_eq!(ci.sslmode, want, "{mode}");
+            let err = ConnInfo::parse(dsn)
+                .expect_err("verify-ca + sslrootcert=system must be refused")
+                .to_string();
+            assert!(
+                err.contains("may not be used with sslrootcert=system"),
+                "{dsn}: {err}"
+            );
         }
+
+        // Keyed on the `system` keyword only: with a pinned CA file, `verify-ca`
+        // is a meaningful mode and must keep working.
+        let ci = ConnInfo::parse("host=h sslrootcert=/etc/ssl/ca.pem sslmode=verify-ca").unwrap();
+        assert_eq!(ci.sslmode, SslMode::VerifyCa);
     }
 
     /// The rule is keyed on the reserved word only — an ordinary CA path must not
@@ -1268,6 +1306,46 @@ mod tests {
         ] {
             assert!(ConnInfo::parse(&format!("host=h {kv}")).is_err(), "{kv}");
         }
+    }
+
+    /// The rejection message must never echo the option's *value*.
+    ///
+    /// `UNSUPPORTED_OPTIONS` holds `scram_client_key`, `scram_server_key` and
+    /// `oauth_client_secret`. A `scram_client_key` is authentication-equivalent —
+    /// it computes `ClientProof` — and `Config` is a permanent error that goes
+    /// straight to a caller who logs it. The secret never becomes a `ConnInfo`
+    /// field, so this path bypasses the hand-written `Debug` redaction entirely;
+    /// key-only is the only thing that closes it.
+    #[test]
+    fn unsupported_option_error_never_echoes_the_value() {
+        const SECRET: &str = "s3cret-scram-client-key-do-not-log";
+        for key in UNSUPPORTED_OPTIONS {
+            for dsn in [
+                format!("host=h {key}={SECRET}"),
+                format!("postgresql://u@h/db?{key}={SECRET}"),
+            ] {
+                let err = ConnInfo::parse(&dsn).unwrap_err().to_string();
+                assert!(err.contains("not supported"), "{key}: {err}");
+                assert!(
+                    !err.contains(SECRET),
+                    "{key} leaked its value into the error: {err}"
+                );
+            }
+        }
+    }
+
+    /// The counterpart: where the *value* is the reason for the rejection, it
+    /// must still be shown, or the message reads as "this key is never
+    /// supported" when only the strict form is.
+    #[test]
+    fn value_sensitive_options_still_report_which_value_was_refused() {
+        let err = ConnInfo::parse("host=h channel_binding=require")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("channel_binding=require"), "{err}");
+        // ...and the loose form is accepted, which is what makes the value
+        // load-bearing in the message.
+        assert!(ConnInfo::parse("host=h channel_binding=prefer").is_ok());
     }
 
     /// `requiressl=1` is `sslmode=require` (translated in `conninfo_storeval`, so
