@@ -62,14 +62,18 @@ fn regular_conn_string() -> String {
     })
 }
 
-/// `server_version_num` (e.g. 160000 for PG 16). Returns 0 if it cannot be read.
+/// `server_version_num` (e.g. 160000 for PG 16). Panics rather than returning a
+/// sentinel: a 0 would fall below every version gate below and turn a broken
+/// connection into three silently skipped tests reporting `ok`.
 fn server_version_num() -> i32 {
-    PgReplicationConnection::connect(&regular_conn_string())
-        .ok()
-        .and_then(|mut c| c.exec("SHOW server_version_num").ok())
-        .and_then(|r| r.get_value(0, 0))
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0)
+    let mut conn = PgReplicationConnection::connect(&regular_conn_string())
+        .expect("regular connection for server_version_num");
+    conn.exec("SHOW server_version_num")
+        .expect("SHOW server_version_num")
+        .get_value(0, 0)
+        .expect("server_version_num value present")
+        .parse()
+        .expect("server_version_num is numeric")
 }
 
 fn setup(conn: &mut PgReplicationConnection) {
@@ -78,7 +82,10 @@ fn setup(conn: &mut PgReplicationConnection) {
     );
     let _ = conn.exec("TRUNCATE stream_test RESTART IDENTITY");
     let _ = conn.exec("DROP PUBLICATION IF EXISTS stream_pub");
-    let _ = conn.exec("CREATE PUBLICATION stream_pub FOR TABLE stream_test");
+    // Load-bearing: without the publication the stream delivers nothing and the
+    // test burns its whole deadline before blaming logical_decoding_work_mem.
+    conn.exec("CREATE PUBLICATION stream_pub FOR TABLE stream_test")
+        .expect("create publication stream_pub");
 }
 
 fn drop_slot(slot_name: &str) {
@@ -115,13 +122,22 @@ fn spawn_cancel(cancel: &CancellationToken, secs: u64) {
     });
 }
 
+/// Why a drain stopped. `Deadline` means the cancellation timer fired, so the
+/// result is partial — assert it before any content check, or a timeout is
+/// reported as a product failure ("every streamed insert should arrive").
+enum DrainEnd {
+    Terminal,
+    Deadline,
+}
+
 /// Drain events into a vector until `is_terminal` matches one, the stream ends,
 /// or the cancellation timer fires. Advances applied-LSN feedback per event.
 async fn drain_until(
     es: &mut EventStream,
     is_terminal: impl Fn(&EventType) -> bool,
-) -> Vec<ChangeEvent> {
+) -> (Vec<ChangeEvent>, DrainEnd) {
     let mut out = Vec::new();
+    let mut end = DrainEnd::Terminal;
     loop {
         match es.next_event().await {
             Ok(ev) => {
@@ -132,11 +148,14 @@ async fn drain_until(
                     break;
                 }
             }
-            Err(pg_walstream::ReplicationError::Cancelled(_)) => break,
+            Err(pg_walstream::ReplicationError::Cancelled(_)) => {
+                end = DrainEnd::Deadline;
+                break;
+            }
             Err(e) => panic!("unexpected stream error: {e}"),
         }
     }
-    out
+    (out, end)
 }
 
 fn count_inserts(events: &[ChangeEvent]) -> usize {
@@ -163,6 +182,8 @@ struct ReencodeDrain {
     reencoded_msgs: usize,
     /// The message that matched `is_terminal`, if the drain stopped on one.
     terminal: Option<LogicalReplicationMessage>,
+    /// Whether the drain ran out of deadline instead of reaching `is_terminal`.
+    end: DrainEnd,
 }
 
 /// Drain raw WAL from `repl`, re-encode every pgoutput body at `proto` with
@@ -181,11 +202,15 @@ async fn drain_reencode(
     let mut data_messages = 0usize;
     let mut reencoded_msgs = 0usize;
     let mut terminal = None;
+    let mut end = DrainEnd::Terminal;
 
     loop {
         let data = match repl.get_copy_data_async(cancel).await {
             Ok(d) => d,
-            Err(pg_walstream::ReplicationError::Cancelled(_)) => break,
+            Err(pg_walstream::ReplicationError::Cancelled(_)) => {
+                end = DrainEnd::Deadline;
+                break;
+            }
             Err(e) => panic!("copy data error: {e}"),
         };
         if data.is_empty() || data[0] != b'w' || data.len() <= 25 {
@@ -226,6 +251,7 @@ async fn drain_reencode(
         data_messages,
         reencoded_msgs,
         terminal,
+        end,
     }
 }
 
@@ -253,7 +279,7 @@ async fn streams_large_committed_transaction() {
     stream.start(None).await.expect("start replication");
 
     let cancel = CancellationToken::new();
-    spawn_cancel(&cancel, 30);
+    let deadline = cancel.clone();
     let mut es = stream.into_stream(cancel);
 
     regular
@@ -263,7 +289,15 @@ async fn streams_large_committed_transaction() {
         ))
         .expect("forced-streaming insert");
 
-    let events = drain_until(&mut es, |t| matches!(t, EventType::StreamCommit { .. })).await;
+    // Start the deadline only now: it bounds the drain, not the blocking INSERT.
+    spawn_cancel(&deadline, 30);
+
+    let (events, end) = drain_until(&mut es, |t| matches!(t, EventType::StreamCommit { .. })).await;
+    assert!(
+        matches!(end, DrainEnd::Terminal),
+        "drain hit its deadline after {} events without a StreamCommit",
+        events.len()
+    );
 
     let inserts = count_inserts(&events);
     let starts = stream_starts(&events);
@@ -325,7 +359,7 @@ async fn streams_large_committed_transaction_parallel_v4() {
     stream.start(None).await.expect("start replication");
 
     let cancel = CancellationToken::new();
-    spawn_cancel(&cancel, 30);
+    let deadline = cancel.clone();
     let mut es = stream.into_stream(cancel);
 
     regular
@@ -335,7 +369,15 @@ async fn streams_large_committed_transaction_parallel_v4() {
         ))
         .expect("forced-streaming insert");
 
-    let events = drain_until(&mut es, |t| matches!(t, EventType::StreamCommit { .. })).await;
+    // Start the deadline only now: it bounds the drain, not the blocking INSERT.
+    spawn_cancel(&deadline, 30);
+
+    let (events, end) = drain_until(&mut es, |t| matches!(t, EventType::StreamCommit { .. })).await;
+    assert!(
+        matches!(end, DrainEnd::Terminal),
+        "drain hit its deadline after {} events without a StreamCommit",
+        events.len()
+    );
 
     assert_eq!(
         count_inserts(&events),
@@ -388,7 +430,7 @@ async fn streams_large_aborted_transaction_v4() {
     stream.start(None).await.expect("start replication");
 
     let cancel = CancellationToken::new();
-    spawn_cancel(&cancel, 30);
+    let deadline = cancel.clone();
     let mut es = stream.into_stream(cancel);
 
     regular.exec("BEGIN").expect("begin");
@@ -400,7 +442,15 @@ async fn streams_large_aborted_transaction_v4() {
         .expect("forced-streaming insert");
     regular.exec("ROLLBACK").expect("rollback");
 
-    let events = drain_until(&mut es, |t| matches!(t, EventType::StreamAbort { .. })).await;
+    // Start the deadline only now: it bounds the drain, not the blocking INSERT.
+    spawn_cancel(&deadline, 30);
+
+    let (events, end) = drain_until(&mut es, |t| matches!(t, EventType::StreamAbort { .. })).await;
+    assert!(
+        matches!(end, DrainEnd::Terminal),
+        "drain hit its deadline after {} events without a StreamAbort",
+        events.len()
+    );
 
     let saw_commit = events
         .iter()
@@ -484,6 +534,11 @@ async fn streaming_bytes_reencode_identically() {
     })
     .await;
 
+    assert!(
+        matches!(drain.end, DrainEnd::Terminal),
+        "drain hit its deadline after {} re-encoded message(s) without a StreamCommit",
+        drain.reencoded_msgs
+    );
     assert!(drain.saw_stream_start, "expected a StreamStart");
     assert!(
         matches!(
@@ -565,6 +620,11 @@ async fn aborted_stream_bytes_reencode_identically() {
     })
     .await;
 
+    assert!(
+        matches!(drain.end, DrainEnd::Terminal),
+        "drain hit its deadline after {} re-encoded message(s) without a StreamAbort",
+        drain.reencoded_msgs
+    );
     assert!(drain.saw_stream_start, "expected a StreamStart");
     assert!(
         matches!(
@@ -580,6 +640,19 @@ async fn aborted_stream_bytes_reencode_identically() {
         "aborted streaming raw re-encode: {} message(s) byte-identical, v4 abort tail present",
         drain.reencoded_msgs
     );
+}
+
+/// Rolls back its prepared transaction on `Drop`, so a panicking assertion never
+/// strands one (a dangling prepared xact holds RowExclusiveLock on `stream_test`,
+/// and the next run's `TRUNCATE` in `setup` blocks on it). Rolling back an
+/// already-resolved gid just errors, and that error is swallowed.
+struct PreparedGuard(String);
+impl Drop for PreparedGuard {
+    fn drop(&mut self) {
+        if let Ok(mut c) = PgReplicationConnection::connect(&regular_conn_string()) {
+            let _ = c.exec(&format!("ROLLBACK PREPARED '{}'", self.0));
+        }
+    }
 }
 
 /// Real-PG byte anchor for the StreamPrepare path: a large two-phase transaction
@@ -610,6 +683,7 @@ async fn streamed_prepare_bytes_reencode_identically() {
 
     // Prepare the large transaction after the slot is consistent, so it decodes
     // as a streamed prepare rather than folding into a later commit.
+    let _prepared = PreparedGuard(gid.to_string());
     regular.exec("BEGIN").expect("begin");
     regular
         .exec(&format!(
@@ -643,6 +717,11 @@ async fn streamed_prepare_bytes_reencode_identically() {
 
     let _ = regular.exec(&format!("ROLLBACK PREPARED '{gid}'"));
 
+    assert!(
+        matches!(drain.end, DrainEnd::Terminal),
+        "drain hit its deadline after {} re-encoded message(s) without a StreamPrepare",
+        drain.reencoded_msgs
+    );
     assert!(drain.saw_stream_start, "expected a StreamStart");
     assert!(
         matches!(

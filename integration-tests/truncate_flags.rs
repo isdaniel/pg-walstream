@@ -53,6 +53,38 @@ fn drop_slot(slot_name: &str) {
     }
 }
 
+/// Poll until the slot's `active` flag clears. The walsender exits
+/// asynchronously after the stream is dropped, and dropping a still-active slot
+/// raises 55006 — which `drop_slot` swallows, leaking the slot. Bounded at 5s.
+fn wait_for_slot_inactive(slot_name: &str) {
+    let Ok(mut conn) = PgReplicationConnection::connect(&replication_conn_string()) else {
+        return;
+    };
+    for _ in 0..50 {
+        let active = conn
+            .exec(&format!(
+                "SELECT active FROM pg_replication_slots WHERE slot_name = '{slot_name}'"
+            ))
+            .ok()
+            .and_then(|r| r.get_value(0, 0))
+            .is_some_and(|v| v == "t");
+        if !active {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Drops its slot on `Drop` so a panicking assertion never leaks it (an orphaned
+/// persistent slot pins WAL). `Drop` is sync, hence the blocking wait.
+struct SlotGuard(&'static str);
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        wait_for_slot_inactive(self.0);
+        drop_slot(self.0);
+    }
+}
+
 fn cfg(slot: &str) -> ReplicationStreamConfig {
     ReplicationStreamConfig::new(
         slot.to_string(),
@@ -104,6 +136,9 @@ async fn truncate_flags_survive_the_wire() {
             "SELECT pg_create_logical_replication_slot('{slot}', 'pgoutput')"
         ))
         .expect("create slot");
+    // Declared before the stream, so the stream drops first and the slot is
+    // already inactive when the guard tries to drop it.
+    let _slot_guard = SlotGuard(slot);
 
     // Each statement is its own transaction, so the Truncate messages arrive in
     // this order. `expected` is (cascade, restart_identity).
@@ -183,9 +218,9 @@ async fn truncate_flags_survive_the_wire() {
         "the first Relation message for a table must surface as an event"
     );
 
+    // Drop the stream so the walsender exits; `_slot_guard` then waits for the
+    // slot's `active` flag to clear and drops it.
     drop(stream);
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    drop_slot(slot);
 
     let _ = regular.exec("DROP PUBLICATION IF EXISTS truncflags_pub");
     let _ = regular.exec("DROP TABLE IF EXISTS truncflags_child, truncflags_parent CASCADE");

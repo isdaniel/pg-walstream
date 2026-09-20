@@ -6,7 +6,9 @@
 //!
 //! Each case is created on a fresh replication connection, asserted to succeed
 //! (or to fail client-side for the guard cases), then dropped. Version-gated
-//! cases are skipped with a `warn!` on older servers.
+//! cases are skipped with a greppable `SKIP:` line, and each test ends with a
+//! `SKIPPED n/total` summary, so a server that runs only part of the matrix is
+//! visible instead of reporting a bare `ok`.
 //!
 //! ## Prerequisites
 //!
@@ -76,6 +78,11 @@ struct Case {
     min_version: i64,
     /// Guard cases fail in the builder before any server round-trip.
     expect_client_err: bool,
+    /// Drop this case's slot with `DROP_REPLICATION_SLOT … WAIT` rather than the
+    /// plain grammar. Both are exercised live; deriving it from the loop index
+    /// silently re-targeted which cases cover WAIT whenever a case was inserted.
+    /// Ignored by temporary and client-error cases, which never reach the DROP.
+    wait: bool,
 }
 
 #[test]
@@ -100,6 +107,7 @@ fn test_create_slot_option_matrix() {
             opts: ReplicationSlotOptions::default(),
             min_version: 0,
             expect_client_err: false,
+            wait: true,
         },
         Case {
             name: "logical temporary",
@@ -111,6 +119,7 @@ fn test_create_slot_option_matrix() {
             },
             min_version: 0,
             expect_client_err: false,
+            wait: false,
         },
         Case {
             name: "snapshot nothing",
@@ -122,6 +131,7 @@ fn test_create_slot_option_matrix() {
             },
             min_version: 0,
             expect_client_err: false,
+            wait: true,
         },
         Case {
             name: "snapshot export",
@@ -133,6 +143,7 @@ fn test_create_slot_option_matrix() {
             },
             min_version: 0,
             expect_client_err: false,
+            wait: false,
         },
         Case {
             name: "two_phase",
@@ -144,6 +155,7 @@ fn test_create_slot_option_matrix() {
             },
             min_version: 150000,
             expect_client_err: false,
+            wait: true,
         },
         Case {
             name: "two_phase + snapshot nothing",
@@ -156,6 +168,7 @@ fn test_create_slot_option_matrix() {
             },
             min_version: 150000,
             expect_client_err: false,
+            wait: false,
         },
         Case {
             name: "physical default",
@@ -164,6 +177,7 @@ fn test_create_slot_option_matrix() {
             opts: ReplicationSlotOptions::default(),
             min_version: 0,
             expect_client_err: false,
+            wait: true,
         },
         Case {
             name: "physical reserve_wal",
@@ -175,6 +189,7 @@ fn test_create_slot_option_matrix() {
             },
             min_version: 0,
             expect_client_err: false,
+            wait: false,
         },
         Case {
             name: "physical temporary",
@@ -186,6 +201,7 @@ fn test_create_slot_option_matrix() {
             },
             min_version: 0,
             expect_client_err: false,
+            wait: false,
         },
         Case {
             name: "failover",
@@ -197,6 +213,7 @@ fn test_create_slot_option_matrix() {
             },
             min_version: 170000,
             expect_client_err: false,
+            wait: false,
         },
         Case {
             name: "failover + snapshot nothing",
@@ -209,6 +226,7 @@ fn test_create_slot_option_matrix() {
             },
             min_version: 170000,
             expect_client_err: false,
+            wait: true,
         },
         Case {
             name: "failover + two_phase",
@@ -221,6 +239,7 @@ fn test_create_slot_option_matrix() {
             },
             min_version: 170000,
             expect_client_err: false,
+            wait: false,
         },
         Case {
             name: "guard: physical + failover",
@@ -232,6 +251,7 @@ fn test_create_slot_option_matrix() {
             },
             min_version: 0,
             expect_client_err: true,
+            wait: false,
         },
         Case {
             name: "guard: temporary + failover",
@@ -244,6 +264,7 @@ fn test_create_slot_option_matrix() {
             },
             min_version: 0,
             expect_client_err: true,
+            wait: false,
         },
         Case {
             name: "guard: missing plugin",
@@ -252,20 +273,31 @@ fn test_create_slot_option_matrix() {
             opts: ReplicationSlotOptions::default(),
             min_version: 0,
             expect_client_err: true,
+            wait: false,
         },
     ];
 
+    let total = cases.len();
+    let mut skipped = 0usize;
+
     for (i, case) in cases.iter().enumerate() {
         if case.min_version > version {
-            warn!(
-                "skip '{}': needs server_version_num {}",
+            // Greppable: `warn!` goes through a best-effort try_init that can no-op,
+            // so a version-gated case would otherwise skip with no visible trace.
+            println!(
+                "SKIP: case '{}' needs server_version_num {}, have {version}",
                 case.name, case.min_version
             );
+            skipped += 1;
             continue;
         }
 
         let slot = format!("it_matrix_{i}");
         drop_slot(&slot);
+        // These are PERSISTENT WAL-pinning slots, so a panicking assertion below
+        // must not leak one. Declared before `repl` so `repl` drops first and the
+        // slot is inactive by the time the guard drops it.
+        let _guard = SlotGuard(slot.clone());
 
         let mut repl = PgReplicationConnection::connect(&replication_conn_string())
             .expect("replication connection");
@@ -286,21 +318,21 @@ fn test_create_slot_option_matrix() {
             result.unwrap_or_else(|e| {
                 panic!("case '{}' must be accepted by the server: {e}", case.name)
             });
-            if case.opts.temporary {
-                // Temporary slots stay owned+active for the session's lifetime, so an
-                // explicit `DROP … WAIT` would block on our own session. Let them
-                // auto-drop when `repl` closes; best-effort cleanup covers the rest.
-                drop_slot(&slot);
-            } else {
+            // Temporary slots stay owned+active for the session's lifetime, so an
+            // explicit `DROP … WAIT` would block on our own session: they are left
+            // to die with `repl` at the end of this iteration.
+            if !case.opts.temporary {
                 // Persistent + inactive: exercise BOTH DROP grammars live via the
-                // typed method, alternating WAIT / no-WAIT across cases.
-                let wait = i % 2 == 0;
+                // typed method, per the case's `wait` flag.
+                let wait = case.wait;
                 repl.drop_replication_slot(&slot, wait).unwrap_or_else(|e| {
                     panic!("case '{}' DROP (wait={wait}) must succeed: {e}", case.name)
                 });
             }
         }
     }
+
+    println!("SKIPPED {skipped}/{total} slot-matrix cases on server_version_num {version}");
 }
 
 /// Drops its slot on `Drop`, so a panicking assertion never leaks a slot (an
@@ -326,7 +358,7 @@ fn test_read_replication_slot_physical() {
         PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
     let version = server_version_num(&mut regular);
     if version < 150000 {
-        warn!("skip READ_REPLICATION_SLOT: needs server_version_num 150000, have {version}");
+        println!("SKIP: READ_REPLICATION_SLOT needs server_version_num 150000, have {version}");
         return;
     }
 
@@ -362,7 +394,8 @@ fn test_read_replication_slot_physical() {
 /// `ALTER_REPLICATION_SLOT` matrix (PG17+ for FAILOVER, PG18+ for TWO_PHASE).
 ///
 /// Creates a plain persistent logical slot, alters it, and verifies the effect via
-/// `pg_replication_slots`. Version-gated cases skip with a `warn!` on older servers.
+/// `pg_replication_slots`. Version-gated cases skip with a `SKIP:` line; below PG17
+/// the whole test is a no-op and says so.
 #[test]
 #[ignore = "requires live PostgreSQL 17+ with wal_level=logical"]
 fn test_alter_replication_slot_matrix() {
@@ -372,7 +405,9 @@ fn test_alter_replication_slot_matrix() {
         PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
     let version = server_version_num(&mut regular);
     if version < 170000 {
-        warn!("skip ALTER_REPLICATION_SLOT: needs server_version_num 170000, have {version}");
+        // The whole test is a no-op below PG17; say so rather than reporting `ok`.
+        println!("SKIP: ALTER_REPLICATION_SLOT needs server_version_num 170000, have {version}");
+        println!("SKIPPED 4/4 alter cases on server_version_num {version}");
         return;
     }
 
@@ -421,12 +456,16 @@ fn test_alter_replication_slot_matrix() {
         },
     ];
 
+    let total = cases.len();
+    let mut skipped = 0usize;
+
     for (i, case) in cases.iter().enumerate() {
         if case.min_version > version {
-            warn!(
-                "skip alter '{}': needs server_version_num {}",
+            println!(
+                "SKIP: alter case '{}' needs server_version_num {}, have {version}",
                 case.name, case.min_version
             );
+            skipped += 1;
             continue;
         }
 
@@ -466,4 +505,6 @@ fn test_alter_replication_slot_matrix() {
 
         let _ = repl.drop_replication_slot(&slot, false);
     }
+
+    println!("SKIPPED {skipped}/{total} alter cases on server_version_num {version}");
 }

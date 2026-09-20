@@ -84,9 +84,11 @@ fn snapshot_config(slot: &str, publication: &str) -> ReplicationStreamConfig {
 /// retry briefly: the server clears `active_pid` asynchronously after the
 /// backend goes away.
 fn drop_slot(slot: &str) {
-    let Ok(mut conn) = PgReplicationConnection::connect(&replication_conn_string()) else {
-        return;
-    };
+    // Not a silent `return`: once leaked walsenders exhaust `max_wal_senders`
+    // this is where it first shows, and skipping cleanup turns that into a
+    // misleading failure three tests later.
+    let mut conn = PgReplicationConnection::connect(&replication_conn_string())
+        .expect("drop_slot: replication connection");
     for attempt in 0..50 {
         let _ = conn.exec(&format!(
             "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots \
@@ -107,6 +109,36 @@ fn drop_slot(slot: &str) {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Drops its slot when it goes out of scope, however the test leaves.
+///
+/// Without this every test leaked its slot on a failed assertion: the trailing
+/// `drop_slot` is unreachable once a panic unwinds. There are ~42 slot names in
+/// this file against `max_replication_slots = 16`, so a handful of leaks turns
+/// into a run of `53400 all replication slots are in use` failures that bury
+/// whichever assertion actually broke.
+///
+/// Declare it *before* the stream it must outlive, so the stream is dropped —
+/// and the slot therefore inactive — by the time `drop_slot` runs.
+struct SlotGuard(&'static str);
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        // `drop_slot` panics on some paths; a panic inside Drop during unwind
+        // aborts the process, so swallow it when we are already unwinding.
+        if std::thread::panicking() {
+            let _ = std::panic::catch_unwind(|| drop_slot(self.0));
+        } else {
+            drop_slot(self.0);
+        }
+    }
+}
+
+/// Drop `slot` now, and again when the returned guard goes out of scope.
+fn slot_guard(slot: &'static str) -> SlotGuard {
+    drop_slot(slot);
+    SlotGuard(slot)
 }
 
 /// Fresh table + publication, seeded with `rows` names.
@@ -197,7 +229,11 @@ async fn drain_inserts(stream: &mut LogicalReplicationStream, want: usize) -> Ve
         match stream.next_event(&token).await {
             Ok(event) if matches!(event.event_type, EventType::Insert { .. }) => out.push(event),
             Ok(_) => {}
-            Err(_) => break,
+            // Only the 10s budget above is an expected exit. Returning a short
+            // vector for a dead connection or a protocol error surfaces at the
+            // caller as `index out of bounds`, which names neither.
+            Err(e) if e.is_cancelled() => break,
+            Err(e) => panic!("stream failed after {} inserts: {e}", out.len()),
         }
     }
     out
@@ -209,7 +245,7 @@ async fn drain_inserts(stream: &mut LogicalReplicationStream, want: usize) -> Ve
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 async fn snapshot_copies_all_published_rows() {
     let (slot, table, publication) = ("it_snap_all", "snap_all", "snap_all_pub");
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
     setup(table, publication, &["alice", "bob", "charlie"]);
 
     let stream = LogicalReplicationStream::new(
@@ -226,15 +262,13 @@ async fn snapshot_copies_all_published_rows() {
     let mut names: Vec<String> = events.iter().map(insert_name).collect();
     names.sort();
     assert_eq!(names, vec!["alice", "bob", "charlie"]);
-
-    drop_slot(slot);
 }
 
 #[tokio::test]
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 async fn snapshot_events_carry_the_consistent_point_lsn() {
     let (slot, table, publication) = ("it_snap_lsn", "snap_lsn", "snap_lsn_pub");
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
     setup(table, publication, &["a", "b"]);
 
     let stream = LogicalReplicationStream::new(
@@ -261,8 +295,6 @@ async fn snapshot_events_carry_the_consistent_point_lsn() {
     // The loop body is the whole test, so a zero-row snapshot would assert
     // nothing at all and still report success.
     assert_eq!(seen, 2, "premise: both seeded rows must have been copied");
-
-    drop_slot(slot);
 }
 
 /// The decisive end-to-end claim: a row inserted *after* the snapshot was
@@ -272,7 +304,7 @@ async fn snapshot_events_carry_the_consistent_point_lsn() {
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 async fn snapshot_then_stream_has_no_gap_and_no_duplicate() {
     let (slot, table, publication) = ("it_snap_gap", "snap_gap", "snap_gap_pub");
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
     setup(table, publication, &["before_1", "before_2"]);
 
     let stream = LogicalReplicationStream::new(
@@ -321,8 +353,6 @@ async fn snapshot_then_stream_has_no_gap_and_no_duplicate() {
         !live_names.iter().any(|n| n.starts_with("before_")),
         "snapshot rows must not be replayed on the stream: {live_names:?}"
     );
-
-    drop_slot(slot);
 }
 
 /// Values must be byte-identical between the snapshot and the live stream. This
@@ -332,7 +362,7 @@ async fn snapshot_then_stream_has_no_gap_and_no_duplicate() {
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 async fn copy_text_values_are_byte_identical_to_pgoutput() {
     let (slot, table, publication) = ("it_snap_bytes", "snap_bytes", "snap_bytes_pub");
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
 
     let mut conn = regular_conn();
     let _ = conn.exec(&format!("DROP PUBLICATION IF EXISTS {publication}"));
@@ -383,15 +413,18 @@ async fn copy_text_values_are_byte_identical_to_pgoutput() {
     let live = tokio::time::timeout(TEST_TIMEOUT, drain_inserts(&mut stream, 1))
         .await
         .expect("timed out");
+    assert!(!live.is_empty(), "no insert arrived within 10s");
     let streamed = match &live[0].event_type {
         EventType::Insert { data, .. } => data.clone(),
         other => panic!("expected an Insert, got {other:?}"),
     };
+    // Released early: the second half of the test opens its own slot, and this
+    // one has nothing left to prove.
     drop_slot(slot);
 
     // Now snapshot the same committed row through COPY.
     let slot2 = "it_snap_bytes_2";
-    drop_slot(slot2);
+    let _guard2 = slot_guard(slot2);
     let stream2 = LogicalReplicationStream::new(
         &replication_conn_string(),
         snapshot_config(slot2, publication),
@@ -441,8 +474,6 @@ async fn copy_text_values_are_byte_identical_to_pgoutput() {
         "NULL must decode as NULL on both paths"
     );
     assert_eq!(snapshotted.get("t_null").map(|v| v.is_null()), Some(true));
-
-    drop_slot(slot2);
 }
 
 #[tokio::test]
@@ -453,7 +484,7 @@ async fn snapshot_rows_api_matches_events_api() {
 
     let mut from_rows = Vec::new();
     let slot_rows = "it_snap_parity_rows";
-    drop_slot(slot_rows);
+    let _guard_rows = slot_guard(slot_rows);
     let stream = LogicalReplicationStream::new(
         &replication_conn_string(),
         snapshot_config(slot_rows, publication),
@@ -478,10 +509,9 @@ async fn snapshot_rows_api_matches_events_api() {
         );
     }
     rows.finish().await.expect("finish");
-    drop_slot(slot_rows);
 
     let slot_events = "it_snap_parity_events";
-    drop_slot(slot_events);
+    let _guard_events = slot_guard(slot_events);
     let stream = LogicalReplicationStream::new(
         &replication_conn_string(),
         snapshot_config(slot_events, publication),
@@ -495,7 +525,6 @@ async fn snapshot_rows_api_matches_events_api() {
     );
     let (events, _s) = collect_snapshot_from(outcome).await;
     let from_events: Vec<String> = events.iter().map(insert_name).collect();
-    drop_slot(slot_events);
 
     // Without this the parity assertion below is satisfiable by two empty
     // vectors, which is the failure it exists to catch.
@@ -519,7 +548,7 @@ async fn typed_deserialization_works_on_snapshot_rows() {
     }
 
     let (slot, table, publication) = ("it_snap_typed", "snap_typed", "snap_typed_pub");
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
     setup(table, publication, &["typed"]);
 
     let stream = LogicalReplicationStream::new(
@@ -533,8 +562,6 @@ async fn typed_deserialization_works_on_snapshot_rows() {
     let row: Row = events[0].deserialize_insert().expect("deserialize");
     assert!(row.id > 0);
     assert_eq!(row.name, "typed");
-
-    drop_slot(slot);
 }
 
 /// One router, one set of handlers, both phases.
@@ -554,7 +581,7 @@ async fn wal_router_runs_across_snapshot_and_stream() {
     }
 
     let (slot, table, publication) = ("it_snap_router", "snap_router", "snap_router_pub");
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
     setup(table, publication, &["r1", "r2"]);
 
     let hits = Arc::new(AtomicUsize::new(0));
@@ -594,7 +621,6 @@ async fn wal_router_runs_across_snapshot_and_stream() {
     );
 
     drop(stream);
-    drop_slot(slot);
 }
 
 // ── Lifecycle and escape hatches ────────────────────────────────────────────
@@ -603,7 +629,7 @@ async fn wal_router_runs_across_snapshot_and_stream() {
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 async fn slot_already_exists_yields_unavailable() {
     let (slot, table, publication) = ("it_snap_exists", "snap_exists", "snap_exists_pub");
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
     setup(table, publication, &["x"]);
 
     // First pass creates the slot and exports a snapshot.
@@ -635,15 +661,13 @@ async fn slot_already_exists_yields_unavailable() {
 
     let mut stream = outcome.skip().await.expect("skip");
     stream.start(None).await.expect("start must still work");
-
-    drop_slot(slot);
 }
 
 #[tokio::test]
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 async fn abandon_returns_the_stream_and_start_succeeds() {
     let (slot, table, publication) = ("it_snap_abandon", "snap_abandon", "snap_abandon_pub");
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
     setup(table, publication, &["a"]);
 
     let stream = LogicalReplicationStream::new(
@@ -658,8 +682,6 @@ async fn abandon_returns_the_stream_and_start_succeeds() {
     };
     let mut stream = snap.abandon().await.expect("abandon");
     stream.start(None).await.expect("start after abandon");
-
-    drop_slot(slot);
 }
 
 /// Abandoning part-way must hang up rather than drain the rest of the table.
@@ -667,7 +689,7 @@ async fn abandon_returns_the_stream_and_start_succeeds() {
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 async fn abandon_midway_drops_reader_without_hanging() {
     let (slot, table, publication) = ("it_snap_mid", "snap_mid", "snap_mid_pub");
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
 
     let mut conn = regular_conn();
     let _ = conn.exec(&format!("DROP PUBLICATION IF EXISTS {publication}"));
@@ -700,8 +722,6 @@ async fn abandon_midway_drops_reader_without_hanging() {
         .await
         .expect("abandon must not wait for the rest of the table")
         .expect("abandon");
-
-    drop_slot(slot);
 }
 
 /// A half-consumed snapshot must not hand back the stream: that is exactly the
@@ -710,7 +730,7 @@ async fn abandon_midway_drops_reader_without_hanging() {
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 async fn finish_before_completion_is_rejected() {
     let (slot, table, publication) = ("it_snap_partial", "snap_partial", "snap_partial_pub");
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
     setup(table, publication, &["a", "b", "c"]);
 
     let stream = LogicalReplicationStream::new(
@@ -730,8 +750,6 @@ async fn finish_before_completion_is_rejected() {
         rows.finish().await.is_err(),
         "finish() on a half-consumed snapshot must fail"
     );
-
-    drop_slot(slot);
 }
 
 /// The hazard this guards: if a failed snapshot left its slot behind, the retry
@@ -744,7 +762,7 @@ async fn finish_before_completion_is_rejected() {
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 async fn a_failed_snapshot_leaves_no_slot_so_a_retry_still_gets_one() {
     let (slot, table, publication) = ("it_snap_cleanup", "snap_cleanup", "snap_cleanup_pub");
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
     setup(table, publication, &["a", "b"]);
 
     // First attempt: fail inside the handler, part-way through the copy.
@@ -798,8 +816,6 @@ async fn a_failed_snapshot_leaves_no_slot_so_a_retry_still_gets_one() {
     let mut names: Vec<String> = events.iter().map(insert_name).collect();
     names.sort();
     assert_eq!(names, vec!["a", "b"]);
-
-    drop_slot(slot);
 }
 
 /// The `?`-shaped leak, which the by-value cleanup on `run`/`finish` never saw.
@@ -817,7 +833,7 @@ async fn a_failed_snapshot_leaves_no_slot_so_a_retry_still_gets_one() {
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 async fn a_snapshot_dropped_mid_consumption_leaves_no_slot() {
     let (slot, table, publication) = ("it_snap_dropped", "snap_dropped", "snap_dropped_pub");
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
     setup(table, publication, &["a", "b"]);
 
     let stream = LogicalReplicationStream::new(
@@ -873,8 +889,6 @@ async fn a_snapshot_dropped_mid_consumption_leaves_no_slot() {
 
     let (events, _s) = collect_snapshot_from(outcome).await;
     assert_eq!(events.len(), 2, "the retry must copy every row");
-
-    drop_slot(slot);
 }
 
 /// The same rule one level up: a `Snapshot` dropped before `rows()`/`events()`
@@ -885,7 +899,7 @@ async fn a_snapshot_dropped_mid_consumption_leaves_no_slot() {
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 async fn a_snapshot_dropped_before_consumption_leaves_no_slot() {
     let (slot, table, publication) = ("it_snap_predrop", "snap_predrop", "snap_predrop_pub");
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
     setup(table, publication, &["a"]);
 
     let stream = LogicalReplicationStream::new(
@@ -913,8 +927,6 @@ async fn a_snapshot_dropped_before_consumption_leaves_no_slot() {
         0,
         "a Snapshot dropped before consumption must discard its slot"
     );
-
-    drop_slot(slot);
 }
 
 /// `START_REPLICATION` destroys the exported snapshot server-side, so the name
@@ -933,7 +945,7 @@ async fn a_snapshot_dropped_before_consumption_leaves_no_slot() {
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 async fn a_direct_start_clears_the_exported_snapshot_name() {
     let (slot, table, publication) = ("it_snap_startclear", "snap_startclear", "snap_sc_pub");
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
     setup(table, publication, &["a"]);
 
     let mut stream = LogicalReplicationStream::new(
@@ -951,8 +963,6 @@ async fn a_direct_start_clears_the_exported_snapshot_name() {
         stream.exported_snapshot_name().is_none(),
         "START_REPLICATION destroyed the exported snapshot; the name must not outlive it"
     );
-
-    drop_slot(slot);
 }
 
 /// A real transport failure mid-COPY, not a simulated handler error.
@@ -966,7 +976,7 @@ async fn a_direct_start_clears_the_exported_snapshot_name() {
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 async fn killing_the_reader_mid_copy_poisons_the_handle_and_drops_the_slot() {
     let (slot, table, publication) = ("it_snap_killrdr", "snap_killrdr", "snap_killrdr_pub");
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
 
     let mut conn = regular_conn();
     let _ = conn.exec(&format!("DROP PUBLICATION IF EXISTS {publication}"));
@@ -997,6 +1007,10 @@ async fn killing_the_reader_mid_copy_poisons_the_handle_and_drops_the_slot() {
     rows.next_row().await.expect("first row").expect("some");
 
     // Terminate the reader backend out from under the in-flight COPY.
+    // `state = 'active'` and this test's own table name are both load-bearing:
+    // `pg_stat_activity.query` keeps the LAST statement, so a bare
+    // `query LIKE 'COPY %'` also matches idle bystanders from other suites —
+    // killing them, and counting them towards the premise below.
     let mut probe = regular_conn();
     let killed = probe
         .exec(
@@ -1004,7 +1018,9 @@ async fn killing_the_reader_mid_copy_poisons_the_handle_and_drops_the_slot() {
                SELECT pg_terminate_backend(pid) FROM pg_stat_activity
                 WHERE datname = current_database()
                   AND pid <> pg_backend_pid()
+                  AND state = 'active'
                   AND query LIKE 'COPY %'
+                  AND query LIKE '%snap_killrdr%'
              ) t",
         )
         .expect("terminate");
@@ -1047,7 +1063,6 @@ async fn killing_the_reader_mid_copy_poisons_the_handle_and_drops_the_slot() {
         "a reader failure must discard the slot, exactly like a handler failure"
     );
 
-    drop_slot(slot);
     let _ = conn.exec(&format!("DROP PUBLICATION IF EXISTS {publication}"));
     let _ = conn.exec(&format!("DROP TABLE IF EXISTS {table} CASCADE"));
 }
@@ -1071,7 +1086,7 @@ async fn killing_the_reader_mid_copy_poisons_the_handle_and_drops_the_slot() {
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 fn dropping_a_half_consumed_snapshot_terminates_and_discards_the_slot() {
     let (slot, table, publication) = ("it_snap_drophang", "snap_drophang", "snap_drophang_pub");
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
 
     let mut conn = regular_conn();
     let _ = conn.exec(&format!("DROP PUBLICATION IF EXISTS {publication}"));
@@ -1136,7 +1151,6 @@ fn dropping_a_half_consumed_snapshot_terminates_and_discards_the_slot() {
         "the drop must discard the slot even when it happens mid-COPY"
     );
 
-    drop_slot(slot);
     let _ = conn.exec(&format!("DROP PUBLICATION IF EXISTS {publication}"));
     let _ = conn.exec(&format!("DROP TABLE IF EXISTS {table} CASCADE"));
 }
@@ -1147,7 +1161,7 @@ fn dropping_a_half_consumed_snapshot_terminates_and_discards_the_slot() {
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 async fn abandon_keeps_the_slot() {
     let (slot, table, publication) = ("it_snap_keep", "snap_keep", "snap_keep_pub");
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
     setup(table, publication, &["a"]);
 
     let stream = LogicalReplicationStream::new(
@@ -1173,15 +1187,13 @@ async fn abandon_keeps_the_slot() {
         1,
         "abandon is a deliberate choice; the slot must survive it"
     );
-
-    drop_slot(slot);
 }
 
 #[tokio::test]
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 async fn handler_error_consumes_the_handle() {
     let (slot, table, publication) = ("it_snap_handler", "snap_handler", "snap_handler_pub");
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
     setup(table, publication, &["a", "b"]);
 
     let stream = LogicalReplicationStream::new(
@@ -1206,8 +1218,6 @@ async fn handler_error_consumes_the_handle() {
     assert!(failed.is_err(), "a handler error must propagate");
     // The handle was moved into `run`, so there is nothing to resume from — the
     // borrow checker enforces that; this test pins the runtime half.
-
-    drop_slot(slot);
 }
 
 // ── Cancellation ────────────────────────────────────────────────────────────
@@ -1239,7 +1249,7 @@ fn seed_large(table: &str, publication: &str, rows: u32) {
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 async fn cancelling_mid_snapshot_stops_promptly() {
     let (slot, table, publication) = ("it_snap_cancel", "snap_cancel", "snap_cancel_pub");
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
     seed_large(table, publication, 200_000);
 
     let stream = LogicalReplicationStream::new(
@@ -1277,8 +1287,6 @@ async fn cancelling_mid_snapshot_stops_promptly() {
         err.is_cancelled() || format!("{err}").contains("poisoned"),
         "expected a cancellation, got {err:?}"
     );
-
-    drop_slot(slot);
 }
 
 /// The same property on the **inline** driver.
@@ -1297,7 +1305,7 @@ async fn cancelling_mid_snapshot_stops_promptly_on_the_inline_driver() {
         "snap_cancel_inline",
         "snap_cancel_inline_pub",
     );
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
     seed_large(table, publication, 200_000);
 
     let stream = LogicalReplicationStream::new(
@@ -1332,8 +1340,6 @@ async fn cancelling_mid_snapshot_stops_promptly_on_the_inline_driver() {
         err.is_cancelled() || format!("{err}").contains("poisoned"),
         "expected a cancellation, got {err:?}"
     );
-
-    drop_slot(slot);
 }
 
 /// A cancelled snapshot is incomplete, so it must never hand back the stream as
@@ -1347,7 +1353,7 @@ async fn a_cancelled_snapshot_is_not_reported_as_success() {
         "snap_cancel_run",
         "snap_cancel_run_pub",
     );
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
     seed_large(table, publication, 200_000);
 
     let stream = LogicalReplicationStream::new(
@@ -1406,8 +1412,6 @@ async fn a_cancelled_snapshot_is_not_reported_as_success() {
         0,
         "a cancelled snapshot must not leave its slot behind"
     );
-
-    drop_slot(slot);
 }
 
 // ── Table resolution ────────────────────────────────────────────────────────
@@ -1416,7 +1420,7 @@ async fn a_cancelled_snapshot_is_not_reported_as_success() {
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 async fn empty_table_produces_no_events() {
     let (slot, table, publication) = ("it_snap_empty", "snap_empty", "snap_empty_pub");
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
     setup(table, publication, &[]);
 
     let stream = LogicalReplicationStream::new(
@@ -1435,15 +1439,13 @@ async fn empty_table_produces_no_events() {
     );
     let (events, _s) = collect_snapshot_from(outcome).await;
     assert!(events.is_empty());
-
-    drop_slot(slot);
 }
 
 #[tokio::test]
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 async fn multi_table_publication_snapshots_every_table() {
     let (slot, publication) = ("it_snap_multi", "snap_multi_pub");
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
 
     let mut conn = regular_conn();
     let _ = conn.exec(&format!("DROP PUBLICATION IF EXISTS {publication}"));
@@ -1472,8 +1474,6 @@ async fn multi_table_publication_snapshots_every_table() {
     let mut names: Vec<String> = events.iter().map(insert_name).collect();
     names.sort();
     assert_eq!(names, vec!["snap_multi_a", "snap_multi_b"]);
-
-    drop_slot(slot);
 }
 
 /// A wide table large enough that rows certainly span `CopyData` frames.
@@ -1481,7 +1481,7 @@ async fn multi_table_publication_snapshots_every_table() {
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 async fn large_table_spans_many_copydata_frames() {
     let (slot, table, publication) = ("it_snap_large", "snap_large", "snap_large_pub");
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
 
     let mut conn = regular_conn();
     let _ = conn.exec(&format!("DROP PUBLICATION IF EXISTS {publication}"));
@@ -1508,8 +1508,6 @@ async fn large_table_spans_many_copydata_frames() {
         .await
         .expect("timed out");
     assert_eq!(events.len(), 50_000);
-
-    drop_slot(slot);
 }
 
 /// Writes committed during the copy must not appear in the snapshot — and must
@@ -1523,7 +1521,7 @@ async fn large_table_spans_many_copydata_frames() {
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 async fn snapshot_is_isolated_from_concurrent_writes() {
     let (slot, table, publication) = ("it_snap_iso", "snap_iso", "snap_iso_pub");
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
 
     let mut conn = regular_conn();
     let _ = conn.exec(&format!("DROP PUBLICATION IF EXISTS {publication}"));
@@ -1591,8 +1589,6 @@ async fn snapshot_is_isolated_from_concurrent_writes() {
         intruders, 1,
         "a write committed mid-copy must arrive on the stream exactly once"
     );
-
-    drop_slot(slot);
 }
 
 /// `publication_name` may be a comma-separated, optionally quoted list, because
@@ -1603,7 +1599,7 @@ async fn snapshot_is_isolated_from_concurrent_writes() {
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 async fn multiple_publications_are_all_snapshotted() {
     let slot = "it_snap_multipub";
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
 
     let mut conn = regular_conn();
     for (t, p) in [
@@ -1634,8 +1630,6 @@ async fn multiple_publications_are_all_snapshotted() {
     let mut names: Vec<String> = events.iter().map(insert_name).collect();
     names.sort();
     assert_eq!(names, vec!["snap_mp_a", "snap_mp_b"]);
-
-    drop_slot(slot);
 }
 
 /// Every identifier goes through `quote_ident`, but only `public` was ever
@@ -1645,7 +1639,7 @@ async fn multiple_publications_are_all_snapshotted() {
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 async fn non_public_schema_is_qualified_correctly() {
     let (slot, publication) = ("it_snap_schema", "snap_schema_pub");
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
 
     let mut conn = regular_conn();
     let _ = conn.exec(&format!("DROP PUBLICATION IF EXISTS {publication}"));
@@ -1688,7 +1682,6 @@ async fn non_public_schema_is_qualified_correctly() {
     assert_eq!(&**schema, "snap_sch");
 
     let _ = conn.exec("DROP SCHEMA IF EXISTS snap_sch CASCADE");
-    drop_slot(slot);
 }
 
 /// `decode_line` returns a `SmallVec<[ColumnData; 16]>`. A table wider than that
@@ -1697,7 +1690,7 @@ async fn non_public_schema_is_qualified_correctly() {
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 async fn wide_table_beyond_smallvec_inline_capacity() {
     let (slot, table, publication) = ("it_snap_wide", "snap_wide", "snap_wide_pub");
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
 
     let columns: Vec<String> = (0..40).map(|i| format!("c{i} TEXT")).collect();
     let values: Vec<String> = (0..40).map(|i| format!("'v{i}'")).collect();
@@ -1736,8 +1729,6 @@ async fn wide_table_beyond_smallvec_inline_capacity() {
             "column c{i} must survive the SmallVec spill"
         );
     }
-
-    drop_slot(slot);
 }
 
 /// `COPY t TO STDOUT` is `SELECT ... FROM ONLY t` — it does **not** read
@@ -1756,12 +1747,15 @@ async fn wide_table_beyond_smallvec_inline_capacity() {
 #[tokio::test]
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 async fn inheritance_children_are_not_copied_twice() {
-    if server_version() < 150000 {
-        eprintln!("skipping: publication row filters require PG15+");
+    let ver = server_version();
+    if ver < 150000 {
+        println!(
+            "SKIP: inheritance_children_are_not_copied_twice requires PG >= 15 (server {ver})"
+        );
         return;
     }
     let (slot, publication) = ("it_snap_inherit", "snap_inherit_pub");
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
 
     let mut conn = regular_conn();
     let _ = conn.exec(&format!("DROP PUBLICATION IF EXISTS {publication}"));
@@ -1797,7 +1791,6 @@ async fn inheritance_children_are_not_copied_twice() {
          parent's COPY read through to the child"
     );
 
-    drop_slot(slot);
     let _ = conn.exec(&format!("DROP PUBLICATION IF EXISTS {publication}"));
     let _ = conn.exec("DROP TABLE IF EXISTS snap_inherit_child, snap_inherit_parent CASCADE");
 }
@@ -1807,13 +1800,14 @@ async fn inheritance_children_are_not_copied_twice() {
 #[tokio::test]
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 async fn publication_column_list_is_respected() {
-    if server_version() < 150000 {
-        eprintln!("skipping: column lists require PG15+");
+    let ver = server_version();
+    if ver < 150000 {
+        println!("SKIP: publication_column_list_is_respected requires PG >= 15 (server {ver})");
         return;
     }
 
     let (slot, table, publication) = ("it_snap_collist", "snap_collist", "snap_collist_pub");
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
 
     let mut conn = regular_conn();
     let _ = conn.exec(&format!("DROP PUBLICATION IF EXISTS {publication}"));
@@ -1849,20 +1843,19 @@ async fn publication_column_list_is_respected() {
         "values must align with the published column list"
     );
     assert!(data.get("b").is_none(), "unpublished column must be absent");
-
-    drop_slot(slot);
 }
 
 #[tokio::test]
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 async fn publication_row_filter_is_respected() {
-    if server_version() < 150000 {
-        eprintln!("skipping: row filters require PG15+");
+    let ver = server_version();
+    if ver < 150000 {
+        println!("SKIP: publication_row_filter_is_respected requires PG >= 15 (server {ver})");
         return;
     }
 
     let (slot, table, publication) = ("it_snap_filter", "snap_filter", "snap_filter_pub");
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
 
     let mut conn = regular_conn();
     let _ = conn.exec(&format!("DROP PUBLICATION IF EXISTS {publication}"));
@@ -1893,8 +1886,6 @@ async fn publication_row_filter_is_respected() {
         5,
         "the row filter must be applied to the copy"
     );
-
-    drop_slot(slot);
 }
 
 /// `publish_via_partition_root` makes `pg_publication_tables` report the ROOT
@@ -1909,7 +1900,7 @@ async fn publication_row_filter_is_respected() {
 async fn partitioned_publication_via_root_uses_the_root_name() {
     let (slot, publication) = ("it_snap_part", "snap_part_pub");
     let root = "snap_part_root";
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
 
     let mut conn = regular_conn();
     let _ = conn.exec(&format!("DROP PUBLICATION IF EXISTS {publication}"));
@@ -1977,8 +1968,6 @@ async fn partitioned_publication_via_root_uses_the_root_name() {
         vec!["in_p1", "in_p2"],
         "copying the root must read every partition"
     );
-
-    drop_slot(slot);
 }
 
 /// The mirror image of `inheritance_children_are_not_copied_twice`, and the more
@@ -1994,13 +1983,17 @@ async fn partitioned_publication_via_root_uses_the_root_name() {
 #[tokio::test]
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 async fn partitioned_root_with_a_row_filter_still_reads_every_partition() {
-    if server_version() < 150000 {
-        eprintln!("skipping: publication row filters require PG15+");
+    let ver = server_version();
+    if ver < 150000 {
+        println!(
+            "SKIP: partitioned_root_with_a_row_filter_still_reads_every_partition \
+             requires PG >= 15 (server {ver})"
+        );
         return;
     }
     let (slot, publication) = ("it_snap_partfilter", "snap_partfilter_pub");
     let root = "snap_partfilter_root";
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
 
     let mut conn = regular_conn();
     let _ = conn.exec(&format!("DROP PUBLICATION IF EXISTS {publication}"));
@@ -2046,7 +2039,6 @@ async fn partitioned_root_with_a_row_filter_still_reads_every_partition() {
          means `ONLY` was applied to a root that holds no rows itself"
     );
 
-    drop_slot(slot);
     let _ = conn.exec(&format!("DROP PUBLICATION IF EXISTS {publication}"));
     let _ = conn.exec(&format!("DROP TABLE IF EXISTS {root} CASCADE"));
 }
@@ -2064,7 +2056,7 @@ async fn partitioned_root_with_a_row_filter_still_reads_every_partition() {
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 async fn a_pre_existing_slot_reports_unavailable_so_the_caller_can_refuse() {
     let (slot, table, publication) = ("it_snap_required", "snap_required", "snap_required_pub");
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
     setup(table, publication, &["a"]);
 
     // First pass creates the slot and takes a real baseline.
@@ -2103,8 +2095,6 @@ async fn a_pre_existing_slot_reports_unavailable_so_the_caller_can_refuse() {
     };
     let err = refused.expect_err("a pre-existing slot must reach the Unavailable arm");
     assert!(err.contains("fresh slot"), "{err}");
-
-    drop_slot(slot);
 }
 
 // ── Configuration guards ────────────────────────────────────────────────────
@@ -2115,7 +2105,7 @@ async fn temporary_slot_is_rejected() {
     use pg_walstream::ReplicationSlotOptions;
 
     let (slot, table, publication) = ("it_snap_temp", "snap_temp", "snap_temp_pub");
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
     setup(table, publication, &["a"]);
 
     let config = snapshot_config(slot, publication).with_slot_options(ReplicationSlotOptions {
@@ -2132,8 +2122,6 @@ async fn temporary_slot_is_rejected() {
         Ok(_) => panic!("a temporary slot must be rejected: a reconnect loses data silently"),
         Err(e) => assert!(format!("{e}").contains("temporary slot"), "{e}"),
     }
-
-    drop_slot(slot);
 }
 
 /// `snapshot()` sets `SNAPSHOT 'export'` itself, so no builder call can suppress
@@ -2153,7 +2141,7 @@ async fn snapshot_forces_the_export_regardless_of_slot_options() {
         "snap_forces_export",
         "snap_forces_export_pub",
     );
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
     setup(table, publication, &["a"]);
 
     let config = snapshot_config(slot, publication).with_slot_options(ReplicationSlotOptions {
@@ -2174,8 +2162,6 @@ async fn snapshot_forces_the_export_regardless_of_slot_options() {
         vec!["a"],
         "snapshot() must export regardless of what the caller set"
     );
-
-    drop_slot(slot);
 }
 
 // ── Generated columns ───────────────────────────────────────────────────────
@@ -2233,7 +2219,7 @@ fn insert_columns(event: &ChangeEvent) -> Vec<String> {
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 async fn snapshot_handles_a_generated_column() {
     let (slot, table, publication) = ("it_snap_gen", "snap_gen", "snap_gen_pub");
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
     setup_generated(table, publication, "");
 
     let stream = LogicalReplicationStream::new(
@@ -2258,8 +2244,6 @@ async fn snapshot_handles_a_generated_column() {
         "without publish_generated_columns, pgoutput never sends the generated \
          column, so the snapshot must not invent it: {columns:?}"
     );
-
-    drop_slot(slot);
 }
 
 /// The snapshot's row shape must equal the live stream's, generated column or
@@ -2272,7 +2256,7 @@ async fn snapshot_handles_a_generated_column() {
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 async fn a_generated_column_has_the_same_shape_in_both_phases() {
     let (slot, table, publication) = ("it_snap_gen_shape", "snap_gen_shape", "snap_gen_shape_pub");
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
     setup_generated(table, publication, "");
 
     let stream = LogicalReplicationStream::new(
@@ -2307,6 +2291,7 @@ async fn a_generated_column_has_the_same_shape_in_both_phases() {
     let live = tokio::time::timeout(TEST_TIMEOUT, drain_inserts(&mut stream, 1))
         .await
         .expect("timed out");
+    assert!(!live.is_empty(), "no insert arrived within 10s");
     let live_columns = insert_columns(&live[0]);
 
     assert_eq!(
@@ -2314,8 +2299,6 @@ async fn a_generated_column_has_the_same_shape_in_both_phases() {
         "COPY TEXT and pgoutput must agree on the column set, or the two phases \
          deserialize into different shapes"
     );
-
-    drop_slot(slot);
 }
 
 /// PG18's `publish_generated_columns = stored` replicates the generated column,
@@ -2328,13 +2311,17 @@ async fn a_generated_column_has_the_same_shape_in_both_phases() {
 #[tokio::test]
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 async fn snapshot_includes_a_published_generated_column_on_pg18() {
-    if server_version() < 180000 {
-        eprintln!("skipping: publish_generated_columns requires PG18+");
+    let ver = server_version();
+    if ver < 180000 {
+        println!(
+            "SKIP: snapshot_includes_a_published_generated_column_on_pg18 \
+             requires PG >= 18 (server {ver})"
+        );
         return;
     }
 
     let (slot, table, publication) = ("it_snap_gen_pub", "snap_gen_pub_t", "snap_gen_pub_p");
-    drop_slot(slot);
+    let _guard = slot_guard(slot);
     setup_generated(
         table,
         publication,
@@ -2386,12 +2373,11 @@ async fn snapshot_includes_a_published_generated_column_on_pg18() {
     let live = tokio::time::timeout(TEST_TIMEOUT, drain_inserts(&mut stream, 1))
         .await
         .expect("timed out");
+    assert!(!live.is_empty(), "no insert arrived within 10s");
 
     assert_eq!(
         snapshot_columns,
         insert_columns(&live[0]),
         "the whole point: including g in one phase and not the other is the bug"
     );
-
-    drop_slot(slot);
 }

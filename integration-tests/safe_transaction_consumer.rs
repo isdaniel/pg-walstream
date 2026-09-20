@@ -49,9 +49,13 @@ fn setup_safe_schema(conn: &mut PgReplicationConnection) {
          )",
     );
     let _ = conn.exec("TRUNCATE safe_test RESTART IDENTITY");
-    let _ = conn.exec("ALTER TABLE safe_test REPLICA IDENTITY FULL");
+    // Both are load-bearing: without REPLICA IDENTITY FULL the Update/Delete
+    // payloads are silently wrong, and without the publication nothing streams.
+    conn.exec("ALTER TABLE safe_test REPLICA IDENTITY FULL")
+        .expect("set REPLICA IDENTITY FULL on safe_test");
     let _ = conn.exec("DROP PUBLICATION IF EXISTS safe_pub");
-    let _ = conn.exec("CREATE PUBLICATION safe_pub FOR TABLE safe_test");
+    conn.exec("CREATE PUBLICATION safe_pub FOR TABLE safe_test")
+        .expect("create publication safe_pub");
 }
 
 fn drop_slot(slot_name: &str) {
@@ -91,6 +95,10 @@ struct TxBuffer {
 struct TestConsumer {
     feedback: Arc<SharedLsnFeedback>,
     active_transactions: BTreeMap<u32, TxBuffer>,
+    /// xid of the transaction opened by the last Begin. Both the DML and the
+    /// Commit arm key on this; pairing them by map order instead only works
+    /// while exactly one transaction is ever in flight.
+    current_xid: Option<u32>,
     committed_xids: Vec<u32>,
     last_applied_lsn: u64,
 }
@@ -100,6 +108,7 @@ impl TestConsumer {
         Self {
             feedback,
             active_transactions: BTreeMap::new(),
+            current_xid: None,
             committed_xids: Vec::new(),
             last_applied_lsn: 0,
         }
@@ -116,25 +125,34 @@ impl TestConsumer {
                         commit_lsn: None,
                     },
                 );
+                self.current_xid = Some(*transaction_id);
             }
             EventType::Insert { .. } | EventType::Update { .. } | EventType::Delete { .. } => {
-                // Buffer the change in the most recent active transaction
-                if let Some(tx) = self.active_transactions.values_mut().last() {
+                // Buffer the change in the transaction the last Begin opened
+                let tx = self
+                    .current_xid
+                    .and_then(|xid| self.active_transactions.get_mut(&xid));
+                if let Some(tx) = tx {
                     tx.changes.push(event);
                 }
             }
             EventType::Commit { commit_lsn, .. } => {
-                let xid_opt = self.active_transactions.keys().next().copied();
-                if let Some(xid) = xid_opt {
-                    if let Some(mut tx) = self.active_transactions.remove(&xid) {
-                        tx.commit_lsn = Some(*commit_lsn);
-                        // Apply (in a real system this would write to a downstream)
-                        self.committed_xids.push(tx.xid);
-                        // Update feedback ONLY after successful commit application
-                        self.last_applied_lsn = commit_lsn.value();
-                        self.feedback.update_applied_lsn(self.last_applied_lsn);
-                    }
-                }
+                // A Commit with no open transaction means the Begin was lost, not
+                // a no-op: failing here beats pushing a stale LSN into lsn_history.
+                let xid = self
+                    .current_xid
+                    .take()
+                    .expect("Commit without an active transaction (missing Begin)");
+                let mut tx = self
+                    .active_transactions
+                    .remove(&xid)
+                    .expect("Commit for a transaction with no buffer");
+                tx.commit_lsn = Some(*commit_lsn);
+                // Apply (in a real system this would write to a downstream)
+                self.committed_xids.push(tx.xid);
+                // Update feedback ONLY after successful commit application
+                self.last_applied_lsn = commit_lsn.value();
+                self.feedback.update_applied_lsn(self.last_applied_lsn);
             }
             _ => {}
         }
@@ -178,6 +196,7 @@ async fn test_transaction_boundaries() {
 
     // Track event order
     let mut event_order: Vec<String> = Vec::new();
+    let mut hit_deadline = false;
 
     loop {
         match event_stream.next_event().await {
@@ -197,12 +216,23 @@ async fn test_transaction_boundaries() {
                     break;
                 }
             }
-            Err(pg_walstream::ReplicationError::Cancelled(_)) => break,
+            Err(pg_walstream::ReplicationError::Cancelled(_)) => {
+                hit_deadline = true;
+                break;
+            }
             Err(e) => panic!("Unexpected error: {e}"),
         }
     }
 
     println!("Event order: {event_order:?}");
+
+    // The cancel timer is a deadline, not a success path: assert it first so a
+    // timeout is not reported as a missing event below.
+    assert!(
+        !hit_deadline,
+        "stream hit its 10s deadline after {} events: {event_order:?}",
+        event_order.len()
+    );
 
     // Verify ordering: Begin must come before Insert, Insert before Commit
     let begin_pos = event_order.iter().position(|e| e == "Begin");
@@ -260,6 +290,7 @@ async fn test_consumer_buffers_until_commit() {
         .expect("INSERT");
 
     // Process events until the first commit
+    let mut hit_deadline = false;
     loop {
         match stream.next_event(&cancel_token).await {
             Ok(event) => {
@@ -270,10 +301,21 @@ async fn test_consumer_buffers_until_commit() {
                     break;
                 }
             }
-            Err(pg_walstream::ReplicationError::Cancelled(_)) => break,
+            Err(pg_walstream::ReplicationError::Cancelled(_)) => {
+                hit_deadline = true;
+                break;
+            }
             Err(e) => panic!("Unexpected error: {e}"),
         }
     }
+
+    // The cancel timer is a deadline, not a success path: assert it first so a
+    // timeout is not reported as a missing commit below.
+    assert!(
+        !hit_deadline,
+        "stream hit its 10s deadline before the commit ({} committed)",
+        consumer.committed_xids.len()
+    );
 
     // Verify: one committed transaction
     assert_eq!(
@@ -343,6 +385,7 @@ async fn test_ordered_multi_transaction_processing() {
     // Track LSN progression
     let mut lsn_history: Vec<u64> = Vec::new();
     let mut commit_count = 0u32;
+    let mut hit_deadline = false;
 
     loop {
         match stream.next_event(&cancel_token).await {
@@ -359,10 +402,20 @@ async fn test_ordered_multi_transaction_processing() {
                     }
                 }
             }
-            Err(pg_walstream::ReplicationError::Cancelled(_)) => break,
+            Err(pg_walstream::ReplicationError::Cancelled(_)) => {
+                hit_deadline = true;
+                break;
+            }
             Err(e) => panic!("Unexpected error: {e}"),
         }
     }
+
+    // The cancel timer is a deadline, not a success path: assert it first so a
+    // timeout is not reported as a missing transaction below.
+    assert!(
+        !hit_deadline,
+        "stream hit its 10s deadline after {commit_count}/3 commits"
+    );
 
     assert_eq!(
         consumer.committed_xids.len(),
@@ -438,6 +491,7 @@ async fn test_mixed_dml_transaction() {
     // Collect events from 3 transactions (INSERT, UPDATE, DELETE)
     let mut commit_count = 0u32;
     let mut event_types_seen: Vec<String> = Vec::new();
+    let mut hit_deadline = false;
 
     loop {
         match stream.next_event(&cancel_token).await {
@@ -459,10 +513,20 @@ async fn test_mixed_dml_transaction() {
                     }
                 }
             }
-            Err(pg_walstream::ReplicationError::Cancelled(_)) => break,
+            Err(pg_walstream::ReplicationError::Cancelled(_)) => {
+                hit_deadline = true;
+                break;
+            }
             Err(e) => panic!("Unexpected error: {e}"),
         }
     }
+
+    // The cancel timer is a deadline, not a success path: assert it first so a
+    // timeout is not reported as a missing DML event below.
+    assert!(
+        !hit_deadline,
+        "stream hit its 10s deadline after {commit_count}/3 commits: {event_types_seen:?}"
+    );
 
     assert!(
         event_types_seen.contains(&"Insert".to_string()),

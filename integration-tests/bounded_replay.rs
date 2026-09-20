@@ -37,6 +37,38 @@ fn drop_slot(slot_name: &str) {
     }
 }
 
+/// Poll until the slot's `active` flag clears. The walsender exits
+/// asynchronously after the stream is dropped, and dropping a still-active slot
+/// raises 55006 — which `drop_slot` swallows, leaking the slot. Bounded at 5s.
+fn wait_for_slot_inactive(slot_name: &str) {
+    let Ok(mut conn) = PgReplicationConnection::connect(&replication_conn_string()) else {
+        return;
+    };
+    for _ in 0..50 {
+        let active = conn
+            .exec(&format!(
+                "SELECT active FROM pg_replication_slots WHERE slot_name = '{slot_name}'"
+            ))
+            .ok()
+            .and_then(|r| r.get_value(0, 0))
+            .is_some_and(|v| v == "t");
+        if !active {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Drops its slot on `Drop` so a panicking assertion never leaks it (an orphaned
+/// persistent slot pins WAL). `Drop` is sync, hence the blocking wait.
+struct SlotGuard(&'static str);
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        wait_for_slot_inactive(self.0);
+        drop_slot(self.0);
+    }
+}
+
 fn cfg(slot: &str) -> ReplicationStreamConfig {
     // Persistent (non-temporary) slot, non-streaming commits for simple assertions.
     ReplicationStreamConfig::new(
@@ -76,6 +108,9 @@ async fn stop_at_lsn_bounds_replay_at_commit_boundary() {
             "SELECT pg_create_logical_replication_slot('{slot}', 'pgoutput')"
         ))
         .expect("create slot");
+    // Declared before the stream, so the stream drops first and the slot is
+    // already inactive when the guard tries to drop it.
+    let _slot_guard = SlotGuard(slot);
 
     // --- Three transactions BEFORE the target ---
     for i in 1..=3 {
@@ -89,8 +124,11 @@ async fn stop_at_lsn_bounds_replay_at_commit_boundary() {
     // Force WAL to advance past txn3's commit record so `target` lands STRICTLY
     // between txn3 and txn4. Without this, `pg_current_wal_lsn()` can equal
     // txn3's commit `end_lsn`; since the stop rule is `end_lsn >= target`, txn3
-    // would then satisfy it and the stream would stop one commit early.
-    let _ = regular.exec("SELECT pg_switch_wal()");
+    // would then satisfy it and the stream would stop one commit early. Failing
+    // here would surface only as `commits == 3`, with no visible cause.
+    regular
+        .exec("SELECT pg_switch_wal()")
+        .expect("pg_switch_wal");
 
     // Capture a target LSN strictly after txn3's commit and before txn4.
     let target: Lsn = regular
@@ -123,17 +161,27 @@ async fn stop_at_lsn_bounds_replay_at_commit_boundary() {
     let mut commits = 0u32;
     let mut inserts = 0u32;
 
-    let reached: Lsn = loop {
-        match stream.next_event(&cancel).await {
-            Ok(event) => match event.event_type {
-                EventType::Insert { .. } => inserts += 1,
-                EventType::Commit { .. } => commits += 1,
-                _ => {}
-            },
-            Err(ReplicationError::StreamStopped(lsn)) => break lsn,
-            Err(e) => panic!("unexpected error: {e}"),
+    let consume = async {
+        loop {
+            match stream.next_event(&cancel).await {
+                Ok(event) => match event.event_type {
+                    EventType::Insert { .. } => inserts += 1,
+                    EventType::Commit { .. } => commits += 1,
+                    _ => {}
+                },
+                Err(ReplicationError::StreamStopped(lsn)) => break lsn,
+                Err(e) => panic!("unexpected error: {e}"),
+            }
         }
     };
+
+    let outcome = tokio::time::timeout(Duration::from_secs(60), consume).await;
+    let reached: Lsn = outcome.unwrap_or_else(|_| {
+        panic!(
+            "bounded replay never reached stop_at_lsn {target} in 60s \
+             (commits={commits}, inserts={inserts})"
+        )
+    });
 
     // txn1..3 have end_lsn < target (no stop); txn4 is the first commit whose
     // end_lsn >= target → stream stops AFTER delivering txn4. So exactly 4
@@ -148,8 +196,7 @@ async fn stop_at_lsn_bounds_replay_at_commit_boundary() {
         "reported stop LSN {reached} must be >= target {target}"
     );
 
-    // Drop the stream so the slot becomes inactive, then clean it up.
+    // Drop the stream so the walsender exits; `_slot_guard` then waits for the
+    // slot's `active` flag to clear and drops it.
     drop(stream);
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    drop_slot(slot);
 }

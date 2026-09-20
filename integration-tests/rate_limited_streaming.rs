@@ -21,7 +21,7 @@
 
 use pg_walstream::{
     CancellationToken, EventType, LogicalReplicationStream, PgReplicationConnection,
-    ReplicationSlotOptions, ReplicationStreamConfig, RetryConfig, StreamingMode,
+    ReplicationStreamConfig, RetryConfig, StreamingMode,
 };
 use std::time::{Duration, Instant};
 
@@ -46,7 +46,10 @@ fn setup_rate_schema(conn: &mut PgReplicationConnection) {
     );
     let _ = conn.exec("TRUNCATE rate_test RESTART IDENTITY");
     let _ = conn.exec("DROP PUBLICATION IF EXISTS rate_pub");
-    let _ = conn.exec("CREATE PUBLICATION rate_pub FOR TABLE rate_test");
+    // Hard `expect`: without the publication every test below streams nothing and
+    // fails on its event assertions instead of on the setup that actually broke.
+    conn.exec("CREATE PUBLICATION rate_pub FOR TABLE rate_test")
+        .expect("CREATE PUBLICATION rate_pub");
 }
 
 fn drop_slot(slot_name: &str) {
@@ -58,6 +61,12 @@ fn drop_slot(slot_name: &str) {
     }
 }
 
+/// Persistent slot, deliberately. These tests consume through
+/// `EventStream::next_event`, i.e. `next_event_with_retry`, and on any transient
+/// hiccup `recover_connection` drops a `temporary` slot to `SlotState::Absent`
+/// and re-creates it at a *later* consistent point — silently discarding the very
+/// INSERT events the assertions are waiting for. Each test drops its slot on entry
+/// and CI sweeps every slot between suites, so nothing is leaked past the run.
 fn rate_config(slot_name: &str) -> ReplicationStreamConfig {
     ReplicationStreamConfig::new(
         slot_name.to_string(),
@@ -69,10 +78,6 @@ fn rate_config(slot_name: &str) -> ReplicationStreamConfig {
         Duration::from_secs(60),
         RetryConfig::default(),
     )
-    .with_slot_options(ReplicationSlotOptions {
-        temporary: true,
-        ..Default::default()
-    })
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -297,12 +302,14 @@ async fn test_rate_limited_event_processing() {
         elapsed.as_secs_f64()
     );
 
-    // With 100ms delay per event and at least a few events, total time should
-    // be significantly more than 0ms
+    // Every counted event is followed by one `delay_per_event` sleep, so this is
+    // an exact lower bound — a broken throttle cannot satisfy it, and a slow
+    // runner only satisfies it harder. (A flat `> 200ms` passed even when the
+    // loop merely ran to its cancel deadline.)
     assert!(
-        elapsed > Duration::from_millis(200),
-        "Rate limiting should slow down processing; elapsed: {:?}",
-        elapsed
+        elapsed >= delay_per_event * event_count,
+        "rate limiting should account for the whole elapsed time; {event_count} events \
+         at {delay_per_event:?} each, elapsed: {elapsed:?}"
     );
     assert!(
         commit_count >= 1,

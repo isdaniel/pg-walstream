@@ -73,6 +73,10 @@ fn ergonomics_config(slot_name: &str, pub_name: &str) -> ReplicationStreamConfig
         .with_streaming_mode(StreamingMode::On)
         .with_slot_options(ReplicationSlotOptions {
             temporary: true,
+            // `..Default::default()` replaces the WHOLE field, so the
+            // `snapshot: Some("nothing")` the builder set is lost unless
+            // restated — without it the server exports a snapshot per slot.
+            snapshot: Some("nothing".into()),
             ..Default::default()
         })
 }
@@ -86,19 +90,31 @@ const DDL: &str = "CREATE TABLE IF NOT EXISTS ergonomics_router (\
 
 fn setup_table(regular: &mut PgReplicationConnection, pub_name: &str) {
     let _ = regular.exec(DDL);
-    let _ = regular.exec("TRUNCATE ergonomics_router");
+    // Not idempotent-and-ignorable: three tests share this table and assert on
+    // exact ids, and nothing decodes at all without the publication. Swallowing
+    // either turns a setup failure into a 20s timeout blamed on the router.
+    regular
+        .exec("TRUNCATE ergonomics_router")
+        .expect("truncate ergonomics_router");
     // REPLICA IDENTITY FULL so UPDATE/DELETE ship the full old row.
-    let _ = regular.exec("ALTER TABLE ergonomics_router REPLICA IDENTITY FULL");
+    regular
+        .exec("ALTER TABLE ergonomics_router REPLICA IDENTITY FULL")
+        .expect("REPLICA IDENTITY FULL");
     let _ = regular.exec(&format!("DROP PUBLICATION IF EXISTS {pub_name}"));
-    let _ = regular.exec(&format!(
-        "CREATE PUBLICATION {pub_name} FOR TABLE ergonomics_router"
-    ));
+    regular
+        .exec(&format!(
+            "CREATE PUBLICATION {pub_name} FOR TABLE ergonomics_router"
+        ))
+        .expect("CREATE PUBLICATION");
 }
 
-fn teardown(regular: &mut PgReplicationConnection, pub_name: &str, slot: &str) {
+/// Drop the publication + table. Call this only AFTER the `EventStream` is
+/// dropped: a live walsender holds the slot and would be issued DDL out from
+/// under it. The slot is `temporary: true`, so it dies with that connection —
+/// an explicit `pg_drop_replication_slot` here could only ever raise 55006.
+fn teardown(regular: &mut PgReplicationConnection, pub_name: &str) {
     let _ = regular.exec(&format!("DROP PUBLICATION IF EXISTS {pub_name}"));
     let _ = regular.exec("DROP TABLE IF EXISTS ergonomics_router");
-    drop_slot(slot);
 }
 
 /// Minimal model matching `ergonomics_router (id BIGINT, ...)`.
@@ -187,15 +203,16 @@ async fn wal_router_dispatches_live_events() {
         .exec("DELETE FROM ergonomics_router WHERE id = 1")
         .expect("DELETE");
 
-    // Cancel once all DML has had time to arrive (router.run exits Ok on cancel).
-    let counted = inserted.clone();
+    // Cancel once all DML has arrived (router.run exits Ok on cancel).
+    let upd_probe = updated.clone();
+    let del_probe = deleted.clone();
     let cancel_clone = cancel_token.clone();
     tokio::spawn(async move {
-        // Poll until both inserts recorded, then cancel; hard timeout below.
+        // Poll the UPDATE and the DELETE — they are separate, LATER txns, and
+        // they are what the assertions below require. Polling the inserts and
+        // then blind-sleeping 500ms for the rest was a guess, and flaked.
         for _ in 0..200 {
-            if counted.lock().unwrap().len() >= 2 {
-                // Give the UPDATE/DELETE a moment to flow through.
-                tokio::time::sleep(Duration::from_millis(500)).await;
+            if !upd_probe.lock().unwrap().is_empty() && !del_probe.lock().unwrap().is_empty() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -229,7 +246,9 @@ async fn wal_router_dispatches_live_events() {
         "applied LSN should have advanced, got {applied}"
     );
 
-    teardown(&mut regular, pub_name, slot);
+    // Release the walsender before DDL — it holds the slot and the table.
+    drop(event_stream);
+    teardown(&mut regular, pub_name);
 }
 
 // ─── 3) WalTable derive + WalRouter::on_insert_of dispatch live events ────────
@@ -321,7 +340,9 @@ mod derive_layer {
             "applied LSN should have advanced, got {applied}"
         );
 
-        teardown(&mut regular, pub_name, slot);
+        // Release the walsender before DDL — it holds the slot and the table.
+        drop(event_stream);
+        teardown(&mut regular, pub_name);
     }
 }
 
@@ -400,5 +421,7 @@ async fn for_each_event_auto_acks_live() {
         "applied LSN should have advanced, got {applied}"
     );
 
-    teardown(&mut regular, pub_name, slot);
+    // Release the walsender before DDL — it holds the slot and the table.
+    drop(event_stream);
+    teardown(&mut regular, pub_name);
 }

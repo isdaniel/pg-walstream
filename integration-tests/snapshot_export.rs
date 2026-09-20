@@ -73,14 +73,20 @@ fn setup_schema(regular_conn: &mut PgReplicationConnection) {
         "CREATE TABLE IF NOT EXISTS snapshot_test (id SERIAL PRIMARY KEY, name TEXT NOT NULL)",
     );
 
-    // Clear and seed data
-    let _ = regular_conn.exec("TRUNCATE snapshot_test RESTART IDENTITY");
-    let _ = regular_conn
-        .exec("INSERT INTO snapshot_test (name) VALUES ('alice'), ('bob'), ('charlie')");
+    // Clear and seed data. Hard `expect`s: a swallowed failure here resurfaces as
+    // a row-count or value assertion further down, blaming the snapshot machinery.
+    regular_conn
+        .exec("TRUNCATE snapshot_test RESTART IDENTITY")
+        .expect("TRUNCATE snapshot_test");
+    regular_conn
+        .exec("INSERT INTO snapshot_test (name) VALUES ('alice'), ('bob'), ('charlie')")
+        .expect("seed snapshot_test");
 
-    // Create publication if not exists (ignore errors if it already exists)
+    // Recreate the publication the streaming tests depend on.
     let _ = regular_conn.exec("DROP PUBLICATION IF EXISTS test_pub");
-    let _ = regular_conn.exec("CREATE PUBLICATION test_pub FOR TABLE snapshot_test");
+    regular_conn
+        .exec("CREATE PUBLICATION test_pub FOR TABLE snapshot_test")
+        .expect("CREATE PUBLICATION test_pub");
 }
 
 /// Helper: clean up a replication slot (best-effort).
@@ -380,9 +386,12 @@ async fn test_snapshot_and_stream_consistency() {
     let cancel_token = CancellationToken::new();
     let cancel_clone = cancel_token.clone();
 
-    // Auto-cancel after 5 seconds to avoid hanging
+    // Failure deadline, not a measured quantity: the loop below breaks on the
+    // first event, so a generous budget costs nothing in the happy path. It has
+    // to absorb the blocking `start()`/`exec()` calls above and below, which on a
+    // current-thread runtime keep this timer from being polled at all.
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_secs(60)).await;
         cancel_clone.cancel();
     });
 
