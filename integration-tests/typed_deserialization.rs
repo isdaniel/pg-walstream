@@ -84,6 +84,10 @@ fn typed_config(slot_name: &str, pub_name: &str) -> ReplicationStreamConfig {
     )
     .with_slot_options(ReplicationSlotOptions {
         temporary: true,
+        // `..Default::default()` replaces the WHOLE field, so the `snapshot:
+        // Some("nothing")` that `new()` set is lost unless restated here —
+        // without it the server exports a snapshot on every slot creation.
+        snapshot: Some("nothing".into()),
         ..Default::default()
     })
 }
@@ -119,7 +123,10 @@ async fn collect_change_events(
                     EventType::Insert { .. }
                     | EventType::Update { .. }
                     | EventType::Delete { .. } => dml += 1,
-                    EventType::Commit { .. } => commits += 1,
+                    // StreamCommit too: CI's logical_decoding_work_mem=64kB
+                    // spills txns, and a spilled commit arrives as StreamCommit
+                    // — counting only Commit burns the whole timeout budget.
+                    EventType::Commit { .. } | EventType::StreamCommit { .. } => commits += 1,
                     _ => {}
                 }
 
@@ -185,14 +192,23 @@ const COMPLEX_DDL: &str = "CREATE TABLE IF NOT EXISTS typed_deser_complex (\
 
 fn setup_complex_table(regular: &mut PgReplicationConnection, pub_name: &str, full_identity: bool) {
     let _ = regular.exec(COMPLEX_DDL);
-    let _ = regular.exec("TRUNCATE typed_deser_complex RESTART IDENTITY");
+    // The table is IF NOT EXISTS, so it survives across tests and re-runs and
+    // libtest does not guarantee order: a swallowed TRUNCATE turns every later
+    // `assert_eq!(row.id, 1)` into a baffling failure instead of a setup error.
+    regular
+        .exec("TRUNCATE typed_deser_complex RESTART IDENTITY")
+        .expect("truncate");
     if full_identity {
         let _ = regular.exec("ALTER TABLE typed_deser_complex REPLICA IDENTITY FULL");
     }
     let _ = regular.exec(&format!("DROP PUBLICATION IF EXISTS {pub_name}"));
-    let _ = regular.exec(&format!(
-        "CREATE PUBLICATION {pub_name} FOR TABLE typed_deser_complex"
-    ));
+    // Without the publication, START_REPLICATION still succeeds and pgoutput
+    // emits nothing — the collector then fails on an event-count assertion.
+    regular
+        .exec(&format!(
+            "CREATE PUBLICATION {pub_name} FOR TABLE typed_deser_complex"
+        ))
+        .expect("CREATE PUBLICATION");
 }
 
 // ─── 1) deserialize_insert::<T> ──────────────────────────────────────────────
@@ -440,11 +456,16 @@ async fn test_row_try_deserialize_into_lenient() {
          count TEXT NOT NULL\
          )",
     );
-    let _ = regular.exec("TRUNCATE typed_deser_lenient RESTART IDENTITY");
+    // Same IF NOT EXISTS table-reuse hazard as `setup_complex_table`.
+    regular
+        .exec("TRUNCATE typed_deser_lenient RESTART IDENTITY")
+        .expect("truncate");
     let _ = regular.exec(&format!("DROP PUBLICATION IF EXISTS {pub_name}"));
-    let _ = regular.exec(&format!(
-        "CREATE PUBLICATION {pub_name} FOR TABLE typed_deser_lenient"
-    ));
+    regular
+        .exec(&format!(
+            "CREATE PUBLICATION {pub_name} FOR TABLE typed_deser_lenient"
+        ))
+        .expect("CREATE PUBLICATION");
 
     let mut stream =
         LogicalReplicationStream::new(&replication_conn_string(), typed_config(slot, pub_name))
@@ -551,11 +572,17 @@ mod wal_table_mapping {
             <User as WalTable>::TABLE
         );
         let _ = regular.exec(&ddl);
-        let _ = regular.exec("TRUNCATE typed_deser_users RESTART IDENTITY");
+        // Same IF NOT EXISTS table-reuse hazard; the id assertions below need
+        // the sequence restarted.
+        regular
+            .exec("TRUNCATE typed_deser_users RESTART IDENTITY")
+            .expect("truncate");
         let _ = regular.exec(&format!("DROP PUBLICATION IF EXISTS {pub_name}"));
-        let _ = regular.exec(&format!(
-            "CREATE PUBLICATION {pub_name} FOR TABLE typed_deser_users"
-        ));
+        regular
+            .exec(&format!(
+                "CREATE PUBLICATION {pub_name} FOR TABLE typed_deser_users"
+            ))
+            .expect("CREATE PUBLICATION");
 
         let mut stream =
             LogicalReplicationStream::new(&replication_conn_string(), typed_config(slot, pub_name))

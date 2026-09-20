@@ -33,6 +33,12 @@ use pg_walstream::{
 };
 use std::time::Duration;
 
+// Setup-DDL convention: `DROP ... IF EXISTS` / `CREATE TABLE IF NOT EXISTS` are
+// idempotent and stay `let _ =`. Anything that gates decoding (CREATE
+// PUBLICATION, REPLICA IDENTITY FULL) is `.expect()`ed — a swallowed failure
+// there makes pgoutput emit nothing and the test fail on an event assertion
+// that points at the parser instead of at setup.
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 fn replication_conn_string() -> String {
@@ -72,6 +78,10 @@ fn complex_config(slot_name: &str, pub_name: &str) -> ReplicationStreamConfig {
     )
     .with_slot_options(ReplicationSlotOptions {
         temporary: true,
+        // `..Default::default()` replaces the WHOLE field, so the `snapshot:
+        // Some("nothing")` that `new()` set is lost unless restated here —
+        // without it the server exports a snapshot on every slot creation.
+        snapshot: Some("nothing".into()),
         ..Default::default()
     })
 }
@@ -153,9 +163,11 @@ async fn test_array_types_basic() {
     );
     let _ = regular.exec("TRUNCATE complex_arr_test RESTART IDENTITY");
     let _ = regular.exec(&format!("DROP PUBLICATION IF EXISTS {pub_name}"));
-    let _ = regular.exec(&format!(
-        "CREATE PUBLICATION {pub_name} FOR TABLE complex_arr_test"
-    ));
+    regular
+        .exec(&format!(
+            "CREATE PUBLICATION {pub_name} FOR TABLE complex_arr_test"
+        ))
+        .expect("CREATE PUBLICATION");
 
     let config = complex_config(slot, pub_name);
     let mut stream = LogicalReplicationStream::new(&replication_conn_string(), config)
@@ -239,9 +251,11 @@ async fn test_array_types_nested_and_nulls() {
     );
     let _ = regular.exec("TRUNCATE complex_arr_nested RESTART IDENTITY");
     let _ = regular.exec(&format!("DROP PUBLICATION IF EXISTS {pub_name}"));
-    let _ = regular.exec(&format!(
-        "CREATE PUBLICATION {pub_name} FOR TABLE complex_arr_nested"
-    ));
+    regular
+        .exec(&format!(
+            "CREATE PUBLICATION {pub_name} FOR TABLE complex_arr_nested"
+        ))
+        .expect("CREATE PUBLICATION");
 
     let config = complex_config(slot, pub_name);
     let mut stream = LogicalReplicationStream::new(&replication_conn_string(), config)
@@ -303,9 +317,11 @@ async fn test_array_types_empty() {
     );
     let _ = regular.exec("TRUNCATE complex_arr_empty RESTART IDENTITY");
     let _ = regular.exec(&format!("DROP PUBLICATION IF EXISTS {pub_name}"));
-    let _ = regular.exec(&format!(
-        "CREATE PUBLICATION {pub_name} FOR TABLE complex_arr_empty"
-    ));
+    regular
+        .exec(&format!(
+            "CREATE PUBLICATION {pub_name} FOR TABLE complex_arr_empty"
+        ))
+        .expect("CREATE PUBLICATION");
 
     let config = complex_config(slot, pub_name);
     let mut stream = LogicalReplicationStream::new(&replication_conn_string(), config)
@@ -360,9 +376,11 @@ async fn test_json_jsonb_basic() {
     );
     let _ = regular.exec("TRUNCATE complex_json_test RESTART IDENTITY");
     let _ = regular.exec(&format!("DROP PUBLICATION IF EXISTS {pub_name}"));
-    let _ = regular.exec(&format!(
-        "CREATE PUBLICATION {pub_name} FOR TABLE complex_json_test"
-    ));
+    regular
+        .exec(&format!(
+            "CREATE PUBLICATION {pub_name} FOR TABLE complex_json_test"
+        ))
+        .expect("CREATE PUBLICATION");
 
     let config = complex_config(slot, pub_name);
     let mut stream = LogicalReplicationStream::new(&replication_conn_string(), config)
@@ -438,9 +456,11 @@ async fn test_json_nested_and_arrays() {
     );
     let _ = regular.exec("TRUNCATE complex_json_nested RESTART IDENTITY");
     let _ = regular.exec(&format!("DROP PUBLICATION IF EXISTS {pub_name}"));
-    let _ = regular.exec(&format!(
-        "CREATE PUBLICATION {pub_name} FOR TABLE complex_json_nested"
-    ));
+    regular
+        .exec(&format!(
+            "CREATE PUBLICATION {pub_name} FOR TABLE complex_json_nested"
+        ))
+        .expect("CREATE PUBLICATION");
 
     let config = complex_config(slot, pub_name);
     let mut stream = LogicalReplicationStream::new(&replication_conn_string(), config)
@@ -513,9 +533,11 @@ async fn test_json_null_handling() {
     );
     let _ = regular.exec("TRUNCATE complex_json_null RESTART IDENTITY");
     let _ = regular.exec(&format!("DROP PUBLICATION IF EXISTS {pub_name}"));
-    let _ = regular.exec(&format!(
-        "CREATE PUBLICATION {pub_name} FOR TABLE complex_json_null"
-    ));
+    regular
+        .exec(&format!(
+            "CREATE PUBLICATION {pub_name} FOR TABLE complex_json_null"
+        ))
+        .expect("CREATE PUBLICATION");
 
     let config = complex_config(slot, pub_name);
     let mut stream = LogicalReplicationStream::new(&replication_conn_string(), config)
@@ -586,9 +608,11 @@ async fn test_geometric_types_basic() {
     );
     let _ = regular.exec("TRUNCATE complex_geo_test RESTART IDENTITY");
     let _ = regular.exec(&format!("DROP PUBLICATION IF EXISTS {pub_name}"));
-    let _ = regular.exec(&format!(
-        "CREATE PUBLICATION {pub_name} FOR TABLE complex_geo_test"
-    ));
+    regular
+        .exec(&format!(
+            "CREATE PUBLICATION {pub_name} FOR TABLE complex_geo_test"
+        ))
+        .expect("CREATE PUBLICATION");
 
     let config = complex_config(slot, pub_name);
     let mut stream = LogicalReplicationStream::new(&replication_conn_string(), config)
@@ -678,9 +702,11 @@ async fn test_geometric_path_polygon() {
     );
     let _ = regular.exec("TRUNCATE complex_geo_path RESTART IDENTITY");
     let _ = regular.exec(&format!("DROP PUBLICATION IF EXISTS {pub_name}"));
-    let _ = regular.exec(&format!(
-        "CREATE PUBLICATION {pub_name} FOR TABLE complex_geo_path"
-    ));
+    regular
+        .exec(&format!(
+            "CREATE PUBLICATION {pub_name} FOR TABLE complex_geo_path"
+        ))
+        .expect("CREATE PUBLICATION");
 
     let config = complex_config(slot, pub_name);
     let mut stream = LogicalReplicationStream::new(&replication_conn_string(), config)
@@ -758,9 +784,11 @@ async fn test_mixed_complex_types_insert() {
     );
     let _ = regular.exec("TRUNCATE complex_mixed RESTART IDENTITY");
     let _ = regular.exec(&format!("DROP PUBLICATION IF EXISTS {pub_name}"));
-    let _ = regular.exec(&format!(
-        "CREATE PUBLICATION {pub_name} FOR TABLE complex_mixed"
-    ));
+    regular
+        .exec(&format!(
+            "CREATE PUBLICATION {pub_name} FOR TABLE complex_mixed"
+        ))
+        .expect("CREATE PUBLICATION");
 
     let config = complex_config(slot, pub_name);
     let mut stream = LogicalReplicationStream::new(&replication_conn_string(), config)
@@ -852,11 +880,15 @@ async fn test_mixed_complex_types_update() {
          )",
     );
     let _ = regular.exec("TRUNCATE complex_update_test RESTART IDENTITY");
-    let _ = regular.exec("ALTER TABLE complex_update_test REPLICA IDENTITY FULL");
+    regular
+        .exec("ALTER TABLE complex_update_test REPLICA IDENTITY FULL")
+        .expect("REPLICA IDENTITY FULL");
     let _ = regular.exec(&format!("DROP PUBLICATION IF EXISTS {pub_name}"));
-    let _ = regular.exec(&format!(
-        "CREATE PUBLICATION {pub_name} FOR TABLE complex_update_test"
-    ));
+    regular
+        .exec(&format!(
+            "CREATE PUBLICATION {pub_name} FOR TABLE complex_update_test"
+        ))
+        .expect("CREATE PUBLICATION");
 
     let config = complex_config(slot, pub_name);
     let mut stream = LogicalReplicationStream::new(&replication_conn_string(), config)
@@ -925,18 +957,26 @@ async fn test_mixed_complex_types_update() {
                         "new items should contain gamma: {items_str}"
                     );
 
-                    // With REPLICA IDENTITY FULL, old_data should be present
-                    if let Some(old) = old_data {
-                        let old_data_col = old.get("data").expect("old_data should have 'data'");
-                        let old_str = old_data_col.as_str().expect("old data should be text");
-                        assert!(
-                            old_str.contains("\"draft\""),
-                            "old data should contain draft: {old_str}"
-                        );
-                    }
+                    // With REPLICA IDENTITY FULL, old_data MUST be present —
+                    // `if let Some` here silently skipped the whole assertion
+                    // whenever the ALTER failed to take.
+                    let old = old_data
+                        .as_ref()
+                        .expect("REPLICA IDENTITY FULL must ship old_data");
+                    let old_data_col = old.get("data").expect("old_data should have 'data'");
+                    let old_str = old_data_col.as_str().expect("old data should be text");
+                    assert!(
+                        old_str.contains("\"draft\""),
+                        "old data should contain draft: {old_str}"
+                    );
                 }
 
-                if matches!(event.event_type, EventType::Commit { .. }) {
+                // StreamCommit too: CI's logical_decoding_work_mem=64kB
+                // spills txns, and a spilled commit arrives as StreamCommit.
+                if matches!(
+                    event.event_type,
+                    EventType::Commit { .. } | EventType::StreamCommit { .. }
+                ) {
                     commit_count += 1;
                     // Wait for the update transaction (2nd commit)
                     if commit_count >= 2 {
@@ -975,11 +1015,15 @@ async fn test_mixed_complex_types_delete() {
          )",
     );
     let _ = regular.exec("TRUNCATE complex_delete_test RESTART IDENTITY");
-    let _ = regular.exec("ALTER TABLE complex_delete_test REPLICA IDENTITY FULL");
+    regular
+        .exec("ALTER TABLE complex_delete_test REPLICA IDENTITY FULL")
+        .expect("REPLICA IDENTITY FULL");
     let _ = regular.exec(&format!("DROP PUBLICATION IF EXISTS {pub_name}"));
-    let _ = regular.exec(&format!(
-        "CREATE PUBLICATION {pub_name} FOR TABLE complex_delete_test"
-    ));
+    regular
+        .exec(&format!(
+            "CREATE PUBLICATION {pub_name} FOR TABLE complex_delete_test"
+        ))
+        .expect("CREATE PUBLICATION");
 
     let config = complex_config(slot, pub_name);
     let mut stream = LogicalReplicationStream::new(&replication_conn_string(), config)
@@ -1037,7 +1081,12 @@ async fn test_mixed_complex_types_delete() {
                     );
                 }
 
-                if matches!(event.event_type, EventType::Commit { .. }) {
+                // StreamCommit too: CI's logical_decoding_work_mem=64kB
+                // spills txns, and a spilled commit arrives as StreamCommit.
+                if matches!(
+                    event.event_type,
+                    EventType::Commit { .. } | EventType::StreamCommit { .. }
+                ) {
                     commit_count += 1;
                     if commit_count >= 2 {
                         break;
@@ -1075,9 +1124,11 @@ async fn test_batch_insert_complex_types() {
     );
     let _ = regular.exec("TRUNCATE complex_batch RESTART IDENTITY");
     let _ = regular.exec(&format!("DROP PUBLICATION IF EXISTS {pub_name}"));
-    let _ = regular.exec(&format!(
-        "CREATE PUBLICATION {pub_name} FOR TABLE complex_batch"
-    ));
+    regular
+        .exec(&format!(
+            "CREATE PUBLICATION {pub_name} FOR TABLE complex_batch"
+        ))
+        .expect("CREATE PUBLICATION");
 
     let config = complex_config(slot, pub_name);
     let mut stream = LogicalReplicationStream::new(&replication_conn_string(), config)
@@ -1167,9 +1218,11 @@ async fn test_json_special_values() {
     );
     let _ = regular.exec("TRUNCATE complex_json_special RESTART IDENTITY");
     let _ = regular.exec(&format!("DROP PUBLICATION IF EXISTS {pub_name}"));
-    let _ = regular.exec(&format!(
-        "CREATE PUBLICATION {pub_name} FOR TABLE complex_json_special"
-    ));
+    regular
+        .exec(&format!(
+            "CREATE PUBLICATION {pub_name} FOR TABLE complex_json_special"
+        ))
+        .expect("CREATE PUBLICATION");
 
     let config = complex_config(slot, pub_name);
     let mut stream = LogicalReplicationStream::new(&replication_conn_string(), config)

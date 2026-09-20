@@ -11,8 +11,10 @@
 //!
 //! ## Prerequisites
 //!
-//! - PostgreSQL 17+ (the command does not exist earlier) — skips gracefully below
-//! - `summarize_wal = on` for the positive case — skips gracefully when off
+//! - PostgreSQL 17+ (the command does not exist earlier) — skips below, with a
+//!   `SKIP:` marker
+//! - `summarize_wal = on` for the positive case — asserted on PG17+, where CI
+//!   sets it on purpose
 //! - `DATABASE_URL` — replication connection
 //! - `DATABASE_URL_REGULAR` — regular connection to the same database
 //! - `BACKUP_MANIFEST_PATH` — path to a real `backup_manifest` from a prior full
@@ -30,7 +32,6 @@
 //! ```
 
 use pg_walstream::{BaseBackupOptions, PgReplicationConnection};
-use tracing::warn;
 
 fn replication_conn_string() -> String {
     std::env::var("DATABASE_URL").unwrap_or_else(|_| {
@@ -68,7 +69,8 @@ fn server_supports_upload_manifest() -> bool {
         .parse()
         .expect("server_version_num is numeric");
     if version < 170000 {
-        warn!("skipping: UPLOAD_MANIFEST requires PostgreSQL 17+, server is {version}");
+        // Greppable: a skip must not read as a pass in the CI log.
+        println!("SKIP: upload_manifest tests require PG >= 17 (server {version})");
         return false;
     }
     true
@@ -77,8 +79,8 @@ fn server_supports_upload_manifest() -> bool {
 /// The full round-trip: a real manifest is accepted, and the incremental
 /// `BASE_BACKUP` that depends on it is then accepted too.
 ///
-/// Needs `BACKUP_MANIFEST_PATH` (CI runs `pg_basebackup` first) and
-/// `summarize_wal = on`; skips gracefully otherwise.
+/// Needs `BACKUP_MANIFEST_PATH` (CI runs `pg_basebackup` first), which it skips
+/// without; `summarize_wal = on` is asserted rather than skipped.
 #[tokio::test]
 #[ignore = "requires live PostgreSQL 17+ and a backup manifest"]
 async fn real_manifest_enables_incremental_base_backup() {
@@ -88,13 +90,18 @@ async fn real_manifest_enables_incremental_base_backup() {
     }
 
     let Ok(path) = std::env::var("BACKUP_MANIFEST_PATH") else {
-        warn!("skipping: BACKUP_MANIFEST_PATH is not set");
+        println!(
+            "SKIP: real_manifest_enables_incremental_base_backup requires BACKUP_MANIFEST_PATH"
+        );
         return;
     };
     let manifest = match std::fs::read(&path) {
         Ok(m) => m,
         Err(e) => {
-            warn!("skipping: cannot read BACKUP_MANIFEST_PATH={path}: {e}");
+            println!(
+                "SKIP: real_manifest_enables_incremental_base_backup \
+                 cannot read BACKUP_MANIFEST_PATH={path}: {e}"
+            );
             return;
         }
     };
@@ -102,10 +109,13 @@ async fn real_manifest_enables_incremental_base_backup() {
 
     let mut regular =
         PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
-    if show(&mut regular, "summarize_wal") != "on" {
-        warn!("skipping: incremental backup requires summarize_wal = on");
-        return;
-    }
+    // PG17+ only: CI sets this GUC deliberately, so a miss is a broken harness.
+    // Skipping here would green-light the one positive case never running.
+    assert_eq!(
+        show(&mut regular, "summarize_wal"),
+        "on",
+        "incremental backup requires summarize_wal = on (CI must set it on PG17+)"
+    );
 
     let mut repl = PgReplicationConnection::connect(&replication_conn_string())
         .expect("replication connection");

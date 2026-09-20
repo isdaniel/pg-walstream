@@ -628,8 +628,10 @@ impl LogicalReplicationStream {
     pub async fn new(connection_string: &str, config: ReplicationStreamConfig) -> Result<Self> {
         info!("Creating logical replication stream with retry support");
 
-        let retry_handler =
-            ReplicationConnectionRetry::new(config.retry_config, connection_string.to_string());
+        let retry_handler = ReplicationConnectionRetry::new(
+            config.retry_config,
+            with_connect_timeout(connection_string, config.connection_timeout),
+        );
 
         // Establish initial connection with retry and enforce timeout
         let connection = timeout_or_error(
@@ -2534,6 +2536,35 @@ impl<'a> EventStreamRef<'a> {
     }
 }
 
+/// Fold `connection_timeout` into the connection string as `connect_timeout`
+/// unless the caller already set one.
+///
+/// This is what gives [`timeout_or_error`] teeth. `connect_with_retry` calls the
+/// *blocking* `PgReplicationConnection::connect` inline, so the `tokio::time::timeout`
+/// wrapped around it can only fire at the backoff `await` *between* attempts — a
+/// single connect parked against a peer that completes the TCP handshake and then
+/// goes silent is unbounded, and no caller-side timeout can reach it.
+///
+/// `connect_timeout` is the bound that does work, on both backends: the native
+/// backend wraps the whole handshake in its own `tokio::time::timeout` driven by
+/// the worker's runtime (where the timer *is* polled), and libpq honours the
+/// keyword natively. A caller who sets it explicitly wins — this only supplies a
+/// default. `Duration::ZERO` means "no timeout", matching libpq, so it adds nothing.
+fn with_connect_timeout(conn_str: &str, timeout: Duration) -> String {
+    if timeout.is_zero() || conn_str.contains("connect_timeout") {
+        return conn_str.to_string();
+    }
+    // libpq's `connect_timeout` is whole seconds, and a sub-second value must not
+    // round down to 0 — that is the "disabled" sentinel.
+    let secs = timeout.as_secs().max(1);
+    if conn_str.starts_with("postgres://") || conn_str.starts_with("postgresql://") {
+        let sep = if conn_str.contains('?') { '&' } else { '?' };
+        format!("{conn_str}{sep}connect_timeout={secs}")
+    } else {
+        format!("{conn_str} connect_timeout={secs}")
+    }
+}
+
 async fn timeout_or_error<T>(
     duration: Duration,
     future: impl Future<Output = Result<T>>,
@@ -4425,6 +4456,57 @@ pub(crate) mod tests {
 
         let data = tuple.into_row_data(&relation);
         assert!(data.is_empty());
+    }
+
+    /// `timeout_or_error` cannot bound the blocking connect inside
+    /// `connect_with_retry`, so the deadline has to travel in the connection
+    /// string. Both DSN syntaxes, and an explicit caller value always wins.
+    #[test]
+    fn with_connect_timeout_supplies_a_default_in_both_dsn_syntaxes() {
+        let t = Duration::from_secs(30);
+
+        // URI with an existing query string → `&`.
+        assert_eq!(
+            with_connect_timeout("postgresql://u@h/db?replication=database", t),
+            "postgresql://u@h/db?replication=database&connect_timeout=30"
+        );
+        // URI with no query string → `?`.
+        assert_eq!(
+            with_connect_timeout("postgres://u@h/db", t),
+            "postgres://u@h/db?connect_timeout=30"
+        );
+        // key=value syntax → space-separated.
+        assert_eq!(
+            with_connect_timeout("host=h port=5432", t),
+            "host=h port=5432 connect_timeout=30"
+        );
+    }
+
+    #[test]
+    fn with_connect_timeout_never_overrides_the_caller() {
+        let t = Duration::from_secs(30);
+        for dsn in [
+            "postgresql://u@h/db?connect_timeout=5",
+            "host=h connect_timeout=5",
+        ] {
+            assert_eq!(with_connect_timeout(dsn, t), dsn, "{dsn}");
+        }
+    }
+
+    /// `Duration::ZERO` is libpq's "no timeout", so it must add nothing — and a
+    /// sub-second budget must not round down to that same sentinel.
+    #[test]
+    fn with_connect_timeout_handles_the_zero_sentinel() {
+        assert_eq!(
+            with_connect_timeout("host=h", Duration::ZERO),
+            "host=h",
+            "zero means disabled, not connect_timeout=0"
+        );
+        assert_eq!(
+            with_connect_timeout("host=h", Duration::from_millis(1)),
+            "host=h connect_timeout=1",
+            "sub-second must clamp up to 1, not down to the disabled sentinel"
+        );
     }
 
     #[tokio::test]

@@ -19,8 +19,8 @@
 
 use pg_walstream::snapshot::SnapshotOutcome;
 use pg_walstream::{
-    EventType, LogicalReplicationStream, PgReplicationConnection, ReplicationStreamConfig,
-    RetryConfig, StreamingMode,
+    CancellationToken, EventType, LogicalReplicationStream, PgReplicationConnection,
+    ReplicationStreamConfig, RetryConfig, StreamingMode,
 };
 use std::time::Duration;
 
@@ -119,6 +119,23 @@ fn setup(table: &str, publication: &str) {
     .expect("publication");
 }
 
+/// A 60s deadline for a snapshot COPY, delivered through the token the copy loop
+/// already polls.
+///
+/// `finish()`, `abandon()` and `SnapshotRows::drop` are blocking, so wrapping them
+/// in `tokio::time::timeout` would not interrupt anything — a wedged COPY would
+/// hang the suite until CI's outer `timeout` killed the whole job. The token is
+/// the only cancellation path that reaches the loop.
+fn copy_deadline() -> CancellationToken {
+    let deadline = CancellationToken::new();
+    let t = deadline.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        t.cancel();
+    });
+    deadline
+}
+
 /// Guard against the whole suite passing vacuously: if the server were not
 /// actually TLS-enabled, `verify-full` would fail to connect and every other test
 /// here would error rather than silently prove nothing.
@@ -158,11 +175,14 @@ async fn snapshot_reader_connection_is_encrypted() {
         panic!("a fresh slot must export a snapshot");
     };
 
-    let mut rows = snap.rows();
+    let mut rows = snap.with_cancellation(copy_deadline()).rows();
     // Pull one row so the reader's COPY is provably in flight.
     rows.next_row().await.expect("next_row").expect("a row");
 
     // Ask the SERVER whether the backend running our COPY is encrypted.
+    // `state = 'active'` and excluding our own pid keep the count to backends that
+    // are *running* a COPY right now: `pg_stat_activity.query` is retained for idle
+    // backends, so a finished reader from an earlier test would otherwise be counted.
     let mut probe =
         PgReplicationConnection::connect(&regular_conn_string()).expect("probe connection");
     let result = probe
@@ -170,6 +190,8 @@ async fn snapshot_reader_connection_is_encrypted() {
             "SELECT count(*) FROM pg_stat_activity a
                JOIN pg_stat_ssl s USING (pid)
               WHERE a.datname = current_database()
+                AND a.pid <> pg_backend_pid()
+                AND a.state <> 'idle'
                 AND a.query LIKE 'COPY %'
                 AND s.ssl",
         )
@@ -179,21 +201,23 @@ async fn snapshot_reader_connection_is_encrypted() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(-1);
 
-    assert_eq!(
-        encrypted, 1,
-        "the snapshot reader must inherit TLS from the replication conninfo; \
-         an unencrypted reader would ship every row of every table in plaintext"
-    );
-
     // And it still produces correct data over TLS.
     let mut seen = 1;
     while rows.next_row().await.expect("next_row").is_some() {
         seen += 1;
     }
-    assert_eq!(seen, 2);
     rows.finish().await.expect("finish");
 
+    // Cleanup before asserting: the slot is not temporary, so a failed assertion
+    // would otherwise leak it and pin WAL for the rest of the run.
     drop_slot(slot);
+
+    assert_eq!(
+        encrypted, 1,
+        "the snapshot reader must inherit TLS from the replication conninfo; \
+         an unencrypted reader would ship every row of every table in plaintext"
+    );
+    assert_eq!(seen, 2);
 }
 
 /// Both connections must agree on the TLS *version and cipher*, not merely on
@@ -216,7 +240,7 @@ async fn reader_and_replication_negotiate_the_same_tls() {
     let SnapshotOutcome::Available(snap) = stream.snapshot().await.expect("snapshot") else {
         panic!("expected a snapshot");
     };
-    let mut rows = snap.rows();
+    let mut rows = snap.with_cancellation(copy_deadline()).rows();
     rows.next_row().await.expect("next_row").expect("a row");
 
     let mut probe =
@@ -227,6 +251,13 @@ async fn reader_and_replication_negotiate_the_same_tls() {
     // the exact downgrade the assertion claims to catch. (`version`/`cipher` are
     // NULL when `ssl` is false, and `count(DISTINCT)` skips NULLs, so the filter
     // was doubly self-defeating.) Count the unencrypted backends instead.
+    //
+    // The COPY arm excludes `state = 'idle'` because `query` is retained after a
+    // backend's transaction ends, so an unreaped reader from an earlier test would
+    // count. It must NOT be narrowed to `active`: these tables are tiny, the COPY
+    // completes at once, and the reader then sits `idle in transaction` holding its
+    // REPEATABLE READ snapshot. The walsender arm cannot be state-gated at all —
+    // ours is idle between CREATE_REPLICATION_SLOT and START_REPLICATION.
     let result = probe
         .exec(
             "SELECT count(*),
@@ -235,7 +266,9 @@ async fn reader_and_replication_negotiate_the_same_tls() {
                FROM pg_stat_activity a
                JOIN pg_stat_ssl s USING (pid)
               WHERE a.datname = current_database()
-                AND (a.backend_type = 'walsender' OR a.query LIKE 'COPY %')",
+                AND a.pid <> pg_backend_pid()
+                AND (a.backend_type = 'walsender'
+                     OR (a.state <> 'idle' AND a.query LIKE 'COPY %'))",
         )
         .expect("probe");
     let column = |i| -> i64 {
@@ -245,6 +278,11 @@ async fn reader_and_replication_negotiate_the_same_tls() {
             .unwrap_or(-1)
     };
     let (total, distinct, unencrypted) = (column(0), column(1), column(2));
+
+    // Cleanup before asserting: `abandon()` deliberately keeps the slot, which is
+    // not temporary, so a failed assertion here would pin WAL for the whole run.
+    drop(rows.abandon().await.expect("abandon"));
+    drop_slot(slot);
 
     assert!(
         total >= 2,
@@ -260,9 +298,6 @@ async fn reader_and_replication_negotiate_the_same_tls() {
         "the reader and the replication connection must negotiate identical TLS \
          parameters; more than one (version, cipher) pair means they diverged"
     );
-
-    drop(rows.abandon().await.expect("abandon"));
-    drop_slot(slot);
 }
 
 /// SCRAM-SHA-256 must work on the derived reader connection too — the password
@@ -289,7 +324,7 @@ async fn snapshot_works_under_scram_authentication() {
         panic!("expected a snapshot");
     };
 
-    let mut events = snap.events();
+    let mut events = snap.with_cancellation(copy_deadline()).events();
     let mut names = Vec::new();
     while let Some(event) = events.next_event().await.expect("next_event") {
         if let EventType::Insert { data, .. } = &event.event_type {
@@ -303,8 +338,10 @@ async fn snapshot_works_under_scram_authentication() {
     }
     events.finish().await.expect("finish");
 
+    // Cleanup before asserting: `finish()` has already defused the Drop-time
+    // cleanup, and the slot is not temporary, so a failed assertion would leak it.
+    drop_slot(slot);
+
     names.sort();
     assert_eq!(names, vec!["tls_a", "tls_b"]);
-
-    drop_slot(slot);
 }

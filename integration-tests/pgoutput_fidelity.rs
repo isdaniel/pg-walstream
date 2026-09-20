@@ -143,6 +143,13 @@ fn encoder_reproduces_text_dml() {
         .expect("emit logical message");
 
     let raws = capture(&mut c, "fid_slot", "fid_pub", "1", false);
+
+    // Cleanup before asserting so a failure does not leak the publication/table/type.
+    let _ = c.exec("DROP PUBLICATION IF EXISTS fid_pub");
+    let _ = c.exec("DROP TABLE IF EXISTS fid_a");
+    let _ = c.exec("DROP TABLE IF EXISTS fid_b");
+    let _ = c.exec("DROP TYPE IF EXISTS fid_mood");
+
     assert!(!raws.is_empty(), "expected pgoutput messages");
     let msgs = roundtrip(&raws, 1);
 
@@ -218,11 +225,6 @@ fn encoder_reproduces_text_dml() {
         saw_update_o,
         "full-identity update produced an 'O' old tuple"
     );
-
-    let _ = c.exec("DROP PUBLICATION IF EXISTS fid_pub");
-    let _ = c.exec("DROP TABLE IF EXISTS fid_a");
-    let _ = c.exec("DROP TABLE IF EXISTS fid_b");
-    let _ = c.exec("DROP TYPE IF EXISTS fid_mood");
 }
 
 #[test]
@@ -248,6 +250,11 @@ fn encoder_reproduces_binary_format_columns() {
 
     // `binary 'true'` makes pgoutput send column values in binary format ('b').
     let raws = capture(&mut c, "fid_bin_slot", "fid_bin_pub", "1", true);
+
+    // Cleanup before asserting so a failure does not leak the publication/table.
+    let _ = c.exec("DROP PUBLICATION IF EXISTS fid_bin_pub");
+    let _ = c.exec("DROP TABLE IF EXISTS fid_bin");
+
     let msgs = roundtrip(&raws, 1);
 
     let saw_binary = msgs.iter().any(|m| {
@@ -258,9 +265,6 @@ fn encoder_reproduces_binary_format_columns() {
         saw_binary,
         "expected at least one binary-format ('b') column from PostgreSQL"
     );
-
-    let _ = c.exec("DROP PUBLICATION IF EXISTS fid_bin_pub");
-    let _ = c.exec("DROP TABLE IF EXISTS fid_bin");
 }
 
 #[test]
@@ -292,6 +296,11 @@ fn encoder_reproduces_unchanged_toast() {
         .expect("update small column");
 
     let raws = capture(&mut c, "fid_toast_slot", "fid_toast_pub", "1", false);
+
+    // Cleanup before asserting so a failure does not leak the publication/table.
+    let _ = c.exec("DROP PUBLICATION IF EXISTS fid_toast_pub");
+    let _ = c.exec("DROP TABLE IF EXISTS fid_toast");
+
     let msgs = roundtrip(&raws, 1);
 
     let saw_unchanged = msgs.iter().any(|m| {
@@ -302,9 +311,23 @@ fn encoder_reproduces_unchanged_toast() {
         saw_unchanged,
         "expected an unchanged-TOAST ('u') column in the UPDATE new tuple"
     );
+}
 
-    let _ = c.exec("DROP PUBLICATION IF EXISTS fid_toast_pub");
-    let _ = c.exec("DROP TABLE IF EXISTS fid_toast");
+/// Roll back a prepared transaction on drop, on a connection of its own.
+///
+/// A prepared transaction stranded by a panic (or by the CI `timeout`'s SIGTERM)
+/// holds `SnapBuildFindSnapshot` back from ever reaching a consistent point, so
+/// every *later* logical slot creation — in this suite and the ones after it —
+/// blocks forever. Rolling back an already-resolved gid just errors, which is
+/// why the result is discarded.
+struct PreparedGuard(String);
+
+impl Drop for PreparedGuard {
+    fn drop(&mut self) {
+        if let Ok(mut c) = PgReplicationConnection::connect(&conn_string()) {
+            let _ = c.exec(&format!("ROLLBACK PREPARED '{}'", self.0));
+        }
+    }
 }
 
 #[test]
@@ -331,6 +354,12 @@ fn encoder_reproduces_two_phase_commit() {
     c.exec("SELECT pg_create_logical_replication_slot('fid_tp_slot', 'pgoutput', true, true)")
         .expect("create two-phase slot");
 
+    // Armed before the BEGINs: anything that unwinds between PREPARE TRANSACTION
+    // and its COMMIT/ROLLBACK PREPARED strands the gid, and a stranded gid wedges
+    // slot creation for the rest of the run.
+    let _gid1 = PreparedGuard("fid_gid1".to_string());
+    let _gid2 = PreparedGuard("fid_gid2".to_string());
+
     // A prepared transaction that commits: BeginPrepare ('b'), Prepare ('P'),
     // CommitPrepared ('K').
     c.exec("BEGIN").expect("begin 1");
@@ -350,6 +379,11 @@ fn encoder_reproduces_two_phase_commit() {
 
     // proto_version 3 is required for the two-phase message set.
     let raws = capture(&mut c, "fid_tp_slot", "fid_tp_pub", "3", false);
+
+    // Cleanup before asserting so a failure does not leak the publication/table.
+    let _ = c.exec("DROP PUBLICATION IF EXISTS fid_tp_pub");
+    let _ = c.exec("DROP TABLE IF EXISTS fid_tp");
+
     let _ = roundtrip(&raws, 3);
 
     let seen = tags(&raws);
@@ -360,9 +394,6 @@ fn encoder_reproduces_two_phase_commit() {
             *tag as char
         );
     }
-
-    let _ = c.exec("DROP PUBLICATION IF EXISTS fid_tp_pub");
-    let _ = c.exec("DROP TABLE IF EXISTS fid_tp");
 }
 
 #[test]
@@ -371,11 +402,15 @@ fn encoder_reproduces_origin() {
     let mut c = connect();
 
     // The pgoutput `origin` option was added in PostgreSQL 16; skip on older servers.
+    // Every step is a hard `expect`: swallowing a failed probe would read as
+    // `ver = 0` and skip on 16/17/18 too, silently retiring the only 'O' coverage.
     let ver: i32 = c
         .exec("SHOW server_version_num")
-        .ok()
-        .and_then(|r| r.get_value(0, 0).and_then(|v| v.parse().ok()))
-        .unwrap_or(0);
+        .expect("SHOW server_version_num")
+        .get_value(0, 0)
+        .expect("server_version_num value")
+        .parse()
+        .expect("server_version_num is numeric");
     if ver < 160000 {
         eprintln!("skipping encoder_reproduces_origin: requires PG 16+ (server_version_num={ver})");
         return;

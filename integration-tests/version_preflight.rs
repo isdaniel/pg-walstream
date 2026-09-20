@@ -5,8 +5,8 @@
 //!
 //! Requires a live PostgreSQL with `wal_level = logical`. On PG17+ the gated-option
 //! test exercises FAILOVER slot create/alter through the library; on older servers
-//! that portion skips with a `warn!`. The core-path test runs on any supported
-//! version.
+//! that portion skips with a `SKIP:` marker. The core-path test runs on any
+//! supported version.
 //!
 //! ## Prerequisites
 //! - `DATABASE_URL` — replication connection
@@ -24,7 +24,6 @@ use pg_walstream::{
 };
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
 
 fn replication_conn_string() -> String {
     std::env::var("DATABASE_URL").unwrap_or_else(|_| {
@@ -67,11 +66,35 @@ fn drop_slot(slot: &str) {
     }
 }
 
+/// Poll until the slot's `active` flag clears. The walsender exits
+/// asynchronously after the stream is dropped, and dropping a still-active slot
+/// raises 55006 — which `drop_slot` swallows, leaking the slot. Bounded at 5s.
+fn wait_for_slot_inactive(slot: &str) {
+    let Ok(mut conn) = PgReplicationConnection::connect(&replication_conn_string()) else {
+        return;
+    };
+    for _ in 0..50 {
+        let active = conn
+            .exec(&format!(
+                "SELECT active FROM pg_replication_slots WHERE slot_name = '{slot}'"
+            ))
+            .ok()
+            .and_then(|r| r.get_value(0, 0))
+            .is_some_and(|v| v == "t");
+        if !active {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Drops its slot on `Drop` so a panicking assertion never leaks a slot (an
-/// orphaned slot pins WAL and can exhaust server disk).
+/// orphaned slot pins WAL and can exhaust server disk). `Drop` is sync, hence
+/// the blocking wait for the walsender to release the slot.
 struct SlotGuard(&'static str);
 impl Drop for SlotGuard {
     fn drop(&mut self) {
+        wait_for_slot_inactive(self.0);
         drop_slot(self.0);
     }
 }
@@ -140,8 +163,9 @@ async fn core_cdc_path_streams_and_decodes_insert() {
     .await;
     assert!(decoded.is_ok(), "timed out waiting for the INSERT event");
 
+    // Drop the stream so the walsender exits; `_guard` then waits for the slot's
+    // `active` flag to clear and drops it.
     drop(stream);
-    tokio::time::sleep(Duration::from_millis(200)).await;
     let _ = regular.exec("DROP PUBLICATION IF EXISTS vp_pub");
     let _ = regular.exec("DROP TABLE IF EXISTS vp_events");
 }
@@ -160,7 +184,11 @@ fn gated_slot_ops_pass_preflight_and_execute_on_pg17plus() {
         PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
     let version = server_version_num(&mut regular);
     if version < 170000 {
-        warn!("skipping gated-ops test: server_version_num {version} < 170000 (FAILOVER is PG17+)");
+        // Greppable: a skip must not read as a pass in the CI log.
+        println!(
+            "SKIP: gated_slot_ops_pass_preflight_and_execute_on_pg17plus \
+             requires PG >= 17 (server {version})"
+        );
         return;
     }
 

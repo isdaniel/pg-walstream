@@ -145,7 +145,10 @@ fn setup_ssl_schema(conn: &mut PgReplicationConnection) {
         .exec("CREATE TABLE IF NOT EXISTS ssl_test (id SERIAL PRIMARY KEY, data TEXT NOT NULL)");
     let _ = conn.exec("TRUNCATE ssl_test RESTART IDENTITY");
     let _ = conn.exec("DROP PUBLICATION IF EXISTS ssl_pub");
-    let _ = conn.exec("CREATE PUBLICATION ssl_pub FOR TABLE ssl_test");
+    // Load-bearing, unlike the idempotent statements above: without the
+    // publication the streaming test sees no Insert and blames TLS.
+    conn.exec("CREATE PUBLICATION ssl_pub FOR TABLE ssl_test")
+        .expect("create publication ssl_pub");
 }
 
 /// Clean up a replication slot using sslmode=prefer for SSL-enabled servers.
@@ -381,29 +384,41 @@ async fn test_ssl_verify_full_streaming() {
     let mut saw_commit = false;
     let mut event_count = 0u32;
 
-    loop {
-        match event_stream.next_event().await {
-            Ok(event) => {
-                event_count += 1;
-                event_stream.update_applied_lsn(event.lsn.value());
+    let consume = async {
+        loop {
+            match event_stream.next_event().await {
+                Ok(event) => {
+                    event_count += 1;
+                    event_stream.update_applied_lsn(event.lsn.value());
 
-                match &event.event_type {
-                    EventType::Begin { .. } => saw_begin = true,
-                    EventType::Insert { table, .. } => {
-                        assert_eq!(&**table, "ssl_test");
-                        saw_insert = true;
+                    match &event.event_type {
+                        EventType::Begin { .. } => saw_begin = true,
+                        EventType::Insert { table, .. } => {
+                            assert_eq!(&**table, "ssl_test");
+                            saw_insert = true;
+                        }
+                        EventType::Commit { .. } => {
+                            saw_commit = true;
+                            break;
+                        }
+                        _ => {}
                     }
-                    EventType::Commit { .. } => {
-                        saw_commit = true;
-                        break;
-                    }
-                    _ => {}
                 }
+                Err(pg_walstream::ReplicationError::Cancelled(_)) => break,
+                Err(e) => panic!("Unexpected error during SSL streaming: {e}"),
             }
-            Err(pg_walstream::ReplicationError::Cancelled(_)) => break,
-            Err(e) => panic!("Unexpected error during SSL streaming: {e}"),
         }
-    }
+    };
+
+    // The cancel token above is a spawned timer, not a deadline: a transient
+    // error sends `next_event` into a blocking reconnect (up to 5 attempts /
+    // 300s) that never observes the token. This is the hard stop.
+    let outcome = tokio::time::timeout(Duration::from_secs(30), consume).await;
+    assert!(
+        outcome.is_ok(),
+        "SSL streaming exceeded its 30s deadline \
+         (begin={saw_begin}, insert={saw_insert}, commit={saw_commit}, events={event_count})"
+    );
 
     assert!(saw_begin, "expected a Begin event over SSL");
     assert!(saw_insert, "expected an Insert event over SSL");

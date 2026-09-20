@@ -286,6 +286,13 @@ jobs:
         psql -h localhost -U postgres -d test_walstream -c "ALTER SYSTEM SET max_prepared_transactions = 16;"
         # streaming_decode forces protocol-v2 streaming by keeping the reorder buffer tiny.
         psql -h localhost -U postgres -d test_walstream -c "ALTER SYSTEM SET logical_decoding_work_mem = '64kB';"
+        # The library has no statement deadline on the blocking sync path (exec/connect
+        # park the caller's thread), so an in-test `tokio::time::timeout` cannot reach a
+        # lock wait. Server-side lock_timeout is the only bound: a leaked prepared txn or
+        # a stranded COPY reader turns a setup TRUNCATE/DROP into a permanent wedge
+        # otherwise. Every legitimate wait here is sub-second; 30s only fires on a wedge,
+        # and names the blocking PID. NOT statement_timeout - that would kill long COPY.
+        psql -h localhost -U postgres -d test_walstream -c "ALTER SYSTEM SET lock_timeout = '30s';"
         # upload_manifest's incremental BASE_BACKUP needs WAL summaries. The GUC is PG17+;
         # on 15/16 this fails and the test skips itself.
         psql -h localhost -U postgres -d test_walstream -c "ALTER SYSTEM SET summarize_wal = 'on';" \
@@ -330,8 +337,8 @@ jobs:
 
     - name: Run integration tests
       env:
-        DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/test_walstream?replication=database"
-        DATABASE_URL_REGULAR: "postgresql://postgres:postgres@localhost:5432/test_walstream"
+        DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/test_walstream?replication=database&connect_timeout=10"
+        DATABASE_URL_REGULAR: "postgresql://postgres:postgres@localhost:5432/test_walstream?connect_timeout=10"
         PGPASSWORD: postgres
         RUST_BACKTRACE: 1
       # The suite list comes from the filesystem, so a new integration-tests/*.rs
@@ -370,7 +377,8 @@ jobs:
           for v in "${variants[@]}"; do
             label="$suite${v:+ [$v]}"
             echo "::group::$label"
-            cargo test --test "$suite" $v -- --ignored --nocapture --test-threads=1 \
+            timeout -k 30 600 \
+              cargo test --test "$suite" $v -- --ignored --nocapture --test-threads=1 \
               || failed+=("$label")
             echo "::endgroup::"
             # Drop every slot between suites: an orphan blocks WAL recycling and
@@ -378,6 +386,9 @@ jobs:
             psql -h localhost -U postgres -d test_walstream \
               -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots;" \
               >/dev/null 2>&1 || true
+            psql -h localhost -U postgres -d test_walstream -tAc \
+              "SELECT format('ROLLBACK PREPARED %L;', gid) FROM pg_prepared_xacts" \
+              | psql -h localhost -U postgres -d test_walstream -q >/dev/null 2>&1 || true
           done
         done
 
@@ -550,8 +561,8 @@ jobs:
 
     - name: Run SSL integration tests
       env:
-        DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/test_walstream?replication=database"
-        DATABASE_URL_REGULAR: "postgresql://postgres:postgres@localhost:5432/test_walstream"
+        DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/test_walstream?replication=database&connect_timeout=10"
+        DATABASE_URL_REGULAR: "postgresql://postgres:postgres@localhost:5432/test_walstream?connect_timeout=10"
         SSL_CA_CERT_PATH: "/tmp/pg-ssl/ca.crt"
         SSL_WRONG_CA_CERT_PATH: "/tmp/pg-ssl/wrong-ca.crt"
         RUST_BACKTRACE: 1
@@ -567,7 +578,11 @@ jobs:
           suite=$(basename "$f" .rs)
           ran=$((ran + 1))
           echo "::group::$suite"
-          cargo test --test "$suite" --no-default-features --features rustls-tls \
+          # Same per-suite cap as the integration job. ssl_initial_snapshot's COPY
+          # drains have no deadline at all and its teardown is a blocking Drop, so
+          # this job carries the identical 45-minute-burn exposure.
+          timeout -k 30 600 \
+            cargo test --test "$suite" --no-default-features --features rustls-tls \
             -- --ignored --nocapture --test-threads=1 || failed+=("$suite")
           echo "::endgroup::"
           # Drop every slot between suites: an orphan blocks WAL recycling.

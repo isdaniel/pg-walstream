@@ -37,6 +37,38 @@ fn drop_slot(slot_name: &str) {
     }
 }
 
+/// Poll until the slot's `active` flag clears. The walsender exits
+/// asynchronously after the stream is dropped, and dropping a still-active slot
+/// raises 55006 — which `drop_slot` swallows, leaking the slot. Bounded at 5s.
+fn wait_for_slot_inactive(slot_name: &str) {
+    let Ok(mut conn) = PgReplicationConnection::connect(&replication_conn_string()) else {
+        return;
+    };
+    for _ in 0..50 {
+        let active = conn
+            .exec(&format!(
+                "SELECT active FROM pg_replication_slots WHERE slot_name = '{slot_name}'"
+            ))
+            .ok()
+            .and_then(|r| r.get_value(0, 0))
+            .is_some_and(|v| v == "t");
+        if !active {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Drops its slot on `Drop` so a panicking assertion never leaks it (an orphaned
+/// persistent slot pins WAL). `Drop` is sync, hence the blocking wait.
+struct SlotGuard(&'static str);
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        wait_for_slot_inactive(self.0);
+        drop_slot(self.0);
+    }
+}
+
 fn cfg(slot: &str) -> ReplicationStreamConfig {
     // Persistent (non-temporary) slot, non-streaming commits for simple assertions.
     ReplicationStreamConfig::new(
@@ -72,6 +104,9 @@ async fn raw_xlogdata_roundtrips_through_parser_and_stops() {
             "SELECT pg_create_logical_replication_slot('{slot}', 'pgoutput')"
         ))
         .expect("create slot");
+    // Declared before the stream, so the stream drops first and the slot is
+    // already inactive when the guard tries to drop it.
+    let _slot_guard = SlotGuard(slot);
 
     // --- Three transactions BEFORE the target ---
     for i in 1..=3 {
@@ -81,8 +116,12 @@ async fn raw_xlogdata_roundtrips_through_parser_and_stops() {
             ))
             .expect("insert before target");
     }
-    // Advance WAL so `target` lands strictly after txn3's commit.
-    let _ = regular.exec("SELECT pg_switch_wal()");
+    // Advance WAL so `target` lands strictly after txn3's commit. If this fails,
+    // `target` can equal txn3's commit and the stop lands one message early —
+    // visible only as a short `inserts_parsed`.
+    regular
+        .exec("SELECT pg_switch_wal()")
+        .expect("pg_switch_wal");
     let target: Lsn = regular
         .exec("SELECT pg_current_wal_lsn()")
         .expect("current wal lsn")
@@ -115,25 +154,38 @@ async fn raw_xlogdata_roundtrips_through_parser_and_stops() {
     let mut inserts_parsed = 0u32;
     let mut last_wal_end: u64 = 0;
 
-    let reached: Lsn = loop {
-        match stream.next_raw_event(&cancel).await {
-            Ok(raw) => {
-                assert!(!raw.data.is_empty(), "raw payload must be non-empty");
-                last_wal_end = raw.wal_end.value();
-                // Decode the raw bytes ourselves.
-                let msg = parser
-                    .parse_wal_message_bytes(raw.data)
-                    .expect("raw bytes must be valid pgoutput");
-                if let LogicalReplicationMessage::Insert { .. } = msg.message {
-                    inserts_parsed += 1;
+    let consume = async {
+        loop {
+            match stream.next_raw_event(&cancel).await {
+                Ok(raw) => {
+                    assert!(!raw.data.is_empty(), "raw payload must be non-empty");
+                    last_wal_end = raw.wal_end.value();
+                    // Decode the raw bytes ourselves.
+                    let msg = parser
+                        .parse_wal_message_bytes(raw.data)
+                        .expect("raw bytes must be valid pgoutput");
+                    if let LogicalReplicationMessage::Insert { .. } = msg.message {
+                        inserts_parsed += 1;
+                    }
+                    // Exercise the manual ack path.
+                    stream.shared_lsn_feedback.update_applied_lsn(last_wal_end);
                 }
-                // Exercise the manual ack path.
-                stream.shared_lsn_feedback.update_applied_lsn(last_wal_end);
+                Err(ReplicationError::StreamStopped(lsn)) => break lsn,
+                Err(e) => panic!("unexpected error: {e}"),
             }
-            Err(ReplicationError::StreamStopped(lsn)) => break lsn,
-            Err(e) => panic!("unexpected error: {e}"),
         }
     };
+
+    // `next_raw_event` has no read timeout: if the transport cutoff never arms,
+    // this loops on keepalives forever. The partial counters make a timeout
+    // distinguishable from a product bug.
+    let outcome = tokio::time::timeout(Duration::from_secs(60), consume).await;
+    let reached: Lsn = outcome.unwrap_or_else(|_| {
+        panic!(
+            "raw replay never reached stop_at_lsn {target} in 60s \
+             (inserts_parsed={inserts_parsed}, last_wal_end={last_wal_end})"
+        )
+    });
 
     // txn1..3 are strictly before the target; the transport-level cutoff stops
     // at the first message whose wal_end >= target, so at least those three
@@ -151,8 +203,7 @@ async fn raw_xlogdata_roundtrips_through_parser_and_stops() {
         "final wal_end {last_wal_end} should reach target {target}"
     );
 
-    // Drop the stream so the slot becomes inactive, then clean it up.
+    // Drop the stream so the walsender exits; `_slot_guard` then waits for the
+    // slot's `active` flag to clear and drops it.
     drop(stream);
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    drop_slot(slot);
 }
