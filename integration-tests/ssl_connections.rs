@@ -410,3 +410,85 @@ async fn test_ssl_verify_full_streaming() {
     assert!(saw_commit, "expected a Commit event over SSL");
     println!("SSL streaming: received {event_count} events over verify-full TLS connection");
 }
+
+/// `sslrootcert=system` must be refused with anything but `verify-full`, and the
+/// refusal must happen before a socket is opened.
+///
+/// `system` loads the whole public root store, and `verify-ca` installs a
+/// verifier that deliberately skips the hostname check. Chain validation against
+/// *every public CA* with no name binding authenticates nothing: any certificate
+/// a public CA issues for any domain the attacker controls is accepted for this
+/// host. libpq refuses the same pairing (`strcmp(sslmode, "verify-full") != 0`).
+///
+/// The unit tests in `conninfo.rs` pin the rule itself; this pins that the rule
+/// is actually reachable from the public entry point rather than sitting in a
+/// function nothing calls on the connect path.
+#[tokio::test]
+#[ignore = "requires live PostgreSQL with SSL"]
+async fn test_sslrootcert_system_refuses_weak_modes_before_connecting() {
+    for mode in ["verify-ca", "require", "prefer", "allow", "disable"] {
+        let conn_str = ssl_conn_string(mode, Some("system"));
+        let result = LogicalReplicationStream::new(&conn_str, ssl_test_config("it_ssl_sys")).await;
+
+        let err = match result {
+            Ok(_) => panic!("sslmode={mode} with sslrootcert=system must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("may not be used with sslrootcert=system"),
+            "sslmode={mode}: expected the sslrootcert=system refusal, got: {err}"
+        );
+    }
+
+    // The one legal pairing still reaches the server and completes a handshake,
+    // so the guard above rejects on the mode and not on `system` itself. The
+    // server's certificate is signed by the suite's private CA, which is not in
+    // the public root store, so this fails at verification rather than at
+    // parsing — a different error, which is the point.
+    let conn_str = ssl_conn_string("verify-full", Some("system"));
+    let err = LogicalReplicationStream::new(&conn_str, ssl_test_config("it_ssl_sys_ok"))
+        .await
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(
+        !err.contains("may not be used with sslrootcert=system"),
+        "verify-full must pass the sslrootcert=system gate, got: {err}"
+    );
+}
+
+/// A rejected connection option must never echo its value into the error.
+///
+/// `scram_client_key` is authentication-equivalent — possession lets an attacker
+/// compute `ClientProof` and log in as the role. The rejection is a permanent
+/// `Config` error handed straight to the caller, who logs it, and the secret
+/// never becomes a `ConnInfo` field, so the struct's `Debug` redaction cannot
+/// help. Verified end to end here because the leak is in the error a real caller
+/// receives, not in an internal representation.
+#[tokio::test]
+#[ignore = "requires live PostgreSQL with SSL"]
+async fn test_unsupported_option_error_does_not_leak_the_secret() {
+    const SECRET: &str = "s3cret-scram-client-key-do-not-log";
+
+    for key in [
+        "scram_client_key",
+        "scram_server_key",
+        "oauth_client_secret",
+    ] {
+        let conn_str = append_params(
+            &replication_conn_string(),
+            &[("sslmode", "verify-full"), (key, SECRET)],
+        );
+        let err = LogicalReplicationStream::new(&conn_str, ssl_test_config("it_ssl_leak"))
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{key} must be rejected"))
+            .to_string();
+
+        assert!(err.contains("not supported"), "{key}: {err}");
+        assert!(
+            !err.contains(SECRET),
+            "{key} leaked its value into the error a caller will log: {err}"
+        );
+    }
+}
