@@ -15,3 +15,9 @@ target_dir=fuzz/target/x86_64-unknown-linux-gnu/release
 for name in $targets; do
     cp "$target_dir/$name" "$OUT/"
 done
+
+# cifuzz unpacks <target>_seed_corpus.zip before fuzzing
+for dir in fuzz/seeds/*/; do
+    name=$(basename "$dir")
+    zip -j -q "$OUT/${name}_seed_corpus.zip" "$dir"*
+done
