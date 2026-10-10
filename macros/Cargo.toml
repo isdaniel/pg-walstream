@@ -15,6 +15,6 @@ categories = ["database"]
 proc-macro = true
 
 [dependencies]
-syn = "3.0.6"
+syn = "3.0.7"
 quote = "1.0.47"
 proc-macro2 = "1.0.107"
