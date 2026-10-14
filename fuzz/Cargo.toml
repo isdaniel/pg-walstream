@@ -11,7 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 bytes = "1"
 arbitrary = "1"
-pg_walstream = { path = ".." }
+pg_walstream = { path = "..", default-features = false, features = ["std"] }
 pg-walstream-arbitrary-fuzzing = { path = "../examples/arbitrary-fuzzing" }
 
 # Keep debug assertions live: a firing is a real bug, not fuzzing noise.
