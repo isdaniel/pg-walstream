@@ -6,7 +6,7 @@
 //! # Async I/O Architecture
 //!
 //! This module implements truly async, non-blocking I/O using tokio's `AsyncFd` wrapper
-//! around libpq's file descriptor. The key design principles are:
+//! around a dup of libpq's file descriptor. The key design principles are:
 //!
 //! - **Non-blocking socket operations**: Uses `AsyncFd::readable()` with proper drain pattern
 //!   to handle edge-triggered epoll notifications correctly
@@ -37,7 +37,7 @@ use pq_sys::*;
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{BorrowedFd, OwnedFd, RawFd};
 use std::{ptr, slice};
 use tokio::io::unix::AsyncFd;
 use tokio_util::sync::CancellationToken;
@@ -231,7 +231,7 @@ const COPY_IN_CHUNK: usize = 64 * 1024;
 /// ```
 pub struct PgReplicationConnection {
     conn: *mut PGconn,
-    async_fd: Option<AsyncFd<RawFd>>,
+    async_fd: Option<AsyncFd<OwnedFd>>,
     /// Reusable buffer for copying data from libpq (avoids per-message heap alloc).
     ///
     /// Connection-scoped, not COPY-scoped: allocated once at connect and reused
@@ -685,12 +685,13 @@ impl PgReplicationConnection {
     /// Register the connection's socket with the reactor and put libpq into
     /// non-blocking mode.
     ///
-    /// **Idempotent.** The fd is stable for the connection's lifetime and epoll
-    /// rejects a duplicate registration outright:
+    /// **Idempotent.** Nothing re-creates `PQsocket`'s fd after connect (no
+    /// `PQreset`), so a second call has nothing to do; it would only dup and
+    /// register the socket again.
     ///
-    /// ```text
-    /// Protocol("Failed to create AsyncFd: File exists (os error 17)")
-    /// ```
+    /// The socket is registered as a `dup`, not libpq's own descriptor: libpq closes
+    /// its socket itself on a fatal error (`pqDropConnection`) while the `PGconn`
+    /// stays alive, and `AsyncFd` requires its fd to stay open until dropped.
     ///
     /// Every entry point that enters a COPY calls this, and `copy_out_begin` is
     /// the one that can legitimately run **more than once per connection**: a
@@ -705,14 +706,9 @@ impl PgReplicationConnection {
             return Ok(());
         }
 
-        let sock: RawFd = unsafe { PQsocket(self.conn) };
-        if sock < 0 {
-            return Err(ReplicationError::protocol(
-                "Invalid PostgreSQL socket".to_string(),
-            ));
-        }
-
         // Put libpq into non-blocking mode so that PQputCopyData, PQflush, etc.. never block the calling thread.
+        // Before `PQsocket`: switching modes flushes the send queue, which can hit a
+        // fatal error and make libpq close its socket.
         let ret = unsafe { PQsetnonblocking(self.conn, 1) };
         if ret != 0 {
             return Err(ReplicationError::protocol(
@@ -720,8 +716,20 @@ impl PgReplicationConnection {
             ));
         }
 
-        let async_fd = AsyncFd::new(sock)
-            .map_err(|e| ReplicationError::protocol(format!("Failed to create AsyncFd: {e}")))?;
+        let sock: RawFd = unsafe { PQsocket(self.conn) };
+        if sock < 0 {
+            return Err(ReplicationError::protocol(
+                "Invalid PostgreSQL socket".to_string(),
+            ));
+        }
+
+        // SAFETY: `sock` was just returned by `PQsocket` on a live connection that we
+        // hold `&mut` to, so it is open for the duration of this call.
+        let async_fd = register_dup(unsafe { BorrowedFd::borrow_raw(sock) }).map_err(|e| {
+            ReplicationError::protocol(format!(
+                "Failed to register PostgreSQL socket with the reactor: {e}"
+            ))
+        })?;
 
         self.async_fd = Some(async_fd);
 
@@ -1425,7 +1433,7 @@ impl PgReplicationConnection {
                 self.copy = CopyMode::Idle;
             }
 
-            // Close the connection, deregister from the tokio reactor FIRST: `PQfinish` closes the socket, and `AsyncFd`'s drop then issues `epoll_ctl(EPOLL_CTL_DEL, fd)` on a closed descriptor. If another thread opened something that reused that fd number in between, that would tear down *their* registration.
+            // Drop the reactor's dup FIRST so `PQfinish`'s close is the last reference to the socket: the FIN then goes out right after Terminate instead of waiting for this struct's fields to drop.
             self.async_fd = None;
 
             unsafe {
@@ -1454,6 +1462,18 @@ impl Drop for PgReplicationConnection {
 // Make the connection Send by ensuring exclusive access
 // # Safety: `PgReplicationConnection` wraps `*mut PGconn` which is neither `Send` nor `Sync` by default because of the raw pointer.  We implement `Send` manually because the connection can safely be moved to another thread.  All access goes through `&mut self`, so only one task ever touches the libpq handle at a time.
 unsafe impl Send for PgReplicationConnection {}
+
+/// Register a private `dup` of `fd` with the tokio reactor.
+///
+/// The caller's descriptor is never registered, so whatever the owner does with it
+/// (libpq closes its socket on a fatal error while the `PGconn` lives on) cannot
+/// leave the `AsyncFd` holding a dangling or reused fd number.
+#[inline]
+fn register_dup(fd: BorrowedFd<'_>) -> std::io::Result<AsyncFd<OwnedFd>> {
+    let owned = fd.try_clone_to_owned()?;
+    // SAFETY: `owned` is exclusively ours and open until the `AsyncFd` drops; it is never exposed through `get_mut`/`into_inner`, so `as_raw_fd` stays constant.
+    Ok(unsafe { AsyncFd::register(owned) }?)
+}
 
 #[cfg(test)]
 impl PgReplicationConnection {
@@ -2421,19 +2441,19 @@ mod tests {
         );
     }
 
-    /// `initialize_async_socket` must be idempotent. `AsyncFd::new` on an
-    /// already-registered fd returns EEXIST, and `copy_out_begin` reaches it once
-    /// per table — which is how every multi-table snapshot on this backend used
-    /// to fail.
+    /// `initialize_async_socket` must be idempotent. Before the socket was dup'd,
+    /// `AsyncFd::new` on an already-registered fd returned EEXIST, and
+    /// `copy_out_begin` reaches it once per table — which is how every multi-table
+    /// snapshot on this backend used to fail. It now guards against a redundant
+    /// dup + registration instead.
     ///
-    /// Scope of this test: it pins that the second call **short-circuits**. It
-    /// does not reproduce the EEXIST itself — a null connection has no libpq
-    /// socket, so without the guard it fails earlier, on `PQsocket`. The actual
-    /// EEXIST reproduction is `initial_snapshot::multi_table_publication_*` run
-    /// against a live server on this backend.
+    /// Scope of this test: it pins that the second call **short-circuits**. A null
+    /// connection has no libpq socket, so without the guard it fails earlier, on
+    /// `PQsocket`. The original EEXIST reproduction is
+    /// `initial_snapshot::multi_table_publication_*` against a live server.
     #[test]
     fn test_initialize_async_socket_is_idempotent() {
-        use std::os::fd::AsRawFd;
+        use std::os::fd::AsFd;
 
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2444,17 +2464,47 @@ mod tests {
                 let mut conn = PgReplicationConnection::null_for_testing();
 
                 // Stand in for a live libpq socket; the null connection has none.
-                conn.async_fd = Some(
-                    tokio::io::unix::AsyncFd::new(sock.as_raw_fd())
-                        .expect("first registration succeeds"),
-                );
+                conn.async_fd = Some(register_dup(sock.as_fd()).expect("first registration"));
 
-                // The whole point: the second call must be a no-op. Before the
-                // guard it re-entered `AsyncFd::new` and returned EEXIST.
+                // The second call must be a no-op: without the guard it would fail
+                // on `PQsocket` of the null connection.
                 conn.initialize_async_socket()
-                    .expect("a second call must be a no-op, not EEXIST");
+                    .expect("a second call must be a no-op");
 
                 assert!(conn.async_fd.is_some());
+            });
+    }
+
+    /// The reason `register_dup` exists: libpq closes its own socket on a fatal
+    /// error while the `PGconn` lives on. The reactor registration must survive
+    /// that, and must not close the owner's fd when it is dropped.
+    #[test]
+    fn test_register_dup_outlives_owner_fd_and_does_not_close_it() {
+        use std::io::Write;
+        use std::os::fd::{AsFd, AsRawFd};
+        use std::os::unix::net::UnixStream;
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                // Dropping the registration leaves the owner's fd open.
+                let (owner, mut peer) = UnixStream::pair().unwrap();
+                let afd = register_dup(owner.as_fd()).unwrap();
+                assert_ne!(afd.as_raw_fd(), owner.as_raw_fd(), "must be a distinct dup");
+                drop(afd);
+                peer.write_all(b"x").unwrap();
+                assert!(owner.peer_addr().is_ok(), "owner's fd must still be open");
+
+                // The owner closes its fd (libpq's `pqDropConnection`); the
+                // registration must keep delivering readiness.
+                let (owner, mut peer) = UnixStream::pair().unwrap();
+                let afd = register_dup(owner.as_fd()).unwrap();
+                drop(owner);
+                peer.write_all(b"x").unwrap();
+                let mut guard = afd.readable().await.unwrap();
+                guard.clear_ready();
             });
     }
 
