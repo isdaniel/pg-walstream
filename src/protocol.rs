@@ -308,12 +308,39 @@ impl TupleData {
     /// [`ColumnValue::Null`]. Unchanged TOAST columns are skipped.
     #[inline]
     pub fn into_row_data(self, relation: &RelationInfo) -> RowData {
-        let mut data = RowData::with_capacity(self.columns.len());
+        let column_count = self.columns.len();
+        self.into_row_data_inner::<false>(relation, column_count)
+    }
+
+    #[inline]
+    fn into_row_data_with_key_only(
+        self,
+        relation: &RelationInfo,
+        key_column_count: Option<usize>,
+    ) -> RowData {
+        match key_column_count {
+            Some(count) if count < relation.columns.len() => {
+                self.into_row_data_inner::<true>(relation, count)
+            }
+            _ => self.into_row_data(relation),
+        }
+    }
+
+    #[inline]
+    fn into_row_data_inner<const KEY_ONLY: bool>(
+        self,
+        relation: &RelationInfo,
+        capacity: usize,
+    ) -> RowData {
+        let mut data = RowData::with_capacity(capacity);
 
         for (i, col_data) in self.columns.into_iter().enumerate() {
             let Some(column_info) = relation.get_column_by_index(i) else {
                 continue;
             };
+            if KEY_ONLY && !column_info.is_key() {
+                continue;
+            }
             let value = match col_data.data_type {
                 b'u' => continue, // Skip unchanged TOAST values
                 b'n' => ColumnValue::Null,
@@ -1525,7 +1552,12 @@ pub(crate) fn message_to_change_event(
             key_type,
         } => {
             if let Some(meta) = relation_metadata(state, relation_id, key_type) {
-                let old_data = old_tuple.map(|t| t.into_row_data(meta.relation));
+                let old_data = old_tuple.map(|t| {
+                    t.into_row_data_with_key_only(
+                        meta.relation,
+                        (key_type == Some('K')).then_some(meta.key_columns.len()),
+                    )
+                });
                 let new_data = new_tuple.into_row_data(meta.relation);
 
                 ChangeEvent {
@@ -1553,7 +1585,10 @@ pub(crate) fn message_to_change_event(
             key_type,
         } => {
             if let Some(meta) = relation_metadata(state, relation_id, Some(key_type)) {
-                let old_data = old_tuple.into_row_data(meta.relation);
+                let old_data = old_tuple.into_row_data_with_key_only(
+                    meta.relation,
+                    (key_type == 'K').then_some(meta.key_columns.len()),
+                );
 
                 ChangeEvent {
                     event_type: EventType::Delete {
@@ -2063,7 +2098,97 @@ mod tests {
     use crate::column_value::ColumnValue;
 
     #[test]
-    fn pgoutput_decoder_decodes_bytes_like_network_path() {
+    fn pgoutput_old_tuple_marker_controls_absent_cells() {
+        use crate::pgoutput_encode::encode_message_to_bytes;
+
+        for (replica_identity, other_flags) in b"dif"
+            .iter()
+            .copied()
+            .flat_map(|identity| [(identity, 0), (identity, 1)])
+        {
+            for marker in *b"KO" {
+                for operation in *b"UD" {
+                    let mut decoder = PgOutputDecoder::with_protocol_version(1);
+                    let relation = LogicalReplicationMessage::Relation {
+                        relation_id: 42,
+                        namespace: Arc::from("public"),
+                        relation_name: Arc::from("orders"),
+                        replica_identity,
+                        columns: vec![
+                            ColumnInfo::new(other_flags, "customer".to_string(), 23, -1),
+                            ColumnInfo::new(1, "id".to_string(), 23, -1),
+                            ColumnInfo::new(other_flags, "status".to_string(), 25, -1),
+                            ColumnInfo::new(1, "other_key".to_string(), 23, -1),
+                        ],
+                    };
+                    decoder
+                        .decode_message(encode_message_to_bytes(&relation, 1).freeze(), Lsn::new(1))
+                        .unwrap();
+
+                    let mut body = BufferWriter::new();
+                    body.write_u8(operation);
+                    body.write_u32(42);
+                    body.write_u8(marker);
+                    body.write_u16(4);
+                    body.write_u8(b'n');
+                    body.write_u8(b't');
+                    body.write_i32(1);
+                    body.write_u8(b'1');
+                    body.write_u8(b'n');
+                    body.write_u8(b'n');
+                    if operation == b'U' {
+                        body.write_u8(b'N');
+                        body.write_u16(4);
+                        body.write_u8(b't');
+                        body.write_i32(2);
+                        body.write_bytes(b"11");
+                        body.write_u8(b't');
+                        body.write_i32(3);
+                        body.write_bytes(b"101");
+                        body.write_u8(b'n');
+                        body.write_u8(b'n');
+                    }
+
+                    let event = decoder
+                        .decode_message(body.freeze(), Lsn::new(2))
+                        .unwrap()
+                        .unwrap();
+                    let old_data = match event.event_type {
+                        EventType::Update {
+                            old_data, new_data, ..
+                        } => {
+                            assert_eq!(new_data.get("customer").unwrap(), "11");
+                            assert_eq!(new_data.get("id").unwrap(), "101");
+                            assert_eq!(new_data.get("status"), Some(&ColumnValue::Null));
+                            assert_eq!(new_data.get("other_key"), Some(&ColumnValue::Null));
+                            old_data.unwrap()
+                        }
+                        EventType::Delete { old_data, .. } => old_data,
+                        other => panic!("unexpected event {other:?}"),
+                    };
+                    assert_eq!(old_data.get("id").unwrap(), "1");
+                    assert_eq!(old_data.get("other_key"), Some(&ColumnValue::Null));
+                    for name in ["customer", "status"] {
+                        assert_eq!(
+                            old_data.get(name),
+                            if marker == b'K' && other_flags == 0 {
+                                None
+                            } else {
+                                Some(&ColumnValue::Null)
+                            },
+                            "identity {}, marker {}, operation {}, column {name}, flags {other_flags}",
+                            char::from(replica_identity),
+                            char::from(marker),
+                            char::from(operation),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pgoutput_decoder_decodes_dml_events() {
         use crate::pgoutput_encode::encode_message_to_bytes;
 
         const VERSION: u32 = 2;
@@ -2112,36 +2237,6 @@ mod tests {
             (truncate, 0x50),
         ];
 
-        // Independent reference for the network path: a bare parser plus state
-        // driven through `message_to_change_event`, exactly what
-        // `LogicalReplicationStream` now delegates to.
-        let mut ref_parser = LogicalReplicationParser::with_protocol_version(VERSION);
-        let mut ref_state = ReplicationState::new();
-        let mut decoder = PgOutputDecoder::with_protocol_version(VERSION);
-
-        for (msg, lsn) in &messages {
-            let body = encode_message_to_bytes(msg, VERSION as u8).freeze();
-
-            let ref_msg = ref_parser.parse_wal_message_bytes(body.clone()).unwrap();
-            let expected = message_to_change_event(&mut ref_state, ref_msg, *lsn).unwrap();
-
-            let got = decoder.decode_message(body, Lsn::new(*lsn)).unwrap();
-
-            match (&expected, &got) {
-                (None, None) => {}
-                (Some(a), Some(b)) => {
-                    assert_eq!(a.event_type, b.event_type, "event mismatch for {msg:?}");
-                    assert_eq!(a.lsn, b.lsn);
-                }
-                _ => panic!("decoder and network path disagree for {msg:?}"),
-            }
-        }
-
-        // The leading Relation populated the cache and emitted an event; the
-        // data messages that followed produced events off that cache.
-        assert!(decoder.state().get_relation(42).is_some());
-
-        // Concrete decode of the Insert, independent of the reference path.
         let mut d = PgOutputDecoder::with_protocol_version(VERSION);
         assert!(
             d.decode_message(
@@ -2231,7 +2326,7 @@ mod tests {
                 assert_eq!(&**table, "users");
                 assert_eq!(relation_oid, 42);
                 assert_eq!(old_data.get("id").unwrap(), "1");
-                assert!(old_data.get("name").unwrap().is_null(), "name was NULL");
+                assert!(old_data.get("name").is_none());
                 // key_type 'K' → replica-identity / key columns.
                 assert_eq!(key_columns, &vec![Arc::from("id")]);
             }

@@ -65,13 +65,8 @@ impl Context {
         }
         transform(&mut self.state, &input);
         let mut digest = [0u8; 16];
-        let mut j = 0;
-        for i in 0..4 {
-            digest[j] = (self.state[i] & 0xff) as u8;
-            digest[j + 1] = ((self.state[i] >> 8) & 0xff) as u8;
-            digest[j + 2] = ((self.state[i] >> 16) & 0xff) as u8;
-            digest[j + 3] = ((self.state[i] >> 24) & 0xff) as u8;
-            j += 4;
+        for (chunk, word) in digest.chunks_exact_mut(4).zip(self.state) {
+            chunk.copy_from_slice(&word.to_le_bytes());
         }
         digest
     }

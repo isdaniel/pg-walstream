@@ -9,16 +9,17 @@
 //!   - `wal_header_parse`     — Parsing the 25-byte WAL XLogData header
 //!   - `parse_begin`          — Full parse of a Begin message (header + payload)
 //!   - `parse_insert`         — Full parse of an Insert message with relation + tuple data
-//!   - `parse_insert_pipeline`— End-to-end: raw bytes → ChangeEvent for an Insert
+//!   - `parse_insert_pipeline`— WAL header and payload → parsed Insert message
 //!   - `parse_multi_column`   — Insert parsing with varying column counts (5, 10, 20, 50)
+//!   - `decode_dml`           — Cached relation + message bytes → `ChangeEvent`
 //!
 //! Run:
 //!   cargo bench --bench wal_pipeline
 
 use bytes::Bytes;
+use core::hint::black_box;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use pg_walstream::{BufferReader, LogicalReplicationParser};
-use std::hint::black_box;
 
 // ---------------------------------------------------------------------------
 // Helper: build raw WAL message bytes
@@ -623,6 +624,94 @@ fn bench_parse_transaction(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_decode_dml(c: &mut Criterion) {
+    use pg_walstream::{
+        encode_message_to_bytes, ColumnInfo, LogicalReplicationMessage, Lsn, PgOutputDecoder,
+    };
+
+    let mut group = c.benchmark_group("decode_dml");
+    group.throughput(criterion::Throughput::Elements(1));
+
+    for n_columns in [9usize, 32] {
+        let values = generate_column_values(n_columns);
+        let old_values: Vec<String> = values.iter().map(|value| format!("old_{value}")).collect();
+        let new_columns: Vec<Col<'_>> = values.iter().map(|s| Col::Text(s)).collect();
+
+        for (operation, old_marker, key_count) in [
+            ("insert", None, 1),
+            ("update_no_old", None, 1),
+            ("update_full", Some(b'O'), n_columns),
+            ("delete_full", Some(b'O'), n_columns),
+            ("update_key", Some(b'K'), 1),
+            ("delete_key", Some(b'K'), 1),
+            ("update_key", Some(b'K'), n_columns.min(17)),
+            ("delete_key", Some(b'K'), n_columns.min(17)),
+        ] {
+            let old_columns: Vec<Col<'_>> = old_values
+                .iter()
+                .enumerate()
+                .map(|(i, value)| {
+                    if i < key_count {
+                        Col::Text(value)
+                    } else {
+                        Col::Null
+                    }
+                })
+                .collect();
+            let mut payload = match operation {
+                "insert" => build_insert_cols(100, &new_columns),
+                "update_no_old" => build_update_payload(100, None, &new_columns),
+                "update_full" | "update_key" => {
+                    build_update_payload(100, Some(&old_columns), &new_columns)
+                }
+                "delete_full" | "delete_key" => build_delete_payload(100, &old_columns),
+                _ => unreachable!(),
+            };
+            if let Some(marker) = old_marker {
+                payload[5] = marker;
+            }
+            let payload = Bytes::from(payload);
+            let relation = LogicalReplicationMessage::Relation {
+                relation_id: 100,
+                namespace: "public".into(),
+                relation_name: "bench_table".into(),
+                replica_identity: if old_marker == Some(b'O') {
+                    b'f'
+                } else if key_count > 1 {
+                    b'i'
+                } else {
+                    b'd'
+                },
+                columns: (0..n_columns)
+                    .map(|i| ColumnInfo::new(u8::from(i < key_count), format!("col_{i}"), 25, -1))
+                    .collect(),
+            };
+            let relation = encode_message_to_bytes(&relation, 2).freeze();
+
+            group.bench_with_input(
+                BenchmarkId::new(operation, format!("{n_columns}cols_{key_count}keys")),
+                &payload,
+                |b, payload| {
+                    let mut decoder = PgOutputDecoder::with_protocol_version(2);
+                    decoder
+                        .decode_message(relation.clone(), Lsn::new(0x1000))
+                        .unwrap();
+                    b.iter(|| {
+                        black_box(
+                            decoder
+                                .decode_message(black_box(payload.clone()), Lsn::new(0x2000))
+                                .unwrap()
+                                .unwrap(),
+                        );
+                    });
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_buffer_reader_create,
@@ -637,5 +726,6 @@ criterion_group!(
     bench_parse_tuple_types,
     bench_parse_large_values,
     bench_parse_transaction,
+    bench_decode_dml,
 );
 criterion_main!(benches);
