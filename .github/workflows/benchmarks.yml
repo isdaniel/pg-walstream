@@ -15,10 +15,10 @@ jobs:
     name: CodSpeed
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup Rust toolchain + cargo-codspeed
-        uses: moonrepo/setup-rust@v0
+        uses: moonrepo/setup-rust@v1
         with:
           channel: stable
           cache-target: release
