@@ -20,3 +20,18 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           fuzz-seconds: 600
           mode: 'prune'
+      - name: Verify the corpus was uploaded
+        # cifuzz logs upload errors and still exits 0, so check the artifacts.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          for _ in 1 2 3 4 5 6; do
+            n=$(gh api "repos/$REPO/actions/runs/$RUN_ID/artifacts" \
+              --jq '[.artifacts[] | select(.name | startswith("cifuzz-corpus-"))] | length')
+            if [ "$n" -gt 0 ]; then echo "$n corpus artifact(s) uploaded"; exit 0; fi
+            sleep 5
+          done
+          echo "::error::this run uploaded no cifuzz-corpus-* artifact"
+          exit 1
