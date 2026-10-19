@@ -14,7 +14,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest]
+        os: [ubuntu-26.04]
         rust: [stable, beta]
 
     steps:
@@ -27,7 +27,7 @@ jobs:
         components: rustfmt, clippy
 
     - name: Install dependencies (Ubuntu)
-      if: matrix.os == 'ubuntu-latest'
+      if: matrix.os == 'ubuntu-26.04'
       run: |
         sudo apt-get update
         # Default backend is rustls-tls (aws-lc-rs) — needs only cmake + a C
@@ -71,7 +71,7 @@ jobs:
 
   libpq-backend:
     name: libpq backend (pq-sys, clean env)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
     - uses: actions/checkout@v4
 
@@ -110,7 +110,7 @@ jobs:
 
   examples:
     name: Examples build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # Examples are workspace-excluded, so nothing else in CI compiles them: a
     # signature change in the crate leaves them broken and silent until a user
     # copies one. Enumerated from the filesystem so a new example is picked up
@@ -164,7 +164,7 @@ jobs:
 
   coverage:
     name: Code Coverage
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
 
     steps:
     - uses: actions/checkout@v4
@@ -226,7 +226,7 @@ jobs:
 
   integration:
     name: Integration Tests (PG ${{ matrix.pg_version }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # The suite deliberately kills backends and drops connections mid-COPY, so a
     # hang is a plausible failure mode — and most tests carry no timeout of their
     # own. Without this a wedged read burns GitHub's 6h default on every cell of
@@ -401,7 +401,7 @@ jobs:
 
   integration-ssl:
     name: SSL Integration Tests (PG ${{ matrix.pg_version }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # See the `integration` job.
     timeout-minutes: 45
     needs: test

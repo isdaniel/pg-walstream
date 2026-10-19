@@ -12,7 +12,7 @@ env:
 jobs:
   formatting:
     name: Check Formatting
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
     - uses: actions/checkout@v4
     - uses: dtolnay/rust-toolchain@stable
@@ -39,7 +39,7 @@ jobs:
 
   unused-dependencies:
     name: Check Unused Dependencies
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
     - uses: actions/checkout@v4
     - uses: dtolnay/rust-toolchain@nightly
@@ -57,7 +57,7 @@ jobs:
 
   typos:
     name: Check for Typos
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
     - uses: actions/checkout@v4
     - uses: crate-ci/typos@v1.50.1

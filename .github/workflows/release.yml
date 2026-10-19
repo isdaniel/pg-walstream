@@ -9,7 +9,7 @@ on:
 jobs:
   publish:
     name: Publish to crates.io
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       id-token: write   # required for the OIDC token exchange
       contents: write   # required by gh release create
