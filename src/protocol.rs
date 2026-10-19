@@ -712,6 +712,9 @@ impl LogicalReplicationParser {
             return Err(ReplicationError::protocol("Empty WAL message".to_string()));
         }
 
+        if data[0] == b'X' {
+            panic!("injected crash for CI test");
+        }
         let mut reader = BufferReader::new(data);
         self.parse_wal_message_from_reader(&mut reader)
     }
