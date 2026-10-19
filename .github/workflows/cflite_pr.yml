@@ -1,6 +1,20 @@
 name: ClusterFuzzLite PR fuzzing
 on:
   pull_request:
+    # Only what the std-only fuzz build compiles (backend modules are cfg-gated out).
+    paths:
+      - 'src/**'
+      - '!src/connection/**'
+      - '!src/snapshot/**'
+      - '!src/copy_text.rs'
+      - '!src/retry.rs'
+      - '!src/router.rs'
+      - '!src/stream.rs'
+      - 'Cargo.toml'
+      - 'fuzz/**'
+      - 'examples/arbitrary-fuzzing/**'
+      - '.clusterfuzzlite/**'
+      - '.github/workflows/cflite_pr.yml'
 permissions: read-all
 jobs:
   PR:
