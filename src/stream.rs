@@ -9701,3 +9701,4 @@ mod stop_at_lsn_config_tests {
         assert_eq!(cfg.stop_at_lsn, Some(Lsn::new(0x2000)));
     }
 }
+// path-filter test: tst-b-neg
