@@ -13,7 +13,9 @@ permissions:
 jobs:
   benchmarks:
     name: CodSpeed
-    runs-on: ubuntu-latest
+    # CodSpeed's CLI rejects Ubuntu 26.04 ("Unsupported system"), which ubuntu-latest
+    # becomes by 2026-11-19. Move back to ubuntu-latest once it supports it.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
 
