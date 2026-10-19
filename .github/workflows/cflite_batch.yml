@@ -3,12 +3,14 @@ on:
   schedule:
     - cron: '0 06 * * *' # 06:00 UTC daily
   workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: Total fuzzing time in seconds, split across the targets
+        default: '3600'
 permissions: read-all
 jobs:
   BatchFuzzing:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -26,8 +28,24 @@ jobs:
         uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          fuzz-seconds: 3600
+          fuzz-seconds: ${{ inputs.fuzz_seconds || 3600 }}
           mode: 'batch'
           sanitizer: ${{ matrix.sanitizer }}
-          storage-repo: ${{ github.server_url }}/${{ github.repository }}.git
-          storage-repo-branch: clusterfuzzlite
+          # No storage-repo: the corpus is kept as GitHub artifacts. A same-repo git
+          # store has no push credentials and fails silently; keep every cflite
+          # workflow on the same store or PR runs never see the batch corpus.
+      - name: Verify the corpus was uploaded
+        # cifuzz logs upload errors and still exits 0, so check the artifacts.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          for _ in 1 2 3 4 5 6; do
+            n=$(gh api "repos/$REPO/actions/runs/$RUN_ID/artifacts" \
+              --jq '[.artifacts[] | select(.name | startswith("cifuzz-corpus-"))] | length')
+            if [ "$n" -gt 0 ]; then echo "$n corpus artifact(s) uploaded"; exit 0; fi
+            sleep 5
+          done
+          echo "::error::this run uploaded no cifuzz-corpus-* artifact"
+          exit 1
