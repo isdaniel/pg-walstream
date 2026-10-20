@@ -345,9 +345,10 @@ impl<'de> Deserialize<'de> for ColumnValue {
 /// ```
 ///
 /// pgoutput encodes an out-of-line (TOASTed) column that an UPDATE did not
-/// touch as `'u'`, which this crate drops from the row entirely. A SQL NULL is
-/// always materialised as [`ColumnValue::Null`], so "absent from the row" is an
-/// unambiguous encoding of "unchanged — reuse the value already in the target".
+/// touch as `'u'`, which this crate drops from the row entirely. Every other
+/// cell is kept, and both SQL NULLs and the NULL padding of a key-only old
+/// image are [`ColumnValue::Null`], so "absent from the row" is an unambiguous
+/// encoding of "unchanged, reuse the value already in the target".
 ///
 /// A sink must therefore build partial `UPDATE` statements from what the row
 /// actually contains (iterate, or check [`get`](Self::get) for `None`).

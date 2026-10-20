@@ -596,6 +596,10 @@ pub enum EventType {
         schema: Arc<str>,
         table: Arc<str>,
         relation_oid: u32,
+        /// Previous row, `None` when pgoutput sent no old tuple.
+        ///
+        /// Every column is present, and cells outside `key_columns` are `NULL` padding unless `replica_identity` is [`ReplicaIdentity::Full`].
+        /// Under `publish_via_partition_root` both describe the root, so a partition with another identity can break this.
         old_data: Option<RowData>,
         new_data: RowData,
         replica_identity: ReplicaIdentity,
@@ -605,6 +609,8 @@ pub enum EventType {
         schema: Arc<str>,
         table: Arc<str>,
         relation_oid: u32,
+        /// Every column is present, and cells outside `key_columns` are `NULL` padding unless `replica_identity` is [`ReplicaIdentity::Full`].
+        /// Under `publish_via_partition_root` both describe the root, so a partition with another identity can break this.
         old_data: RowData,
         replica_identity: ReplicaIdentity,
         key_columns: Vec<Arc<str>>,
@@ -812,7 +818,7 @@ impl ChangeEvent {
     /// * `schema_name` - Database schema name
     /// * `table_name` - Table name
     /// * `relation_oid` - PostgreSQL relation OID
-    /// * `old_data` - Previous row data (may be None depending on replica identity)
+    /// * `old_data` - Previous row data (see [`EventType::Update`] for which cells are meaningful)
     /// * `new_data` - New row data after update
     /// * `replica_identity` - Table's replica identity setting (affects old_data availability)
     /// * `key_columns` - Names of columns that form the replica identity key
@@ -840,8 +846,8 @@ impl ChangeEvent {
     ///     12345,
     ///     Some(old_data),
     ///     new_data,
-    ///     ReplicaIdentity::Default,
-    ///     vec![Arc::from("id")],
+    ///     ReplicaIdentity::Full,
+    ///     vec![Arc::from("id"), Arc::from("name")],
     ///     Lsn::new(0x16B374D848),
     /// );
     /// ```
@@ -878,7 +884,7 @@ impl ChangeEvent {
     /// * `schema_name` - Database schema name
     /// * `table_name` - Table name
     /// * `relation_oid` - PostgreSQL relation OID
-    /// * `old_data` - Deleted row data (columns available depend on replica identity)
+    /// * `old_data` - Deleted row data (see [`EventType::Delete`] for which cells are meaningful)
     /// * `replica_identity` - Table's replica identity setting
     /// * `key_columns` - Names of columns that form the replica identity key
     /// * `lsn` - Log Sequence Number for this event
@@ -900,7 +906,7 @@ impl ChangeEvent {
     ///     12345,
     ///     old_data,
     ///     ReplicaIdentity::Full,
-    ///     vec![Arc::from("id")],
+    ///     vec![Arc::from("id"), Arc::from("name")],
     ///     Lsn::new(0x16B374D848),
     /// );
     /// ```
