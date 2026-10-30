@@ -85,7 +85,7 @@ rustls-tls = [
 ]
 
 [dev-dependencies]
-tokio = { version = "1.54.1", features = ["full"] }
+tokio = { version = "1.54.1", features = ["full", "test-util"] }
 criterion = { package = "codspeed-criterion-compat", version = "5.0.3", features = ["html_reports"] }
 futures = "0.3.34"
 serde_bytes = "0.11.19"
@@ -208,6 +208,10 @@ path = "integration-tests/libpq_async_connect.rs"
 [[test]]
 name = "libpq_async_commands"
 path = "integration-tests/libpq_async_commands.rs"
+
+[[test]]
+name = "reconnect_recovery"
+path = "integration-tests/reconnect_recovery.rs"
 
 [[bench]]
 name = "wal_pipeline"

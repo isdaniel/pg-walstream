@@ -390,8 +390,9 @@ jobs:
             # `PQgetCopyData` on libpq, with nothing shared between the two. Each
             # backend sends `unread_stream_feedback`'s status update through its
             # own writer. `startup_metadata` drives each backend's own non-blocking
-            # startup path.
-            error_classification|upload_manifest|initial_snapshot|require_existing_slot|unread_stream_feedback|aligned_snapshot|startup_metadata)
+            # startup path. `reconnect_recovery` reconnects through each backend's own
+            # connect, identity check and START_REPLICATION.
+            error_classification|upload_manifest|initial_snapshot|require_existing_slot|unread_stream_feedback|aligned_snapshot|startup_metadata|reconnect_recovery)
               variants=("" "--no-default-features --features libpq") ;;
             *) variants=("") ;;
           esac

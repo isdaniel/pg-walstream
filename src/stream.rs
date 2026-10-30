@@ -1339,7 +1339,11 @@ impl LogicalReplicationStream {
         if !self.connection.is_alive() {
             warn!("Connection health check failed, attempting recovery");
 
-            match self.recover_connection().await {
+            // Boxed: reconnecting is cold, and awaiting it inline would make every
+            // retrying read future (`next_event_with_retry`, `EventStream::next_event`)
+            // carry the whole connect state machine, which callers then memcpy once
+            // per event.
+            match Box::pin(self.recover_connection()).await {
                 Ok(_) => {
                     info!("Connection recovered successfully");
                 }
@@ -1577,104 +1581,107 @@ impl LogicalReplicationStream {
         loop {
             attempt += 1;
 
-            match self.next_event_until(cancellation_token, boundary).await {
+            // Only the error leaves this statement. Matching with the arms' awaits inside
+            // would keep the whole `Result<Option<ChangeEvent>>` temporary alive across them,
+            // and callers memcpy that slot once per event.
+            let e = match self.next_event_until(cancellation_token, boundary).await {
                 Ok(event) => return Ok(event),
-                Err(e) => {
-                    // Cancellation and bounded-replay stop are terminal — never retry.
-                    if matches!(
-                        e,
-                        ReplicationError::Cancelled(_) | ReplicationError::StreamStopped(_)
-                    ) {
-                        debug!("Terminal signal, ending stream: {}", e);
-                        return Err(e);
-                    }
+                Err(e) => e,
+            };
 
-                    if e.is_permanent() {
-                        error!("Permanent error in event processing: {}", e);
-                        return Err(e);
-                    }
+            // Cancellation and bounded-replay stop are terminal — never retry.
+            if matches!(
+                e,
+                ReplicationError::Cancelled(_) | ReplicationError::StreamStopped(_)
+            ) {
+                debug!("Terminal signal, ending stream: {}", e);
+                return Err(e);
+            }
 
-                    // A decode failure on a *live* connection is not recoverable by
-                    // retrying: `next_event` has already consumed the offending frame,
-                    // so looping just reads the NEXT frame and returns that — silently
-                    // dropping a change the consumer never saw, while the received LSN
-                    // has already advanced past it. Surface it instead.
-                    //
-                    // Server-reported conditions do NOT reach this guard as
-                    // `Protocol`: `from_sqlstate` maps the transient ones (57P01
-                    // admin shutdown, 55006 slot busy, …) to `TransientConnection`,
-                    // which is not in the match below. And any error out of the COPY
-                    // read path clears the backend's liveness first — the native
-                    // worker stores `alive = false` for every non-cancelled error,
-                    // and the libpq backend reports `is_alive() == false` once
-                    // `copy_end` is latched — so `is_alive()` is already false by the
-                    // time a server error arrives here. What this guard actually
-                    // catches is parse-stage failures on a connection that is still
-                    // healthy. Unclassified SQLSTATEs still fall back to `Protocol`;
-                    // those genuinely are terminal here for the reason above.
-                    if self.connection.is_alive()
-                        && matches!(
-                            e,
-                            ReplicationError::Protocol(_)
-                                | ReplicationError::Buffer(_)
-                                | ReplicationError::Deserialize(_)
-                        )
-                    {
-                        error!("Unrecoverable decode error on a live connection: {}", e);
-                        return Err(e);
-                    }
+            if e.is_permanent() {
+                error!("Permanent error in event processing: {}", e);
+                return Err(e);
+            }
 
-                    // Check if we've exhausted retry attempts
-                    if attempt >= MAX_ATTEMPTS {
-                        error!(
-                            "Exhausted retry attempts ({}) for event processing: {}",
-                            MAX_ATTEMPTS, e
-                        );
-                        return Err(e);
-                    }
+            // A decode failure on a *live* connection is not recoverable by
+            // retrying: `next_event` has already consumed the offending frame,
+            // so looping just reads the NEXT frame and returns that — silently
+            // dropping a change the consumer never saw, while the received LSN
+            // has already advanced past it. Surface it instead.
+            //
+            // Server-reported conditions do NOT reach this guard as
+            // `Protocol`: `from_sqlstate` maps the transient ones (57P01
+            // admin shutdown, 55006 slot busy, …) to `TransientConnection`,
+            // which is not in the match below. And any error out of the COPY
+            // read path clears the backend's liveness first — the native
+            // worker stores `alive = false` for every non-cancelled error,
+            // and the libpq backend reports `is_alive() == false` once
+            // `copy_end` is latched — so `is_alive()` is already false by the
+            // time a server error arrives here. What this guard actually
+            // catches is parse-stage failures on a connection that is still
+            // healthy. Unclassified SQLSTATEs still fall back to `Protocol`;
+            // those genuinely are terminal here for the reason above.
+            if self.connection.is_alive()
+                && matches!(
+                    e,
+                    ReplicationError::Protocol(_)
+                        | ReplicationError::Buffer(_)
+                        | ReplicationError::Deserialize(_)
+                )
+            {
+                error!("Unrecoverable decode error on a live connection: {}", e);
+                return Err(e);
+            }
 
+            // Check if we've exhausted retry attempts
+            if attempt >= MAX_ATTEMPTS {
+                error!(
+                    "Exhausted retry attempts ({}) for event processing: {}",
+                    MAX_ATTEMPTS, e
+                );
+                return Err(e);
+            }
+
+            warn!(
+                "Transient error in event processing (attempt {}/{}): {}",
+                attempt, MAX_ATTEMPTS, e
+            );
+
+            // Attempt connection recovery if connection is dead
+            if !self.connection.is_alive() {
+                if let Err(recovery_err) = Box::pin(self.recover_connection()).await {
+                    // Only a *permanent* recovery failure ends the stream.
+                    // Returning on a transient one skipped the backoff
+                    // below and handed the consumer an error it would
+                    // immediately retry, at zero delay. The connection is
+                    // marked dead on this path, so the next attempt
+                    // re-enters recovery rather than reading from a socket
+                    // that never entered COPY mode.
+                    if recovery_err.is_permanent() || attempt >= MAX_ATTEMPTS {
+                        error!("Failed to recover connection: {}", recovery_err);
+                        return Err(recovery_err);
+                    }
                     warn!(
-                        "Transient error in event processing (attempt {}/{}): {}",
-                        attempt, MAX_ATTEMPTS, e
+                        "Connection recovery failed (attempt {}/{}), backing off: {}",
+                        attempt, MAX_ATTEMPTS, recovery_err
                     );
+                } else {
+                    info!("Connection recovered successfully");
+                }
+            }
 
-                    // Attempt connection recovery if connection is dead
-                    if !self.connection.is_alive() {
-                        if let Err(recovery_err) = self.recover_connection().await {
-                            // Only a *permanent* recovery failure ends the stream.
-                            // Returning on a transient one skipped the backoff
-                            // below and handed the consumer an error it would
-                            // immediately retry, at zero delay. The connection is
-                            // marked dead on this path, so the next attempt
-                            // re-enters recovery rather than reading from a socket
-                            // that never entered COPY mode.
-                            if recovery_err.is_permanent() || attempt >= MAX_ATTEMPTS {
-                                error!("Failed to recover connection: {}", recovery_err);
-                                return Err(recovery_err);
-                            }
-                            warn!(
-                                "Connection recovery failed (attempt {}/{}), backing off: {}",
-                                attempt, MAX_ATTEMPTS, recovery_err
-                            );
-                        } else {
-                            info!("Connection recovered successfully");
-                        }
-                    }
+            // Exponential backoff before retry
+            let delay = Duration::from_millis(1000 * (1 << (attempt - 1)));
+            debug!("Waiting {:?} before retry attempt {}", delay, attempt + 1);
 
-                    // Exponential backoff before retry
-                    let delay = Duration::from_millis(1000 * (1 << (attempt - 1)));
-                    debug!("Waiting {:?} before retry attempt {}", delay, attempt + 1);
-
-                    // Use tokio::select! to allow cancellation during backoff
-                    tokio::select! {
-                        biased;
-                        _ = tokio::time::sleep(delay) => {},
-                        _ = cancellation_token.cancelled() => {
-                            return Err(ReplicationError::cancelled(
-                                "Operation cancelled during retry backoff"
-                            ));
-                        }
-                    }
+            // Use tokio::select! to allow cancellation during backoff
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep(delay) => {},
+                _ = cancellation_token.cancelled() => {
+                    return Err(ReplicationError::cancelled(
+                        "Operation cancelled during retry backoff"
+                    ));
                 }
             }
         }
@@ -2647,27 +2654,32 @@ impl EventStream {
 
     /// [`LogicalReplicationStream::next_event_before`] with this stream's retry and recovery.
     pub async fn next_event_before(&mut self, boundary: Lsn) -> Result<Option<ChangeEvent>> {
-        let event = match self.held.take() {
-            Some(event) => event,
-            None => match self.resume_parked_poll().await {
-                Some(result) => result?,
-                None => {
-                    let inner = self
-                        .state
-                        .stream_mut()
-                        .expect("Polling was handled above, so the stream is in hand");
-                    return inner
-                        .next_event_with_retry_until(&self.cancellation_token, Some(boundary))
-                        .await;
-                }
-            },
-        };
-        // A held event or one a parked poll read without the boundary.
+        // Each early read is its own statement that returns, so its event-sized
+        // temporary is gone before the next `.await`. Matching them as one expression
+        // kept both alive across the final read: ~2 KB in a future callers move.
+        if let Some(event) = self.held.take() {
+            return Ok(self.deliver_unless_past(event, boundary));
+        }
+        if let Some(result) = self.resume_parked_poll().await {
+            return Ok(self.deliver_unless_past(result?, boundary));
+        }
+        let inner = self
+            .state
+            .stream_mut()
+            .expect("Polling was handled above, so the stream is in hand");
+        inner
+            .next_event_with_retry_until(&self.cancellation_token, Some(boundary))
+            .await
+    }
+
+    /// An event read without the boundary (held, or from an abandoned poll): hand it over
+    /// unless its commit is at or past `boundary`, in which case keep it for the next read.
+    fn deliver_unless_past(&mut self, event: ChangeEvent, boundary: Lsn) -> Option<ChangeEvent> {
         if event.event_type.commit_lsn().is_some_and(|c| c >= boundary) {
             self.held = Some(event);
-            return Ok(None);
+            return None;
         }
-        Ok(Some(event))
+        Some(event)
     }
 
     /// Await a poll future that `poll_next` parked and its caller abandoned, taking the stream back.
@@ -5435,6 +5447,145 @@ pub(crate) mod tests {
         );
     }
 
+    /// A stream whose reads fail (the test connection is never in COPY mode) and whose
+    /// recovery fails at once and transiently, with no network: an exhausted
+    /// `max_duration` makes the reconnect give up before its first attempt.
+    fn stream_that_cannot_read_or_reconnect() -> LogicalReplicationStream {
+        let retry = RetryConfig {
+            max_duration: Duration::ZERO,
+            ..RetryConfig::default()
+        };
+        create_test_stream(ReplicationStreamConfig::builder("slot", "pub").with_retry_config(retry))
+    }
+
+    /// The loop makes three attempts with a 1 s then a 2 s backoff between them, retries
+    /// through a failed recovery, and hands the last read error back.
+    #[tokio::test(start_paused = true)]
+    async fn next_event_with_retry_backs_off_and_gives_up_after_three_attempts() {
+        let mut stream = stream_that_cannot_read_or_reconnect();
+        let token = CancellationToken::new();
+        let started = tokio::time::Instant::now();
+
+        let err = stream.next_event_with_retry(&token).await.unwrap_err();
+
+        assert!(
+            matches!(err, ReplicationError::Protocol(_)),
+            "the last read error comes back, not the recovery error or a cancellation: {err:?}"
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_secs(3) && waited < Duration::from_millis(3100),
+            "1 s + 2 s of backoff between three attempts, waited {waited:?}"
+        );
+    }
+
+    /// Cancelling while the loop sleeps between attempts ends it at once, not after the delay.
+    #[tokio::test(start_paused = true)]
+    async fn next_event_with_retry_backoff_ends_on_cancellation() {
+        let mut stream = stream_that_cannot_read_or_reconnect();
+        let token = CancellationToken::new();
+        let started = tokio::time::Instant::now();
+        let cancel_midway = async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            token.cancel();
+        };
+
+        let (result, ()) = tokio::join!(stream.next_event_with_retry(&token), cancel_midway);
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, ReplicationError::Cancelled(m) if m.contains("retry backoff")),
+            "expected the cancellation raised from the backoff, got {err:?}"
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_secs(1),
+            "cancelled at 500 ms, yet waited {waited:?}"
+        );
+    }
+
+    /// The server-side `ErrorResponse` a COPY stream ends with, as the wire carries it.
+    #[cfg(feature = "rustls-tls")]
+    fn error_response(sqlstate: &str, message: &str) -> Vec<u8> {
+        let fields = format!("SERROR\0C{sqlstate}\0M{message}\0\0");
+        let mut frame = vec![b'E'];
+        frame.extend_from_slice(&((4 + fields.len()) as i32).to_be_bytes());
+        frame.extend_from_slice(fields.as_bytes());
+        frame
+    }
+
+    /// A permanent error out of the COPY stream (`42704`: the slot is gone) ends the loop
+    /// on the first attempt. Retrying cannot help, and recovery would only reconnect into
+    /// the same failure. A real worker and socket carry the error, so this is the path a
+    /// live server takes. Real time, because a paused clock would jump ahead while the
+    /// worker thread is still reading; a retry would sit out a 1 s and a 2 s backoff.
+    #[cfg(feature = "rustls-tls")]
+    #[tokio::test]
+    async fn next_event_with_retry_returns_a_permanent_read_error_without_retrying() {
+        use std::io::Write;
+        let (connection, mut server) = PgReplicationConnection::silent_replication_for_testing();
+        let mut stream = stream_that_cannot_read_or_reconnect();
+        stream.connection = connection;
+        server
+            .write_all(&error_response(
+                "42704",
+                "replication slot \"slot\" does not exist",
+            ))
+            .unwrap();
+        let token = CancellationToken::new();
+        let started = std::time::Instant::now();
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(20),
+            stream.next_event_with_retry(&token),
+        )
+        .await
+        .expect("the error must reach the loop, not leave it waiting")
+        .unwrap_err();
+
+        assert!(
+            matches!(err, ReplicationError::ReplicationSlot(_)),
+            "the server's error comes back as it was classified: {err:?}"
+        );
+        assert!(err.is_permanent());
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_secs(2),
+            "a permanent error must not wait out a backoff, waited {waited:?}"
+        );
+    }
+
+    /// A frame that fails to decode on a connection that is still up is surfaced, not
+    /// retried: the bad frame is already consumed, so a retry would read the next one and
+    /// silently skip a change. The paused clock shows no backoff was started.
+    #[cfg(feature = "rustls-tls")]
+    #[tokio::test(start_paused = true)]
+    async fn next_event_with_retry_surfaces_a_decode_error_on_a_live_connection() {
+        let retry = RetryConfig {
+            max_duration: Duration::ZERO,
+            ..RetryConfig::default()
+        };
+        let config = ReplicationStreamConfig::builder("slot", "pub").with_retry_config(retry);
+        // One byte is too short to be an XLogData header.
+        let mut stream =
+            create_test_stream_with_frames(config, vec![bytes::Bytes::from_static(b"w")]);
+        stream.connection.set_alive_for_testing(true);
+        let token = CancellationToken::new();
+        let started = tokio::time::Instant::now();
+
+        let err = stream.next_event_with_retry(&token).await.unwrap_err();
+
+        assert!(
+            matches!(err, ReplicationError::Protocol(_)),
+            "the decode error itself comes back: {err:?}"
+        );
+        assert_eq!(
+            started.elapsed(),
+            Duration::ZERO,
+            "a decode error on a live connection must not be retried"
+        );
+    }
+
     #[tokio::test]
     async fn event_stream_terminates_none_on_stream_stopped() {
         use futures::StreamExt;
@@ -5447,6 +5598,35 @@ pub(crate) mod tests {
 
         assert!(es.next().await.is_none(), "StreamStopped should yield None");
         assert!(es.is_terminated(), "stream should mark itself terminated");
+    }
+
+    /// Callers move the `next_event` future once per event (`timeout`, `select!`, a
+    /// `Stream` adapter), so its size is a per-event cost, and `stream.rs` is outside
+    /// every benchmark. Two things have inflated it: reconnect state awaited inline
+    /// (several KB) and a `ChangeEvent`-sized value held across an await in the retry
+    /// loop (about 1 KB). The limit sits below the second, so either one fails this.
+    #[test]
+    fn read_path_futures_stay_small() {
+        const LIMIT: usize = 1024;
+        let mut stream = create_test_stream(create_test_config());
+        let token = CancellationToken::new();
+        let boundary = Lsn::new(0x100);
+        let plain = std::mem::size_of_val(&stream.next_event(&token));
+        let retry = std::mem::size_of_val(&stream.next_event_with_retry(&token));
+        let before = std::mem::size_of_val(&stream.next_event_before(boundary, &token));
+        let mut es = stream.into_stream(token);
+        let event_stream = std::mem::size_of_val(&es.next_event());
+        let event_stream_before = std::mem::size_of_val(&es.next_event_before(boundary));
+
+        for (name, size) in [
+            ("LogicalReplicationStream::next_event", plain),
+            ("LogicalReplicationStream::next_event_with_retry", retry),
+            ("LogicalReplicationStream::next_event_before", before),
+            ("EventStream::next_event", event_stream),
+            ("EventStream::next_event_before", event_stream_before),
+        ] {
+            assert!(size <= LIMIT, "{name} future grew to {size} bytes");
+        }
     }
 
     #[test]
@@ -9127,6 +9307,51 @@ pub(crate) mod tests {
             below.unwrap().event_type.commit_lsn(),
             Some(Lsn::new(0x100))
         );
+    }
+
+    /// A commit exactly at the boundary belongs after it: the boundary is the consistent
+    /// point of a copy, which already contains everything committed before it and nothing
+    /// at or after it. One LSN below is delivered, the boundary itself is held.
+    #[tokio::test]
+    async fn event_stream_holds_a_parked_commit_exactly_at_the_boundary() {
+        let boundary = Lsn::new(0x200);
+        let mut events =
+            create_test_stream(create_test_config()).into_stream(CancellationToken::new());
+
+        events.state.park_with_result(Ok(begin_event(0x1ff)));
+        let below = events.next_event_before(boundary).await.unwrap();
+        assert_eq!(
+            below.unwrap().event_type.commit_lsn(),
+            Some(Lsn::new(0x1ff)),
+            "one below the boundary is still before it"
+        );
+
+        events.state.park_with_result(Ok(begin_event(0x200)));
+        assert!(
+            events.next_event_before(boundary).await.unwrap().is_none(),
+            "a commit at the boundary must be held back"
+        );
+        let held = events.next_event().await.unwrap();
+        assert_eq!(held.event_type.commit_lsn(), Some(boundary));
+    }
+
+    /// An abandoned poll that ended in an error hands that error to the next read, and the
+    /// stream is back in hand for the one after.
+    #[tokio::test]
+    async fn event_stream_surfaces_the_error_of_a_parked_poll() {
+        let mut events =
+            create_test_stream(create_test_config()).into_stream(CancellationToken::new());
+        events
+            .state
+            .park_with_result(Err(ReplicationError::protocol("parked failure")));
+
+        let err = events.next_event_before(Lsn::new(0x200)).await.unwrap_err();
+
+        assert!(
+            matches!(&err, ReplicationError::Protocol(m) if m == "parked failure"),
+            "{err:?}"
+        );
+        assert!(!events.state.is_polling(), "the stream must be taken back");
     }
 
     #[tokio::test]
