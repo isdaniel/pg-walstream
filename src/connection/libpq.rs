@@ -351,49 +351,37 @@ fn is_unix_socket_host(host: &str) -> bool {
     host.starts_with('/') || host.starts_with('@')
 }
 
-/// Resolve each server's name into one target per address, keeping `host` for TLS verification and passfile lookup.
+/// Resolve one server's name into one target per address, keeping `host` for TLS verification and passfile lookup.
 ///
-/// Returns the targets grouped by server, and libpq-style messages for names that did not resolve.
-async fn resolve_slots(slots: Vec<ConnectTarget>) -> (Vec<Vec<ConnectTarget>>, String) {
-    let mut servers = Vec::with_capacity(slots.len());
-    let mut errors = String::new();
-    for slot in slots {
-        let name = match (&slot.host, &slot.hostaddr) {
-            (Some(host), None)
-                if !host.is_empty()
-                    && !is_unix_socket_host(host)
-                    && host.parse::<std::net::IpAddr>().is_err() =>
-            {
-                host.clone()
-            }
-            _ => {
-                servers.push(vec![slot]);
-                continue;
-            }
-        };
-        let resolved = tokio::net::lookup_host((name.as_str(), 0)).await;
-        match resolved {
-            Ok(addresses) => {
-                let targets: Vec<ConnectTarget> = addresses
-                    .map(|address| ConnectTarget {
-                        hostaddr: Some(address.ip().to_string()),
-                        ..slot.clone()
-                    })
-                    .collect();
-                if targets.is_empty() {
-                    errors.push_str(&format!(
-                        "could not translate host name \"{name}\" to address: no addresses\n"
-                    ));
-                } else {
-                    servers.push(targets);
-                }
-            }
-            Err(e) => errors.push_str(&format!(
-                "could not translate host name \"{name}\" to address: {e}\n"
-            )),
+/// A server that is not a name (a socket directory, an IP address, or an explicit `hostaddr`) is its own single target. A name that does not resolve gives libpq's message.
+async fn resolve_server(slot: &ConnectTarget) -> std::result::Result<Vec<ConnectTarget>, String> {
+    let name = match (&slot.host, &slot.hostaddr) {
+        (Some(host), None)
+            if !host.is_empty()
+                && !is_unix_socket_host(host)
+                && host.parse::<std::net::IpAddr>().is_err() =>
+        {
+            host
         }
+        _ => return Ok(vec![slot.clone()]),
+    };
+    let untranslated = |why: &dyn std::fmt::Display| {
+        format!("could not translate host name \"{name}\" to address: {why}\n")
+    };
+    let addresses = tokio::net::lookup_host((name.as_str(), 0))
+        .await
+        .map_err(|e| untranslated(&e))?;
+    let targets: Vec<ConnectTarget> = addresses
+        .map(|address| ConnectTarget {
+            hostaddr: Some(address.ip().to_string()),
+            ..slot.clone()
+        })
+        .collect();
+    if targets.is_empty() {
+        Err(untranslated(&"no addresses"))
+    } else {
+        Ok(targets)
     }
-    (servers, errors)
 }
 
 /// Shuffle in place for `load_balance_hosts=random`, seeded per call by the standard library's hasher keys.
@@ -409,27 +397,90 @@ fn shuffle<T>(items: &mut [T]) {
     }
 }
 
-/// Every attempt in order. `prefer-standby` tries every address as a standby first, then every address in any mode, as libpq's two passes do.
-fn plan_attempts(servers: Vec<Vec<ConnectTarget>>, prefer_standby: bool) -> Vec<ConnectAttempt> {
-    let targets: Vec<ConnectTarget> = servers.into_iter().flatten().collect();
-    let attempt = |session_attrs| {
-        move |target| ConnectAttempt {
-            target,
-            session_attrs,
+/// The attempts of one connect in libpq's order, produced lazily: a server's name is resolved only when its turn comes, as `PQconnectPoll` does, so a slow lookup costs nothing until that server is reached.
+///
+/// `prefer-standby` makes two passes over the servers, every address as a standby first and then in any mode, and the second pass reuses what the first resolved.
+struct AttemptPlan {
+    servers: Vec<ConnectTarget>,
+    /// Each server's addresses once resolved, empty when its name did not resolve.
+    addresses: Vec<Option<Vec<ConnectTarget>>>,
+    /// The `target_session_attrs` of each pass, `None` leaving the conninfo's own.
+    passes: &'static [Option<&'static CStr>],
+    /// `load_balance_hosts=random` shuffles a server's addresses as they resolve.
+    random: bool,
+    pass: usize,
+    server: usize,
+    address: usize,
+    /// libpq-style messages of names that did not resolve and attempts that failed, in the order they happened.
+    errors: String,
+    /// The message of the last failed attempt, which a failure every attempt shares repeats.
+    last_failure: String,
+}
+
+impl AttemptPlan {
+    /// `load_balance_hosts=random` shuffles the servers here, as libpq does before it resolves any.
+    fn new(mut servers: Vec<ConnectTarget>, random: bool, prefer_standby: bool) -> Self {
+        if random {
+            shuffle(&mut servers);
         }
-    };
-    if prefer_standby {
-        let standby: Vec<ConnectAttempt> = targets
-            .iter()
-            .cloned()
-            .map(attempt(Some(c"standby")))
-            .collect();
-        standby
-            .into_iter()
-            .chain(targets.into_iter().map(attempt(Some(c"any"))))
-            .collect()
-    } else {
-        targets.into_iter().map(attempt(None)).collect()
+        let passes: &'static [Option<&'static CStr>] = if prefer_standby {
+            &[Some(c"standby"), Some(c"any")]
+        } else {
+            &[None]
+        };
+        Self {
+            addresses: vec![None; servers.len()],
+            servers,
+            passes,
+            random,
+            pass: 0,
+            server: 0,
+            address: 0,
+            errors: String::new(),
+            last_failure: String::new(),
+        }
+    }
+
+    /// Records a failed attempt. An option every attempt shares fails each one with the same message, which libpq reports once.
+    fn failed(&mut self, message: &str) {
+        if self.last_failure != message {
+            self.errors.push_str(message);
+            self.last_failure = message.to_owned();
+        }
+    }
+
+    /// The next attempt, resolving a server's name the first time it is reached. `None` once every pass has run.
+    async fn next(&mut self) -> Option<ConnectAttempt> {
+        loop {
+            let session_attrs = *self.passes.get(self.pass)?;
+            if self.server == self.servers.len() {
+                (self.pass, self.server, self.address) = (self.pass + 1, 0, 0);
+                continue;
+            }
+            let server = self.server;
+            if self.addresses[server].is_none() {
+                let mut resolved =
+                    resolve_server(&self.servers[server])
+                        .await
+                        .unwrap_or_else(|message| {
+                            self.errors.push_str(&message);
+                            Vec::new()
+                        });
+                if self.random {
+                    shuffle(&mut resolved);
+                }
+                self.addresses[server] = Some(resolved);
+            }
+            let addresses = self.addresses[server].as_deref().unwrap_or_default();
+            if let Some(target) = addresses.get(self.address) {
+                self.address += 1;
+                return Some(ConnectAttempt {
+                    target: target.clone(),
+                    session_attrs,
+                });
+            }
+            (self.server, self.address) = (server + 1, 0);
+        }
     }
 }
 
@@ -699,7 +750,7 @@ impl PgReplicationConnection {
 
     /// Non-blocking [`connect`](Self::connect), driving `PQconnectPoll` on `AsyncFd` socket readiness. Dropping the future closes the half-open connection.
     ///
-    /// `PQconnectPoll` leaves `connect_timeout` and multi-host failover to its caller, so this runs `PQconnectdb`'s attempt loop itself: one attempt per address, each with its own `connect_timeout`, in libpq's order, honouring `load_balance_hosts` and `target_session_attrs=prefer-standby`. Host names resolve through tokio, so no `getaddrinfo` blocks the calling thread. Two differences remain. After an authentication failure the next address is still tried, because a failed connection exposes no SQLSTATE. A host list that only a conninfo's `service` file supplies is one attempt under one deadline.
+    /// `PQconnectPoll` leaves `connect_timeout` and multi-host failover to its caller, so this runs `PQconnectdb`'s attempt loop itself: one attempt per address, each with its own `connect_timeout`, in libpq's order, honouring `load_balance_hosts` and `target_session_attrs=prefer-standby`. Host names resolve through tokio, so no `getaddrinfo` blocks the calling thread, and each resolves when its server's turn comes, as in libpq, so a slow name later in the list does not delay the hosts before it. Two differences remain. After an authentication failure the next address is still tried, because a failed connection exposes no SQLSTATE. A host list that only a conninfo's `service` file supplies is one attempt under one deadline.
     pub async fn connect_async(conninfo: &str) -> Result<Self> {
         let libpq_version = unsafe { PQlibVersion() };
         debug!("Using libpq version: {}", libpq_version);
@@ -710,13 +761,13 @@ impl PgReplicationConnection {
         let timeout = connect_timeout(options.connect_timeout.as_deref(), libpq_version)
             .map_err(Self::classify_connect_error)?;
 
-        let (attempts, mut errors) = if options.service {
+        let mut plan = if options.service {
             let whole = ConnectTarget {
                 host: None,
                 hostaddr: None,
                 port: None,
             };
-            (plan_attempts(vec![vec![whole]], false), String::new())
+            AttemptPlan::new(vec![whole], false, false)
         } else {
             let slots = connect_slots(
                 options.host.as_deref(),
@@ -724,25 +775,21 @@ impl PgReplicationConnection {
                 options.port.as_deref(),
             )
             .map_err(Self::classify_connect_error)?;
-            let (mut servers, errors) = resolve_slots(slots).await;
-            if options.load_balance_hosts.as_deref() == Some("random") {
-                shuffle(&mut servers);
-                servers.iter_mut().for_each(|addresses| shuffle(addresses));
-            }
-            let prefer_standby = options.target_session_attrs.as_deref() == Some("prefer-standby");
-            (plan_attempts(servers, prefer_standby), errors)
+            AttemptPlan::new(
+                slots,
+                options.load_balance_hosts.as_deref() == Some("random"),
+                options.target_session_attrs.as_deref() == Some("prefer-standby"),
+            )
         };
 
-        for attempt in &attempts {
-            match Self::connect_attempt(&options, attempt, timeout).await {
+        while let Some(attempt) = plan.next().await {
+            match Self::connect_attempt(&options, &attempt, timeout).await {
                 Ok(conn) => return Self::from_established(conn),
                 Err(AttemptFailure::Unallocated(e)) => return Err(e),
-                // An option every attempt shares fails each attempt with one message, which libpq reports once.
-                Err(AttemptFailure::Failed(message)) if errors.ends_with(&message) => {}
-                Err(AttemptFailure::Failed(message)) => errors.push_str(&message),
+                Err(AttemptFailure::Failed(message)) => plan.failed(&message),
             }
         }
-        Err(Self::classify_connect_error(errors))
+        Err(Self::classify_connect_error(plan.errors))
     }
 
     /// One `PQconnectStartParams` and `PQconnectPoll` loop against a single attempt's server, under its own deadline.
@@ -3759,25 +3806,43 @@ mod tests {
         );
     }
 
+    /// A plan over servers whose addresses are already known, so no name is resolved.
+    fn resolved_plan(servers: Vec<Vec<ConnectTarget>>, prefer_standby: bool) -> AttemptPlan {
+        let mut plan = AttemptPlan::new(
+            servers
+                .iter()
+                .map(|addresses| addresses[0].clone())
+                .collect(),
+            false,
+            prefer_standby,
+        );
+        plan.addresses = servers.into_iter().map(Some).collect();
+        plan
+    }
+
     /// `prefer-standby` tries every address as a standby first, then every address again in any mode.
-    #[test]
-    fn prefer_standby_plans_a_standby_pass_before_an_any_pass() {
+    #[tokio::test]
+    async fn prefer_standby_plans_a_standby_pass_before_an_any_pass() {
         let a1 = target(Some("a"), Some("10.0.0.1"), None);
         let a2 = target(Some("a"), Some("10.0.0.2"), None);
         let b = target(Some("b"), Some("10.0.0.3"), None);
         let addresses = vec![vec![a1.clone(), a2.clone()], vec![b.clone()]];
         let plan = |prefer_standby| {
-            plan_attempts(addresses.clone(), prefer_standby)
-                .into_iter()
-                .map(|attempt| (attempt.target, attempt.session_attrs))
-                .collect::<Vec<_>>()
+            let mut plan = resolved_plan(addresses.clone(), prefer_standby);
+            async move {
+                let mut attempts = Vec::new();
+                while let Some(attempt) = plan.next().await {
+                    attempts.push((attempt.target, attempt.session_attrs));
+                }
+                attempts
+            }
         };
         assert_eq!(
-            plan(false),
+            plan(false).await,
             vec![(a1.clone(), None), (a2.clone(), None), (b.clone(), None)]
         );
         assert_eq!(
-            plan(true),
+            plan(true).await,
             vec![
                 (a1.clone(), Some(c"standby")),
                 (a2.clone(), Some(c"standby")),
@@ -3787,6 +3852,80 @@ mod tests {
                 (b, Some(c"any")),
             ]
         );
+    }
+
+    /// An option every attempt shares is recorded once even when a name that did not resolve falls between two attempts.
+    #[test]
+    fn a_shared_failure_is_recorded_once_around_an_unresolved_name() {
+        let mut plan = AttemptPlan::new(vec![target(Some("a"), None, None)], false, false);
+        let unresolved = "could not translate host name \"b\" to address: no such host\n";
+        plan.failed("invalid sslmode value\n");
+        plan.errors.push_str(unresolved);
+        plan.failed("invalid sslmode value\n");
+        assert_eq!(plan.errors, format!("invalid sslmode value\n{unresolved}"));
+    }
+
+    /// Runs `body` on a current-thread runtime whose only blocking thread is held for `hold`, so a name lookup queues behind it as it would behind a slow resolver.
+    fn with_slow_name_lookups<F: std::future::Future>(hold: Duration, body: F) -> F::Output {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let output = rt.block_on(async {
+            drop(tokio::task::spawn_blocking(move || {
+                std::thread::sleep(hold)
+            }));
+            body.await
+        });
+        rt.shutdown_background();
+        output
+    }
+
+    /// A name later in the list is resolved only when its turn comes, as `PQconnectPoll` does, so a slow lookup cannot delay a host that comes first.
+    #[test]
+    fn connect_async_tries_the_first_host_before_resolving_a_later_name() {
+        with_slow_name_lookups(Duration::from_secs(2), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let conninfo = format!(
+                "host=127.0.0.1,localhost port={port},{port} dbname=lazy user=lazy sslmode=disable gssencmode=disable connect_timeout=1"
+            );
+            let connect = tokio::spawn(async move {
+                PgReplicationConnection::connect_async(&conninfo)
+                    .await
+                    .map(drop)
+            });
+            tokio::time::timeout(Duration::from_secs(1), listener.accept())
+                .await
+                .expect("the first host waited for the later name's lookup")
+                .unwrap();
+            connect.abort();
+        });
+    }
+
+    /// A slow name lookup leaves the executor free, so an enclosing timeout fires on time.
+    #[test]
+    fn connect_async_does_not_block_the_executor_while_a_name_resolves() {
+        with_slow_name_lookups(Duration::from_secs(2), async {
+            let start = std::time::Instant::now();
+            let outcome = tokio::time::timeout(
+                Duration::from_millis(200),
+                PgReplicationConnection::connect_async(
+                    "host=localhost port=1 dbname=lazy user=lazy sslmode=disable gssencmode=disable",
+                ),
+            )
+            .await;
+            assert!(
+                outcome.is_err(),
+                "the lookup is queued, so the connect cannot have finished"
+            );
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "the timeout fired after {:?}: the executor was blocked",
+                start.elapsed()
+            );
+        });
     }
 
     // === PgResult::get_bytes / get_bytes_owned ===
