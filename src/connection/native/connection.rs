@@ -1929,6 +1929,22 @@ impl NativeConnection {
         conn
     }
 
+    /// Test-only: a [`silent_for_testing`](Self::silent_for_testing) connection already in
+    /// COPY mode. Its reads go to the real worker and socket, so whatever the caller writes
+    /// to the returned server end (an `ErrorResponse`, say) comes out of
+    /// `get_copy_data_async` exactly as it would from a live server.
+    pub(crate) fn silent_replication_for_testing() -> (Self, std::net::TcpStream) {
+        let (mut conn, peer) = Self::silent_for_testing();
+        conn.copy = CopyMode::Replication;
+        (conn, peer)
+    }
+
+    /// Test-only: force the liveness flag the worker normally maintains, for paths that
+    /// branch on `is_alive()` (a null connection never reports alive).
+    pub(crate) fn set_alive_for_testing(&self, alive: bool) {
+        self.alive.store(alive, Ordering::Relaxed);
+    }
+
     /// Test-only: whether this connection uses the inline driver.
     fn driver_is_inline(&self) -> bool {
         matches!(self.driver, Driver::Inline { .. })
