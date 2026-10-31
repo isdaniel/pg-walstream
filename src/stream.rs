@@ -53,6 +53,8 @@ pub struct LogicalReplicationStream {
     held: Option<HeldFrame>,
     /// The last keepalive's `wal_end` on this connection: every commit below it has been delivered.
     keepalive_wal_end: Lsn,
+    /// Raised when a reconnect starts and lowered when one succeeds, so a reconnect a caller dropped mid-way leaves it raised.
+    recovering: bool,
 }
 
 /// A `'w'` frame held back at a boundary, with the commit position that stopped it.
@@ -250,8 +252,22 @@ impl ServerIdentity {
     }
 
     /// Identify the server on the far end of `connection`.
-    async fn identify(connection: &mut PgReplicationConnection) -> Result<Self> {
+    pub(crate) async fn identify(connection: &mut PgReplicationConnection) -> Result<Self> {
         Self::from_identify_system(&connection.identify_system_async().await?)
+    }
+
+    /// Fail permanently unless `other`, read on a second connection opened for this stream, names the same cluster and timeline.
+    ///
+    /// A conninfo with several hosts can land the second connection on another cluster, whose WAL positions mean nothing to this stream.
+    pub(crate) fn ensure_same_server(&self, other: &Self) -> Result<()> {
+        if self == other {
+            return Ok(());
+        }
+        Err(ReplicationError::permanent_connection(format!(
+            "a side connection reached system {} on timeline {}, but the stream runs on system {} \
+             on timeline {}; its positions would not match the stream's",
+            other.system_id, other.timeline, self.system_id, self.timeline
+        )))
     }
 }
 
@@ -449,7 +465,7 @@ impl ReplicationStreamConfig {
     /// * `streaming_mode` - Streaming mode for logical decoding (off/on/parallel).
     ///   `on` requires protocol version >= 2; `parallel` requires protocol version >= 4.
     /// * `feedback_interval` - How often to send status feedback to PostgreSQL
-    /// * `connection_timeout` - Maximum time to wait for connection establishment
+    /// * `connection_timeout` - Time budget for connecting: the per-address `connect_timeout`, and the limit on retries between attempts. See [`with_connection_timeout`](Self::with_connection_timeout)
     /// * `health_check_interval` - How often to check connection health
     /// * `retry_config` - Configuration for connection retry behavior
     ///
@@ -674,7 +690,9 @@ impl ReplicationStreamConfig {
         self
     }
 
-    /// Set the connection establishment timeout.
+    /// Set the connection time budget.
+    ///
+    /// It is each address's `connect_timeout` (unless the connection string sets one) and it stops the retries between attempts once spent, but an attempt in flight is never cut short, so a host name with several addresses can take up to that long for each. It also bounds the `IDENTIFY_SYSTEM` that follows in [`new`](LogicalReplicationStream::new). `Duration::ZERO` means no timeout.
     #[inline]
     pub fn with_connection_timeout(mut self, d: Duration) -> Self {
         self.connection_timeout = d;
@@ -842,6 +860,7 @@ impl LogicalReplicationStream {
             replay_stop: ReplayStop::Running,
             held: None,
             keepalive_wal_end: Lsn::new(0),
+            recovering: false,
         })
     }
 
@@ -853,16 +872,30 @@ impl LogicalReplicationStream {
         &self.identity
     }
 
+    /// A command that a caller cancelled before its reply leaves the connection refusing every later one with a `Protocol` error that reads as retryable, and nothing before [`start`](Self::start) replaces the connection. The refusal is the only `Protocol` a command meets on a connection that reports dead, so it is one a retry cannot cure; a read reconnects instead, and keeps the transient classification.
+    fn rebuild_if_refused(&self, error: ReplicationError) -> ReplicationError {
+        match error {
+            ReplicationError::Protocol(refusal) if !self.connection.is_alive() => {
+                ReplicationError::permanent_connection(format!("{refusal}; create a new stream"))
+            }
+            other => other,
+        }
+    }
+
     /// The replication slot's `confirmed_flush_lsn`, read on the stream's own connection, or `None` when the slot does not exist.
     ///
     /// A point-in-time read that must run before [`start`](Self::start), while the connection still accepts queries. The stream never feeds the value into its feedback. Requires a `replication=database` connection.
     ///
     /// # Errors
     ///
-    /// Returns an error when the stream is already streaming, when the query fails, or when the slot is not a logical slot.
+    /// Returns an error when the stream is already streaming, when the query fails, or when the slot is not a logical slot. After a cancelled startup command the error is [`ReplicationError::PermanentConnection`], as for [`start`](Self::start).
     pub async fn slot_confirmed_flush_lsn(&mut self) -> Result<Option<Lsn>> {
         let sql = crate::sql_builder::build_slot_confirmed_flush_sql(&self.config.slot_name)?;
-        let result = self.connection.exec_async(&sql).await?;
+        let result = self
+            .connection
+            .exec_async(&sql)
+            .await
+            .map_err(|e| self.rebuild_if_refused(e))?;
         confirmed_flush_lsn_from(&self.config.slot_name, &result)
     }
 
@@ -872,7 +905,7 @@ impl LogicalReplicationStream {
     ///
     /// # Errors
     ///
-    /// Returns an error when `TIMELINE_HISTORY` fails, which it does once the stream is streaming, or when its reply is not a well-formed history of that timeline.
+    /// Returns an error when `TIMELINE_HISTORY` fails, which it does once the stream is streaming, or when its reply is not a well-formed history of that timeline. After a cancelled startup command the error is [`ReplicationError::PermanentConnection`], as for [`start`](Self::start).
     pub async fn timeline_history(&mut self) -> Result<Vec<TimelineSwitch>> {
         let timeline = self.identity.timeline;
         if timeline == 1 {
@@ -881,7 +914,8 @@ impl LogicalReplicationStream {
         let result = self
             .connection
             .exec_async(&format!("TIMELINE_HISTORY {timeline}"))
-            .await?;
+            .await
+            .map_err(|e| self.rebuild_if_refused(e))?;
         timeline_history_from(timeline, &result)
     }
 
@@ -1007,6 +1041,7 @@ impl LogicalReplicationStream {
     /// - Replication slot creation fails (only when automatic creation is enabled)
     /// - Starting replication command fails
     /// - The slot is missing and [`existing_slot_required`](ReplicationStreamConfig::existing_slot_required) is enabled, yielding [`ReplicationError::ReplicationSlot`]
+    /// - A startup command of this stream (`start`, [`slot_confirmed_flush_lsn`](Self::slot_confirmed_flush_lsn), [`timeline_history`](Self::timeline_history)) was cancelled before its reply, for instance by a `timeout`: the connection refuses every later command and the error is [`ReplicationError::PermanentConnection`], so create a new stream
     ///
     /// # Example
     ///
@@ -1038,7 +1073,9 @@ impl LogicalReplicationStream {
     pub async fn start(&mut self, start_lsn: Option<XLogRecPtr>) -> Result<()> {
         info!("Starting logical replication stream");
 
-        self.initialize().await?;
+        self.initialize()
+            .await
+            .map_err(|e| self.rebuild_if_refused(e))?;
         let start_lsn = start_lsn.unwrap_or(INVALID_XLOG_REC_PTR);
 
         // Seed `applied` with the caller's startpoint: `start(Some(X))` asserts
@@ -1057,7 +1094,8 @@ impl LogicalReplicationStream {
             .collect::<Vec<_>>();
         self.connection
             .start_replication_async(&self.config.slot_name, start_lsn, &options_ref)
-            .await?;
+            .await
+            .map_err(|e| self.rebuild_if_refused(e))?;
 
         self.reset_barrier();
         if !self.slot.is_present() {
@@ -1343,7 +1381,7 @@ impl LogicalReplicationStream {
             // retrying read future (`next_event_with_retry`, `EventStream::next_event`)
             // carry the whole connect state machine, which callers then memcpy once
             // per event.
-            match Box::pin(self.recover_connection()).await {
+            match self.recover_connection_boxed().await {
                 Ok(_) => {
                     info!("Connection recovered successfully");
                 }
@@ -1390,9 +1428,19 @@ impl LogicalReplicationStream {
         Ok(())
     }
 
+    /// [`recover_connection`](Self::recover_connection) boxed in a frame of its own. Boxing it where it is awaited builds the several-KB connect state machine on that caller's stack first, and the callers are the per-event read futures, which would then reserve it on every poll.
+    #[cold]
+    #[inline(never)]
+    fn recover_connection_boxed(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(self.recover_connection())
+    }
+
     /// Recover connection after a failure
     async fn recover_connection(&mut self) -> Result<()> {
         info!("Attempting to recover replication connection");
+        self.recovering = true;
         // The new connection resends everything from the applied position, held frame included.
         self.reset_barrier();
 
@@ -1475,6 +1523,7 @@ impl LogicalReplicationStream {
         // before the disconnect has no matching StreamStop coming.
         self.parser.reset();
 
+        self.recovering = false;
         info!("Replication connection recovered and restarted");
         Ok(())
     }
@@ -1489,6 +1538,10 @@ impl LogicalReplicationStream {
     ///
     /// For an even more ergonomic API, consider using `into_stream()` which provides
     /// an async iterator interface that automatically calls this method.
+    ///
+    /// Not cancel-safe across a reconnect: dropping the future (a `timeout`) mid-reconnect
+    /// restarts the reconnect on the next call, so a timeout shorter than a reconnect never
+    /// lets it finish. [`EventStream::next_event`] keeps the reconnect across such drops.
     ///
     /// # Arguments
     /// * `cancellation_token` - Token to signal cancellation/shutdown
@@ -1568,7 +1621,16 @@ impl LogicalReplicationStream {
         //
         // The check itself is cheap when nothing is wrong (it just compares `Instant::now()` against `last_health_check`), but `Instant::now()` is a vDSO syscall on Linux. At 100k+ rps that adds up, so we gate the health check on the per-event feedback counter and let it amortize across `HEALTH_CHECK_EVENT_INTERVAL` events. The actual time-based interval inside `check_connection_health()` still applies, this just skips the syscall on the inner-loop hot path.
         if self.feedback_check_counter & (HEALTH_CHECK_EVENT_INTERVAL - 1) == 0 {
-            if let Err(e) = self.check_connection_health().await {
+            let health = tokio::select! {
+                biased;
+                health = self.check_connection_health() => health,
+                _ = cancellation_token.cancelled() => {
+                    return Err(ReplicationError::cancelled(
+                        "Operation cancelled during reconnect"
+                    ));
+                }
+            };
+            if let Err(e) = health {
                 warn!("Health check failed: {}", e);
                 // Don't fail immediately, try to continue
             }
@@ -1649,7 +1711,17 @@ impl LogicalReplicationStream {
 
             // Attempt connection recovery if connection is dead
             if !self.connection.is_alive() {
-                if let Err(recovery_err) = Box::pin(self.recover_connection()).await {
+                // The token ends a reconnect too: a parked one is awaited by `shutdown()`.
+                let recovery = tokio::select! {
+                    biased;
+                    recovery = self.recover_connection_boxed() => recovery,
+                    _ = cancellation_token.cancelled() => {
+                        return Err(ReplicationError::cancelled(
+                            "Operation cancelled during reconnect"
+                        ));
+                    }
+                };
+                if let Err(recovery_err) = recovery {
                     // Only a *permanent* recovery failure ends the stream.
                     // Returning on a transient one skipped the backoff
                     // below and handed the consumer an error it would
@@ -2348,8 +2420,9 @@ pub struct EventStream {
 /// It **owns** the stream for the duration of the poll and hands it back
 /// alongside the result — which is why "polling" and "holding the stream" are
 /// mutually exclusive, and why dropping this future drops the connection.
-type PollFuture =
-    std::pin::Pin<Box<dyn Future<Output = (LogicalReplicationStream, Result<ChangeEvent>)> + Send>>;
+type PollFuture = std::pin::Pin<
+    Box<dyn Future<Output = (LogicalReplicationStream, Result<Option<ChangeEvent>>)> + Send>,
+>;
 
 /// Where an [`EventStream`]'s replication stream is, and whether it is done.
 ///
@@ -2417,11 +2490,17 @@ impl StreamState {
     /// needing a real server to stall on.
     #[cfg(test)]
     fn park_with_result(&mut self, result: Result<ChangeEvent>) {
+        self.park_resolved(result.map(Some));
+    }
+
+    /// [`park_with_result`](Self::park_with_result) for a read that may have stopped at its boundary (`Ok(None)`).
+    #[cfg(test)]
+    fn park_resolved(&mut self, result: Result<Option<ChangeEvent>>) {
         let placeholder: PollFuture = Box::pin(core::future::pending());
         let StreamState::Ready { stream, .. } =
             core::mem::replace(self, StreamState::Polling(placeholder))
         else {
-            panic!("park_with_result expects a stream in hand");
+            panic!("park_resolved expects a stream in hand");
         };
         let stream = *stream;
         *self = StreamState::Polling(Box::pin(async move { (stream, result) }));
@@ -2436,8 +2515,8 @@ impl StreamState {
         }
     }
 
-    /// Park the stream in a fresh poll future. A no-op unless idle.
-    fn start_poll(&mut self, cancellation_token: &CancellationToken) {
+    /// Park the stream in a fresh poll future that reads up to `boundary`. A no-op unless idle.
+    fn start_poll(&mut self, cancellation_token: &CancellationToken, boundary: Option<Lsn>) {
         if !matches!(
             self,
             StreamState::Ready {
@@ -2459,7 +2538,9 @@ impl StreamState {
             let mut stream = *stream;
             let cancellation_token = cancellation_token.clone();
             *self = StreamState::Polling(Box::pin(async move {
-                let result = stream.next_event_with_retry(&cancellation_token).await;
+                let result = stream
+                    .next_event_with_retry_until(&cancellation_token, boundary)
+                    .await;
                 (stream, result)
             }));
         }
@@ -2540,7 +2621,8 @@ impl EventStream {
     /// includes the ordinary case of a poll that was *abandoned*, such as
     /// `tokio::time::timeout(d, stream.next())` expiring or a `select!` arm
     /// losing. Call [`next_event`](Self::next_event) first: it reclaims the
-    /// parked stream. These accessors are synchronous and cannot.
+    /// parked stream. These accessors are synchronous and cannot. A
+    /// `next_event` dropped while it was reconnecting parks the stream the same way.
     pub fn inner(&self) -> &LogicalReplicationStream {
         self.state
             .stream()
@@ -2632,17 +2714,25 @@ impl EventStream {
     /// **Note**: If you also use this type as a `futures::Stream`, prefer calling
     /// `StreamExt::next()` instead to avoid confusion. This method is named `next_event()`
     /// to avoid conflict with `StreamExt::next()`.
+    ///
+    /// A reconnect that a dropped future (a `timeout`, a `select!` arm) interrupted carries on
+    /// in the next call instead of restarting, so a timeout shorter than a reconnect does not
+    /// starve it. Only the first call after the connection dies reconnects inline, and loses
+    /// its partial reconnect if dropped.
     pub async fn next_event(&mut self) -> Result<ChangeEvent> {
         if let Some(event) = self.held.take() {
             return Ok(event);
         }
+        self.park_if_recovering(None);
         // A `poll_next` that returned `Pending` parked the stream inside
         // `inflight`, and dropping the `Next`/`select!` future that drove it does
         // not clear that field. Resume the parked future rather than asserting it
         // cannot exist: abandoning a poll is ordinary use (`tokio::time::timeout`
         // around `StreamExt::next`), and its event is still owed to the caller.
         if let Some(result) = self.resume_parked_poll().await {
-            return result;
+            if let Some(event) = result? {
+                return Ok(event);
+            }
         }
 
         let inner = self
@@ -2660,8 +2750,9 @@ impl EventStream {
         if let Some(event) = self.held.take() {
             return Ok(self.deliver_unless_past(event, boundary));
         }
+        self.park_if_recovering(Some(boundary));
         if let Some(result) = self.resume_parked_poll().await {
-            return Ok(self.deliver_unless_past(result?, boundary));
+            return Ok(result?.and_then(|event| self.deliver_unless_past(event, boundary)));
         }
         let inner = self
             .state
@@ -2682,8 +2773,15 @@ impl EventStream {
         Some(event)
     }
 
+    /// A reconnect dropped mid-way (a caller's `timeout`) restarts from its first attempt, so one longer than the timeout never finishes; parked in a poll future it survives the drop.
+    fn park_if_recovering(&mut self, boundary: Option<Lsn>) {
+        if self.state.stream().is_some_and(|stream| stream.recovering) {
+            self.state.start_poll(&self.cancellation_token, boundary);
+        }
+    }
+
     /// Await a poll future that `poll_next` parked and its caller abandoned, taking the stream back.
-    async fn resume_parked_poll(&mut self) -> Option<Result<ChangeEvent>> {
+    async fn resume_parked_poll(&mut self) -> Option<Result<Option<ChangeEvent>>> {
         let StreamState::Polling(fut) = &mut self.state else {
             return None;
         };
@@ -2772,7 +2870,7 @@ impl futures_core::Stream for EventStream {
             cancellation_token,
             ..
         } = &mut *self;
-        state.start_poll(cancellation_token);
+        state.start_poll(cancellation_token, None);
 
         let StreamState::Polling(fut) = &mut self.state else {
             // Unreachable: `start_poll` parks anything that is Ready and not
@@ -2787,6 +2885,19 @@ impl futures_core::Stream for EventStream {
                 // was the last event decides `terminated`, so the state
                 // transition is part of each arm rather than a separate step.
                 let stream = Box::new(stream);
+                let result = match result {
+                    Ok(Some(event)) => Ok(event),
+                    // A dropped `next_event_before` parked a read that stopped at its boundary.
+                    Ok(None) => {
+                        self.state = StreamState::Ready {
+                            stream,
+                            terminated: false,
+                        };
+                        cx.waker().wake_by_ref();
+                        return std::task::Poll::Pending;
+                    }
+                    Err(e) => Err(e),
+                };
                 match result {
                     Ok(event) => {
                         self.state = StreamState::Ready {
@@ -5018,6 +5129,7 @@ pub(crate) mod tests {
             replay_stop: ReplayStop::Running,
             held: None,
             keepalive_wal_end: Lsn::new(0),
+            recovering: false,
         }
     }
 
@@ -5318,6 +5430,27 @@ pub(crate) mod tests {
         assert!(stream.check_server_identity(&identity(7682, 1)).is_ok());
     }
 
+    /// A second connection that lands on another cluster or timeline must not be used for the stream's positions.
+    #[test]
+    fn a_side_connection_must_report_the_streams_identity() {
+        let stream = identity(7682, 1);
+        assert!(stream.ensure_same_server(&identity(7682, 1)).is_ok());
+
+        for other in [identity(9999, 1), identity(7682, 2)] {
+            let err = stream.ensure_same_server(&other).unwrap_err();
+            assert!(
+                matches!(err, ReplicationError::PermanentConnection(_)),
+                "{err:?}"
+            );
+            assert!(err.is_permanent(), "{err}");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("7682") && msg.contains(&other.system_id.to_string()),
+                "{msg}"
+            );
+        }
+    }
+
     /// A promoted standby keeps the primary's systemid, so only the timeline
     /// moves. This is the failover case, and it must be permanent: retrying
     /// would stream the post-fork history under LSNs the consumer already used.
@@ -5502,6 +5635,225 @@ pub(crate) mod tests {
             waited < Duration::from_secs(1),
             "cancelled at 500 ms, yet waited {waited:?}"
         );
+    }
+
+    /// A server that counts the connections it accepts and either holds them without ever
+    /// answering or, with `hang_up`, closes them at once. Returns its port and the count.
+    async fn counting_server(hang_up: bool) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::SeqCst);
+                if !hang_up {
+                    held.push(socket);
+                }
+            }
+        });
+        (port, accepted)
+    }
+
+    fn conninfo_for(port: u16) -> String {
+        format!(
+            "postgresql://u@127.0.0.1:{port}/db?replication=database&sslmode=disable&connect_timeout=60"
+        )
+    }
+
+    /// A stream whose reads fail and whose reconnect hangs on a server that never answers.
+    /// Each connection the server counts is one connect attempt.
+    async fn stream_reconnecting_to_a_silent_server(
+    ) -> (EventStream, Arc<std::sync::atomic::AtomicUsize>) {
+        let (port, dialed) = counting_server(false).await;
+        let config = ReplicationStreamConfig::builder("slot", "pub")
+            .with_connection_timeout(Duration::from_secs(60));
+        let mut stream = create_test_stream(config);
+        stream.retry_handler =
+            ReplicationConnectionRetry::new(RetryConfig::default(), conninfo_for(port));
+        (stream.into_stream(CancellationToken::new()), dialed)
+    }
+
+    /// A caller's `timeout` shorter than the reconnect must not restart it: a dropped
+    /// read used to take the connect attempt with it, so the next read dialled again and
+    /// no reconnect could finish. The first read runs the reconnect inline and the second
+    /// parks it, so at most two dials, however many reads time out after that.
+    #[tokio::test]
+    async fn a_caller_timeout_does_not_restart_the_reconnect() {
+        let (mut events, dialed) = stream_reconnecting_to_a_silent_server().await;
+        let lsn = Lsn::new(0x100);
+
+        for round in 0..8 {
+            let read = Duration::from_millis(40);
+            // `next_event_before` shares the parking with `next_event`.
+            let timed_out = if round % 2 == 0 {
+                tokio::time::timeout(read, events.next_event())
+                    .await
+                    .is_err()
+            } else {
+                tokio::time::timeout(read, events.next_event_before(lsn))
+                    .await
+                    .is_err()
+            };
+            assert!(timed_out, "the reconnect hangs, so each read must time out");
+        }
+
+        let dials = dialed.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            (1..=2).contains(&dials),
+            "8 timed-out reads dialled {dials} times; the reconnect must survive them"
+        );
+    }
+
+    /// Cancelling ends a parked reconnect at once, so `shutdown()`, which awaits the
+    /// parked read, does not sit out the connect timeout.
+    #[tokio::test]
+    async fn shutdown_does_not_wait_for_a_parked_reconnect() {
+        let (mut events, _) = stream_reconnecting_to_a_silent_server().await;
+        for _ in 0..3 {
+            tokio::time::timeout(Duration::from_millis(40), events.next_event())
+                .await
+                .unwrap_err();
+        }
+
+        let shutdown = tokio::time::timeout(Duration::from_secs(10), events.shutdown()).await;
+
+        assert!(
+            shutdown.is_ok(),
+            "shutdown waited on the reconnect's connect timeout (60 s)"
+        );
+    }
+
+    /// A reconnect that the periodic health check starts is ended by the token too: with a
+    /// zero interval the first read runs the check, which finds the connection dead.
+    #[tokio::test]
+    async fn shutdown_does_not_wait_for_a_health_check_reconnect() {
+        let (port, _) = counting_server(false).await;
+        let config = ReplicationStreamConfig::builder("slot", "pub")
+            .with_connection_timeout(Duration::from_secs(60))
+            .with_health_check_interval(Duration::ZERO);
+        let mut stream = create_test_stream(config);
+        stream.retry_handler =
+            ReplicationConnectionRetry::new(RetryConfig::default(), conninfo_for(port));
+        let mut events = stream.into_stream(CancellationToken::new());
+        for _ in 0..3 {
+            tokio::time::timeout(Duration::from_millis(40), events.next_event())
+                .await
+                .unwrap_err();
+        }
+
+        let shutdown = tokio::time::timeout(Duration::from_secs(10), events.shutdown()).await;
+
+        assert!(
+            shutdown.is_ok(),
+            "shutdown waited on a health-check reconnect's connect timeout (60 s)"
+        );
+    }
+
+    /// A stream whose startup command was cancelled before the silent peer answered, which
+    /// leaves its connection refusing every later command.
+    #[cfg(feature = "rustls-tls")]
+    async fn stream_with_a_cancelled_startup_command(
+    ) -> (LogicalReplicationStream, std::net::TcpStream) {
+        let (connection, peer) = PgReplicationConnection::silent_for_testing();
+        let mut stream = stream_that_cannot_read_or_reconnect();
+        stream.connection = connection;
+        stream.identity = identity(7682, 2);
+        tokio::time::timeout(Duration::from_millis(50), stream.slot_confirmed_flush_lsn())
+            .await
+            .expect_err("the peer never answers");
+        (stream, peer)
+    }
+
+    /// The refusal a cancelled command leaves reads as retryable, yet nothing before `start`
+    /// replaces the connection: the pre-start commands must say the stream is to be rebuilt,
+    /// or a caller's retry loop spins on it forever.
+    #[cfg(feature = "rustls-tls")]
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_startup_command_makes_the_next_one_a_permanent_error() {
+        let (mut stream, _peer) = stream_with_a_cancelled_startup_command().await;
+
+        let errors = [
+            stream.slot_confirmed_flush_lsn().await.unwrap_err(),
+            stream.timeline_history().await.unwrap_err(),
+            stream.start(None).await.unwrap_err(),
+        ];
+
+        for error in errors {
+            assert!(
+                matches!(&error, ReplicationError::PermanentConnection(m) if m.contains("cancelled") && m.contains("new stream")),
+                "{error:?}"
+            );
+            assert!(error.is_permanent());
+        }
+    }
+
+    /// Only the pre-start commands say "rebuild": a read must keep reconnecting a poisoned
+    /// connection, which a permanent error from the connection itself would have turned
+    /// into an immediate give-up.
+    #[cfg(feature = "rustls-tls")]
+    #[tokio::test(start_paused = true)]
+    async fn a_read_still_reconnects_after_a_cancelled_startup_command() {
+        let (mut stream, _peer) = stream_with_a_cancelled_startup_command().await;
+        let started = tokio::time::Instant::now();
+
+        let err = stream
+            .next_event_with_retry(&CancellationToken::new())
+            .await
+            .unwrap_err();
+
+        assert!(!err.is_permanent(), "{err:?}");
+        assert!(
+            started.elapsed() >= Duration::from_secs(3),
+            "gave up after {:?} instead of retrying through the backoff",
+            started.elapsed()
+        );
+    }
+
+    fn retries_three_times_quickly() -> RetryConfig {
+        RetryConfig {
+            max_attempts: 3,
+            initial_delay: Duration::from_millis(5),
+            ..RetryConfig::default()
+        }
+    }
+
+    /// `connection_timeout = Duration::ZERO` is "no timeout", so connecting still makes
+    /// every attempt `max_attempts` allows; it used to give up after the first with a
+    /// `Timeout` of `0ns`.
+    #[tokio::test]
+    async fn new_with_a_zero_connection_timeout_makes_every_connect_attempt() {
+        let (port, dialed) = counting_server(true).await;
+        let config = ReplicationStreamConfig::builder("slot", "pub")
+            .with_connection_timeout(Duration::ZERO)
+            .with_retry_config(retries_three_times_quickly());
+
+        let err = match LogicalReplicationStream::new(&conninfo_for(port), config).await {
+            Ok(_) => panic!("the server hangs up on every connection"),
+            Err(e) => e,
+        };
+
+        assert!(!matches!(err, ReplicationError::Timeout(_)), "{err:?}");
+        assert_eq!(dialed.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    /// The same for a reconnect.
+    #[tokio::test]
+    async fn recovery_with_a_zero_connection_timeout_makes_every_connect_attempt() {
+        let (port, dialed) = counting_server(true).await;
+        let config = ReplicationStreamConfig::builder("slot", "pub")
+            .with_connection_timeout(Duration::ZERO)
+            .with_retry_config(retries_three_times_quickly());
+        let mut stream = create_test_stream(config.clone());
+        stream.retry_handler =
+            ReplicationConnectionRetry::new(config.retry_config, conninfo_for(port));
+
+        let err = stream.recover_connection().await.unwrap_err();
+
+        assert!(!matches!(err, ReplicationError::Timeout(_)), "{err:?}");
+        assert_eq!(dialed.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 
     /// The server-side `ErrorResponse` a COPY stream ends with, as the wire carries it.
@@ -9335,6 +9687,31 @@ pub(crate) mod tests {
         assert_eq!(held.event_type.commit_lsn(), Some(boundary));
     }
 
+    /// A read a dropped `next_event_before` parked can end at its boundary, which is no event: `next_event_before` reports the stop again,
+    /// and `next_event` and `poll_next` take the stream back and read on instead of returning one.
+    #[tokio::test]
+    async fn a_parked_read_that_stopped_at_its_boundary_is_not_an_event() {
+        let boundary = Lsn::new(0x200);
+        let mut events =
+            create_test_stream(create_test_config()).into_stream(CancellationToken::new());
+
+        events.state.park_resolved(Ok(None));
+        assert!(events.next_event_before(boundary).await.unwrap().is_none());
+        assert!(!events.state.is_polling(), "the stream must be taken back");
+
+        events.state.park_resolved(Ok(None));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            futures_core::Stream::poll_next(std::pin::Pin::new(&mut events), &mut cx).is_pending()
+        );
+        assert!(!events.state.is_polling(), "the stream must be taken back");
+
+        events.state.park_resolved(Ok(None));
+        // The read that follows has no server to reach; only that it began is checked.
+        let _ = tokio::time::timeout(Duration::from_millis(50), events.next_event()).await;
+        assert!(!events.state.is_polling(), "the stream must be taken back");
+    }
+
     /// An abandoned poll that ended in an error hands that error to the next read, and the
     /// stream is back in hand for the one after.
     #[tokio::test]
@@ -10897,14 +11274,17 @@ mod startup_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// What happened when an operation raced a 50 ms outer timeout.
+    /// What happened when an operation raced the outer timeout.
     struct Raced {
         timed_out: bool,
         elapsed: Duration,
         heartbeat_ticks: usize,
     }
 
-    /// Race `op` against a 50 ms timeout beside a 5 ms heartbeat on a fresh runtime thread, panicking if that thread stays blocked for five seconds.
+    /// How long `op` is raced for. A loaded machine can stall the runtime thread for tens of milliseconds, and a stall longer than this wakes the timeout before the heartbeat has run once.
+    const OUTER_TIMEOUT: Duration = Duration::from_millis(250);
+
+    /// Race `op` against `OUTER_TIMEOUT` beside a 5 ms heartbeat on a fresh runtime thread, panicking if that thread stays blocked for five seconds.
     fn race_outer_timeout<F, Fut>(multi_thread: bool, op: F) -> Raced
     where
         F: FnOnce() -> Fut + Send + 'static,
@@ -10934,7 +11314,7 @@ mod startup_tests {
                 });
                 tokio::task::yield_now().await;
                 let started = Instant::now();
-                let result = tokio::time::timeout(Duration::from_millis(50), op()).await;
+                let result = tokio::time::timeout(OUTER_TIMEOUT, op()).await;
                 let elapsed = started.elapsed();
                 heartbeat.abort();
                 (result.is_err(), elapsed)
@@ -10956,8 +11336,9 @@ mod startup_tests {
             "the operation finished before the outer timeout, after {:?}",
             raced.elapsed
         );
+        // A blocked thread would have waited out the 2 s `connect_timeout` first.
         assert!(
-            raced.elapsed < Duration::from_millis(500),
+            raced.elapsed < OUTER_TIMEOUT + Duration::from_millis(1000),
             "the outer timeout fired late, after {:?}",
             raced.elapsed
         );

@@ -256,12 +256,13 @@ impl ReplicationConnectionRetry {
 
     /// [`connect_with_retry`](Self::connect_with_retry) that stops once `budget` has passed, checked only between attempts.
     ///
-    /// An attempt in flight is never cut short, because its own per-address `connect_timeout` bounds it and a multi-host attempt needs that time to reach its next host. A backoff that would end past `budget` ends at `budget` with [`connect_budget_exceeded`].
+    /// An attempt in flight is never cut short, because its own per-address `connect_timeout` bounds it and a multi-host attempt needs that time to reach its next host. A backoff that would end past `budget` ends at `budget` with [`connect_budget_exceeded`]. A zero `budget` means none, as for `connect_timeout`.
     pub(crate) async fn connect_with_retry_within(
         &self,
         budget: Duration,
     ) -> Result<PgReplicationConnection> {
-        self.connect_until(Some(budget)).await
+        self.connect_until((!budget.is_zero()).then_some(budget))
+            .await
     }
 
     async fn connect_until(&self, budget: Option<Duration>) -> Result<PgReplicationConnection> {
@@ -392,6 +393,48 @@ mod tests {
             start.elapsed()
         );
         silent.abort();
+    }
+
+    /// A server that accepts every connection and hangs up at once, so each attempt fails
+    /// without a timeout of its own. Returns its port and the number of connections seen.
+    async fn server_that_hangs_up() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+        let count = std::sync::Arc::clone(&attempts);
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::SeqCst);
+                drop(socket);
+            }
+        });
+        (port, attempts)
+    }
+
+    /// A zero budget is "no budget", not a budget already spent: it made one attempt and
+    /// returned `Timeout("... 0ns")` whatever `max_attempts` said.
+    #[tokio::test]
+    async fn a_zero_connect_budget_does_not_cut_the_retries_short() {
+        let (port, attempts) = server_that_hangs_up().await;
+        let retry = ReplicationConnectionRetry::new(
+            fixed_backoff(3, Duration::from_millis(5)),
+            format!(
+                "host=127.0.0.1 port={port} user=u dbname=db sslmode=disable gssencmode=disable"
+            ),
+        );
+
+        let err = match retry.connect_with_retry_within(Duration::ZERO).await {
+            Ok(_) => panic!("the server hangs up on every connection"),
+            Err(e) => e,
+        };
+
+        assert!(!matches!(err, ReplicationError::Timeout(_)), "{err:?}");
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "every attempt `max_attempts` allows must be made"
+        );
     }
 
     /// A backoff that would end past the budget ends at the budget with a timeout instead.

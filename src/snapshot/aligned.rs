@@ -8,7 +8,8 @@ use super::table_copy::{poisoned_err, TableCopy};
 use crate::connection::PgReplicationConnection;
 use crate::error::{ReplicationError, Result};
 use crate::prelude::*;
-use crate::stream::LogicalReplicationStream;
+use crate::sql_builder::quote_ident;
+use crate::stream::{LogicalReplicationStream, ServerIdentity};
 use crate::types::{Lsn, ReplicationSlotOptions, SlotType};
 use core::sync::atomic::{AtomicU32, Ordering};
 use tokio_util::sync::CancellationToken;
@@ -16,10 +17,13 @@ use tokio_util::sync::CancellationToken;
 /// A copy of chosen tables exact at a temporary side slot's consistent point
 /// `C`, to be merged with a stream that is already running.
 ///
-/// The copy contains every transaction whose commit record lies below `C` and
+/// The snapshot contains every transaction whose commit record lies below `C` and
 /// none at or past it, which is what
 /// [`EXPORT_SNAPSHOT`](https://www.postgresql.org/docs/current/logicaldecoding-explanation.html#LOGICALDECODING-EXPLANATION-EXPORTED-SNAPSHOTS)
-/// guarantees.
+/// guarantees. A `COPY` still reads the table's current file, so a `TRUNCATE` or
+/// rewriting `ALTER TABLE` committed after `C` would make it return nothing.
+/// [`capture`](Self::capture) therefore locks the tables against such commands
+/// (see Cost) and fails for a table one has already changed.
 ///
 /// # Merging with the running stream
 ///
@@ -35,7 +39,33 @@ use tokio_util::sync::CancellationToken;
 /// transaction that ends in `RollbackPrepared` or in a `StreamAbort` of the
 /// whole transaction is dropped. A `StreamAbort` of a subtransaction drops the
 /// buffered changes whose [`ChangeEvent::xid`](crate::ChangeEvent::xid) equals
-/// its `subtransaction_xid`.
+/// its `subtransaction_xid`, except a `Message`, which always carries the
+/// top-level xid.
+///
+/// Acknowledge each transaction decided below `C` before loading the copy. A
+/// reconnect replays from the acknowledged position, so without it every
+/// transaction delivered before the `None` arrives again after the copy and is
+/// applied twice (50 of 50 in a measured idle-database run, none with the
+/// acknowledgement). [`EventStream::next_event_before`](crate::EventStream::next_event_before)
+/// reconnects without telling the caller, so a buffer keyed by transaction id
+/// should also start over when a `Begin`, a `BeginPrepare` or a `StreamStart`
+/// with `first_segment` arrives for a transaction it already holds. That replay
+/// of a streamed transaction was not reproduced; this is a precaution.
+///
+/// ```no_run
+/// # use pg_walstream::{AlignedSnapshot, EventType, LogicalReplicationStream, Result};
+/// # use tokio_util::sync::CancellationToken;
+/// # async fn merge(mut stream: LogicalReplicationStream, copy: AlignedSnapshot, cancel: CancellationToken) -> Result<()> {
+/// let c = copy.consistent_point();
+/// while let Some(event) = stream.next_event_before(c, &cancel).await? {
+///     // Buffer it, and apply its transaction at the commit event.
+///     if let EventType::Commit { .. } | EventType::StreamCommit { .. } = event.event_type {
+///         stream.shared_lsn_feedback.update_applied_lsn(event.lsn);
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// ```
 ///
 /// [`next_event_before`](LogicalReplicationStream::next_event_before) returns
 /// `None` once every commit below `C` has been delivered, which is where the
@@ -64,6 +94,17 @@ use tokio_util::sync::CancellationToken;
 /// database's `xmin` until [`finish`](Self::finish) or drop, exactly as a
 /// [`Snapshot`](super::Snapshot) does.
 ///
+/// The same transaction holds an `ACCESS SHARE` lock on every requested table
+/// from [`capture`](Self::capture) on. Reads and writes are not blocked, but a
+/// `TRUNCATE`, `ALTER TABLE`, `DROP`, `VACUUM FULL` or `CLUSTER` on those tables
+/// waits until [`finish`](Self::finish) or drop, and every write issued behind
+/// such a waiting command waits with it, up to its `lock_timeout` if it has one
+/// (an `ALTER TABLE` waited 2.4 s, and an `INSERT` behind it failed with
+/// `55P03` at its 2 s timeout). Give that DDL a `lock_timeout`, or run it before
+/// the capture or after the copy. One that already holds its lock when
+/// `capture` asks for its own makes `capture` fail at once, and so does a table
+/// changed since `C`: capture again.
+///
 /// # Cancellation
 ///
 /// Dropping the future that [`capture`](Self::capture) returns closes its
@@ -72,6 +113,15 @@ use tokio_util::sync::CancellationToken;
 /// transaction can therefore exhaust `max_wal_senders` and block the running
 /// stream's own reconnect. [`with_cancellation`](Self::with_cancellation)
 /// covers only the copy loop.
+///
+/// `capture` has no deadline of its own, and a prepared transaction left open
+/// blocks the slot creation like any other. To end the wait, end the blocker or
+/// cancel the walsender from a second connection, for example with
+/// `SELECT pg_cancel_backend(active_pid) FROM pg_replication_slots WHERE slot_name LIKE 'pg_walstream_aligned_%'`.
+///
+/// [`next_row`](Self::next_row) is not cancel-safe where a table's `COPY`
+/// starts. Do not race it in a `select!` that can drop it, because a dropped
+/// start leaves the reader unusable; race the feedback ticker instead.
 ///
 /// # Failure
 ///
@@ -102,9 +152,18 @@ impl AlignedSnapshot {
         publications: &[&str],
         tables: &[(&str, &str)],
     ) -> Result<Self> {
+        Self::capture_on(conninfo, publications, tables, None).await
+    }
+
+    async fn capture_on(
+        conninfo: &str,
+        publications: &[&str],
+        tables: &[(&str, &str)],
+        expected: Option<ServerIdentity>,
+    ) -> Result<Self> {
         let publications = validate_request(publications, tables)?;
         let (reader, tables, consistent_point) =
-            capture_tables(conninfo, &publications, tables).await?;
+            capture_tables(conninfo, &publications, tables, expected).await?;
 
         tracing::info!(
             "Aligned snapshot ready: {} table(s) at {}",
@@ -131,6 +190,8 @@ impl AlignedSnapshot {
     }
 
     /// The next row, or `Ok(None)` once every table has been copied.
+    ///
+    /// Not cancel-safe where a table's `COPY` starts: a future dropped there leaves the reader unusable and every later call fails.
     pub async fn next_row(&mut self) -> Result<Option<SnapshotRow>> {
         self.copy.next_row().await
     }
@@ -172,6 +233,11 @@ impl LogicalReplicationStream {
     /// [`AlignedSnapshot::capture`] with this stream's connection string and
     /// publications, leaving this stream's own connection untouched.
     ///
+    /// The side connection must reach the stream's cluster and timeline
+    /// ([`server_identity`](Self::server_identity)). A connection string with
+    /// several hosts can land it elsewhere, which fails with a permanent error
+    /// before any slot is created.
+    ///
     /// The returned future borrows nothing from the stream, so it can be
     /// spawned, or raced against the
     /// [`send_feedback`](Self::send_feedback) ticker that keeps the stream alive
@@ -183,6 +249,7 @@ impl LogicalReplicationStream {
         let logical = self.config().slot_type == SlotType::Logical;
         let conninfo = self.conninfo().to_string();
         let publications = plan::split_publication_names(&self.config().publication_name);
+        let identity = *self.server_identity();
         let tables: Vec<(String, String)> = tables
             .iter()
             .map(|(schema, table)| (schema.to_string(), table.to_string()))
@@ -198,7 +265,7 @@ impl LogicalReplicationStream {
                 .iter()
                 .map(|(schema, table)| (schema.as_str(), table.as_str()))
                 .collect();
-            AlignedSnapshot::capture(&conninfo, &publications, &tables).await
+            AlignedSnapshot::capture_on(&conninfo, &publications, &tables, Some(identity)).await
         }
     }
 }
@@ -208,9 +275,13 @@ async fn capture_tables(
     conninfo: &str,
     publications: &[String],
     requested: &[(&str, &str)],
+    expected: Option<ServerIdentity>,
 ) -> Result<(PgReplicationConnection, Vec<SnapshotTable>, Lsn)> {
     let mut side =
         PgReplicationConnection::connect_async(&plan::derive_side_conninfo(conninfo)).await?;
+    if let Some(expected) = expected {
+        expected.ensure_same_server(&ServerIdentity::identify(&mut side).await?)?;
+    }
     let created = side
         .create_replication_slot_with_options_async(
             &side_slot_name(),
@@ -240,7 +311,65 @@ async fn capture_tables(
     drop(side);
 
     let tables = select_tables(published, requested, publications)?;
+    pin_tables(&mut reader, &tables).await?;
     Ok((reader, tables, consistent_point))
+}
+
+/// Lock the requested tables, then fail if one changed since the snapshot.
+///
+/// A `COPY` reads the table's current file with the snapshot's visibility, so a `TRUNCATE` or rewriting `ALTER TABLE` that committed after `C` makes it return nothing, silently. `ACCESS SHARE` blocks those commands until the reader's transaction ends; `NOWAIT` fails fast instead of waiting without a deadline behind one in flight. One that committed before the lock changes the table's file or name, which the second statement reports.
+async fn pin_tables(reader: &mut PgReplicationConnection, tables: &[SnapshotTable]) -> Result<()> {
+    let (lock, changed) = pin_sql(tables)?;
+    reader.exec_async(&lock).await?;
+    let result = reader.exec_async(&changed).await?;
+    let moved: Vec<String> = (0..result.ntuples())
+        .filter_map(|row| result.get_value(row, 0))
+        .collect();
+    if moved.is_empty() {
+        return Ok(());
+    }
+    Err(ReplicationError::protocol(format!(
+        "table(s) {} changed after the snapshot, so a copy would not match it: truncated, \
+         rewritten, renamed or dropped. Capture again",
+        moved.join(", ")
+    )))
+}
+
+/// The `LOCK TABLE` statement and the query that lists the tables whose file or name moved on since the snapshot.
+///
+/// The second query's `pg_relation_filenode` reads the current catalog while `pg_class` reads the snapshot's, so a difference is a change made after `C`. A partitioned table has no file of its own and its `COPY` reads every partition, so the query walks the partitions the snapshot sees, and `pg_partition_tree` (current catalog) catches one detached since. The locks come first because only then can nothing change further.
+fn pin_sql(tables: &[SnapshotTable]) -> Result<(String, String)> {
+    let names = tables
+        .iter()
+        .map(|t| {
+            Ok(format!(
+                "{}.{}",
+                quote_ident(&t.relation.namespace)?,
+                quote_ident(&t.relation.relation_name)?
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?
+        .join(", ");
+    let oids = tables
+        .iter()
+        .map(|t| t.relation.relation_id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok((
+        format!("LOCK TABLE {names} IN ACCESS SHARE MODE NOWAIT"),
+        format!(
+            "WITH RECURSIVE tree(root, oid) AS (SELECT c.oid, c.oid FROM pg_class c \
+             WHERE c.oid IN ({oids}) UNION ALL SELECT t.root, i.inhrelid FROM tree t \
+             JOIN pg_class p ON p.oid = t.oid AND p.relkind = 'p' \
+             JOIN pg_inherits i ON i.inhparent = t.oid) \
+             SELECT format('%I.%I', n.nspname, c.relname) FROM tree t \
+             JOIN pg_class c ON c.oid = t.oid JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relfilenode IS DISTINCT FROM coalesce(pg_relation_filenode(c.oid), 0) \
+             OR to_regclass(format('%I.%I', n.nspname, c.relname))::oid IS DISTINCT FROM c.oid \
+             OR (t.oid <> t.root AND NOT EXISTS \
+             (SELECT 1 FROM pg_partition_tree(t.root) pt WHERE pt.relid = t.oid))"
+        ),
+    ))
 }
 
 /// Reject requests that cannot name a well-defined copy, before any connection opens.
@@ -393,6 +522,23 @@ mod tests {
         let err = validate_request(&["p"], &[("public", "a"), ("public", "a")]).unwrap_err();
         assert!(err.to_string().contains("public.a"), "{err}");
         assert_eq!(validate_request(&[" p ", ""], &t).unwrap(), ["p"]);
+    }
+
+    #[test]
+    fn pinning_quotes_every_name_and_lists_every_table() {
+        let tables = published(&[("My Schema", "Order \"x\""), ("public", "select")]);
+        let (lock, changed) = pin_sql(&tables).unwrap();
+        assert_eq!(
+            lock,
+            "LOCK TABLE \"My Schema\".\"Order \"\"x\"\"\", \"public\".\"select\" IN ACCESS SHARE MODE NOWAIT"
+        );
+        assert!(changed.contains("c.oid IN (0, 1)"), "{changed}");
+        // A partitioned table has no file of its own: its partitions are what a `COPY` reads.
+        assert!(
+            changed.contains("pg_inherits") && changed.contains("pg_partition_tree"),
+            "{changed}"
+        );
+        assert!(pin_sql(&published(&[("public", "a\0b")])).is_err());
     }
 
     #[test]

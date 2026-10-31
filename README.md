@@ -17,7 +17,7 @@ A high-performance Rust library for PostgreSQL logical and physical replication 
 - **Pure-Rust Backend (default)**: The default `rustls-tls` backend needs no libpq and no OpenSSL, using `aws-lc-rs` for hardware-accelerated TLS (AES-NI, AVX2, SHA-NI). 
 - **TLS/SSL Support**: All PostgreSQL SSL modes (`disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`)
 - **Authentication**: Cleartext, MD5, and SCRAM-SHA-256 authentication methods
-- **Streaming Transactions**: Support for streaming large transactions (protocol v2+). Each streamed change carries the xid of its subtransaction in `ChangeEvent::xid`, so a `StreamAbort` for a rolled-back savepoint names exactly the changes to drop
+- **Streaming Transactions**: Support for streaming large transactions (protocol v2+). Each streamed change carries the xid of its subtransaction in `ChangeEvent::xid`, so a `StreamAbort` for a rolled-back savepoint names exactly the changes to drop, except a `Message`, which always carries the top-level xid
 - **Two-Phase Commit**: Prepared transaction support (protocol v3+)
 - **Parallel Streaming**: Multi-stream parallel replication (protocol v4+)
 - **Zero-Copy Operations**: Efficient buffer management using the `bytes` crate with drain-loop batch queue optimization. The libpq backend copies each COPY message into a reusable `BytesMut` buffer, then reference-counts it downstream as `Bytes` (no per-message heap allocation after warmup)
@@ -39,7 +39,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-pg_walstream = "0.8"
+pg_walstream = "0.9"
 ```
 
 By default, this uses the pure-Rust `rustls-tls` backend — no libpq and no OpenSSL, only `cmake` + a C compiler at build time (for `aws-lc-rs`).
@@ -48,10 +48,24 @@ To use the C **libpq** backend instead (bound by `pq-sys`; requires system libpq
 
 ```toml
 [dependencies]
-pg_walstream = { version = "0.8", default-features = false, features = ["libpq"] }
+pg_walstream = { version = "0.9", default-features = false, features = ["libpq"] }
 ```
 
 If both backends are enabled, `rustls-tls` takes priority automatically.
+
+## Unreleased: changes since 0.9.0
+<!-- Rename to "Upgrading from 0.9" when the release version is chosen. -->
+
+The next release changes the public API, so code written for 0.9 may not compile unchanged.
+
+- **`ChangeEvent` has a new public field `xid: Option<u32>`.** Build events with `xid: None` and add `..` to struct patterns (`let ChangeEvent { event_type, lsn, .. } = event`). It is `Some` only for a `Relation`, `Type`, `Insert`, `Update`, `Delete`, `Truncate` or `Message` inside a streamed chunk.
+- **`ChangeEvent::encode` and `ChangeEvent::decode` (deprecated since 0.9.0) are removed.** Serialize events with `serde_json`; JSON written by 0.9 (no `xid` key) still deserializes, with `xid` as `None`. Bytes written by `encode` are not JSON and cannot be read after the upgrade, so convert them on 0.9 first. bincode and postcard cannot read a `ColumnValue`.
+- **`StreamingReplicationMessage::xid`, returned by `LogicalReplicationParser::parse_wal_message`, changes meaning inside a streamed chunk (protocol v2+).** For `Relation`, `Type`, `Insert`, `Update`, `Delete`, `Truncate` and `Message` it is now the xid pgoutput wrote before that change, which is a subtransaction's xid after a savepoint; it used to be the chunk's xid. A consumer that buffers rows by `xid` and flushes on `StreamCommit` must take the top-level xid from `StreamStart`, or it strands the savepoint's rows. A `Message` always carries the top-level xid.
+- **The `libpq` feature now also builds `socket2`,** which only `rustls-tls` needed before.
+- **`LogicalReplicationStream::new` now runs `IDENTIFY_SYSTEM`, which `start` ran before:** one more round trip at construction. A reply with no usable system identifier and timeline now fails `new` with `ReplicationError::PermanentConnection`, where `start` used to continue without it. `server_identity()` returns what it read.
+- **`send_feedback()` before `start()` returns `ReplicationError::Protocol`;** it returned `Ok(())`. After `start()` and before the first message it sends an all-zero status update instead of returning early, and `stop()` of a stream that was never started logs a warning.
+- **A cancelled command poisons the connection.** If the future of `start()`, `slot_confirmed_flush_lsn()` or `timeline_history()` is dropped before the reply arrives, every later command on that connection fails with `ReplicationError::PermanentConnection`; create a new stream.
+- **`EventStream::next_event` carries a reconnect across a dropped future.** A `timeout` or `select!` that cancels `next_event()` while the stream reconnects no longer restarts the reconnect from its first attempt; the next call resumes it, so a timeout shorter than a reconnect cannot starve it. While such a reconnect is parked, `inner()`, `inner_mut()` and `current_lsn()` panic until the next `next_event()` returns (as they already do after an abandoned `poll_next`); the feedback methods keep working.
 
 ## Feature Flags
 
@@ -97,7 +111,7 @@ sudo apt-get install cmake gcc
 Then add to `Cargo.toml`:
 
 ```toml
-pg_walstream = { version = "0.8", features = ["rustls-tls"] }
+pg_walstream = { version = "0.9", features = ["rustls-tls"] }
 ```
 
 #### TLS trust store
@@ -313,7 +327,11 @@ let mut copy = loop {
 };
 let c = copy.consistent_point();
 while let Some(event) = stream.next_event_before(c, &cancel).await? {
-    sink.buffer(event); // per transaction, decided at its commit event
+    let lsn = event.lsn;
+    // per transaction, decided at its commit event; true once that transaction is applied
+    if sink.buffer(event).await? {
+        stream.shared_lsn_feedback.update_applied_lsn(lsn);
+    }
 }
 let mut fed = std::time::Instant::now();
 while let Some(row) = copy.next_row().await? {
@@ -327,9 +345,13 @@ copy.finish()?;
 // stream.next_event(&cancel) continues at the first transaction committed at or past c.
 ```
 
-`next_event_before(C)` returns `None` once every transaction committed below `C` has been delivered. Decide each transaction at its commit event. Below `C`, apply it without the copied tables' rows, which the copy already holds. At or past `C`, apply it in full, after the copy. A transaction that ends in `RollbackPrepared` or in a `StreamAbort` of the whole transaction is dropped. A `StreamAbort` of a subtransaction drops the buffered changes whose `ChangeEvent::xid` equals its `subtransaction_xid`. Streamed chunks, `BeginPrepare` through `Prepare`, and `StreamPrepare` can arrive before the `None` for a transaction that commits at or past `C`, so buffer each transaction until its commit event. `EventStream::next_event_before` does the same with retries.
+`next_event_before(C)` returns `None` once every transaction committed below `C` has been delivered. Decide each transaction at its commit event. Below `C`, apply it without the copied tables' rows, which the copy already holds. At or past `C`, apply it in full, after the copy. A transaction that ends in `RollbackPrepared` or in a `StreamAbort` of the whole transaction is dropped. A `StreamAbort` of a subtransaction drops the buffered changes whose `ChangeEvent::xid` equals its `subtransaction_xid`, except a `Message`, which always carries the top-level xid. Streamed chunks, `BeginPrepare` through `Prepare`, and `StreamPrepare` can arrive before the `None` for a transaction that commits at or past `C`, so buffer each transaction until its commit event. `EventStream::next_event_before` does the same with retries.
 
-The capture holds a second replication connection and a temporary slot until slot creation ends. Slot creation waits for the transactions open when it starts and can also wait for ones that start during the wait. Dropping the capture future closes its connections, but a slot creation already sent keeps its walsender waiting on the server, so abandoned captures behind a long transaction can exhaust `max_wal_senders`. `with_cancellation` covers only the copy loop. The copy pins `xmin` until `finish()`.
+Acknowledge each transaction you decided below `C` (`update_applied_lsn` with its commit event's `lsn`, or `EventStream::update_applied_lsn`) before the copy loads. A reconnect replays from the acknowledged position, so without it every transaction delivered before the `None` arrives again after the copy and is applied twice: 50 of 50 transactions in a measured idle-database run, none with the acknowledgement. `EventStream::next_event_before` reconnects without telling you, so also start a buffered transaction over when a `Begin`, a `BeginPrepare` or a `StreamStart` with `first_segment` arrives for one you already hold. That replay of a streamed transaction was not reproduced, so treat it as a precaution.
+
+The capture holds a second replication connection and a temporary slot until slot creation ends. `capture_aligned` fails with a permanent error, before creating the slot, if that connection reaches another cluster or timeline than the stream's, which a connection string with several hosts can cause. Slot creation waits for the transactions open when it starts and can also wait for ones that start during the wait, a prepared transaction left open included. `capture` has no deadline of its own: end the blocker, or cancel the walsender from a second connection with `SELECT pg_cancel_backend(active_pid) FROM pg_replication_slots WHERE slot_name LIKE 'pg_walstream_aligned_%'`. Dropping the capture future closes its connections, but a slot creation already sent keeps its walsender waiting on the server, so abandoned captures behind a long transaction can exhaust `max_wal_senders`. `with_cancellation` covers only the copy loop, and `next_row()` is not cancel-safe where a table's `COPY` starts, so do not race it in a `select!` that can drop it.
+
+The copy pins `xmin` until `finish()`, and it holds an `ACCESS SHARE` lock on each copied table from `capture` on. Reads and writes go on, but a `TRUNCATE`, `ALTER TABLE`, `DROP`, `VACUUM FULL` or `CLUSTER` on those tables waits until `finish()` or drop, and writes issued behind a waiting one wait with it (an `ALTER TABLE` waited 2.4 s, an `INSERT` behind it failed with `55P03` at its 2 s `lock_timeout`). Give that DDL a `lock_timeout`, or run it before the capture or after the copy. The lock is what keeps the copy exact: a `COPY` reads the table's current file, so a `TRUNCATE` or rewriting `ALTER TABLE` committed after `C` would otherwise return it empty. If such a command is in flight when `capture` asks for its lock, or committed after `C`, `capture` fails and you capture again.
 
 ## Connection Timeouts
 

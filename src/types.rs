@@ -647,8 +647,9 @@ pub enum EventType {
     ///
     /// With `subtransaction_xid == transaction_id` the whole streamed transaction
     /// is rolled back. Otherwise only that subtransaction is, and its changes
-    /// are the ones whose [`ChangeEvent::xid`] equals `subtransaction_xid`. Rolling
-    /// back nested savepoints sends one `StreamAbort` per subtransaction.
+    /// are the ones whose [`ChangeEvent::xid`] equals `subtransaction_xid`, except
+    /// a `Message`, which always carries the top-level xid. Rolling back nested
+    /// savepoints sends one `StreamAbort` per subtransaction.
     StreamAbort {
         transaction_id: u32,
         subtransaction_xid: u32,
@@ -802,10 +803,11 @@ pub struct ChangeEvent {
     /// The xid pgoutput wrote before this change inside a streamed chunk.
     ///
     /// It is the subtransaction's xid for a change made after a savepoint, and
-    /// the top-level transaction's otherwise. A `StreamAbort` whose
+    /// the top-level transaction's otherwise, except for a `Message`, which
+    /// always carries the top-level xid. A `StreamAbort` whose
     /// `subtransaction_xid` differs from its `transaction_id` rolls back the
-    /// changes with that `xid`. `None` outside a streamed chunk and for events
-    /// that are not changes.
+    /// changes with that `xid`, so it never names a `Message`. `None` outside a
+    /// streamed chunk and for events that are not changes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub xid: Option<u32>,
 }
@@ -2122,6 +2124,107 @@ mod tests {
         assert_eq!(decoded.event_type, event.event_type);
         assert_eq!(decoded.lsn, event.lsn);
         assert_eq!(decoded.metadata, event.metadata);
+    }
+
+    /// One event per payload shape serde has to carry: row data, `Option`s, `Bytes`, timestamps and unit variants.
+    fn serde_samples() -> Vec<EventType> {
+        let ts = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let data = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("1")),
+            ("note", ColumnValue::Null),
+        ]);
+        vec![
+            EventType::Insert {
+                schema: Arc::from("public"),
+                table: Arc::from("t"),
+                relation_oid: 7,
+                data: data.clone(),
+            },
+            EventType::Update {
+                schema: Arc::from("public"),
+                table: Arc::from("t"),
+                relation_oid: 7,
+                old_data: None,
+                new_data: data,
+                replica_identity: ReplicaIdentity::Default,
+                key_columns: vec![Arc::from("id")],
+            },
+            EventType::Message {
+                flags: 1,
+                message_lsn: Lsn::new(u64::MAX),
+                prefix: Arc::from("p"),
+                content: Bytes::from_static(b"c"),
+            },
+            EventType::Commit {
+                commit_timestamp: ts,
+                commit_lsn: Lsn::new(0x100),
+                end_lsn: Lsn::new(0x200),
+            },
+            EventType::StreamAbort {
+                transaction_id: 7,
+                subtransaction_xid: 8,
+                abort_lsn: Some(Lsn::new(0x100)),
+                abort_timestamp: None,
+            },
+            EventType::StreamStop,
+        ]
+    }
+
+    fn event_with_xid(event_type: EventType, xid: Option<u32>) -> ChangeEvent {
+        ChangeEvent {
+            event_type,
+            lsn: Lsn::new(0x10),
+            metadata: None,
+            xid,
+        }
+    }
+
+    /// `xid` survives a `serde_json` round trip as `None`, a subtransaction's xid and `u32::MAX`, on every payload shape.
+    #[test]
+    fn change_event_xid_round_trips_through_json() {
+        for event_type in serde_samples() {
+            for xid in [None, Some(746), Some(u32::MAX)] {
+                let event = event_with_xid(event_type.clone(), xid);
+                let json = serde_json::to_vec(&event).unwrap();
+                let decoded: ChangeEvent = serde_json::from_slice(&json).unwrap();
+                assert_eq!(decoded.xid, xid, "{event_type:?}");
+                assert_eq!(decoded.event_type, event_type);
+                assert_eq!(decoded.lsn, event.lsn);
+            }
+        }
+    }
+
+    /// JSON written before `xid` existed has no such key and must still deserialize, with `xid` as `None`.
+    #[test]
+    fn json_without_an_xid_key_deserializes_with_no_xid() {
+        let v090 = r#"{"event_type":"StreamStop","lsn":16,"metadata":null}"#;
+        let decoded: ChangeEvent = serde_json::from_str(v090).unwrap();
+        assert_eq!(decoded.event_type, EventType::StreamStop);
+        assert_eq!(decoded.xid, None);
+
+        for event_type in serde_samples() {
+            let mut json =
+                serde_json::to_value(event_with_xid(event_type.clone(), Some(746))).unwrap();
+            assert_eq!(json["xid"], 746, "{event_type:?}");
+            json.as_object_mut().unwrap().remove("xid");
+            let decoded: ChangeEvent = serde_json::from_value(json).unwrap();
+            assert_eq!(decoded.xid, None, "{event_type:?}");
+            assert_eq!(decoded.event_type, event_type);
+        }
+    }
+
+    /// An event without an `xid` serializes with no `xid` key, so it is byte-identical to the JSON 0.9 wrote.
+    #[test]
+    fn a_missing_xid_is_not_serialized() {
+        let v090 = r#"{"event_type":"StreamStop","lsn":16,"metadata":null}"#;
+        assert_eq!(
+            serde_json::to_string(&event_with_xid(EventType::StreamStop, None)).unwrap(),
+            v090
+        );
+        for event_type in serde_samples() {
+            let json = serde_json::to_value(event_with_xid(event_type.clone(), None)).unwrap();
+            assert!(json.get("xid").is_none(), "{event_type:?}: {json}");
+        }
     }
 
     #[test]

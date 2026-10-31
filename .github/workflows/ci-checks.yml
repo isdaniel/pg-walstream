@@ -108,6 +108,44 @@ jobs:
     - name: Unit tests (libpq / pq-sys)
       run: cargo test --lib --no-default-features --features libpq --verbose
 
+  msrv:
+    name: MSRV (Rust 1.87)
+    runs-on: ubuntu-latest
+    # The library must build on the declared rust-version. Tests are not built here:
+    # a dev-dependency (proptest 1.12) may need a newer compiler than the library does.
+    # Keep the toolchain in step with `rust-version` in Cargo.toml.
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Install Rust (MSRV)
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: "1.87"
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libpq-dev libssl-dev pkg-config cmake
+
+    - name: Cache cargo registry
+      uses: actions/cache@v5
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+        key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-msrv-
+
+    - name: Check (default features)
+      run: cargo check --locked --lib
+
+    - name: Check (no_std, no default features)
+      run: cargo check --locked --lib --no-default-features
+
+    - name: Check (libpq / pq-sys)
+      run: cargo check --locked --lib --no-default-features --features libpq
+
   examples:
     name: Examples build
     runs-on: ubuntu-latest
@@ -137,6 +175,8 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-cargo-examples-
 
+    # --locked: each example has its own lock, which a root dependency-floor bump leaves
+    # stale; without the flag cargo regenerates it silently and the drift goes unseen.
     - name: Check every example
       run: |
         set -uo pipefail
@@ -146,7 +186,7 @@ jobs:
           name=$(basename "$(dirname "$manifest")")
           ran=$((ran + 1))
           echo "::group::$name"
-          cargo check --manifest-path "$manifest" --all-targets || failed+=("$name")
+          cargo check --locked --manifest-path "$manifest" --all-targets || failed+=("$name")
           echo "::endgroup::"
         done
 

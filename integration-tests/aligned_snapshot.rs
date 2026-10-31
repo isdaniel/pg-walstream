@@ -736,6 +736,19 @@ impl Recording {
         }
     }
 
+    /// Rows inserted by an event delivered before the `None` that the copy holds too.
+    fn overlap(&self) -> Vec<i64> {
+        let copied: std::collections::BTreeSet<i64> =
+            self.copy.iter().map(|(row, _)| *row).collect();
+        self.before
+            .iter()
+            .filter_map(|e| match step(e.event_type.clone(), self.prefix) {
+                Step::Change(row, Some(_), false) if copied.contains(&row) => Some(row),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn changes_before(&self) -> usize {
         self.before
             .iter()
@@ -885,14 +898,27 @@ async fn a_table_added_to_a_running_stream_merges_exactly_by_the_documented_flow
 }
 
 /// Applying the changes delivered before the `None` and then the copy feeds a
-/// strict sink rows it already holds, or changes to rows it lacks.
+/// strict sink a row twice: a row the writer inserted below `C` comes from the
+/// stream and again from the copy. The updates to the 20 rows from before the
+/// writer started, and the deletes of rows inserted before the table joined the
+/// publication, are out of step for want of a baseline whatever the overlap, so
+/// only a row in both says the overlap was exercised.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a live PostgreSQL with wal_level = logical"]
 async fn a_strict_sink_fed_the_overlap_and_then_the_copy_goes_out_of_step() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let (_guard, _admin, recording) =
             table_added_to_a_running_stream("aligned_naive", "aligned_naive_main").await;
-        assert!(!recording.merge_naively().out_of_step.is_empty());
+        let overlap = recording.overlap();
+        assert!(
+            !overlap.is_empty(),
+            "the stream and the copy never held the same insert"
+        );
+        let out_of_step = recording.merge_naively().out_of_step;
+        assert!(
+            overlap.iter().any(|row| out_of_step.contains(row)),
+            "{out_of_step:?}"
+        );
     })
     .await
     .expect("test timed out");
@@ -1056,20 +1082,19 @@ async fn a_dropped_capture_leaves_no_walsender_or_slot_once_the_blocker_ends() {
         exec(&mut blocker, "BEGIN");
         let blocking = xid(&mut blocker);
 
-        let abandoned = tokio::time::timeout(
-            Duration::from_millis(500),
-            AlignedSnapshot::capture(
-                &replication_conn_string(),
-                &["aligned_dropped_pub"],
-                &[("public", "aligned_dropped")],
-            ),
-        )
-        .await;
-        assert!(abandoned.is_err(), "the capture did not wait for the open transaction");
-        eventually("the abandoned setup waits for the blocker", || {
-            walsender_waits_for(&mut admin, blocking)
-        })
-        .await;
+        let conninfo = replication_conn_string();
+        let mut capture = Box::pin(AlignedSnapshot::capture(
+            &conninfo,
+            &["aligned_dropped_pub"],
+            &[("public", "aligned_dropped")],
+        ));
+        tokio::select! {
+            _ = &mut capture => panic!("the capture did not wait for the open transaction"),
+            () = eventually("slot creation waits for the blocker", || {
+                walsender_waits_for(&mut admin, blocking)
+            }) => {}
+        }
+        drop(capture);
         let walsender = count(&exec(
             &mut admin,
             "SELECT active_pid FROM pg_replication_slots WHERE slot_name LIKE 'pg_walstream_aligned_%'",
@@ -1087,6 +1112,217 @@ async fn a_dropped_capture_leaves_no_walsender_or_slot_once_the_blocker_ends() {
             )) == 0
         })
         .await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// A table whose `COPY` would read an empty new file instead of the snapshot's rows
+/// (`TRUNCATE`, a rewriting `ALTER TABLE`, a drop) cannot change while the copy is open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a live PostgreSQL with wal_level = logical"]
+async fn ddl_that_would_empty_the_copy_waits_for_it_instead() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let mut admin = regular_conn();
+        exec(&mut admin, "SET lock_timeout = '500ms'");
+        for ddl in [
+            "TRUNCATE aligned_ddl",
+            "ALTER TABLE aligned_ddl ADD COLUMN extra double precision DEFAULT random()",
+            "ALTER TABLE aligned_ddl ALTER COLUMN v TYPE int USING length(v)",
+            "DROP TABLE aligned_ddl",
+        ] {
+            for sql in [
+                "DROP PUBLICATION IF EXISTS aligned_ddl_pub",
+                "DROP TABLE IF EXISTS aligned_ddl",
+                "CREATE TABLE aligned_ddl (id bigint PRIMARY KEY, v text NOT NULL)",
+                "INSERT INTO aligned_ddl SELECT g, 'orig' FROM generate_series(1, 100) g",
+                "CREATE PUBLICATION aligned_ddl_pub FOR TABLE aligned_ddl",
+            ] {
+                exec(&mut admin, sql);
+            }
+            let mut snapshot = AlignedSnapshot::capture(
+                &replication_conn_string(),
+                &["aligned_ddl_pub"],
+                &[("public", "aligned_ddl")],
+            )
+            .await
+            .expect("capture");
+
+            let blocked = admin.exec(ddl).err().unwrap_or_else(|| {
+                panic!("`{ddl}` committed while the copy was open, so the copy reads the new table")
+            });
+            assert!(
+                blocked.to_string().contains("lock timeout"),
+                "{ddl}: {blocked}"
+            );
+
+            let mut rows = 0;
+            while snapshot.next_row().await.expect("copy").is_some() {
+                rows += 1;
+            }
+            assert_eq!(rows, 100, "after `{ddl}`");
+            snapshot.finish().expect("finish");
+            exec(&mut admin, ddl);
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// A writer that truncates and refills the table in one transaction, over and over, never leaves it
+/// empty for a snapshot, so a copy of 0 rows is the silent loss.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a live PostgreSQL with wal_level = logical"]
+async fn a_table_truncated_around_the_capture_is_never_copied_silently_empty() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let mut admin = regular_conn();
+        for sql in [
+            "DROP PUBLICATION IF EXISTS aligned_storm_pub",
+            "DROP TABLE IF EXISTS aligned_storm",
+            "CREATE TABLE aligned_storm (id bigint PRIMARY KEY, v text NOT NULL)",
+            "INSERT INTO aligned_storm SELECT g, 'orig' FROM generate_series(1, 100) g",
+            "CREATE PUBLICATION aligned_storm_pub FOR TABLE aligned_storm",
+        ] {
+            exec(&mut admin, sql);
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut w = regular_conn();
+                let _ = w.exec("SET lock_timeout = '2s'");
+                while !stop.load(Ordering::Relaxed) {
+                    // A refused lock rolls the transaction back and the next one retries.
+                    if w.exec(
+                        "BEGIN; TRUNCATE aligned_storm; \
+                         INSERT INTO aligned_storm SELECT g, 'n' FROM generate_series(1, 100) g; COMMIT",
+                    )
+                    .is_err()
+                    {
+                        let _ = w.exec("ROLLBACK");
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            })
+        };
+
+        let (mut copied, mut refused) = (0, 0);
+        for _ in 0..15 {
+            match AlignedSnapshot::capture(
+                &replication_conn_string(),
+                &["aligned_storm_pub"],
+                &[("public", "aligned_storm")],
+            )
+            .await
+            {
+                Ok(mut snapshot) => {
+                    let mut rows = 0;
+                    while snapshot.next_row().await.expect("copy").is_some() {
+                        rows += 1;
+                    }
+                    assert_eq!(rows, 100, "a copy that is neither exact nor an error");
+                    snapshot.finish().expect("finish");
+                    copied += 1;
+                }
+                Err(e) => {
+                    let message = e.to_string();
+                    assert!(
+                        message.contains("changed after the snapshot")
+                            || message.contains("could not obtain lock"),
+                        "{message}"
+                    );
+                    refused += 1;
+                }
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+        println!("captures: {copied} exact, {refused} refused");
+
+        let mut snapshot = AlignedSnapshot::capture(
+            &replication_conn_string(),
+            &["aligned_storm_pub"],
+            &[("public", "aligned_storm")],
+        )
+        .await
+        .expect("a quiet table captures");
+        let mut rows = 0;
+        while snapshot.next_row().await.expect("copy").is_some() {
+            rows += 1;
+        }
+        assert_eq!(rows, 100);
+        snapshot.finish().expect("finish");
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// The same race on a partitioned table published through its root. The root has no file of its own,
+/// so only a check of its partitions sees a leaf that was truncated after the snapshot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a live PostgreSQL with wal_level = logical"]
+async fn a_leaf_truncated_around_the_capture_is_never_copied_silently_short() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let mut admin = regular_conn();
+        for sql in [
+            "DROP PUBLICATION IF EXISTS aligned_leaf_pub",
+            "DROP TABLE IF EXISTS aligned_leaf CASCADE",
+            "CREATE TABLE aligned_leaf (id bigint PRIMARY KEY, v text NOT NULL) PARTITION BY RANGE (id)",
+            "CREATE TABLE aligned_leaf_a PARTITION OF aligned_leaf FOR VALUES FROM (0) TO (100)",
+            "CREATE TABLE aligned_leaf_b PARTITION OF aligned_leaf FOR VALUES FROM (100) TO (200)",
+            "INSERT INTO aligned_leaf SELECT g, 'orig' FROM generate_series(0, 199) g",
+            "CREATE PUBLICATION aligned_leaf_pub FOR TABLE aligned_leaf WITH (publish_via_partition_root = true)",
+        ] {
+            exec(&mut admin, sql);
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut w = regular_conn();
+                let _ = w.exec("SET lock_timeout = '2s'");
+                while !stop.load(Ordering::Relaxed) {
+                    if w.exec(
+                        "BEGIN; TRUNCATE aligned_leaf_a; \
+                         INSERT INTO aligned_leaf_a SELECT g, 'n' FROM generate_series(0, 99) g; COMMIT",
+                    )
+                    .is_err()
+                    {
+                        let _ = w.exec("ROLLBACK");
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            })
+        };
+
+        for _ in 0..15 {
+            match AlignedSnapshot::capture(
+                &replication_conn_string(),
+                &["aligned_leaf_pub"],
+                &[("public", "aligned_leaf")],
+            )
+            .await
+            {
+                Ok(mut snapshot) => {
+                    let mut rows = 0;
+                    while snapshot.next_row().await.expect("copy").is_some() {
+                        rows += 1;
+                    }
+                    assert_eq!(rows, 200, "a copy that is neither exact nor an error");
+                    snapshot.finish().expect("finish");
+                }
+                Err(e) => {
+                    let message = e.to_string();
+                    assert!(
+                        message.contains("changed after the snapshot")
+                            || message.contains("could not obtain lock"),
+                        "{message}"
+                    );
+                }
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
     })
     .await
     .expect("test timed out");
