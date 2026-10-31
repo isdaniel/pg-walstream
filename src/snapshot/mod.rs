@@ -480,8 +480,9 @@ async fn resolve_tables(
         ))
         .await?;
 
-    // Run inside the snapshot transaction so the catalog we read is the one the
-    // COPYs will see, and a concurrent ALTER PUBLICATION cannot race us.
+    // The table list is the one the snapshot sees, so a concurrent ALTER PUBLICATION
+    // cannot race us. The COPYs resolve each table in the current catalog, though, and
+    // read an empty new file after a TRUNCATE or a rewriting ALTER that committed later.
     let sql = plan::build_catalog_sql(server_version, publications)?;
     let result = reader.exec_async(&sql).await?;
     let rows = catalog_rows_from_result(&result)?;

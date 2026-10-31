@@ -1047,6 +1047,8 @@ impl PgReplicationConnection {
         self.reject_in_flight()?;
         let c_query = CString::new(query)
             .map_err(|e| ReplicationError::protocol(format!("Invalid query string: {e}")))?;
+        // The socket is registered for this command and released after it unless a COPY holds a registration: a connection built under one runtime may be driven by another, and an `AsyncFd` stays bound to the reactor it was registered with.
+        let registered_here = self.async_fd.is_none();
         self.initialize_async_socket()?;
 
         // Raised before the first await and lowered on every exit path; a dropped
@@ -1054,6 +1056,9 @@ impl PgReplicationConnection {
         self.in_flight = true;
         let result = self.exec_in_flight(&c_query, query).await;
         self.in_flight = false;
+        if registered_here {
+            self.async_fd = None;
+        }
         result
     }
 
@@ -3155,6 +3160,9 @@ mod tests {
 
     /// A silent server must neither block the runtime nor keep the socket open once the caller gives up,
     /// and the startup packet must have reached it before the connect gave up.
+    ///
+    /// The caller gives up when the server reports the startup packet, not after a fixed time: a time limit
+    /// that is too short for a slow or stalled thread cancels the connect before it has sent anything.
     #[tokio::test(flavor = "current_thread")]
     async fn connect_async_yields_to_a_timeout_and_releases_its_socket() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3166,30 +3174,37 @@ mod tests {
         let conninfo = format!(
             "host=127.0.0.1 port={port} dbname=async user=async sslmode=disable gssencmode=disable connect_timeout=10"
         );
+        let (startup_seen, startup_packet) = tokio::sync::oneshot::channel();
         let silent_server = tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
-            let mut startup = Vec::new();
-            sock.read_to_end(&mut startup).await.unwrap();
+            let mut len = [0u8; 4];
+            sock.read_exact(&mut len).await.unwrap();
+            let mut startup = vec![0; (u32::from_be_bytes(len) as usize).saturating_sub(4)];
+            sock.read_exact(&mut startup).await.unwrap();
+            let _ = startup_seen.send(());
+            sock.read_to_end(&mut Vec::new()).await.unwrap();
             startup
         });
+        // Scheduled, not timed: a timer tick can lose a race that a stalled thread decides.
         let ticks = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&ticks);
         let heartbeat = tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_millis(5)).await;
                 counter.fetch_add(1, Ordering::Relaxed);
+                tokio::task::yield_now().await;
             }
         });
 
         let started = std::time::Instant::now();
-        let result = tokio::time::timeout(
-            Duration::from_millis(50),
-            PgReplicationConnection::connect_async(&conninfo),
-        )
-        .await;
-        assert!(result.is_err(), "the outer timeout must fire");
+        tokio::select! {
+            result = PgReplicationConnection::connect_async(&conninfo) => {
+                panic!("connect_async must stay pending against a silent server: {:?}", result.err());
+            }
+            seen = startup_packet => seen.expect("the server task ended before the startup packet"),
+        }
+        // A blocking connect would hold the thread for the whole `connect_timeout` of 10 s.
         assert!(
-            started.elapsed() < Duration::from_millis(500),
+            started.elapsed() < Duration::from_secs(5),
             "{:?}",
             started.elapsed()
         );
@@ -3199,13 +3214,13 @@ mod tests {
         );
         heartbeat.abort();
 
-        let startup = tokio::time::timeout(Duration::from_secs(2), silent_server)
+        let startup = tokio::time::timeout(Duration::from_secs(10), silent_server)
             .await
             .expect("dropping the connect future must close its socket")
             .unwrap();
         assert!(
             !startup.is_empty(),
-            "the startup packet never reached the server before the timeout"
+            "the startup packet never reached the server before the connect was dropped"
         );
     }
 
@@ -3725,6 +3740,265 @@ mod tests {
                 )),
                 "{err}"
             );
+        }
+    }
+
+    // === Stand-in server ===
+
+    /// What a stand-in server answers to a startup packet.
+    #[derive(Clone, Copy)]
+    enum Greeting {
+        /// Accept the login; the session reports `in_hot_standby` as `standby`.
+        Accept { standby: bool },
+        /// Refuse it with an ErrorResponse of `(sqlstate, message)`.
+        Reject(&'static str, &'static str),
+    }
+
+    /// A PostgreSQL stand-in on plain threads, so it outlives any runtime a test builds. It counts startup packets, answers each with its greeting and, once a login is accepted, answers every simple query with one row. Dropping it stops the listener and waits for the sessions, which end when their clients hang up.
+    struct StandIn {
+        port: u16,
+        startups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        stopping: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        listener: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl StandIn {
+        fn new(greeting: Greeting) -> Self {
+            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+            use std::sync::Arc;
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let startups = Arc::new(AtomicUsize::new(0));
+            let stopping = Arc::new(AtomicBool::new(false));
+            let (counter, stop) = (Arc::clone(&startups), Arc::clone(&stopping));
+            let listener = std::thread::spawn(move || {
+                let mut sessions = Vec::new();
+                for stream in listener.incoming() {
+                    let (stream, counter) = (stream.unwrap(), Arc::clone(&counter));
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    sessions.push(std::thread::spawn(move || {
+                        let _ = Self::serve(stream, greeting, &counter);
+                    }));
+                }
+                // A session ends when its client hangs up, so the test must drop its connections first.
+                for session in sessions {
+                    let _ = session.join();
+                }
+            });
+            Self {
+                port,
+                startups,
+                stopping,
+                listener: Some(listener),
+            }
+        }
+
+        fn startups(&self) -> usize {
+            self.startups.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// One backend message: its type byte, a length that counts itself, and the body.
+        fn message(kind: u8, body: &[u8]) -> Vec<u8> {
+            let mut out = vec![kind];
+            out.extend_from_slice(&(body.len() as u32 + 4).to_be_bytes());
+            out.extend_from_slice(body);
+            out
+        }
+
+        fn serve(
+            mut sock: std::net::TcpStream,
+            greeting: Greeting,
+            startups: &std::sync::atomic::AtomicUsize,
+        ) -> std::io::Result<()> {
+            use std::io::{Read, Write};
+
+            let read_frame = |sock: &mut std::net::TcpStream| -> std::io::Result<Vec<u8>> {
+                let mut len = [0u8; 4];
+                sock.read_exact(&mut len)?;
+                let mut body = vec![0; (u32::from_be_bytes(len) as usize).saturating_sub(4)];
+                sock.read_exact(&mut body)?;
+                Ok(body)
+            };
+            read_frame(&mut sock)?;
+            startups.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let standby = match greeting {
+                Greeting::Reject(sqlstate, text) => {
+                    let fields = format!("SFATAL\0VFATAL\0C{sqlstate}\0M{text}\0\0");
+                    return sock.write_all(&Self::message(b'E', fields.as_bytes()));
+                }
+                Greeting::Accept { standby } => standby,
+            };
+            let mut hello = Self::message(b'R', &0u32.to_be_bytes());
+            for (name, value) in [
+                ("client_encoding", "UTF8"),
+                ("server_version", "17.0"),
+                ("default_transaction_read_only", "off"),
+                ("in_hot_standby", if standby { "on" } else { "off" }),
+            ] {
+                hello.extend(Self::message(b'S', format!("{name}\0{value}\0").as_bytes()));
+            }
+            hello.extend(Self::message(b'K', &[0; 8]));
+            hello.extend(Self::message(b'Z', b"I"));
+            sock.write_all(&hello)?;
+            loop {
+                let mut kind = [0u8; 1];
+                sock.read_exact(&mut kind)?;
+                read_frame(&mut sock)?;
+                if kind[0] == b'X' {
+                    return Ok(());
+                }
+                // One text column "x" holding "1".
+                let mut row_description = 1u16.to_be_bytes().to_vec();
+                row_description.extend_from_slice(b"x\0");
+                row_description.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 25, 255, 255]);
+                row_description.extend_from_slice(&[255, 255, 255, 255, 0, 0]);
+                let mut reply = Self::message(b'T', &row_description);
+                reply.extend(Self::message(b'D', &[0, 1, 0, 0, 0, 1, b'1']));
+                reply.extend(Self::message(b'C', b"SELECT 1\0"));
+                reply.extend(Self::message(b'Z', b"I"));
+                sock.write_all(&reply)?;
+            }
+        }
+    }
+
+    impl Drop for StandIn {
+        fn drop(&mut self) {
+            self.stopping
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            // A connection wakes the listener out of `accept` to see the flag.
+            let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+            if let Some(listener) = self.listener.take() {
+                let _ = listener.join();
+            }
+        }
+    }
+
+    /// A conninfo that lists `servers` in order, each address once.
+    fn stand_in_conninfo(servers: &[&StandIn], extra: &str) -> String {
+        let hosts = vec!["127.0.0.1"; servers.len()].join(",");
+        let ports: Vec<String> = servers.iter().map(|s| s.port.to_string()).collect();
+        format!(
+            "host={hosts} port={} dbname=async user=async sslmode=disable gssencmode=disable connect_timeout=5 {extra}",
+            ports.join(",")
+        )
+    }
+
+    /// A server that cannot accept connections yet is passed over for the next host, in whatever language it words the error, and `connect_async` words the failure as `PQconnectdb` does.
+    #[test]
+    fn connect_async_walks_past_every_server_that_cannot_accept_connections() {
+        let servers =
+            |greeting| -> Vec<StandIn> { (0..3).map(|_| StandIn::new(greeting)).collect() };
+        // The text of an error with each server's port replaced by its position in the list.
+        let text = |err: &ReplicationError, servers: &[StandIn]| {
+            servers
+                .iter()
+                .enumerate()
+                .fold(err.to_string(), |text, (i, s)| {
+                    text.replace(&s.port.to_string(), &format!("<{i}>"))
+                })
+        };
+        for message in [
+            "the database system is starting up",
+            "das Datenbanksystem nimmt keine Verbindungen an",
+        ] {
+            let greeting = Greeting::Reject("57P03", message);
+            let (for_sync, for_async) = (servers(greeting), servers(greeting));
+            let list =
+                |servers: &[StandIn]| stand_in_conninfo(&servers.iter().collect::<Vec<_>>(), "");
+            let sync = PgReplicationConnection::connect(&list(&for_sync))
+                .err()
+                .expect("every server refuses");
+            let async_ = block_on(PgReplicationConnection::connect_async(&list(&for_async)))
+                .err()
+                .expect("every server refuses");
+            let count = |servers: &[StandIn]| servers.iter().map(StandIn::startups).sum::<usize>();
+            assert_eq!(count(&for_sync), 3, "{message}: connect");
+            assert_eq!(count(&for_async), 3, "{message}: connect_async");
+            assert_eq!(
+                text(&async_, &for_async),
+                text(&sync, &for_sync),
+                "{message}"
+            );
+        }
+    }
+
+    /// A bad password is still an `Authentication` error, which the retry loop treats differently from a transient one.
+    #[test]
+    fn connect_async_reports_a_bad_password_as_an_authentication_error() {
+        let server = StandIn::new(Greeting::Reject(
+            "28P01",
+            "password authentication failed for user \"async\"",
+        ));
+        let err = block_on(PgReplicationConnection::connect_async(&stand_in_conninfo(
+            &[&server, &server],
+            "",
+        )))
+        .err()
+        .expect("the server refuses every login");
+        assert!(matches!(err, ReplicationError::Authentication(_)), "{err}");
+    }
+
+    /// A server that cannot accept connections yet, such as a standby still starting up, is passed over for the next host.
+    #[test]
+    fn connect_async_walks_past_a_server_that_is_not_accepting_connections() {
+        let starting = StandIn::new(Greeting::Reject(
+            "57P03",
+            "the database system is starting up",
+        ));
+        let ready = StandIn::new(Greeting::Accept { standby: false });
+        block_on(PgReplicationConnection::connect_async(&stand_in_conninfo(
+            &[&starting, &ready],
+            "",
+        )))
+        .map(drop)
+        .expect("the second host accepts");
+        assert_eq!((starting.startups(), ready.startups()), (1, 1));
+    }
+
+    /// A session that does not match `target_session_attrs` is judged after startup, and the walk goes on to the next host.
+    #[test]
+    fn connect_async_walks_past_a_session_of_the_wrong_kind() {
+        let standby = StandIn::new(Greeting::Accept { standby: true });
+        let primary = StandIn::new(Greeting::Accept { standby: false });
+        block_on(PgReplicationConnection::connect_async(&stand_in_conninfo(
+            &[&standby, &primary],
+            "target_session_attrs=read-write",
+        )))
+        .map(drop)
+        .expect("the primary matches");
+        assert_eq!((standby.startups(), primary.startups()), (1, 1));
+    }
+
+    /// A connection built under one runtime must run its commands under another, whether the first was dropped (its reactor is gone) or only kept without being driven (its reactor never fires).
+    #[test]
+    fn a_connection_runs_commands_under_a_runtime_other_than_the_one_that_built_it() {
+        let server = StandIn::new(Greeting::Accept { standby: false });
+        let conninfo = stand_in_conninfo(&[&server], "");
+        for drop_first in [true, false] {
+            let first = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let mut conn = first
+                .block_on(PgReplicationConnection::connect_async(&conninfo))
+                .unwrap();
+            first.block_on(conn.exec_async("IDENTIFY_SYSTEM")).unwrap();
+            let kept = if drop_first {
+                drop(first);
+                None
+            } else {
+                Some(first)
+            };
+            let reply = block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), conn.exec_async("IDENTIFY_SYSTEM"))
+                    .await
+                    .unwrap_or_else(|_| panic!("hung (first runtime dropped: {drop_first})"))
+            });
+            assert!(reply.is_ok(), "dropped {drop_first}: {:?}", reply.err());
+            drop(kept);
         }
     }
 

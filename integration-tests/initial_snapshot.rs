@@ -689,11 +689,6 @@ async fn snapshot_cancelled_during_slot_creation_leaves_no_slot() {
     )
     .await
     .expect("connect");
-    let cancelled = tokio::time::timeout(Duration::from_millis(500), stream.snapshot()).await;
-    assert!(
-        cancelled.is_err(),
-        "slot creation must still be waiting on the open transaction"
-    );
     let mut probe = regular_conn();
     let count = |probe: &mut PgReplicationConnection| {
         probe_count(
@@ -704,11 +699,20 @@ async fn snapshot_cancelled_during_slot_creation_leaves_no_slot() {
                 .expect("count slots"),
         )
     };
-    assert_eq!(
-        count(&mut probe),
-        1,
-        "the server holds the half-created slot while it waits"
-    );
+    // Cancel only once the server holds the half-created slot, however long the connect takes.
+    let mut snapshot = Box::pin(stream.snapshot());
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while count(&mut probe) != 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the server never held the half-created slot while it waited"
+        );
+        tokio::select! {
+            _ = &mut snapshot => panic!("slot creation must still be waiting on the open transaction"),
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+    }
+    drop(snapshot);
     blocker.exec("COMMIT").expect("commit");
 
     let deadline = std::time::Instant::now() + Duration::from_secs(30);

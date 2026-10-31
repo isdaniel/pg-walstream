@@ -42,7 +42,7 @@ smallvec = { version = "1.16.4", features = ["serde"] }
 pg-walstream-macros = { workspace = true, optional = true }
 
 # libpq backend (opt-in) — pq-sys: raw FFI to the system libpq via pkg-config, with pre-generated bindings (no libclang/bindgen at build time).
-pq-sys = { version = "0.7.6", optional = true }
+pq-sys = { version = "0.7.8", optional = true }
 
 # rustls-tls
 tokio-rustls = { version = "0.26.6", optional = true }

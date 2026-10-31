@@ -529,7 +529,16 @@ impl RelationInfo {
 #[derive(Debug, Clone)]
 pub struct StreamingReplicationMessage {
     pub message: LogicalReplicationMessage,
+    /// `true` for a message read inside a streamed chunk, which is exactly when `xid` is `Some`.
     pub is_streaming: bool,
+    /// The xid of a message read inside a streamed chunk (protocol v2+); `None` outside one.
+    ///
+    /// For `Relation`, `Type`, `Insert`, `Update`, `Delete`, `Truncate` and `Message` it is the
+    /// xid pgoutput wrote just before that change: a subtransaction's xid after a savepoint,
+    /// the top-level transaction's otherwise. A `Message` is the exception: pgoutput always
+    /// stamps it with the top-level xid. `StreamStart` carries the chunk's top-level xid and
+    /// `StreamStop` none, so take the top-level xid from `StreamStart`; do not assume every
+    /// `xid` inside the chunk equals it.
     pub xid: Option<Xid>,
 }
 
@@ -3559,6 +3568,23 @@ mod tests {
             let reencoded = crate::pgoutput_encode::encode_streaming_message_to_bytes(&parsed, 2);
             assert_eq!(reencoded, bytes, "{message:?}");
         }
+    }
+
+    /// Within one chunk `xid` follows the stamp on each change: the chunk's own xid, then a subtransaction's, then back.
+    #[test]
+    fn xid_follows_each_change_in_a_chunk_not_the_chunk() {
+        let mut parser = LogicalReplicationParser::with_protocol_version(2);
+        let started = parser.parse_wal_message(&stream_start(745)).unwrap();
+        assert_eq!(started.xid, Some(745));
+
+        let insert = streamed_changes().swap_remove(2);
+        let mut xids = Vec::new();
+        for stamp in [745, 746, 745] {
+            let sent = StreamingReplicationMessage::new_streaming(insert.clone(), stamp);
+            let bytes = crate::pgoutput_encode::encode_streaming_message_to_bytes(&sent, 2);
+            xids.push(parser.parse_wal_message(&bytes).unwrap().xid);
+        }
+        assert_eq!(xids, [Some(745), Some(746), Some(745)]);
     }
 
     /// Outside a chunk no change carries an xid, `StreamStart` carries its own and `StreamStop` none.
