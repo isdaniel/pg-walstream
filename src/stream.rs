@@ -5531,17 +5531,17 @@ pub(crate) mod tests {
             .unwrap()
             .iter()
             .map(|t| {
-                let send = if t.sends_binary { "t" } else { "f" };
+                let send = if t.sends_binary() { "t" } else { "f" };
                 format!(
                     "{}|{}|{}|{}|{send}|{}|{}|{}|{}",
-                    t.oid,
-                    t.namespace,
-                    t.name,
-                    t.kind,
-                    oid(t.element),
-                    oid(t.base_type),
-                    oid(t.range_subtype),
-                    oid(t.relation)
+                    t.oid(),
+                    t.namespace(),
+                    t.name(),
+                    t.kind(),
+                    oid(t.element()),
+                    oid(t.base_type()),
+                    oid(t.range_subtype()),
+                    oid(t.relation())
                 )
             })
             .collect();
