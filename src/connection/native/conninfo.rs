@@ -429,11 +429,6 @@ impl ConnInfo {
             //   unterminated quote is an error:    | silently uses the partial
             //   `unterminated quoted string in     | value -> a TRUNCATED
             //    connection info string`           | password reaches the server
-            //
-            // All three matter more now that unknown keys hard-error rather than
-            // being ignored: a valid libpq conninfo can fail outright. Left as-is
-            // deliberately for now — fixing it is a behaviour change (`''` stops
-            // working) and belongs with the 0.9.0 semver bump, not a patch.
             let value = if chars.peek() == Some(&'\'') {
                 chars.next(); // skip opening quote
                 let mut v = String::new();

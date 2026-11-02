@@ -39,7 +39,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-pg_walstream = "0.9"
+pg_walstream = "0.10"
 ```
 
 By default, this uses the pure-Rust `rustls-tls` backend — no libpq and no OpenSSL, only `cmake` + a C compiler at build time (for `aws-lc-rs`).
@@ -48,15 +48,11 @@ To use the C **libpq** backend instead (bound by `pq-sys`; requires system libpq
 
 ```toml
 [dependencies]
-pg_walstream = { version = "0.9", default-features = false, features = ["libpq"] }
+pg_walstream = { version = "0.10", default-features = false, features = ["libpq"] }
 ```
 
 If both backends are enabled, `rustls-tls` takes priority automatically.
 
-## Unreleased: changes since 0.9.0
-<!-- Rename to "Upgrading from 0.9" when the release version is chosen. -->
-
-The next release changes the public API, so code written for 0.9 may not compile unchanged.
 
 - **`ChangeEvent` has a new public field `xid: Option<u32>`.** Build events with `xid: None` and add `..` to struct patterns (`let ChangeEvent { event_type, lsn, .. } = event`). It is `Some` only for a `Relation`, `Type`, `Insert`, `Update`, `Delete`, `Truncate` or `Message` inside a streamed chunk.
 - **`ChangeEvent::encode` and `ChangeEvent::decode` (deprecated since 0.9.0) are removed.** Serialize events with `serde_json`; JSON written by 0.9 (no `xid` key) still deserializes, with `xid` as `None`. Bytes written by `encode` are not JSON and cannot be read after the upgrade, so convert them on 0.9 first. bincode and postcard cannot read a `ColumnValue`.
@@ -111,7 +107,7 @@ sudo apt-get install cmake gcc
 Then add to `Cargo.toml`:
 
 ```toml
-pg_walstream = { version = "0.9", features = ["rustls-tls"] }
+pg_walstream = { version = "0.10", features = ["rustls-tls"] }
 ```
 
 #### TLS trust store
