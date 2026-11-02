@@ -882,20 +882,29 @@ impl LogicalReplicationStream {
         }
     }
 
+    /// Run `command` before [`start`](Self::start), refused while a snapshot exported by [`ensure_replication_slot`](Self::ensure_replication_slot) is outstanding, because any command on this connection ends the export.
+    async fn pre_start_command(&mut self, command: &str) -> Result<crate::connection::PgResult> {
+        if let Some(snapshot) = self.slot.exported_snapshot() {
+            return Err(ReplicationError::protocol(format!(
+                "{command:?} would end exported snapshot {snapshot}, so run it before ensure_replication_slot"
+            )));
+        }
+        self.connection
+            .exec_async(command)
+            .await
+            .map_err(|e| self.rebuild_if_refused(e))
+    }
+
     /// The replication slot's `confirmed_flush_lsn`, read on the stream's own connection, or `None` when the slot does not exist.
     ///
     /// A point-in-time read that must run before [`start`](Self::start), while the connection still accepts queries. The stream never feeds the value into its feedback. Requires a `replication=database` connection.
     ///
     /// # Errors
     ///
-    /// Returns an error when the stream is already streaming, when the query fails, or when the slot is not a logical slot. After a cancelled startup command the error is [`ReplicationError::PermanentConnection`], as for [`start`](Self::start).
+    /// Returns an error when the stream is already streaming, when a snapshot exported by [`ensure_replication_slot`](Self::ensure_replication_slot) is outstanding, when the query fails, or when the slot is not a logical slot. After a cancelled startup command the error is [`ReplicationError::PermanentConnection`], as for [`start`](Self::start).
     pub async fn slot_confirmed_flush_lsn(&mut self) -> Result<Option<Lsn>> {
         let sql = crate::sql_builder::build_slot_confirmed_flush_sql(&self.config.slot_name)?;
-        let result = self
-            .connection
-            .exec_async(&sql)
-            .await
-            .map_err(|e| self.rebuild_if_refused(e))?;
+        let result = self.pre_start_command(&sql).await?;
         confirmed_flush_lsn_from(&self.config.slot_name, &result)
     }
 
@@ -905,17 +914,15 @@ impl LogicalReplicationStream {
     ///
     /// # Errors
     ///
-    /// Returns an error when `TIMELINE_HISTORY` fails, which it does once the stream is streaming, or when its reply is not a well-formed history of that timeline. After a cancelled startup command the error is [`ReplicationError::PermanentConnection`], as for [`start`](Self::start).
+    /// Returns an error when `TIMELINE_HISTORY` fails, which it does once the stream is streaming, when a snapshot exported by [`ensure_replication_slot`](Self::ensure_replication_slot) is outstanding, or when its reply is not a well-formed history of that timeline. After a cancelled startup command the error is [`ReplicationError::PermanentConnection`], as for [`start`](Self::start).
     pub async fn timeline_history(&mut self) -> Result<Vec<TimelineSwitch>> {
         let timeline = self.identity.timeline;
         if timeline == 1 {
             return Ok(Vec::new());
         }
         let result = self
-            .connection
-            .exec_async(&format!("TIMELINE_HISTORY {timeline}"))
-            .await
-            .map_err(|e| self.rebuild_if_refused(e))?;
+            .pre_start_command(&format!("TIMELINE_HISTORY {timeline}"))
+            .await?;
         timeline_history_from(timeline, &result)
     }
 
@@ -948,6 +955,7 @@ impl LogicalReplicationStream {
     /// [`start()`](Self::start). Once `start()` issues `START_REPLICATION`, PostgreSQL
     /// destroys the exported snapshot. You **must** read the snapshot on a separate
     /// connection before calling `start()`.
+    /// Until then [`slot_confirmed_flush_lsn`](Self::slot_confirmed_flush_lsn) and [`timeline_history`](Self::timeline_history) refuse to run, because any command on this connection ends the export.
     ///
     /// If the slot already exists, this is a no-op.
     ///
@@ -5537,6 +5545,25 @@ pub(crate) mod tests {
             "the attempt never reached the server, so the snapshot is still alive \
              and must stay reachable"
         );
+    }
+
+    /// Both pre-start reads are refused, naming the snapshot, while an export is outstanding.
+    #[tokio::test]
+    async fn pre_start_reads_are_refused_while_an_export_is_outstanding() {
+        let mut stream = create_test_stream(ReplicationStreamConfig::builder("slot", "pub"));
+        stream.identity = identity(7682, 2);
+        stream.slot = SlotState::Ours {
+            consistent_point: None,
+            exported_snapshot: Some("00000004-00000391-1".to_string()),
+        };
+        let refused = |err: ReplicationError| {
+            assert!(
+                matches!(&err, ReplicationError::Protocol(m) if m.contains("00000004-00000391-1")),
+                "{err:?}"
+            );
+        };
+        refused(stream.slot_confirmed_flush_lsn().await.unwrap_err());
+        refused(stream.timeline_history().await.unwrap_err());
     }
 
     #[tokio::test]
