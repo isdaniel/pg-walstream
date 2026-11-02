@@ -240,12 +240,14 @@ async fn type_catalog_predicts_the_binary_columns() {
         "DROP TABLE IF EXISTS it_type_catalog",
         "DROP TYPE IF EXISTS it_type_catalog_mood",
         "DROP DOMAIN IF EXISTS it_type_catalog_positive",
+        "DROP TYPE IF EXISTS it_type_catalog_floats",
     ];
     let mut regular = regular();
     drop_slot(&mut regular, name);
     for sql in cleanup.into_iter().chain([
         "CREATE TYPE it_type_catalog_mood AS ENUM ('sad', 'happy')",
         "CREATE DOMAIN it_type_catalog_positive AS int4 CHECK (VALUE > 0)",
+        "CREATE TYPE it_type_catalog_floats AS RANGE (subtype = float8)",
         "CREATE TABLE it_type_catalog (id int4 PRIMARY KEY, acl aclitem, \
          mood it_type_catalog_mood, amount it_type_catalog_positive)",
         "CREATE PUBLICATION it_type_catalog FOR TABLE it_type_catalog",
@@ -274,6 +276,13 @@ async fn type_catalog_predicts_the_binary_columns() {
         named("_it_type_catalog_mood").element(),
         Some(named("it_type_catalog_mood").oid())
     );
+    assert_eq!(named("point").element(), None);
+    for range in [
+        "it_type_catalog_floats",
+        "it_type_catalog_floats_multirange",
+    ] {
+        assert_eq!(named(range).range_subtype(), Some(701), "{range}");
+    }
     assert!(!named("aclitem").sends_binary());
 
     stream.start(None).await.expect("start");
@@ -283,7 +292,10 @@ async fn type_catalog_predicts_the_binary_columns() {
     );
 
     regular
-        .exec("INSERT INTO it_type_catalog VALUES (1, 'postgres=r/postgres', 'happy', 7)")
+        .exec(
+            "INSERT INTO it_type_catalog \
+             VALUES (1, (current_user || '=r/' || current_user)::aclitem, 'happy', 7)",
+        )
         .expect("insert");
     let cancel = CancellationToken::new();
     let row = loop {

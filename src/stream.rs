@@ -339,7 +339,7 @@ impl TypeInfo {
         self.sends_binary
     }
 
-    /// `typelem`, an array's element type, also set on a few subscriptable base types such as `point`.
+    /// The element type of an array, `None` for every other type, including subscriptable base types such as `point`.
     #[inline]
     pub fn element(&self) -> Option<Oid> {
         self.element
@@ -351,7 +351,7 @@ impl TypeInfo {
         self.base_type
     }
 
-    /// A range's bound type.
+    /// The bound type of a range or multirange.
     #[inline]
     pub fn range_subtype(&self) -> Option<Oid> {
         self.range_subtype
@@ -366,11 +366,12 @@ impl TypeInfo {
 
 /// Every `pg_type` row in [`TypeInfo`]'s field order, with absent OIDs as `NULL`.
 const TYPE_CATALOG_SQL: &str = "SELECT t.oid, n.nspname, t.typname, t.typtype, \
-     t.typsend::oid <> 0, NULLIF(t.typelem, 0), NULLIF(t.typbasetype, 0), r.rngsubtype, \
-     NULLIF(t.typrelid, 0) \
+     t.typsend::oid <> 0, \
+     CASE WHEN t.typsubscript = 'pg_catalog.array_subscript_handler'::regproc THEN t.typelem END, \
+     NULLIF(t.typbasetype, 0), r.rngsubtype, NULLIF(t.typrelid, 0) \
      FROM pg_catalog.pg_type t \
      JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace \
-     LEFT JOIN pg_catalog.pg_range r ON r.rngtypid = t.oid \
+     LEFT JOIN pg_catalog.pg_range r ON t.oid IN (r.rngtypid, r.rngmultitypid) \
      ORDER BY t.oid";
 
 fn type_catalog_from(result: &crate::connection::PgResult) -> Result<Vec<TypeInfo>> {
