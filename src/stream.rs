@@ -15,7 +15,9 @@
 
 use crate::error::{ReplicationError, Result};
 use crate::lsn::SharedLsnFeedback;
-use crate::types::{ChangeEvent, EventType, Lsn, ReplicationSlotOptions, SlotType, TimestampTz};
+use crate::types::{
+    ChangeEvent, EventType, Lsn, Oid, ReplicationSlotOptions, SlotType, TimestampTz,
+};
 use crate::{
     format_lsn, parse_keepalive_message, LogicalReplicationParser, PgReplicationConnection,
     ReplicationConnectionRetry, ReplicationState, RetryConfig, XLogRecPtr, INVALID_XLOG_REC_PTR,
@@ -290,6 +292,121 @@ impl TimelineSwitch {
     pub fn switchpoint(&self) -> Lsn {
         self.switchpoint
     }
+}
+
+/// One `pg_type` row, read by [`LogicalReplicationStream::type_catalog`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeInfo {
+    oid: Oid,
+    namespace: String,
+    name: String,
+    kind: char,
+    sends_binary: bool,
+    element: Option<Oid>,
+    base_type: Option<Oid>,
+    range_subtype: Option<Oid>,
+    relation: Option<Oid>,
+}
+
+impl TypeInfo {
+    /// The OID a `Relation` message names as a column's type.
+    #[inline]
+    pub fn oid(&self) -> Oid {
+        self.oid
+    }
+
+    /// The schema.
+    #[inline]
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    /// The name within the schema.
+    #[inline]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The `typtype` letter, such as `b` base, `d` domain or `e` enum.
+    #[inline]
+    pub fn kind(&self) -> char {
+        self.kind
+    }
+
+    /// Whether the type has a send function, which is when a [binary](ReplicationStreamConfig::with_binary) stream sends it in binary.
+    #[inline]
+    pub fn sends_binary(&self) -> bool {
+        self.sends_binary
+    }
+
+    /// `typelem`, an array's element type, also set on a few subscriptable base types such as `point`.
+    #[inline]
+    pub fn element(&self) -> Option<Oid> {
+        self.element
+    }
+
+    /// A domain's base type, whose binary format the domain shares.
+    #[inline]
+    pub fn base_type(&self) -> Option<Oid> {
+        self.base_type
+    }
+
+    /// A range's bound type.
+    #[inline]
+    pub fn range_subtype(&self) -> Option<Oid> {
+        self.range_subtype
+    }
+
+    /// The `pg_class` relation holding a composite type's fields.
+    #[inline]
+    pub fn relation(&self) -> Option<Oid> {
+        self.relation
+    }
+}
+
+/// Every `pg_type` row in [`TypeInfo`]'s field order, with absent OIDs as `NULL`.
+const TYPE_CATALOG_SQL: &str = "SELECT t.oid, n.nspname, t.typname, t.typtype, \
+     t.typsend::oid <> 0, NULLIF(t.typelem, 0), NULLIF(t.typbasetype, 0), r.rngsubtype, \
+     NULLIF(t.typrelid, 0) \
+     FROM pg_catalog.pg_type t \
+     JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace \
+     LEFT JOIN pg_catalog.pg_range r ON r.rngtypid = t.oid \
+     ORDER BY t.oid";
+
+fn type_catalog_from(result: &crate::connection::PgResult) -> Result<Vec<TypeInfo>> {
+    (0..result.ntuples())
+        .map(|row| {
+            type_info_from(result, row).ok_or_else(|| {
+                ReplicationError::protocol(format!("pg_type catalog row {row} is malformed"))
+            })
+        })
+        .collect()
+}
+
+fn type_info_from(result: &crate::connection::PgResult, row: i32) -> Option<TypeInfo> {
+    let text = |col| result.get_value(row, col);
+    let oid = |col| text(col)?.parse::<Oid>().ok().filter(|&oid| oid != 0);
+    let optional_oid = |col| match result.get_bytes(row, col) {
+        None => Some(None),
+        Some(_) => oid(col).map(Some),
+    };
+    let kind = text(3)?;
+    let mut kind = kind.chars();
+    Some(TypeInfo {
+        oid: oid(0)?,
+        namespace: text(1)?,
+        name: text(2)?,
+        kind: kind.next().filter(|_| kind.next().is_none())?,
+        sends_binary: match text(4)?.as_str() {
+            "t" => true,
+            "f" => false,
+            _ => return None,
+        },
+        element: optional_oid(5)?,
+        base_type: optional_oid(6)?,
+        range_subtype: optional_oid(7)?,
+        relation: optional_oid(8)?,
+    })
 }
 
 /// Read `confirmed_flush_lsn` out of the slot query's reply, `None` when the slot does not exist.
@@ -924,6 +1041,22 @@ impl LogicalReplicationStream {
             .pre_start_command(&format!("TIMELINE_HISTORY {timeline}"))
             .await?;
         timeline_history_from(timeline, &result)
+    }
+
+    /// Every type in `pg_type`, ordered by OID, read on the stream's own connection before [`start`](Self::start).
+    ///
+    /// A [binary](ReplicationStreamConfig::with_binary) stream sends a column in binary exactly when its type [sends binary](TypeInfo::sends_binary). Types created or altered after this read are missing or stale, and reconnects do not read it again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stream is already streaming, when the query fails, or when a row is malformed. After a cancelled startup command the error is [`ReplicationError::PermanentConnection`], as for [`start`](Self::start).
+    pub async fn type_catalog(&mut self) -> Result<Vec<TypeInfo>> {
+        let result = self
+            .connection
+            .exec_async(TYPE_CATALOG_SQL)
+            .await
+            .map_err(|e| self.rebuild_if_refused(e))?;
+        type_catalog_from(&result)
     }
 
     /// Initialize the replication stream
@@ -5365,6 +5498,83 @@ pub(crate) mod tests {
         let garbage = identify_system_result(&["confirmed_flush_lsn"], &[Some("x")]);
         let err = confirmed_flush_lsn_from("s", &garbage).unwrap_err();
         assert!(matches!(err, ReplicationError::Protocol(_)), "{err:?}");
+    }
+
+    /// A `pg_type` catalog reply from psql-style rows, `|`-separated with an empty field for `NULL`.
+    #[cfg(feature = "rustls-tls")]
+    fn type_catalog_result(rows: &[&str]) -> crate::connection::PgResult {
+        let mut r = crate::connection::PgResult::new();
+        r.rows = rows
+            .iter()
+            .map(|row| {
+                row.split('|')
+                    .map(|v| (!v.is_empty()).then(|| v.as_bytes().to_vec()))
+                    .collect()
+            })
+            .collect();
+        r
+    }
+
+    /// Each row's fields land in the matching `TypeInfo` field, with `NULL` OIDs as `None`.
+    #[cfg(feature = "rustls-tls")]
+    #[test]
+    fn type_catalog_reads_every_row() {
+        let rows = [
+            "1033|pg_catalog|aclitem|b|f||||",
+            "16390|public|positive|d|t||23||",
+            "16400|public|_mood|b|t|16399|||",
+            "16410|public|floatrange|r|t|||701|",
+            "16420|public|pair|c|t||||16418",
+        ];
+        let oid = |oid: Option<Oid>| oid.map_or(String::new(), |oid| oid.to_string());
+        let read: Vec<String> = type_catalog_from(&type_catalog_result(&rows))
+            .unwrap()
+            .iter()
+            .map(|t| {
+                let send = if t.sends_binary { "t" } else { "f" };
+                format!(
+                    "{}|{}|{}|{}|{send}|{}|{}|{}|{}",
+                    t.oid,
+                    t.namespace,
+                    t.name,
+                    t.kind,
+                    oid(t.element),
+                    oid(t.base_type),
+                    oid(t.range_subtype),
+                    oid(t.relation)
+                )
+            })
+            .collect();
+        assert_eq!(read, rows);
+    }
+
+    /// A row with a missing, zero or unparsable OID, kind or send flag is a protocol error naming the row.
+    #[cfg(feature = "rustls-tls")]
+    #[test]
+    fn type_catalog_rejects_malformed_rows() {
+        let good = "16390|public|positive|d|t||23||";
+        for (column, value) in [
+            (0, ""),
+            (0, "x"),
+            (0, "0"),
+            (1, ""),
+            (2, ""),
+            (3, ""),
+            (3, "db"),
+            (4, "yes"),
+            (5, "0"),
+            (6, "-1"),
+            (7, "x"),
+        ] {
+            let mut row: Vec<&str> = good.split('|').collect();
+            row[column] = value;
+            let row = row.join("|");
+            let err = type_catalog_from(&type_catalog_result(&[good, &row])).unwrap_err();
+            assert!(
+                matches!(&err, ReplicationError::Protocol(m) if m.contains("row 1")),
+                "{row}: {err:?}"
+            );
+        }
     }
 
     /// The history file is the reply's second column, and a reply without exactly one row is refused.

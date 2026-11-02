@@ -9,8 +9,8 @@
 //! ```
 
 use pg_walstream::{
-    CancellationToken, EventType, LogicalReplicationStream, Lsn, PgReplicationConnection,
-    ReplicationStreamConfig, RetryConfig,
+    CancellationToken, ColumnValue, EventType, LogicalReplicationStream, Lsn,
+    PgReplicationConnection, ReplicationStreamConfig, RetryConfig,
 };
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -228,6 +228,92 @@ async fn slot_position_of_a_physical_slot_is_an_error() {
 
     drop(stream);
     drop_slot(&mut regular, slot);
+}
+
+/// A binary stream sends each column in binary exactly when the catalog read before `start` says its type sends binary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live PostgreSQL with wal_level=logical"]
+async fn type_catalog_predicts_the_binary_columns() {
+    let name = "it_type_catalog";
+    let cleanup = [
+        "DROP PUBLICATION IF EXISTS it_type_catalog",
+        "DROP TABLE IF EXISTS it_type_catalog",
+        "DROP TYPE IF EXISTS it_type_catalog_mood",
+        "DROP DOMAIN IF EXISTS it_type_catalog_positive",
+    ];
+    let mut regular = regular();
+    drop_slot(&mut regular, name);
+    for sql in cleanup.into_iter().chain([
+        "CREATE TYPE it_type_catalog_mood AS ENUM ('sad', 'happy')",
+        "CREATE DOMAIN it_type_catalog_positive AS int4 CHECK (VALUE > 0)",
+        "CREATE TABLE it_type_catalog (id int4 PRIMARY KEY, acl aclitem, \
+         mood it_type_catalog_mood, amount it_type_catalog_positive)",
+        "CREATE PUBLICATION it_type_catalog FOR TABLE it_type_catalog",
+    ]) {
+        regular.exec(sql).expect(sql);
+    }
+
+    let mut stream = LogicalReplicationStream::new(
+        &replication_conn_string(),
+        config(name, name).with_binary(true),
+    )
+    .await
+    .expect("stream");
+    let catalog = stream.type_catalog().await.expect("catalog");
+    assert!(catalog.windows(2).all(|w| w[0].oid() < w[1].oid()));
+    let named = |name: &str| {
+        catalog
+            .iter()
+            .find(|t| t.name() == name)
+            .unwrap_or_else(|| panic!("{name} is in the catalog"))
+    };
+    let positive = named("it_type_catalog_positive");
+    assert_eq!((positive.kind(), positive.base_type()), ('d', Some(23)));
+    assert_eq!(named("it_type_catalog_mood").kind(), 'e');
+    assert_eq!(
+        named("_it_type_catalog_mood").element(),
+        Some(named("it_type_catalog_mood").oid())
+    );
+    assert!(!named("aclitem").sends_binary());
+
+    stream.start(None).await.expect("start");
+    assert!(
+        stream.type_catalog().await.is_err(),
+        "a streaming connection cannot read the catalog"
+    );
+
+    regular
+        .exec("INSERT INTO it_type_catalog VALUES (1, 'postgres=r/postgres', 'happy', 7)")
+        .expect("insert");
+    let cancel = CancellationToken::new();
+    let row = loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), stream.next_event(&cancel))
+            .await
+            .expect("an event arrives")
+            .expect("event");
+        if let EventType::Insert { data, .. } = event.event_type {
+            break data;
+        }
+    };
+    for (column, type_name) in [
+        ("id", "int4"),
+        ("acl", "aclitem"),
+        ("mood", "it_type_catalog_mood"),
+        ("amount", "it_type_catalog_positive"),
+    ] {
+        let value = row.get(column).expect("the column is in the row");
+        assert_eq!(
+            matches!(value, ColumnValue::Binary(_)),
+            named(type_name).sends_binary(),
+            "{column}: {value:?}"
+        );
+    }
+
+    drop(stream);
+    drop_slot(&mut regular, name);
+    for sql in cleanup {
+        let _ = regular.exec(sql);
+    }
 }
 
 /// `Duration::ZERO` is "no timeout", so a stream whose server answers in a few milliseconds still starts.
