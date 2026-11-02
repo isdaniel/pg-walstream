@@ -191,6 +191,45 @@ async fn test_snapshot_readable_before_start() {
     println!("Stream started successfully after snapshot read — workflow complete");
 }
 
+/// A pre-start read while the export is outstanding is refused, so the export stays importable.
+#[tokio::test]
+#[ignore = "requires live PostgreSQL with wal_level=logical"]
+async fn test_pre_start_reads_keep_the_export_alive() {
+    let slot = "it_snap_guard";
+    drop_slot(slot);
+
+    let mut regular =
+        PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
+    setup_schema(&mut regular);
+
+    let mut stream = LogicalReplicationStream::new(&replication_conn_string(), test_config(slot))
+        .await
+        .expect("replication stream");
+    stream
+        .ensure_replication_slot()
+        .await
+        .expect("ensure_replication_slot");
+    let snap_name = stream
+        .exported_snapshot_name()
+        .expect("snapshot must exist")
+        .to_string();
+
+    let err = stream.slot_confirmed_flush_lsn().await.unwrap_err();
+    assert!(err.to_string().contains(&snap_name), "{err}");
+
+    let mut reader = PgReplicationConnection::connect(&regular_conn_string())
+        .expect("snapshot reader connection");
+    reader
+        .exec("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .expect("BEGIN");
+    reader
+        .exec(&format!("SET TRANSACTION SNAPSHOT '{snap_name}'"))
+        .expect("the refused read left the export alive");
+    reader.exec("COMMIT").expect("COMMIT");
+
+    stream.start(None).await.expect("start");
+}
+
 /// Verify that the snapshot becomes **invalid** after `start()` issues
 /// `START_REPLICATION`.
 #[tokio::test]
