@@ -238,7 +238,7 @@ pub use pgoutput_encode::{
 #[cfg(any(feature = "libpq", feature = "rustls-tls"))]
 pub use stream::{
     EventStream, EventStreamRef, LogicalReplicationStream, OriginFilter, RawXLogData,
-    ReplicationStreamConfig, ServerIdentity, StreamingMode, TimelineSwitch,
+    ReplicationStreamConfig, ServerIdentity, StreamingMode, TimelineSwitch, TypeInfo,
 };
 
 #[cfg(any(feature = "libpq", feature = "rustls-tls"))]
