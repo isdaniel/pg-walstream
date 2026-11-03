@@ -1050,13 +1050,9 @@ impl LogicalReplicationStream {
     ///
     /// # Errors
     ///
-    /// Returns an error when the stream is already streaming, when the query fails, or when a row is malformed. After a cancelled startup command the error is [`ReplicationError::PermanentConnection`], as for [`start`](Self::start).
+    /// Returns an error when the stream is already streaming, when a snapshot exported by [`ensure_replication_slot`](Self::ensure_replication_slot) is outstanding, when the query fails, or when a row is malformed. After a cancelled startup command the error is [`ReplicationError::PermanentConnection`], as for [`start`](Self::start).
     pub async fn type_catalog(&mut self) -> Result<Vec<TypeInfo>> {
-        let result = self
-            .connection
-            .exec_async(TYPE_CATALOG_SQL)
-            .await
-            .map_err(|e| self.rebuild_if_refused(e))?;
+        let result = self.pre_start_command(TYPE_CATALOG_SQL).await?;
         type_catalog_from(&result)
     }
 
@@ -1089,7 +1085,7 @@ impl LogicalReplicationStream {
     /// [`start()`](Self::start). Once `start()` issues `START_REPLICATION`, PostgreSQL
     /// destroys the exported snapshot. You **must** read the snapshot on a separate
     /// connection before calling `start()`.
-    /// Until then [`slot_confirmed_flush_lsn`](Self::slot_confirmed_flush_lsn) and [`timeline_history`](Self::timeline_history) refuse to run, because any command on this connection ends the export.
+    /// Until then [`slot_confirmed_flush_lsn`](Self::slot_confirmed_flush_lsn), [`timeline_history`](Self::timeline_history) and [`type_catalog`](Self::type_catalog) refuse to run, because any command on this connection ends the export.
     ///
     /// If the slot already exists, this is a no-op.
     ///
@@ -5781,6 +5777,7 @@ pub(crate) mod tests {
         };
         refused(stream.slot_confirmed_flush_lsn().await.unwrap_err());
         refused(stream.timeline_history().await.unwrap_err());
+        refused(stream.type_catalog().await.unwrap_err());
     }
 
     #[tokio::test]
