@@ -230,6 +230,55 @@ async fn test_pre_start_reads_keep_the_export_alive() {
     stream.start(None).await.expect("start");
 }
 
+/// Releasing the export after importing it lets pre-start reads run, and the import keeps reading.
+#[tokio::test]
+#[ignore = "requires live PostgreSQL with wal_level=logical"]
+async fn test_released_export_allows_pre_start_reads() {
+    let slot = "it_snap_release";
+    drop_slot(slot);
+
+    let mut regular =
+        PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
+    setup_schema(&mut regular);
+
+    let mut stream = LogicalReplicationStream::new(&replication_conn_string(), test_config(slot))
+        .await
+        .expect("replication stream");
+    stream
+        .ensure_replication_slot()
+        .await
+        .expect("ensure_replication_slot");
+    let snap_name = stream
+        .exported_snapshot_name()
+        .expect("snapshot must exist")
+        .to_string();
+
+    let mut reader = PgReplicationConnection::connect(&regular_conn_string())
+        .expect("snapshot reader connection");
+    reader
+        .exec("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .expect("BEGIN");
+    reader
+        .exec(&format!("SET TRANSACTION SNAPSHOT '{snap_name}'"))
+        .expect("SET TRANSACTION SNAPSHOT");
+
+    stream.release_exported_snapshot();
+    assert!(stream.exported_snapshot_name().is_none());
+    assert!(stream
+        .slot_confirmed_flush_lsn()
+        .await
+        .expect("slot position")
+        .is_some());
+
+    let rows = reader
+        .exec("SELECT count(*) FROM snapshot_test")
+        .expect("the import outlives the ended export");
+    assert_eq!(rows.get_value(0, 0).as_deref(), Some("3"));
+    reader.exec("COMMIT").expect("COMMIT");
+
+    stream.start(None).await.expect("start");
+}
+
 /// Verify that the snapshot becomes **invalid** after `start()` issues
 /// `START_REPLICATION`.
 #[tokio::test]

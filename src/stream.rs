@@ -886,7 +886,7 @@ impl LogicalReplicationStream {
     async fn pre_start_command(&mut self, command: &str) -> Result<crate::connection::PgResult> {
         if let Some(snapshot) = self.slot.exported_snapshot() {
             return Err(ReplicationError::protocol(format!(
-                "{command:?} would end exported snapshot {snapshot}, so run it before ensure_replication_slot"
+                "{command:?} would end exported snapshot {snapshot}; run it before ensure_replication_slot, or after importing the snapshot and calling release_exported_snapshot"
             )));
         }
         self.connection
@@ -955,7 +955,7 @@ impl LogicalReplicationStream {
     /// [`start()`](Self::start). Once `start()` issues `START_REPLICATION`, PostgreSQL
     /// destroys the exported snapshot. You **must** read the snapshot on a separate
     /// connection before calling `start()`.
-    /// Until then [`slot_confirmed_flush_lsn`](Self::slot_confirmed_flush_lsn) and [`timeline_history`](Self::timeline_history) refuse to run, because any command on this connection ends the export.
+    /// Until then, or until [`release_exported_snapshot`](Self::release_exported_snapshot) after the import, [`slot_confirmed_flush_lsn`](Self::slot_confirmed_flush_lsn) and [`timeline_history`](Self::timeline_history) refuse to run, because any command on this connection ends the export.
     ///
     /// If the slot already exists, this is a no-op.
     ///
@@ -2034,6 +2034,14 @@ impl LogicalReplicationStream {
         self.slot.exported_snapshot()
     }
 
+    /// Forget the exported snapshot once the caller has imported it with `SET TRANSACTION SNAPSHOT`, so the pre-start reads run again.
+    ///
+    /// The stream cannot see an import made on another connection. After this, [`exported_snapshot_name`](Self::exported_snapshot_name) is `None` and [`snapshot`](Self::snapshot) is [`Unavailable`](crate::SnapshotOutcome::Unavailable).
+    #[inline]
+    pub fn release_exported_snapshot(&mut self) {
+        self.slot.clear_exported_snapshot();
+    }
+
     /// Best-effort drop of the replication slot this stream created.
     ///
     /// Used by the initial-snapshot helper when an attempt fails part-way. A slot
@@ -2070,12 +2078,6 @@ impl LogicalReplicationStream {
     #[inline]
     pub(crate) fn slot_is_present(&self) -> bool {
         self.slot.is_present()
-    }
-
-    /// Forget the exported snapshot once a managed snapshot hands the stream back, so pre-start reads run again.
-    #[inline]
-    pub(crate) fn forget_exported_snapshot(&mut self) {
-        self.slot.clear_exported_snapshot();
     }
 
     /// Whether the server has a slot by this stream's name, read on the stream's own connection.

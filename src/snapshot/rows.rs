@@ -192,7 +192,7 @@ impl SnapshotRows {
     #[inline]
     fn take_stream(&mut self) -> LogicalReplicationStream {
         let mut stream = self.stream.take().expect(STREAM_TAKEN);
-        stream.forget_exported_snapshot();
+        stream.release_exported_snapshot();
         stream
     }
 
