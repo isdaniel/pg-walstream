@@ -67,12 +67,12 @@ impl SnapshotEvents {
         self.inner.run(move |row| handler(row_to_insert(row))).await
     }
 
-    /// Hand back the replication stream after a fully consumed snapshot.
+    /// Hand back the replication stream after a fully consumed snapshot, as [`SnapshotRows::finish`](super::SnapshotRows::finish) does.
     pub async fn finish(self) -> Result<LogicalReplicationStream> {
         self.inner.finish().await
     }
 
-    /// Give up on the snapshot and hand back the replication stream.
+    /// Give up on the snapshot and hand back the replication stream, as [`SnapshotRows::abandon`](super::SnapshotRows::abandon) does.
     pub async fn abandon(self) -> Result<LogicalReplicationStream> {
         self.inner.abandon().await
     }

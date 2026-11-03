@@ -786,6 +786,60 @@ async fn abandon_returns_the_stream_and_start_succeeds() {
     stream.start(None).await.expect("start after abandon");
 }
 
+/// A stream handed back by `finish()` or `abandon()` holds no export, so pre-start reads run and a second `snapshot()` is `Unavailable`.
+#[tokio::test]
+#[ignore = "requires live PostgreSQL with wal_level=logical"]
+async fn a_handed_back_stream_holds_no_exported_snapshot() {
+    for finish in [true, false] {
+        let (slot, table, publication) = if finish {
+            (
+                "it_snap_handback_f",
+                "snap_handback_f",
+                "snap_handback_f_pub",
+            )
+        } else {
+            (
+                "it_snap_handback_a",
+                "snap_handback_a",
+                "snap_handback_a_pub",
+            )
+        };
+        let _guard = slot_guard(slot);
+        setup(table, publication, &["a"]);
+
+        let stream = LogicalReplicationStream::new(
+            &replication_conn_string(),
+            snapshot_config(slot, publication),
+        )
+        .await
+        .expect("connect");
+        let SnapshotOutcome::Available(snap) = stream.snapshot().await.expect("snapshot") else {
+            panic!("expected a snapshot");
+        };
+        let mut stream = if finish {
+            let mut events = snap.events();
+            while events.next_event().await.expect("next_event").is_some() {}
+            events.finish().await.expect("finish")
+        } else {
+            snap.abandon().await.expect("abandon")
+        };
+
+        assert!(stream.exported_snapshot_name().is_none(), "finish={finish}");
+        assert!(
+            stream
+                .slot_confirmed_flush_lsn()
+                .await
+                .expect("slot position")
+                .is_some(),
+            "finish={finish}"
+        );
+        let again = stream.snapshot().await.expect("second snapshot");
+        assert!(!again.is_available(), "finish={finish}");
+        let mut stream = again.skip().await.expect("skip");
+        stream.start(None).await.expect("start");
+    }
+}
+
 /// Abandoning part-way must hang up rather than drain the rest of the table.
 #[tokio::test]
 #[ignore = "requires live PostgreSQL with wal_level=logical"]

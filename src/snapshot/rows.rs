@@ -136,6 +136,8 @@ impl SnapshotRows {
     /// incomplete snapshot therefore restarts from a fresh export rather than
     /// resuming. That is why the message points at `abandon()` as a *different
     /// call to make instead*, not as something still available afterwards.
+    ///
+    /// The returned stream holds no exported snapshot, so a second [`snapshot`](LogicalReplicationStream::snapshot) on it is [`Unavailable`](crate::SnapshotOutcome::Unavailable).
     pub async fn finish(mut self) -> Result<LogicalReplicationStream> {
         if self.copy.poisoned() {
             // Reached via the pull API: `next_row` failed, and the caller is now
@@ -175,6 +177,8 @@ impl SnapshotRows {
     /// stream after a partial snapshot with no error anywhere — `run_snapshot`
     /// and `for_each_event` both return `Ok(())` on cancellation, so the failure
     /// has to surface here.
+    ///
+    /// The returned stream holds no exported snapshot, so a second [`snapshot`](LogicalReplicationStream::snapshot) on it is [`Unavailable`](crate::SnapshotOutcome::Unavailable).
     pub async fn abandon(mut self) -> Result<LogicalReplicationStream> {
         if self.copy.poisoned() {
             return Err(poisoned_err());
@@ -184,10 +188,12 @@ impl SnapshotRows {
     }
 
     /// Move the stream out, which also defuses [`Drop`]'s slot cleanup: the
-    /// caller owns the stream now, so the slot is theirs to keep.
+    /// caller owns the stream now, so the slot is theirs to keep. The export is consumed or skipped by then, so the stream forgets it.
     #[inline]
     fn take_stream(&mut self) -> LogicalReplicationStream {
-        self.stream.take().expect(STREAM_TAKEN)
+        let mut stream = self.stream.take().expect(STREAM_TAKEN);
+        stream.forget_exported_snapshot();
+        stream
     }
 
     /// Drop the slot this snapshot created, so a retry gets a fresh export.

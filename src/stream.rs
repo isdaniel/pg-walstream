@@ -2072,6 +2072,12 @@ impl LogicalReplicationStream {
         self.slot.is_present()
     }
 
+    /// Forget the exported snapshot once a managed snapshot hands the stream back, so pre-start reads run again.
+    #[inline]
+    pub(crate) fn forget_exported_snapshot(&mut self) {
+        self.slot.clear_exported_snapshot();
+    }
+
     /// Whether the server has a slot by this stream's name, read on the stream's own connection.
     pub(crate) async fn slot_exists_on_server(&mut self) -> Result<bool> {
         let sql = crate::sql_builder::build_slot_confirmed_flush_sql(&self.config.slot_name)?;
