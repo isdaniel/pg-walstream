@@ -5816,6 +5816,13 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn published_relations_needs_a_publication() {
+        let mut stream = create_test_stream(ReplicationStreamConfig::builder("slot", " , "));
+        let err = stream.published_relations().await.unwrap_err();
+        assert!(matches!(err, ReplicationError::Config(_)), "{err:?}");
+    }
+
+    #[tokio::test]
     async fn next_event_terminates_after_stop_boundary_reached() {
         // Simulate a crossing commit already delivered: the terminal guard must
         // send CopyDone once (a no-op on the null test connection) and return

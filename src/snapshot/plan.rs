@@ -277,12 +277,11 @@ pub(super) fn tables_from_catalog_rows(rows: &[CatalogRow]) -> Result<Vec<Snapsh
     table_groups(rows)
         .map(|group| {
             let relation = relation_of(group);
-            let copy_sql = build_copy_sql(
-                &relation,
-                unique_row_filter(group)?.as_deref(),
-                group[0].relkind == b'p',
-                group.iter().any(|row| row.generated),
-            )?;
+            let row_filter = unique_row_filter(group)?;
+            let partitioned = group[0].relkind == b'p';
+            let generated = group.iter().any(|row| row.generated);
+            let copy_sql =
+                build_copy_sql(&relation, row_filter.as_deref(), partitioned, generated)?;
             Ok(SnapshotTable {
                 relation: Arc::new(relation),
                 copy_sql,
