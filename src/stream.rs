@@ -20,11 +20,9 @@ use crate::types::{
 };
 use crate::{
     format_lsn, parse_keepalive_message, LogicalReplicationParser, PgReplicationConnection,
-    ReplicationConnectionRetry, ReplicationState, RetryConfig, XLogRecPtr, INVALID_XLOG_REC_PTR,
+    RelationInfo, ReplicationConnectionRetry, ReplicationState, RetryConfig, XLogRecPtr,
+    INVALID_XLOG_REC_PTR,
 };
-// `RelationInfo` is referenced only by the unit tests in this file, via `super::*`.
-#[cfg(test)]
-use crate::RelationInfo;
 use bytes::{Buf, Bytes};
 use std::sync::Arc;
 
@@ -306,6 +304,7 @@ pub struct TypeInfo {
     base_type: Option<Oid>,
     range_subtype: Option<Oid>,
     relation: Option<Oid>,
+    fields: Vec<Oid>,
 }
 
 impl TypeInfo {
@@ -335,7 +334,7 @@ impl TypeInfo {
 
     /// Whether the type has a send function, which is what a [binary](ReplicationStreamConfig::with_binary) stream checks to send a column of this type in binary.
     ///
-    /// An array, range, multirange, domain or composite over a type without one still reports `true`, and the walsender then fails with "no binary output function available". Follow [`element`](Self::element), [`base_type`](Self::base_type) and [`range_subtype`](Self::range_subtype) to the leaf type to catch it. A composite's field types are only reachable through [`relation`](Self::relation), outside this catalog.
+    /// An array, range, multirange, domain or composite over a type without one still reports `true`, and the walsender then fails with "no binary output function available". Follow [`element`](Self::element), [`base_type`](Self::base_type), [`range_subtype`](Self::range_subtype) and [`fields`](Self::fields) to the leaf types to catch it.
     #[inline]
     pub fn sends_binary(&self) -> bool {
         self.sends_binary
@@ -364,13 +363,21 @@ impl TypeInfo {
     pub fn relation(&self) -> Option<Oid> {
         self.relation
     }
+
+    /// A composite type's field types in attribute order, empty for every other type.
+    #[inline]
+    pub fn fields(&self) -> &[Oid] {
+        &self.fields
+    }
 }
 
 /// Every `pg_type` row in [`TypeInfo`]'s field order, with absent OIDs as `NULL`.
 const TYPE_CATALOG_SQL: &str = "SELECT t.oid, n.nspname, t.typname, t.typtype, \
      t.typsend::oid <> 0, \
      CASE WHEN t.typsubscript = 'pg_catalog.array_subscript_handler'::regproc THEN t.typelem END, \
-     NULLIF(t.typbasetype, 0), r.rngsubtype, NULLIF(t.typrelid, 0) \
+     NULLIF(t.typbasetype, 0), r.rngsubtype, NULLIF(t.typrelid, 0), \
+     (SELECT string_agg(a.atttypid::text, ',' ORDER BY a.attnum) FROM pg_catalog.pg_attribute a \
+     WHERE a.attrelid = t.typrelid AND a.attnum > 0 AND NOT a.attisdropped) \
      FROM pg_catalog.pg_type t \
      JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace \
      LEFT JOIN pg_catalog.pg_range r ON t.oid IN (r.rngtypid, r.rngmultitypid) \
@@ -388,7 +395,8 @@ fn type_catalog_from(result: &crate::connection::PgResult) -> Result<Vec<TypeInf
 
 fn type_info_from(result: &crate::connection::PgResult, row: i32) -> Option<TypeInfo> {
     let text = |col| result.get_value(row, col);
-    let oid = |col| text(col)?.parse::<Oid>().ok().filter(|&oid| oid != 0);
+    let parse_oid = |text: &str| text.parse::<Oid>().ok().filter(|&oid| oid != 0);
+    let oid = |col| parse_oid(&text(col)?);
     let optional_oid = |col| match result.get_bytes(row, col) {
         None => Some(None),
         Some(_) => oid(col).map(Some),
@@ -409,6 +417,10 @@ fn type_info_from(result: &crate::connection::PgResult, row: i32) -> Option<Type
         base_type: optional_oid(6)?,
         range_subtype: optional_oid(7)?,
         relation: optional_oid(8)?,
+        fields: match text(9) {
+            None => Vec::new(),
+            Some(fields) => fields.split(',').map(parse_oid).collect::<Option<_>>()?,
+        },
     })
 }
 
@@ -1058,6 +1070,20 @@ impl LogicalReplicationStream {
     pub async fn type_catalog(&mut self) -> Result<Vec<TypeInfo>> {
         let result = self.pre_start_command(TYPE_CATALOG_SQL).await?;
         type_catalog_from(&result)
+    }
+
+    /// Every table the stream's publications publish, with the columns pgoutput sends for it and `flags` of 0, read before [`start`](Self::start) like [`type_catalog`](Self::type_catalog).
+    ///
+    /// # Errors
+    ///
+    /// As for [`type_catalog`](Self::type_catalog), and when the stream names no publication.
+    pub async fn published_relations(&mut self) -> Result<Vec<RelationInfo>> {
+        let sql = crate::snapshot::published_relations_sql(
+            self.server_version(),
+            &self.config.publication_name,
+        )?;
+        let result = self.pre_start_command(&sql).await?;
+        crate::snapshot::published_relations_from(&result)
     }
 
     /// Initialize the replication stream
@@ -5521,11 +5547,11 @@ pub(crate) mod tests {
     #[test]
     fn type_catalog_reads_every_row() {
         let rows = [
-            "1033|pg_catalog|aclitem|b|f||||",
-            "16390|public|positive|d|t||23||",
-            "16400|public|_mood|b|t|16399|||",
-            "16410|public|floatrange|r|t|||701|",
-            "16420|public|pair|c|t||||16418",
+            "1033|pg_catalog|aclitem|b|f|||||",
+            "16390|public|positive|d|t||23|||",
+            "16400|public|_mood|b|t|16399||||",
+            "16410|public|floatrange|r|t|||701||",
+            "16420|public|pair|c|t||||16418|1034,23",
         ];
         let oid = |oid: Option<Oid>| oid.map_or(String::new(), |oid| oid.to_string());
         let read: Vec<String> = type_catalog_from(&type_catalog_result(&rows))
@@ -5533,8 +5559,9 @@ pub(crate) mod tests {
             .iter()
             .map(|t| {
                 let send = if t.sends_binary() { "t" } else { "f" };
+                let fields: Vec<String> = t.fields().iter().map(Oid::to_string).collect();
                 format!(
-                    "{}|{}|{}|{}|{send}|{}|{}|{}|{}",
+                    "{}|{}|{}|{}|{send}|{}|{}|{}|{}|{}",
                     t.oid(),
                     t.namespace(),
                     t.name(),
@@ -5542,7 +5569,8 @@ pub(crate) mod tests {
                     oid(t.element()),
                     oid(t.base_type()),
                     oid(t.range_subtype()),
-                    oid(t.relation())
+                    oid(t.relation()),
+                    fields.join(",")
                 )
             })
             .collect();
@@ -5553,7 +5581,7 @@ pub(crate) mod tests {
     #[cfg(feature = "rustls-tls")]
     #[test]
     fn type_catalog_rejects_malformed_rows() {
-        let good = "16390|public|positive|d|t||23||";
+        let good = "16390|public|positive|d|t||23|||";
         for (column, value) in [
             (0, ""),
             (0, "x"),
@@ -5566,6 +5594,8 @@ pub(crate) mod tests {
             (5, "0"),
             (6, "-1"),
             (7, "x"),
+            (9, "23,"),
+            (9, "0"),
         ] {
             let mut row: Vec<&str> = good.split('|').collect();
             row[column] = value;
@@ -5764,7 +5794,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// Both pre-start reads are refused, naming the snapshot, while an export is outstanding.
+    /// Every pre-start read is refused, naming the snapshot, while an export is outstanding.
     #[tokio::test]
     async fn pre_start_reads_are_refused_while_an_export_is_outstanding() {
         let mut stream = create_test_stream(ReplicationStreamConfig::builder("slot", "pub"));
@@ -5782,6 +5812,7 @@ pub(crate) mod tests {
         refused(stream.slot_confirmed_flush_lsn().await.unwrap_err());
         refused(stream.timeline_history().await.unwrap_err());
         refused(stream.type_catalog().await.unwrap_err());
+        refused(stream.published_relations().await.unwrap_err());
     }
 
     #[tokio::test]

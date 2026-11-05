@@ -230,7 +230,7 @@ async fn slot_position_of_a_physical_slot_is_an_error() {
     drop_slot(&mut regular, slot);
 }
 
-/// A binary stream sends each column in binary exactly when the catalog read before `start` says its type sends binary.
+/// A binary stream sends each published column in binary exactly when the catalog read before `start` says its type sends binary.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 async fn type_catalog_predicts_the_binary_columns() {
@@ -241,6 +241,7 @@ async fn type_catalog_predicts_the_binary_columns() {
         "DROP TYPE IF EXISTS it_type_catalog_mood",
         "DROP DOMAIN IF EXISTS it_type_catalog_positive",
         "DROP TYPE IF EXISTS it_type_catalog_floats",
+        "DROP TYPE IF EXISTS it_type_catalog_pair",
     ];
     let mut regular = regular();
     drop_slot(&mut regular, name);
@@ -248,9 +249,13 @@ async fn type_catalog_predicts_the_binary_columns() {
         "CREATE TYPE it_type_catalog_mood AS ENUM ('sad', 'happy')",
         "CREATE DOMAIN it_type_catalog_positive AS int4 CHECK (VALUE > 0)",
         "CREATE TYPE it_type_catalog_floats AS RANGE (subtype = float8)",
+        "CREATE TYPE it_type_catalog_pair AS (gone int8, n int4, x float8)",
+        "ALTER TYPE it_type_catalog_pair DROP ATTRIBUTE gone",
         "CREATE TABLE it_type_catalog (id int4 PRIMARY KEY, acl aclitem, \
-         mood it_type_catalog_mood, amount it_type_catalog_positive)",
-        "CREATE PUBLICATION it_type_catalog FOR TABLE it_type_catalog",
+         mood it_type_catalog_mood, amount it_type_catalog_positive, \
+         pair it_type_catalog_pair, unlisted text)",
+        "CREATE PUBLICATION it_type_catalog \
+         FOR TABLE it_type_catalog (id, acl, mood, amount, pair)",
     ]) {
         regular.exec(sql).expect(sql);
     }
@@ -262,6 +267,7 @@ async fn type_catalog_predicts_the_binary_columns() {
     .await
     .expect("stream");
     let catalog = stream.type_catalog().await.expect("catalog");
+    let relations = stream.published_relations().await.expect("relations");
     assert!(catalog.windows(2).all(|w| w[0].oid() < w[1].oid()));
     let named = |name: &str| {
         catalog
@@ -284,6 +290,12 @@ async fn type_catalog_predicts_the_binary_columns() {
         assert_eq!(named(range).range_subtype(), Some(701), "{range}");
     }
     assert!(!named("aclitem").sends_binary());
+    assert_eq!(named("it_type_catalog_pair").fields(), [23, 701]);
+    let [relation] = relations.as_slice() else {
+        panic!("{relations:?}");
+    };
+    let columns: Vec<&str> = relation.columns.iter().map(|c| &*c.name).collect();
+    assert_eq!(columns, ["id", "acl", "mood", "amount", "pair"]);
 
     stream.start(None).await.expect("start");
     assert!(
@@ -294,7 +306,7 @@ async fn type_catalog_predicts_the_binary_columns() {
     regular
         .exec(
             "INSERT INTO it_type_catalog \
-             VALUES (1, (current_user || '=r/' || current_user)::aclitem, 'happy', 7)",
+             VALUES (1, (current_user || '=r/' || current_user)::aclitem, 'happy', 7, ROW(1, 2.5), 'x')",
         )
         .expect("insert");
     let cancel = CancellationToken::new();
@@ -307,17 +319,16 @@ async fn type_catalog_predicts_the_binary_columns() {
             break data;
         }
     };
-    for (column, type_name) in [
-        ("id", "int4"),
-        ("acl", "aclitem"),
-        ("mood", "it_type_catalog_mood"),
-        ("amount", "it_type_catalog_positive"),
-    ] {
-        let value = row.get(column).expect("the column is in the row");
+    for column in &relation.columns {
+        let value = row.get(&column.name).expect("the column is in the row");
+        let sends_binary = catalog
+            .iter()
+            .any(|t| t.oid() == column.type_id && t.sends_binary());
         assert_eq!(
             matches!(value, ColumnValue::Binary(_)),
-            named(type_name).sends_binary(),
-            "{column}: {value:?}"
+            sends_binary,
+            "{}: {value:?}",
+            column.name
         );
     }
 
