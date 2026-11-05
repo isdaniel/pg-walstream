@@ -548,6 +548,25 @@ fn parse_catalog_u32(text: &str, what: &str) -> Result<u32> {
     })
 }
 
+/// The query behind [`LogicalReplicationStream::published_relations`].
+pub(crate) fn published_relations_sql(
+    server_version: i32,
+    publication_name: &str,
+) -> Result<String> {
+    plan::build_catalog_sql(
+        server_version,
+        &plan::split_publication_names(publication_name),
+    )
+}
+
+/// Parse a [`published_relations_sql`] reply.
+pub(crate) fn published_relations_from(
+    result: &crate::connection::PgResult,
+) -> Result<Vec<crate::protocol::RelationInfo>> {
+    let rows = catalog_rows_from_result(result)?;
+    Ok(plan::relations_from_catalog_rows(&rows))
+}
+
 /// Reject configurations that cannot produce a correct snapshot.
 ///
 /// These are hard `Config` errors rather than best-effort degradation, because
