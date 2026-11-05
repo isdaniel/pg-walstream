@@ -131,7 +131,7 @@ pub(super) struct CatalogRow {
 pub(super) fn build_catalog_sql(server_version: i32, publications: &[String]) -> Result<String> {
     if publications.is_empty() {
         return Err(ReplicationError::config(
-            "initial snapshot requires at least one publication",
+            "reading the published tables requires at least one publication",
         ));
     }
 
@@ -274,63 +274,54 @@ fn build_copy_sql(
 /// than one publication yields duplicate column rows; those are collapsed, but a
 /// *disagreement* between publications is rejected rather than guessed at.
 pub(super) fn tables_from_catalog_rows(rows: &[CatalogRow]) -> Result<Vec<SnapshotTable>> {
-    let mut tables: Vec<SnapshotTable> = Vec::new();
+    table_groups(rows)
+        .map(|group| {
+            let relation = relation_of(group);
+            let copy_sql = build_copy_sql(
+                &relation,
+                unique_row_filter(group)?.as_deref(),
+                group[0].relkind == b'p',
+                group.iter().any(|row| row.generated),
+            )?;
+            Ok(SnapshotTable {
+                relation: Arc::new(relation),
+                copy_sql,
+            })
+        })
+        .collect()
+}
 
-    let mut index = 0usize;
-    while index < rows.len() {
-        let first = &rows[index];
-        let mut end = index;
-        while end < rows.len()
-            && rows[end].namespace == first.namespace
-            && rows[end].relation_name == first.relation_name
-        {
-            end += 1;
+/// One [`RelationInfo`] per published table, from rows ordered by `(schema, table, attnum)`.
+pub(super) fn relations_from_catalog_rows(rows: &[CatalogRow]) -> Vec<RelationInfo> {
+    table_groups(rows).map(relation_of).collect()
+}
+
+fn table_groups(rows: &[CatalogRow]) -> impl Iterator<Item = &[CatalogRow]> {
+    rows.chunk_by(|a, b| a.namespace == b.namespace && a.relation_name == b.relation_name)
+}
+
+/// The table of a non-empty group, with duplicate columns from several publications collapsed.
+fn relation_of(group: &[CatalogRow]) -> RelationInfo {
+    let mut columns: Vec<ColumnInfo> = Vec::with_capacity(group.len());
+    for row in group {
+        if columns.iter().any(|c| &*c.name == row.column_name.as_str()) {
+            continue;
         }
-        let group = &rows[index..end];
-        index = end;
-
-        let row_filter = unique_row_filter(group)?;
-        let partitioned = first.relkind == b'p';
-
-        let mut columns: Vec<ColumnInfo> = Vec::with_capacity(group.len());
-        let mut has_generated = false;
-        for row in group {
-            // Collapse the duplicate produced by a second publication listing the
-            // same table.
-            if columns.iter().any(|c| &*c.name == row.column_name.as_str()) {
-                continue;
-            }
-            has_generated |= row.generated;
-            columns.push(ColumnInfo::new(
-                0, // key flags are an UPDATE/DELETE concern; snapshot rows are INSERT events
-                row.column_name.clone(),
-                row.type_id,
-                row.type_modifier,
-            ));
-        }
-
-        // `columns` is never empty: the group has at least one row, and the first
-        // one always pushes. A table whose published column set really is empty
-        // has `attnames IS NULL`, so the `ANY (pt.attnames)` join drops it and it
-        // never reaches this loop.
-
-        let relation = RelationInfo::new(
-            first.relation_id,
-            first.namespace.clone(),
-            first.relation_name.clone(),
-            first.replica_identity,
-            columns,
-        );
-        let copy_sql =
-            build_copy_sql(&relation, row_filter.as_deref(), partitioned, has_generated)?;
-
-        tables.push(SnapshotTable {
-            relation: Arc::new(relation),
-            copy_sql,
-        });
+        columns.push(ColumnInfo::new(
+            0, // replica identity membership is not read
+            row.column_name.clone(),
+            row.type_id,
+            row.type_modifier,
+        ));
     }
-
-    Ok(tables)
+    let first = &group[0];
+    RelationInfo::new(
+        first.relation_id,
+        first.namespace.clone(),
+        first.relation_name.clone(),
+        first.replica_identity,
+        columns,
+    )
 }
 
 /// The row filter that applies to a table group.
@@ -784,6 +775,22 @@ mod tests {
         assert!(
             format!("{err}").contains("conflicting row filters"),
             "{err}"
+        );
+    }
+
+    /// Conflicting row filters stop a snapshot but not the published column read.
+    #[test]
+    fn relations_ignore_row_filters_and_collapse_duplicate_columns() {
+        let mut a = row("public", "t", "id");
+        a.row_filter = Some("(id > 1)".to_string());
+        let mut b = a.clone();
+        b.row_filter = Some("(id > 2)".to_string());
+
+        let relations = relations_from_catalog_rows(&[a, b]);
+        assert_eq!(relations.len(), 1);
+        assert_eq!(
+            relations[0].columns,
+            relation("public", "t", &["id"]).columns
         );
     }
 
