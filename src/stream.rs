@@ -333,7 +333,9 @@ impl TypeInfo {
         self.kind
     }
 
-    /// Whether the type has a send function, which is when a [binary](ReplicationStreamConfig::with_binary) stream sends it in binary.
+    /// Whether the type has a send function, which is what a [binary](ReplicationStreamConfig::with_binary) stream checks to send a column of this type in binary.
+    ///
+    /// An array, range, multirange, domain or composite over a type without one still reports `true`, and the walsender then fails with "no binary output function available". Follow [`element`](Self::element), [`base_type`](Self::base_type) and [`range_subtype`](Self::range_subtype) to the leaf type to catch it. A composite's field types are only reachable through [`relation`](Self::relation), outside this catalog.
     #[inline]
     pub fn sends_binary(&self) -> bool {
         self.sends_binary
@@ -1046,7 +1048,9 @@ impl LogicalReplicationStream {
 
     /// Every type in `pg_type`, ordered by OID, read on the stream's own connection before [`start`](Self::start).
     ///
-    /// A [binary](ReplicationStreamConfig::with_binary) stream sends a column in binary exactly when its type [sends binary](TypeInfo::sends_binary). Types created or altered after this read are missing or stale, and reconnects do not read it again.
+    /// A [binary](ReplicationStreamConfig::with_binary) stream sends a column in binary when its type [sends binary](TypeInfo::sends_binary), with the caveat there for container types. Types created or altered after this read are missing or stale, and reconnects do not read it again. Requires a `replication=database` connection.
+    ///
+    /// With a snapshot exported by [`ensure_replication_slot`](Self::ensure_replication_slot), call this before that method, since the read is refused until [`start`](Self::start) or a managed snapshot hands the stream back.
     ///
     /// # Errors
     ///
