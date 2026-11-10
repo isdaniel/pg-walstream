@@ -1072,7 +1072,7 @@ impl LogicalReplicationStream {
         type_catalog_from(&result)
     }
 
-    /// Every table the stream's publications publish, with the columns pgoutput sends for it and `flags` of 0, read before [`start`](Self::start) like [`type_catalog`](Self::type_catalog).
+    /// Every table the stream's publications publish with at least one column pgoutput sends, with those columns and `flags` of 0, read before [`start`](Self::start) like [`type_catalog`](Self::type_catalog).
     ///
     /// # Errors
     ///
