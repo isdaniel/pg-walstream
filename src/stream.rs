@@ -1072,11 +1072,17 @@ impl LogicalReplicationStream {
         type_catalog_from(&result)
     }
 
-    /// Every table the stream's publications publish with at least one column pgoutput sends, with those columns and `flags` of 0, read before [`start`](Self::start) like [`type_catalog`](Self::type_catalog).
+    /// Published relations and their catalog column types, with `flags` of 0, read before [`start`](Self::start) like [`type_catalog`](Self::type_catalog).
+    ///
+    /// Column lists are unioned across publications, including `FOR ALL TABLES`, without validating combinations PostgreSQL rejects during streaming.
+    ///
+    /// Unknown or empty publications contribute no relations, and tables with no published columns are omitted even though their empty inserts can still stream.
+    ///
+    /// Publication names containing commas, escaped quotes or surrounding whitespace are unsupported by this catalog read.
     ///
     /// # Errors
     ///
-    /// As for [`type_catalog`](Self::type_catalog), and when the stream names no publication.
+    /// As for [`type_catalog`](Self::type_catalog), and when the configured publication list is empty.
     pub async fn published_relations(&mut self) -> Result<Vec<RelationInfo>> {
         let sql = crate::snapshot::published_relations_sql(
             self.server_version(),
