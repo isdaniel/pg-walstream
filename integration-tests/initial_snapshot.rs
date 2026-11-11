@@ -1747,10 +1747,48 @@ async fn snapshot_is_isolated_from_concurrent_writes() {
     );
 }
 
-/// `publication_name` may be a comma-separated, optionally quoted list, because
-/// that is what `START_REPLICATION ... (publication_names '...')` takes.
-/// `split_publication_names` is unit-tested, but nothing proved the catalog query
-/// actually resolves a multi-publication list end to end.
+#[tokio::test]
+#[ignore = "requires live PostgreSQL with wal_level=logical"]
+async fn publication_catalog_preserves_zero_column_rows() {
+    let _guard = slot_guard("it_snap_zero");
+    let mut conn = regular_conn();
+    for sql in [
+        "DROP PUBLICATION IF EXISTS snap_zero_pub",
+        "DROP TABLE IF EXISTS snap_zero, snap_generated_only CASCADE",
+        "CREATE TABLE snap_zero ()",
+        "CREATE TABLE snap_generated_only (g int GENERATED ALWAYS AS (7) STORED)",
+        "CREATE PUBLICATION snap_zero_pub FOR TABLE snap_zero, snap_generated_only",
+    ] {
+        conn.exec(sql).expect("setup");
+    }
+    for table in ["snap_zero", "snap_zero", "snap_generated_only"] {
+        conn.exec(&format!("INSERT INTO {table} DEFAULT VALUES"))
+            .expect("seed");
+    }
+
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let stream = LogicalReplicationStream::new(
+            &replication_conn_string(),
+            snapshot_config("it_snap_zero", "snap_zero_pub"),
+        )
+        .await
+        .expect("connect");
+        let (events, _stream) = collect_snapshot(stream).await;
+        let mut tables = Vec::new();
+        for event in &events {
+            let EventType::Insert { table, data, .. } = &event.event_type else {
+                panic!("expected an Insert");
+            };
+            assert_eq!(data.iter().count(), 0);
+            tables.push(&**table);
+        }
+        assert_eq!(tables, ["snap_generated_only", "snap_zero", "snap_zero"]);
+    })
+    .await
+    .expect("timed out");
+}
+
+/// Snapshot selection follows the stream's quoted publication list.
 #[tokio::test]
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 async fn multiple_publications_are_all_snapshotted() {
@@ -1759,9 +1797,12 @@ async fn multiple_publications_are_all_snapshotted() {
 
     let mut conn = regular_conn();
     for (t, p) in [
-        ("snap_mp_a", "snap_mp_pub_a"),
-        ("snap_mp_b", "snap_mp_pub_b"),
+        ("snap_mp_a", "snap_mp_pub_a,snap_mp_pub_b"),
+        ("snap_mp_b", " snap_mp_\"quoted\" "),
+        ("snap_mp_decoy_a", "snap_mp_pub_a"),
+        ("snap_mp_decoy_b", "snap_mp_pub_b"),
     ] {
+        let p = pg_walstream::sql_builder::quote_ident(p).unwrap();
         let _ = conn.exec(&format!("DROP PUBLICATION IF EXISTS {p}"));
         let _ = conn.exec(&format!("DROP TABLE IF EXISTS {t} CASCADE"));
         conn.exec(&format!(
@@ -1774,15 +1815,19 @@ async fn multiple_publications_are_all_snapshotted() {
             .expect("publication");
     }
 
-    // The quoted-CSV form the replication protocol uses.
     let stream = LogicalReplicationStream::new(
         &replication_conn_string(),
-        snapshot_config(slot, "\"snap_mp_pub_a\",\"snap_mp_pub_b\""),
+        snapshot_config(
+            slot,
+            r#"snap_mp_pub_a,snap_mp_pub_b"," snap_mp_""quoted"" "#,
+        ),
     )
     .await
     .expect("connect");
 
-    let (events, _s) = collect_snapshot(stream).await;
+    let (events, _stream) = tokio::time::timeout(TEST_TIMEOUT, collect_snapshot(stream))
+        .await
+        .expect("timed out");
     let mut names: Vec<String> = events.iter().map(insert_name).collect();
     names.sort();
     assert_eq!(names, vec!["snap_mp_a", "snap_mp_b"]);

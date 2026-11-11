@@ -248,7 +248,8 @@ impl LogicalReplicationStream {
     ) -> impl core::future::Future<Output = Result<AlignedSnapshot>> + Send + 'static {
         let logical = self.config().slot_type == SlotType::Logical;
         let conninfo = self.conninfo().to_string();
-        let publications = plan::split_publication_names(&self.config().publication_name);
+        let publications =
+            plan::split_publication_names(self.server_version(), &self.config().publication_name);
         let identity = *self.server_identity();
         let tables: Vec<(String, String)> = tables
             .iter()
@@ -260,6 +261,7 @@ impl LogicalReplicationStream {
                     "an aligned snapshot requires a logical replication stream",
                 ));
             }
+            let publications = publications?;
             let publications: Vec<&str> = publications.iter().map(String::as_str).collect();
             let tables: Vec<(&str, &str)> = tables
                 .iter()

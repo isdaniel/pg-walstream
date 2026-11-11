@@ -327,6 +327,9 @@ impl LogicalReplicationStream {
     /// Must address the same database and must **not** be a replication connection.
     async fn snapshot_with_reader(mut self, reader_conninfo: &str) -> Result<SnapshotOutcome> {
         validate_snapshot_config(self.config())?;
+        let server_version = self.server_version();
+        let publications =
+            plan::split_publication_names(server_version, &self.config().publication_name)?;
 
         // Force the precondition rather than asking the caller to have set it.
         //
@@ -360,9 +363,6 @@ impl LogicalReplicationStream {
             tracing::info!("No exported snapshot available; the replication slot already existed");
             return Ok(SnapshotOutcome::Unavailable(guard.release()));
         };
-
-        let publications = plan::split_publication_names(&guard.stream().config().publication_name);
-        let server_version = guard.stream().server_version();
 
         // Everything past this point runs with a slot we just created. If any of
         // it fails we must drop that slot again: leaving it behind would make the
@@ -516,11 +516,19 @@ fn catalog_rows_from_result(result: &crate::connection::PgResult) -> Result<Vec<
             relation_name: get(2)?,
             replica_identity: get(3)?.bytes().next().unwrap_or(b'd'),
             relkind: get(4)?.bytes().next().unwrap_or(b'r'),
-            column_name: get(5)?,
-            type_id: parse_catalog_u32(&get(6)?, "type oid")?,
-            type_modifier: get(7)?.parse::<i32>().map_err(|e| {
-                ReplicationError::protocol(format!("catalog query returned a bad typmod: {e}"))
-            })?,
+            column: match result.get_value(index, 5) {
+                Some(name) => Some(crate::protocol::ColumnInfo::new(
+                    0, // replica identity membership is not read
+                    name,
+                    parse_catalog_u32(&get(6)?, "type oid")?,
+                    get(7)?.parse::<i32>().map_err(|e| {
+                        ReplicationError::protocol(format!(
+                            "catalog query returned a bad typmod: {e}"
+                        ))
+                    })?,
+                )),
+                None => None,
+            },
             // NULL for an unfiltered table, and always before PG15.
             row_filter: result.get_value(index, 8).filter(|v| !v.is_empty()),
             // Only ever true on PG18+ with `publish_generated_columns = stored`;
@@ -555,7 +563,7 @@ pub(crate) fn published_relations_sql(
 ) -> Result<String> {
     plan::build_catalog_sql(
         server_version,
-        &plan::split_publication_names(publication_name),
+        &plan::split_publication_names(server_version, publication_name)?,
     )
 }
 
@@ -735,11 +743,12 @@ mod tests {
         assert_eq!(rows[0].namespace, "public");
         assert_eq!(rows[0].relation_name, "users");
         assert_eq!(rows[0].replica_identity, b'd');
-        assert_eq!(rows[0].column_name, "id");
-        assert_eq!(rows[0].type_id, 23);
-        assert_eq!(rows[0].type_modifier, -1);
+        let column = rows[0].column.as_ref().unwrap();
+        assert_eq!(&*column.name, "id");
+        assert_eq!(column.type_id, 23);
+        assert_eq!(column.type_modifier, -1);
         assert!(rows[0].row_filter.is_none());
-        assert_eq!(rows[1].column_name, "name");
+        assert_eq!(&*rows[1].column.as_ref().unwrap().name, "name");
     }
 
     #[cfg(feature = "rustls-tls")]
@@ -950,17 +959,26 @@ mod tests {
     /// physical slot export a snapshot.
     #[test]
     fn snapshot_rejects_an_invalid_config_before_touching_the_connection() {
-        let stream = crate::stream::tests::create_test_stream(
-            snapshot_config().with_slot_type(SlotType::Physical),
-        );
-        // `SnapshotOutcome` is deliberately not `Debug` (it owns the stream),
-        // so the error has to be matched out rather than `unwrap_err`ed.
-        let err = match block_on(stream.snapshot()) {
-            Ok(_) => panic!("a physical slot cannot produce a snapshot"),
-            Err(e) => e,
-        };
-        assert!(matches!(err, ReplicationError::Config(_)), "{err:?}");
-        assert!(err.is_permanent(), "{err:?}");
+        for (config, message) in [
+            (
+                snapshot_config().with_slot_type(SlotType::Physical),
+                "logical",
+            ),
+            (
+                ReplicationStreamConfig::builder("slot", r#"a",,"b"#),
+                "invalid publication_names",
+            ),
+        ] {
+            let stream = crate::stream::tests::create_test_stream(config);
+            // `SnapshotOutcome` is deliberately not `Debug` (it owns the stream),
+            // so the error is taken with `err()` rather than `unwrap_err`.
+            let err = block_on(stream.snapshot())
+                .err()
+                .expect("an invalid config cannot produce a snapshot");
+            assert!(matches!(err, ReplicationError::Config(_)), "{err:?}");
+            assert!(err.is_permanent(), "{err:?}");
+            assert!(err.to_string().contains(message), "{err}");
+        }
     }
 
     /// The other half of the gate: a config that passes validation must go on to

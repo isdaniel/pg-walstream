@@ -8,7 +8,7 @@
 use crate::error::{ReplicationError, Result};
 use crate::prelude::*;
 use crate::protocol::{ColumnInfo, RelationInfo};
-use crate::sql_builder::{quote_ident, quote_literal, PG15, PG18};
+use crate::sql_builder::{quote_ident, quote_literal, PG15, PG17, PG18};
 
 /// A table to be copied, with the metadata needed to decode its rows.
 #[derive(Debug, Clone)]
@@ -27,7 +27,7 @@ pub struct SnapshotTable {
 }
 
 impl SnapshotTable {
-    /// Column names, types and replica identity, in `COPY` output order.
+    /// Column names, types and replica identity, with columns in `COPY` output order or empty when none are transmitted.
     ///
     /// This is the other half of the [`retain_tables`](super::Snapshot::retain_tables)
     /// escape hatch: filtering by column presence, type OID, typmod or replica
@@ -55,7 +55,7 @@ impl SnapshotTable {
     }
 }
 
-/// One row of the catalog query: a single column of a single published table.
+/// A published table and one transmitted column, if any.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct CatalogRow {
     pub(super) relation_id: u32,
@@ -64,9 +64,7 @@ pub(super) struct CatalogRow {
     pub(super) replica_identity: u8,
     /// `pg_class.relkind`. `'p'` is a partitioned table, which PostgreSQL refuses to `COPY` from directly.
     pub(super) relkind: u8,
-    pub(super) column_name: String,
-    pub(super) type_id: u32,
-    pub(super) type_modifier: i32,
+    pub(super) column: Option<ColumnInfo>,
     /// The publication's row filter, deparsed by the server. `None` before PG15.
     pub(super) row_filter: Option<String>,
     /// `pg_attribute.attgenerated <> ''` — a stored generated column.
@@ -178,7 +176,7 @@ pub(super) fn build_catalog_sql(server_version: i32, publications: &[String]) ->
             ON n.nspname = pt.schemaname
           JOIN pg_catalog.pg_class c
             ON c.relname = pt.tablename AND c.relnamespace = n.oid
-          JOIN pg_catalog.pg_attribute a
+          LEFT JOIN pg_catalog.pg_attribute a
             ON a.attrelid = c.oid
            AND a.attnum > 0
            AND NOT a.attisdropped
@@ -188,22 +186,60 @@ pub(super) fn build_catalog_sql(server_version: i32, publications: &[String]) ->
     ))
 }
 
-/// Split a `publication_names` option value into individual names.
-///
-/// [`crate::stream::ReplicationStreamConfig::publication_name`] may hold a
-/// comma-separated, optionally quoted list, because that is what
-/// `START_REPLICATION ... (publication_names '...')` takes.
-///
-/// The quote handling is deliberately naive — it strips quotes and splits on
-/// every comma, so a publication name containing a literal comma or quote would
-/// be mangled. Such a name would already break the `publication_names` option
-/// itself, so this is consistent with the stream rather than a separate limit.
-pub(super) fn split_publication_names(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(|part| part.trim().trim_matches('"').trim().to_string())
-        .filter(|part| !part.is_empty())
-        .collect()
+/// Parse the quoted `publication_names` value emitted by the stream using the server's `SplitIdentifierString` rules.
+pub(super) fn split_publication_names(server_version: i32, value: &str) -> Result<Vec<String>> {
+    let invalid = || ReplicationError::config("invalid publication_names identifier list");
+    if value.contains('\0') {
+        return Err(invalid());
+    }
+    let space = |c: char| {
+        matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c') || (server_version >= PG17 && c == '\x0b')
+    };
+    let mut chars = core::iter::once('"')
+        .chain(value.chars())
+        .chain(core::iter::once('"'))
+        .peekable();
+    let mut names = Vec::new();
+    loop {
+        while chars.peek().is_some_and(|&c| space(c)) {
+            chars.next();
+        }
+        let mut name = String::new();
+        if chars.peek() == Some(&'"') {
+            chars.next();
+            loop {
+                match chars.next() {
+                    Some('"') if chars.peek() == Some(&'"') => {
+                        chars.next();
+                        name.push('"');
+                    }
+                    Some('"') => break,
+                    Some(c) => name.push(c),
+                    None => return Err(invalid()),
+                }
+            }
+        } else {
+            while let Some(&c) = chars.peek() {
+                if c == ',' || space(c) {
+                    break;
+                }
+                name.push(c.to_ascii_lowercase());
+                chars.next();
+            }
+            if name.is_empty() {
+                return Err(invalid());
+            }
+        }
+        while chars.peek().is_some_and(|&c| space(c)) {
+            chars.next();
+        }
+        names.push(name);
+        match chars.next() {
+            Some(',') => {}
+            None => return Ok(names),
+            _ => return Err(invalid()),
+        }
+    }
 }
 
 /// Build the `COPY ... TO STDOUT` statement for one table.
@@ -215,7 +251,7 @@ pub(super) fn split_publication_names(value: &str) -> Vec<String> {
 /// unpublished columns too — shifting every value and corrupting the snapshot.
 ///
 /// `COPY t (cols) TO STDOUT` is the fast path — a direct heap scan, no executor —
-/// so it stays the default. Three things force the `COPY (SELECT ...)` form:
+/// so it stays the default. These cases require the `COPY (SELECT ...)` form:
 ///
 /// * a **row filter**, because only a query can carry a `WHERE`;
 /// * a **partitioned table**, which PostgreSQL refuses to `COPY` from directly:
@@ -225,6 +261,7 @@ pub(super) fn split_publication_names(value: &str) -> Vec<String> {
 ///   `ERROR: column "g" is a generated column` /
 ///   `DETAIL: Generated columns cannot be used in COPY.` — but which a subselect
 ///   reads without complaint. Verified on both PG 14 and PG 18.
+/// * an **empty column set**, which requires a zero-column projection.
 fn build_copy_sql(
     relation: &RelationInfo,
     row_filter: Option<&str>,
@@ -244,7 +281,7 @@ fn build_copy_sql(
         .collect::<Result<Vec<_>>>()?
         .join(", ");
 
-    if row_filter.is_none() && !partitioned && !has_generated {
+    if row_filter.is_none() && !partitioned && !has_generated && !relation.columns.is_empty() {
         return Ok(format!("COPY {table} ({columns}) TO STDOUT"));
     }
 
@@ -301,19 +338,18 @@ fn table_groups(rows: &[CatalogRow]) -> impl Iterator<Item = &[CatalogRow]> {
 
 /// The table of a non-empty group, with duplicate columns from several publications collapsed.
 fn relation_of(group: &[CatalogRow]) -> RelationInfo {
-    let mut columns: Vec<ColumnInfo> = Vec::with_capacity(group.len());
+    let first = &group[0];
+    let mut columns: Vec<ColumnInfo> =
+        Vec::with_capacity(first.column.as_ref().map_or(0, |_| group.len()));
     for row in group {
-        if columns.iter().any(|c| &*c.name == row.column_name.as_str()) {
+        let Some(column) = &row.column else {
+            continue;
+        };
+        if columns.iter().any(|c| c.name == column.name) {
             continue;
         }
-        columns.push(ColumnInfo::new(
-            0, // replica identity membership is not read
-            row.column_name.clone(),
-            row.type_id,
-            row.type_modifier,
-        ));
+        columns.push(column.clone());
     }
-    let first = &group[0];
     RelationInfo::new(
         first.relation_id,
         first.namespace.clone(),
@@ -405,9 +441,7 @@ mod tests {
             relation_name: table.to_string(),
             replica_identity: b'd',
             relkind: b'r',
-            column_name: col.to_string(),
-            type_id: 25,
-            type_modifier: -1,
+            column: Some(ColumnInfo::new(0, col.to_string(), 25, -1)),
             row_filter: None,
             generated: false,
         }
@@ -534,18 +568,49 @@ mod tests {
     // ---- split_publication_names -------------------------------------------
 
     #[test]
-    fn split_publication_names_handles_quoted_csv() {
-        assert_eq!(split_publication_names("a"), vec!["a"]);
-        assert_eq!(split_publication_names("\"a\""), vec!["a"]);
-        assert_eq!(split_publication_names("\"a\",\"b\""), vec!["a", "b"]);
-        assert_eq!(split_publication_names("a, b ,c"), vec!["a", "b", "c"]);
+    fn split_publication_names_matches_the_streams_outer_quotes() {
+        for (input, expected) in [
+            ("a", vec!["a"]),
+            ("sales,archive", vec!["sales,archive"]),
+            (" Mixed Case ", vec![" Mixed Case "]),
+            ("a, b ,c", vec!["a, b ,c"]),
+            (r#"a","b"#, vec!["a", "b"]),
+            (r#"a", B ,"c"#, vec!["a", "b", "c"]),
+            ("\x0bb\x0b", vec!["\x0bb\x0b"]),
+            (r#"a""b"#, vec!["a\"b"]),
+            ("", vec![""]),
+        ] {
+            assert_eq!(
+                split_publication_names(PG18, input).unwrap(),
+                expected,
+                "{input:?}"
+            );
+        }
     }
 
     #[test]
-    fn split_publication_names_drops_empties() {
-        assert_eq!(split_publication_names(""), Vec::<String>::new());
-        assert_eq!(split_publication_names(" , "), Vec::<String>::new());
-        assert_eq!(split_publication_names("a,,b"), vec!["a", "b"]);
+    fn split_publication_names_uses_server_whitespace() {
+        for (version, middle) in [(PG17 - 1, "\x0bb\x0b"), (PG17, "b")] {
+            assert_eq!(
+                split_publication_names(version, "a\",\x0bb\x0b,\"c").unwrap(),
+                ["a", middle, "c"],
+                "{version}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_publication_names_rejects_malformed_lists() {
+        for input in [
+            "\0",
+            "\"a\"",
+            "a\"b",
+            "a\",,\"b",
+            "a\", b c,\"d",
+            "a\",\"b\"",
+        ] {
+            assert!(split_publication_names(PG18, input).is_err(), "{input:?}");
+        }
     }
 
     // ---- build_copy_sql ----------------------------------------------------
@@ -843,8 +908,9 @@ mod tests {
     fn carries_replica_identity_and_types_through() {
         let mut r = row("public", "t", "id");
         r.replica_identity = b'f';
-        r.type_id = 23;
-        r.type_modifier = 4;
+        let column = r.column.as_mut().unwrap();
+        column.type_id = 23;
+        column.type_modifier = 4;
         let tables = tables_from_catalog_rows(&[r]).unwrap();
         assert_eq!(tables[0].relation.replica_identity, b'f');
         assert_eq!(tables[0].relation.columns[0].type_id, 23);
@@ -887,7 +953,7 @@ mod tests {
     #[test]
     fn relation_reports_the_metadata_of_its_own_table() {
         let mut second = row("public", "b", "id");
-        second.type_id = 23;
+        second.column.as_mut().unwrap().type_id = 23;
         let tables = tables_from_catalog_rows(&[row("public", "a", "id"), second]).unwrap();
 
         assert_eq!(&*tables[0].relation().relation_name, "a");
