@@ -524,6 +524,8 @@ pub struct ReplicationStreamConfig {
     /// Publication to replicate from.
     ///
     /// To stream from several publications at once, pass them comma-separated  with each name quoted — `r#"pub_a","pub_b"#` — which produces the `publication_names '"pub_a","pub_b"'` list pgoutput expects. One stream and one slot cover all of them.
+    ///
+    /// [`snapshot`](LogicalReplicationStream::snapshot) and [`published_relations`](LogicalReplicationStream::published_relations) read this list as PostgreSQL does, so a single name is taken literally once each `"` is doubled, and a malformed list is a `Config` error.
     pub publication_name: String,
     pub protocol_version: u32,
     pub streaming_mode: StreamingMode,
@@ -1076,13 +1078,11 @@ impl LogicalReplicationStream {
     ///
     /// Column lists are unioned across publications, including `FOR ALL TABLES`, without validating combinations PostgreSQL rejects during streaming.
     ///
-    /// Unknown or empty publications contribute no relations, and tables with no published columns are omitted even though their empty inserts can still stream.
-    ///
-    /// Publication names containing commas, escaped quotes or surrounding whitespace are unsupported by this catalog read.
+    /// Unknown or empty publications contribute no relations, and tables with no transmitted columns have empty column lists.
     ///
     /// # Errors
     ///
-    /// As for [`type_catalog`](Self::type_catalog), and when the configured publication list is empty.
+    /// As for [`type_catalog`](Self::type_catalog), and when the configured publication list is malformed.
     pub async fn published_relations(&mut self) -> Result<Vec<RelationInfo>> {
         let sql = crate::snapshot::published_relations_sql(
             self.server_version(),
@@ -5822,10 +5822,14 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn published_relations_needs_a_publication() {
-        let mut stream = create_test_stream(ReplicationStreamConfig::builder("slot", " , "));
+    async fn published_relations_rejects_a_malformed_publication_list() {
+        let mut stream = create_test_stream(ReplicationStreamConfig::builder("slot", r#"a",,"b"#));
         let err = stream.published_relations().await.unwrap_err();
         assert!(matches!(err, ReplicationError::Config(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("invalid publication_names"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
