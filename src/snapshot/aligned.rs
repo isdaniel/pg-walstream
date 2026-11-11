@@ -137,6 +137,8 @@ impl AlignedSnapshot {
     /// Copy `tables`, given as `(schema, table)` catalog names, as published by
     /// `publications` at a new temporary slot's consistent point.
     ///
+    /// Publication names are literal catalog names, including any whitespace.
+    ///
     /// `conninfo` addresses the database, with or without `replication=database`,
     /// and both the side connection and the reader are derived from it, the way
     /// [`LogicalReplicationStream::snapshot`] derives its reader. Each table is
@@ -376,8 +378,8 @@ fn pin_sql(tables: &[SnapshotTable]) -> Result<(String, String)> {
 fn validate_request(publications: &[&str], tables: &[(&str, &str)]) -> Result<Vec<String>> {
     let publications: Vec<String> = publications
         .iter()
-        .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty())
+        .map(|p| p.to_string())
         .collect();
     if publications.is_empty() {
         return Err(ReplicationError::config(
@@ -517,11 +519,22 @@ mod tests {
     #[test]
     fn requests_without_publication_or_tables_or_with_duplicates_are_rejected() {
         let t = [("public", "a")];
-        assert!(validate_request(&[" "], &t).is_err());
+        assert!(validate_request(&[], &t).is_err());
+        assert!(validate_request(&[""], &t).is_err());
         assert!(validate_request(&["p"], &[]).is_err());
         let err = validate_request(&["p"], &[("public", "a"), ("public", "a")]).unwrap_err();
         assert!(err.to_string().contains("public.a"), "{err}");
-        assert_eq!(validate_request(&[" p ", ""], &t).unwrap(), ["p"]);
+        assert_eq!(validate_request(&["p", ""], &t).unwrap(), ["p"]);
+    }
+
+    #[test]
+    fn publication_names_preserve_literal_whitespace() {
+        let t = [("public", "a")];
+        assert_eq!(
+            validate_request(&[" pad ", "pad", ""], &t).unwrap(),
+            [" pad ", "pad"]
+        );
+        assert_eq!(validate_request(&[" "], &t).unwrap(), [" "]);
     }
 
     #[test]
