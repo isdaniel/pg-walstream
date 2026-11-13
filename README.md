@@ -63,6 +63,7 @@ If both backends are enabled, `rustls-tls` takes priority automatically.
 - **A cancelled command poisons the connection.** If the future of `start()`, `slot_confirmed_flush_lsn()` or `timeline_history()` is dropped before the reply arrives, every later command on that connection fails with `ReplicationError::PermanentConnection`; create a new stream.
 - **`EventStream::next_event` carries a reconnect across a dropped future.** A `timeout` or `select!` that cancels `next_event()` while the stream reconnects no longer restarts the reconnect from its first attempt; the next call resumes it, so a timeout shorter than a reconnect cannot starve it. While such a reconnect is parked, `inner()`, `inner_mut()` and `current_lsn()` panic until the next `next_event()` returns (as they already do after an abandoned `poll_next`); the feedback methods keep working.
 - **The minimum supported Rust version is 1.88.**
+- **`ReplicationError::Protocol`, `TransientConnection`, `PermanentConnection`, `Authentication` and `ReplicationSlot` have a second field, `Option<Box<ServerError>>`,** holding the server's `ErrorResponse` when the error came from one. Patterns become `Protocol(msg, _)` or `Protocol(..)`, and an error built directly takes `None`, or use the `protocol(...)` style constructors. `sqlstate()` returns the SQLSTATE, to match against the re-exported `sqlstate::pg` constants, and `server_error()` returns the whole response. The message text is unchanged.
 
 ## Feature Flags
 

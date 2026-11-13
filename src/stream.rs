@@ -1009,8 +1009,11 @@ impl LogicalReplicationStream {
     /// A command that a caller cancelled before its reply leaves the connection refusing every later one with a `Protocol` error that reads as retryable, and nothing before [`start`](Self::start) replaces the connection. The refusal is the only `Protocol` a command meets on a connection that reports dead, so it is one a retry cannot cure; a read reconnects instead, and keeps the transient classification.
     fn rebuild_if_refused(&self, error: ReplicationError) -> ReplicationError {
         match error {
-            ReplicationError::Protocol(refusal) if !self.connection.is_alive() => {
-                ReplicationError::permanent_connection(format!("{refusal}; create a new stream"))
+            ReplicationError::Protocol(refusal, server) if !self.connection.is_alive() => {
+                ReplicationError::PermanentConnection(
+                    format!("{refusal}; create a new stream"),
+                    server,
+                )
             }
             other => other,
         }
@@ -1846,7 +1849,7 @@ impl LogicalReplicationStream {
             // has already advanced past it. Surface it instead.
             //
             // Server-reported conditions do NOT reach this guard as
-            // `Protocol`: `from_sqlstate` maps the transient ones (57P01
+            // `Protocol`: `from_server` maps the transient ones (57P01
             // admin shutdown, 55006 slot busy, …) to `TransientConnection`,
             // which is not in the match below. And any error out of the COPY
             // read path clears the backend's liveness first — the native
@@ -1860,7 +1863,7 @@ impl LogicalReplicationStream {
             if self.connection.is_alive()
                 && matches!(
                     e,
-                    ReplicationError::Protocol(_)
+                    ReplicationError::Protocol(..)
                         | ReplicationError::Buffer(_)
                         | ReplicationError::Deserialize(_)
                 )
@@ -3421,7 +3424,7 @@ pub(crate) mod tests {
             .await
             .expect_err("creating a slot needs a live connection");
         assert!(
-            matches!(error, ReplicationError::TransientConnection(_)),
+            matches!(error, ReplicationError::TransientConnection(..)),
             "{error:?}"
         );
         assert!(matches!(stream.slot, SlotState::Absent));
@@ -5501,7 +5504,7 @@ pub(crate) mod tests {
         ] {
             let err = ServerIdentity::from_identify_system(&reply).unwrap_err();
             assert!(
-                matches!(err, ReplicationError::PermanentConnection(_)),
+                matches!(err, ReplicationError::PermanentConnection(..)),
                 "{err:?}"
             );
         }
@@ -5524,13 +5527,13 @@ pub(crate) mod tests {
         let physical = identify_system_result(&["confirmed_flush_lsn"], &[None]);
         let err = confirmed_flush_lsn_from("s", &physical).unwrap_err();
         assert!(
-            matches!(err, ReplicationError::ReplicationSlot(_)),
+            matches!(err, ReplicationError::ReplicationSlot(..)),
             "{err:?}"
         );
 
         let garbage = identify_system_result(&["confirmed_flush_lsn"], &[Some("x")]);
         let err = confirmed_flush_lsn_from("s", &garbage).unwrap_err();
-        assert!(matches!(err, ReplicationError::Protocol(_)), "{err:?}");
+        assert!(matches!(err, ReplicationError::Protocol(..)), "{err:?}");
     }
 
     /// A `pg_type` catalog reply from psql-style rows, `|`-separated with an empty field for `NULL`.
@@ -5608,7 +5611,7 @@ pub(crate) mod tests {
             let row = row.join("|");
             let err = type_catalog_from(&type_catalog_result(&[good, &row])).unwrap_err();
             assert!(
-                matches!(&err, ReplicationError::Protocol(m) if m.contains("row 1")),
+                matches!(&err, ReplicationError::Protocol(m, _) if m.contains("row 1")),
                 "{row}: {err:?}"
             );
         }
@@ -5630,7 +5633,7 @@ pub(crate) mod tests {
         let mut empty = crate::connection::PgResult::new();
         empty.columns = vec!["filename".into(), "content".into()];
         let err = timeline_history_from(2, &empty).unwrap_err();
-        assert!(matches!(err, ReplicationError::Protocol(_)), "{err:?}");
+        assert!(matches!(err, ReplicationError::Protocol(..)), "{err:?}");
     }
 
     fn identity(system_id: u64, timeline: u32) -> ServerIdentity {
@@ -5700,7 +5703,7 @@ pub(crate) mod tests {
         for other in [identity(9999, 1), identity(7682, 2)] {
             let err = stream.ensure_same_server(&other).unwrap_err();
             assert!(
-                matches!(err, ReplicationError::PermanentConnection(_)),
+                matches!(err, ReplicationError::PermanentConnection(..)),
                 "{err:?}"
             );
             assert!(err.is_permanent(), "{err}");
@@ -5724,7 +5727,7 @@ pub(crate) mod tests {
             .check_server_identity(&identity(7682, 2))
             .unwrap_err();
         assert!(
-            matches!(err, ReplicationError::ReplicationSlot(_)),
+            matches!(err, ReplicationError::ReplicationSlot(..)),
             "expected ReplicationSlot, got {err:?}"
         );
         assert!(err.is_permanent(), "a fork must stop the retry loop: {err}");
@@ -5811,7 +5814,7 @@ pub(crate) mod tests {
         };
         let refused = |err: ReplicationError| {
             assert!(
-                matches!(&err, ReplicationError::Protocol(m) if m.contains("00000004-00000391-1")),
+                matches!(&err, ReplicationError::Protocol(m, _) if m.contains("00000004-00000391-1")),
                 "{err:?}"
             );
         };
@@ -5895,7 +5898,7 @@ pub(crate) mod tests {
         let err = stream.next_event_with_retry(&token).await.unwrap_err();
 
         assert!(
-            matches!(err, ReplicationError::Protocol(_)),
+            matches!(err, ReplicationError::Protocol(..)),
             "the last read error comes back, not the recovery error or a cancellation: {err:?}"
         );
         let waited = started.elapsed();
@@ -6076,7 +6079,7 @@ pub(crate) mod tests {
 
         for error in errors {
             assert!(
-                matches!(&error, ReplicationError::PermanentConnection(m) if m.contains("cancelled") && m.contains("new stream")),
+                matches!(&error, ReplicationError::PermanentConnection(m, _) if m.contains("cancelled") && m.contains("new stream")),
                 "{error:?}"
             );
             assert!(error.is_permanent());
@@ -6189,7 +6192,7 @@ pub(crate) mod tests {
         .unwrap_err();
 
         assert!(
-            matches!(err, ReplicationError::ReplicationSlot(_)),
+            matches!(err, ReplicationError::ReplicationSlot(..)),
             "the server's error comes back as it was classified: {err:?}"
         );
         assert!(err.is_permanent());
@@ -6221,7 +6224,7 @@ pub(crate) mod tests {
         let err = stream.next_event_with_retry(&token).await.unwrap_err();
 
         assert!(
-            matches!(err, ReplicationError::Protocol(_)),
+            matches!(err, ReplicationError::Protocol(..)),
             "the decode error itself comes back: {err:?}"
         );
         assert_eq!(
@@ -7392,7 +7395,7 @@ pub(crate) mod tests {
     async fn test_send_feedback_no_received_lsn() {
         let mut stream = create_test_stream(create_test_config());
         let err = stream.send_feedback().await.unwrap_err();
-        assert!(matches!(err, ReplicationError::Protocol(_)), "{err:?}");
+        assert!(matches!(err, ReplicationError::Protocol(..)), "{err:?}");
     }
 
     #[test]
@@ -8247,7 +8250,7 @@ pub(crate) mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, ReplicationError::Authentication(_)));
+        assert!(matches!(err, ReplicationError::Authentication(..)));
         assert!(err.to_string().contains("bad password"));
     }
 
@@ -10018,7 +10021,7 @@ pub(crate) mod tests {
         let err = events.next_event_before(Lsn::new(0x200)).await.unwrap_err();
 
         assert!(
-            matches!(&err, ReplicationError::Protocol(m) if m == "parked failure"),
+            matches!(&err, ReplicationError::Protocol(m, _) if m == "parked failure"),
             "{err:?}"
         );
         assert!(!events.state.is_polling(), "the stream must be taken back");
@@ -10365,7 +10368,7 @@ pub(crate) mod tests {
         let mut event_stream = stream.into_stream(cancel_token);
         event_stream
             .state
-            .park_with_result(Err(ReplicationError::Protocol("parked".to_string())));
+            .park_with_result(Err(ReplicationError::protocol("parked")));
 
         let result = event_stream.shutdown().await;
 
@@ -10604,7 +10607,7 @@ pub(crate) mod tests {
     async fn test_poll_next_permanent_error_branch() {
         use futures::StreamExt;
 
-        let err = ReplicationError::PermanentConnection("fatal error".to_string());
+        let err = ReplicationError::permanent_connection("fatal error");
         let mut event_stream = create_event_stream_with_inflight(Err(err));
 
         // poll_next should return Ready(Some(Err(...))) and set terminated
@@ -10632,7 +10635,7 @@ pub(crate) mod tests {
 
         // Protocol error is neither permanent, nor cancelled, nor transient (by enum match) —
         // it falls through to the catch-all Err(e) arm
-        let err = ReplicationError::Protocol("not in replication mode".to_string());
+        let err = ReplicationError::protocol("not in replication mode");
         let mut event_stream = create_event_stream_with_inflight(Err(err));
 
         // poll_next should return Ready(Some(Err(...))) but NOT terminate
@@ -10669,7 +10672,7 @@ pub(crate) mod tests {
     async fn test_poll_next_authentication_error_is_permanent() {
         use futures::StreamExt;
 
-        let err = ReplicationError::Authentication("bad credentials".to_string());
+        let err = ReplicationError::authentication("bad credentials");
         let mut event_stream = create_event_stream_with_inflight(Err(err));
 
         let result = event_stream.next().await;
@@ -10685,7 +10688,7 @@ pub(crate) mod tests {
     async fn test_poll_next_slot_error_is_permanent() {
         use futures::StreamExt;
 
-        let err = ReplicationError::ReplicationSlot("slot does not exist".to_string());
+        let err = ReplicationError::replication_slot("slot does not exist");
         let mut event_stream = create_event_stream_with_inflight(Err(err));
 
         let result = event_stream.next().await;
@@ -10722,7 +10725,7 @@ pub(crate) mod tests {
         // Inject first transient error
         event_stream
             .state
-            .park_with_result(Err(ReplicationError::Protocol("error 1".to_string())));
+            .park_with_result(Err(ReplicationError::protocol("error 1")));
 
         let result1 = event_stream.next().await;
         assert!(result1.is_some());
@@ -10742,9 +10745,7 @@ pub(crate) mod tests {
         // Now inject a permanent error
         event_stream
             .state
-            .park_with_result(Err(ReplicationError::PermanentConnection(
-                "done".to_string(),
-            )));
+            .park_with_result(Err(ReplicationError::permanent_connection("done")));
 
         let result3 = event_stream.next().await;
         assert!(result3.is_some());

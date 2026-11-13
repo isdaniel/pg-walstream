@@ -586,6 +586,7 @@ dependencies = [
  "serde",
  "smallvec",
  "socket2",
+ "sqlstate",
  "tokio",
  "tokio-rustls",
  "tokio-util",
@@ -881,6 +882,12 @@ dependencies = [
  "libc",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "sqlstate"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "858cea190fe7555971c35a5eb336858f1bf962a2bd7ceb8704fb1759b36af2cd"
 
 [[package]]
 name = "stringprep"

@@ -803,10 +803,8 @@ async fn startup_and_auth(
             }
             b'E' => {
                 let fields = super::error::parse_error_fields(&msg[5..]);
-                return Err(ReplicationError::from_sqlstate_startup(
-                    &fields.code,
-                    format!("Server error during startup: {fields}"),
-                ));
+                let message = format!("Server error during startup: {fields}");
+                return Err(ReplicationError::from_server_startup(fields, message));
             }
             b'N' => {
                 // NoticeResponse — log and continue

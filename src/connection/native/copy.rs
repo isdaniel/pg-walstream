@@ -186,10 +186,8 @@ fn drain_read_buffer(
                     break;
                 }
                 let fields = super::error::parse_error_fields(&read_buf[HEADER_LEN..total_len]);
-                return Some(ReplicationError::from_sqlstate(
-                    &fields.code,
-                    format!("server error during replication: {fields}"),
-                ));
+                let msg = format!("server error during replication: {fields}");
+                return Some(ReplicationError::from_server(Some(fields), msg));
             }
             b'c' => {
                 // CopyDone — the server ended the replication stream.
@@ -384,7 +382,7 @@ mod tests {
         let err = drain_read_buffer(&mut buf, &mut pending)
             .expect("CopyDone must terminate once the queue is empty");
         assert!(
-            matches!(err, ReplicationError::TransientConnection(_)),
+            matches!(err, ReplicationError::TransientConnection(..)),
             "{err:?}"
         );
 
@@ -399,7 +397,7 @@ mod tests {
             let again = drain_read_buffer(&mut buf, &mut pending)
                 .expect("terminal must be sticky across calls");
             assert!(
-                matches!(again, ReplicationError::TransientConnection(_)),
+                matches!(again, ReplicationError::TransientConnection(..)),
                 "{again:?}"
             );
         }
@@ -575,6 +573,39 @@ mod tests {
             "Expected protocol error, got: {err}"
         );
         assert!(pending.is_empty());
+    }
+
+    /// A walsender serving `binary on` raises 42883 when a column's type nests
+    /// one without a send function. The consumer recognises it by SQLSTATE, so the
+    /// whole response must reach it, next to the unchanged message.
+    #[test]
+    fn drain_error_response_keeps_the_server_response() {
+        let payload = b"SERROR\0VERROR\0C42883\0\
+            Mno binary output function available for type aclitem\0\
+            Flsyscache.c\0L3076\0RgetTypeBinaryOutputInfo\0\0";
+        let mut buf = BytesMut::new();
+        buf.put_u8(b'E');
+        buf.put_i32(i32::try_from(4 + payload.len()).unwrap());
+        buf.put_slice(payload);
+
+        let err =
+            drain_read_buffer(&mut buf, &mut VecDeque::new()).expect("ErrorResponse terminates");
+        assert!(matches!(err, ReplicationError::Protocol(..)), "{err:?}");
+        assert_eq!(err.sqlstate(), Some(sqlstate::pg::UNDEFINED_FUNCTION));
+        let server = err.server_error().expect("the server's response");
+        assert_eq!(server.severity, "ERROR");
+        assert_eq!(
+            server.message,
+            "no binary output function available for type aclitem"
+        );
+        assert_eq!(server.routine.as_deref(), Some("getTypeBinaryOutputInfo"));
+        assert_eq!(server.detail, None);
+        assert_eq!(
+            err.to_string(),
+            "Protocol parsing error: [42883] server error during replication: \
+             ERROR: no binary output function available for type aclitem (SQLSTATE 42883)\n\
+             ROUTINE: getTypeBinaryOutputInfo"
+        );
     }
 
     #[test]

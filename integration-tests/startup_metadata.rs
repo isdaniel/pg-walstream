@@ -9,7 +9,7 @@
 //! ```
 
 use pg_walstream::{
-    CancellationToken, ColumnValue, EventType, LogicalReplicationStream, Lsn,
+    sqlstate, CancellationToken, ColumnValue, EventType, LogicalReplicationStream, Lsn,
     PgReplicationConnection, ReplicationStreamConfig, RetryConfig,
 };
 use std::time::Duration;
@@ -331,6 +331,63 @@ async fn type_catalog_predicts_the_binary_columns() {
             column.name
         );
     }
+
+    drop(stream);
+    drop_slot(&mut regular, name);
+    for sql in cleanup {
+        let _ = regular.exec(sql);
+    }
+}
+
+/// A binary stream over a type that nests one without a send function fails with SQLSTATE 42883, which the consumer reads off the error to fall back to text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live PostgreSQL with wal_level=logical"]
+async fn binary_stream_reports_a_nested_unsendable_type_by_sqlstate() {
+    let name = "it_unsendable";
+    let cleanup = [
+        "DROP PUBLICATION IF EXISTS it_unsendable",
+        "DROP TABLE IF EXISTS it_unsendable",
+    ];
+    let mut regular = regular();
+    drop_slot(&mut regular, name);
+    for sql in cleanup.into_iter().chain([
+        "CREATE TABLE it_unsendable (id int4 PRIMARY KEY, acl aclitem[])",
+        "CREATE PUBLICATION it_unsendable FOR TABLE it_unsendable",
+    ]) {
+        regular.exec(sql).expect(sql);
+    }
+
+    let mut stream = LogicalReplicationStream::new(
+        &replication_conn_string(),
+        config(name, name).with_binary(true),
+    )
+    .await
+    .expect("stream");
+    stream.start(None).await.expect("start");
+    regular
+        .exec(
+            "INSERT INTO it_unsendable \
+             VALUES (1, ARRAY[(current_user || '=r/' || current_user)::aclitem])",
+        )
+        .expect("insert");
+
+    let cancel = CancellationToken::new();
+    let err = loop {
+        match tokio::time::timeout(Duration::from_secs(10), stream.next_event(&cancel))
+            .await
+            .expect("the stream ends")
+        {
+            Ok(_) => continue,
+            Err(err) => break err,
+        }
+    };
+    assert_eq!(
+        err.sqlstate(),
+        Some(sqlstate::pg::UNDEFINED_FUNCTION),
+        "{err:?}"
+    );
+    let server = err.server_error().expect("the server's response");
+    assert!(server.message.contains("aclitem"), "{server:?}");
 
     drop(stream);
     drop_slot(&mut regular, name);

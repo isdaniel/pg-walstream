@@ -97,10 +97,8 @@ pub async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
             b'E' => {
                 // ErrorResponse during auth
                 let fields = super::error::parse_error_fields(&msg[5..]);
-                return Err(ReplicationError::from_sqlstate_startup(
-                    &fields.code,
-                    format!("Authentication failed: {fields}"),
-                ));
+                let message = format!("Authentication failed: {fields}");
+                return Err(ReplicationError::from_server_startup(fields, message));
             }
             _ => {
                 // Unexpected message during auth phase — skip
@@ -226,10 +224,10 @@ async fn handle_scram_sha256<S: AsyncRead + AsyncWrite + Unpin>(
     let msg2 = wire::read_message(stream, buf).await?;
     if msg2[0] == b'E' {
         let fields = super::error::parse_error_fields(&msg2[5..]);
-        return Err(ReplicationError::authentication(format!(
-            "SCRAM authentication failed: {}",
-            fields
-        )));
+        return Err(ReplicationError::Authentication(
+            format!("SCRAM authentication failed: {fields}"),
+            Some(Box::new(fields)),
+        ));
     }
     if msg2[0] != b'R' || msg2.len() < 9 {
         return Err(ReplicationError::protocol(
@@ -262,10 +260,10 @@ async fn handle_scram_sha256<S: AsyncRead + AsyncWrite + Unpin>(
     let msg3 = wire::read_message(stream, buf).await?;
     if msg3[0] == b'E' {
         let fields = super::error::parse_error_fields(&msg3[5..]);
-        return Err(ReplicationError::authentication(format!(
-            "SCRAM authentication failed: {}",
-            fields
-        )));
+        return Err(ReplicationError::Authentication(
+            format!("SCRAM authentication failed: {fields}"),
+            Some(Box::new(fields)),
+        ));
     }
     if msg3[0] != b'R' || msg3.len() < 9 {
         return Err(ReplicationError::protocol(
@@ -296,10 +294,10 @@ async fn handle_scram_sha256<S: AsyncRead + AsyncWrite + Unpin>(
         }
     } else if msg4[0] == b'E' {
         let fields = super::error::parse_error_fields(&msg4[5..]);
-        return Err(ReplicationError::authentication(format!(
-            "Authentication failed after SCRAM: {}",
-            fields
-        )));
+        return Err(ReplicationError::Authentication(
+            format!("Authentication failed after SCRAM: {fields}"),
+            Some(Box::new(fields)),
+        ));
     }
 
     Ok(())
@@ -474,6 +472,10 @@ mod tests {
                 || err.to_string().contains("Authentication"),
             "Expected authentication error, got: {err}"
         );
+        assert_eq!(
+            err.sqlstate(),
+            Some(sqlstate::pg::INVALID_AUTHORIZATION_SPECIFICATION)
+        );
     }
 
     #[tokio::test]
@@ -597,7 +599,17 @@ mod tests {
 
         let mut buf = BytesMut::new();
         // No TLS endpoint → should use SCRAM-SHA-256
-        let _ = authenticate(&mut client, &mut buf, "user", Some("pass"), None).await;
+        let err = authenticate(&mut client, &mut buf, "user", Some("pass"), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ReplicationError::Authentication(..)),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.server_error().map(|server| server.message.as_str()),
+            Some("test abort")
+        );
     }
 
     #[tokio::test]
