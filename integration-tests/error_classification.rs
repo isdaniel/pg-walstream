@@ -5,10 +5,10 @@
 //! Both backends used to discard the server's SQLSTATE and return every failure
 //! as a generic `Protocol` error, so a dead replication slot was indistinguishable
 //! from a transient hiccup and consumers had to string-match an error message
-//! whose wording changed in PostgreSQL 18. `ReplicationError::from_sqlstate` now
+//! whose wording changed in PostgreSQL 18. `ReplicationError::from_server` now
 //! promotes the two slot-fatal codes to `ReplicationSlot`, which `is_permanent()`
 //! reports as `true` so the retry loop gives up instead of reconnecting into the
-//! same dead slot.
+//! same dead slot, and keeps the server's response for `ReplicationError::sqlstate`.
 //!
 //! Covered against a live server:
 //! - `42704` undefined_object — START_REPLICATION on a slot that does not exist.
@@ -30,7 +30,7 @@
 //! cargo test --test error_classification -- --ignored --nocapture --test-threads=1
 //! ```
 
-use pg_walstream::{PgReplicationConnection, ReplicationError};
+use pg_walstream::{sqlstate::pg, PgReplicationConnection, ReplicationError};
 
 fn replication_conn_string() -> String {
     std::env::var("DATABASE_URL").unwrap_or_else(|_| {
@@ -83,7 +83,7 @@ fn missing_slot_is_a_permanent_replication_slot_error() {
         .expect_err("START_REPLICATION on an absent slot must fail");
 
     assert!(
-        matches!(err, ReplicationError::ReplicationSlot(_)),
+        matches!(err, ReplicationError::ReplicationSlot(..)),
         "expected ReplicationSlot, got {err:?}"
     );
     assert!(
@@ -94,6 +94,7 @@ fn missing_slot_is_a_permanent_replication_slot_error() {
         err.to_string().contains("42704"),
         "the SQLSTATE must reach the caller: {err}"
     );
+    assert_eq!(err.sqlstate(), Some(pg::UNDEFINED_OBJECT), "{err:?}");
 }
 
 /// Starting *logical* replication on a *physical* slot yields SQLSTATE 55000 —
@@ -138,13 +139,18 @@ fn wrong_slot_type_is_a_permanent_replication_slot_error() {
         .expect_err("logical replication on a physical slot must fail");
 
     assert!(
-        matches!(err, ReplicationError::ReplicationSlot(_)),
+        matches!(err, ReplicationError::ReplicationSlot(..)),
         "expected ReplicationSlot, got {err:?}"
     );
     assert!(err.is_permanent(), "55000 must be permanent: {err}");
     assert!(
         err.to_string().contains("55000"),
         "the SQLSTATE must reach the caller: {err}"
+    );
+    assert_eq!(
+        err.sqlstate(),
+        Some(pg::OBJECT_NOT_IN_PREREQUISITE_STATE),
+        "{err:?}"
     );
 }
 
@@ -164,7 +170,7 @@ fn ordinary_sql_error_stays_retryable() {
     };
 
     assert!(
-        matches!(err, ReplicationError::Protocol(_)),
+        matches!(err, ReplicationError::Protocol(..)),
         "expected Protocol, got {err:?}"
     );
     assert!(
@@ -175,5 +181,19 @@ fn ordinary_sql_error_stays_retryable() {
     assert!(
         err.to_string().contains("42P01"),
         "the SQLSTATE must reach the caller: {err}"
+    );
+    let server = err.server_error().expect("the server's response");
+    assert_eq!(server.code, Some(pg::UNDEFINED_TABLE));
+    assert_eq!(server.severity, "ERROR");
+    assert!(
+        server
+            .message
+            .contains("it_errcls_table_that_does_not_exist"),
+        "{server:?}"
+    );
+    assert_eq!(
+        server.routine.as_deref(),
+        Some("parserOpenTable"),
+        "{server:?}"
     );
 }

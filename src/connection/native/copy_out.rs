@@ -78,10 +78,8 @@ pub(super) async fn next_copy_out<S: AsyncRead + Unpin>(
 
             Some(b'E') => {
                 let fields = super::error::parse_error_fields(&msg[wire::HEADER_LEN..]);
-                let err = ReplicationError::from_sqlstate(
-                    &fields.code,
-                    format!("server error during COPY OUT: {fields}"),
-                );
+                let message = format!("server error during COPY OUT: {fields}");
+                let err = ReplicationError::from_server(Some(fields), message);
                 let _ = super::query::drain_to_ready(stream, buf).await;
                 return Err(err);
             }
@@ -150,10 +148,8 @@ async fn drain_epilogue<S: AsyncRead + Unpin>(
             Some(b'E') => {
                 let fields = super::error::parse_error_fields(&msg[wire::HEADER_LEN..]);
                 deferred.get_or_insert_with(|| {
-                    ReplicationError::from_sqlstate(
-                        &fields.code,
-                        format!("COPY OUT failed after CopyDone: {fields}"),
-                    )
+                    let message = format!("COPY OUT failed after CopyDone: {fields}");
+                    ReplicationError::from_server(Some(fields), message)
                 });
             }
             // Same reasoning as the data loop: after `CopyDone` the only things
@@ -321,7 +317,7 @@ mod tests {
 
         let (_, result) = drive(script).await;
         let err = result.unwrap_err();
-        assert!(matches!(err, ReplicationError::Protocol(_)), "{err:?}");
+        assert!(matches!(err, ReplicationError::Protocol(..)), "{err:?}");
         assert!(format!("{err}").contains("42P01"), "{err}");
     }
 
@@ -406,7 +402,7 @@ mod tests {
             assert_eq!(rows.len(), 1);
             let err = result.unwrap_err();
             assert!(
-                matches!(err, ReplicationError::Protocol(_)),
+                matches!(err, ReplicationError::Protocol(..)),
                 "'{}' must not be silently skipped, got {err:?}",
                 tag as char
             );
@@ -449,7 +445,7 @@ mod tests {
 
         let (_, result) = drive(script).await;
         let err = result.unwrap_err();
-        assert!(matches!(err, ReplicationError::Protocol(_)), "{err:?}");
+        assert!(matches!(err, ReplicationError::Protocol(..)), "{err:?}");
     }
 
     #[tokio::test]
@@ -487,7 +483,7 @@ mod tests {
     async fn copy_in_response_is_rejected() {
         let (_, result) = drive(frame(b'G', b"\0\0\0")).await;
         let err = result.unwrap_err();
-        assert!(matches!(err, ReplicationError::Protocol(_)), "{err:?}");
+        assert!(matches!(err, ReplicationError::Protocol(..)), "{err:?}");
         assert!(format!("{err}").contains('G'), "{err}");
     }
 

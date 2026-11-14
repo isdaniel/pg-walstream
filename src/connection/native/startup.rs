@@ -811,10 +811,8 @@ async fn startup_and_auth(
             }
             b'E' => {
                 let fields = super::error::parse_error_fields(&msg[5..]);
-                return Err(ReplicationError::from_sqlstate_startup(
-                    &fields.code,
-                    format!("Server error during startup: {fields}"),
-                ));
+                let message = format!("Server error during startup: {fields}");
+                return Err(ReplicationError::from_server_startup(fields, message));
             }
             b'N' => {
                 // NoticeResponse — log and continue
@@ -1136,6 +1134,57 @@ mod tests {
         assert!(
             !err.is_permanent(),
             "a handshake timeout must stay retryable"
+        );
+    }
+
+    /// An ErrorResponse after authentication and before ReadyForQuery reaches the
+    /// caller with the server's response. `55000` here is the database refusing
+    /// connections, so it stays a connection error instead of naming a slot.
+    #[tokio::test]
+    async fn startup_error_response_keeps_the_server_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let len = usize::try_from(stream.read_u32().await.unwrap()).unwrap();
+            let mut startup = vec![0; len - 4];
+            stream.read_exact(&mut startup).await.unwrap();
+            let fields = b"SFATAL\0VFATAL\0C55000\0\
+                Mdatabase \"test\" is not currently accepting connections\0\
+                RCheckMyDatabase\0\0";
+            // AuthenticationOk, then the ErrorResponse.
+            let mut reply = vec![b'R', 0, 0, 0, 8, 0, 0, 0, 0, b'E'];
+            reply.extend_from_slice(&u32::try_from(4 + fields.len()).unwrap().to_be_bytes());
+            reply.extend_from_slice(fields);
+            stream.write_all(&reply).await.unwrap();
+            stream
+        });
+
+        let mut info = test_conninfo(SslMode::Disable, None);
+        info.host = addr.ip().to_string();
+        info.port = addr.port();
+        info.connect_timeout = 5;
+        // `Transport` is not `Debug`, so `expect_err` is unavailable here.
+        let err = connect(&info)
+            .await
+            .err()
+            .expect("the server refused the startup");
+        drop(peer.await.unwrap());
+
+        assert!(
+            matches!(err, ReplicationError::PermanentConnection(..)),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.sqlstate(),
+            Some(sqlstate::pg::OBJECT_NOT_IN_PREREQUISITE_STATE)
+        );
+        assert_eq!(
+            err.server_error()
+                .and_then(|server| server.routine.as_deref()),
+            Some("CheckMyDatabase")
         );
     }
 

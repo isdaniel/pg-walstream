@@ -48,7 +48,7 @@ pub(super) async fn simple_query<S: AsyncRead + AsyncWrite + Unpin>(
         // either way, so the reconnect decision is unchanged and what this
         // actually saves is the diagnosis — which is the difference between an
         // operator seeing "admin shutdown" and seeing nothing. The stronger
-        // claim — a FATAL whose code `from_sqlstate` maps elsewhere
+        // claim — a FATAL whose code `from_server` maps elsewhere
         // (`55000`/`42704` → ReplicationSlot, `28000` → Authentication,
         // `3D000`/`42501` → PermanentConnection) collapsing to transient and
         // reconnect-looping forever — is read off that table, not observed:
@@ -123,10 +123,8 @@ pub(super) async fn simple_query<S: AsyncRead + AsyncWrite + Unpin>(
             }
             b'E' => {
                 // ErrorResponse
-                let fields = super::error::parse_error_fields(&msg[5..]);
                 result.status = NativeResultStatus::FatalError;
-                result.error_code = Some(fields.code.clone());
-                result.error_msg = Some(format!("{}", fields));
+                result.error = Some(super::error::parse_error_fields(&msg[5..]));
                 // After an error, the server sends ReadyForQuery
                 // We need to consume it
             }
@@ -180,10 +178,8 @@ pub(super) async fn simple_query_copy_in<S: AsyncRead + AsyncWrite + Unpin>(
         match msg[0] {
             b'G' => break, // CopyInResponse — the server is ready for data
             b'E' => {
-                let fields = super::error::parse_error_fields(&msg[5..]);
                 result.status = NativeResultStatus::FatalError;
-                result.error_code = Some(fields.code.clone());
-                result.error_msg = Some(format!("{fields}"));
+                result.error = Some(super::error::parse_error_fields(&msg[5..]));
                 // The command never entered CopyIn; drain to ReadyForQuery so
                 // the connection stays usable.
                 drain_to_ready(stream, buf).await?;
@@ -235,10 +231,8 @@ pub(super) async fn simple_query_copy_in<S: AsyncRead + AsyncWrite + Unpin>(
             }
             b'Z' => break,
             b'E' => {
-                let fields = super::error::parse_error_fields(&msg[5..]);
                 result.status = NativeResultStatus::FatalError;
-                result.error_code = Some(fields.code.clone());
-                result.error_msg = Some(format!("{fields}"));
+                result.error = Some(super::error::parse_error_fields(&msg[5..]));
             }
             b'N' => {
                 let fields = super::error::parse_error_fields(&msg[5..]);
@@ -445,7 +439,10 @@ mod tests {
 
         let result = res.expect("the parsed FATAL must survive the close");
         assert_eq!(result.status, NativeResultStatus::FatalError);
-        assert_eq!(result.error_code.as_deref(), Some("57P01"));
+        assert_eq!(
+            result.server_error().unwrap().code,
+            Some(sqlstate::pg::ADMIN_SHUTDOWN)
+        );
     }
 
     /// Phase 3 has the same FATAL-closes-without-ReadyForQuery hole as
@@ -480,7 +477,10 @@ mod tests {
 
         let result = res.expect("the parsed FATAL must survive the close");
         assert_eq!(result.status, NativeResultStatus::FatalError);
-        assert_eq!(result.error_code.as_deref(), Some("XX000"));
+        assert_eq!(
+            result.server_error().unwrap().code,
+            Some(sqlstate::pg::INTERNAL_ERROR)
+        );
     }
 
     /// Read everything the client sends until it goes quiet, so a test can
@@ -682,7 +682,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.status(), &NativeResultStatus::FatalError);
-        assert_eq!(result.error_sqlstate(), "42601");
+        assert_eq!(
+            result.server_error().unwrap().code,
+            Some(sqlstate::pg::SYNTAX_ERROR)
+        );
         assert!(result.error_message().unwrap().contains("syntax error"));
     }
 
@@ -720,7 +723,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.status(), &NativeResultStatus::FatalError);
-        assert_eq!(result.error_sqlstate(), "XX000");
+        assert_eq!(
+            result.server_error().unwrap().code,
+            Some(sqlstate::pg::INTERNAL_ERROR)
+        );
         assert!(result.error_message().unwrap().contains("manifest"));
     }
 

@@ -29,11 +29,12 @@
 //!
 //! This ensures that no thread is blocked waiting for network I/O, maximizing
 //! throughput and enabling efficient concurrent processing of multiple replication streams.
-use crate::error::{ReplicationError, Result};
+use crate::error::{ReplicationError, Result, ServerError};
 use crate::protocol::build_hot_standby_feedback_message;
 use crate::types::{format_lsn, BaseBackupOptions, ReplicationSlotOptions, SlotType, XLogRecPtr};
 use bytes::{BufMut, Bytes, BytesMut};
 use pq_sys::*;
+use sqlstate::SqlState;
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
@@ -53,8 +54,8 @@ enum ReadResult {
     WouldBlock,
     /// COPY stream has ended gracefully
     CopyDone,
-    /// COPY stream was ended by a server error: `(sqlstate, message)`
-    CopyFailed(String, String),
+    /// COPY stream was ended by a server error: `(response, libpq message)`
+    CopyFailed(Option<ServerError>, String),
 }
 
 /// Result of draining all available messages from libpq
@@ -152,8 +153,8 @@ impl CopyMode {
 enum CopyEnd {
     /// Graceful CopyDone.
     Done,
-    /// The server terminated the stream: `(sqlstate, message)`.
-    Failed(String, String),
+    /// The server terminated the stream: `(response, libpq message)`.
+    Failed(Option<ServerError>, String),
 }
 
 impl CopyEnd {
@@ -169,8 +170,8 @@ impl CopyEnd {
             CopyEnd::Done => ReplicationError::transient_connection(
                 "replication stream ended by server (CopyDone)",
             ),
-            CopyEnd::Failed(sqlstate, message) => ReplicationError::from_sqlstate(
-                sqlstate,
+            CopyEnd::Failed(server, message) => ReplicationError::from_server(
+                server.clone(),
                 format!("replication stream terminated by server: {message}"),
             ),
         }
@@ -1178,8 +1179,8 @@ impl PgReplicationConnection {
             let error_msg = pg_result
                 .error_message()
                 .unwrap_or_else(|| "Unknown error".to_string());
-            return Err(ReplicationError::from_sqlstate(
-                &pg_result.error_sqlstate(),
+            return Err(ReplicationError::from_server(
+                pg_result.server_error(),
                 format!("Query execution failed: {error_msg}"),
             ));
         }
@@ -1423,10 +1424,12 @@ impl PgReplicationConnection {
                         let message = res
                             .error_message()
                             .unwrap_or_else(|| "Unknown error".to_string());
-                        let sqlstate = res.error_sqlstate();
+                        let server = res.server_error();
+                        let code = server.as_ref().and_then(|server| server.code);
+                        let sqlstate = code.as_ref().map_or("", SqlState::as_str);
                         warn!("COPY OUT failed after CopyDone [{sqlstate}]: {message}");
-                        return Err(ReplicationError::from_sqlstate(
-                            &sqlstate,
+                        return Err(ReplicationError::from_server(
+                            server,
                             format!("COPY OUT failed after CopyDone: {message}"),
                         ));
                     }
@@ -2150,8 +2153,8 @@ impl PgReplicationConnection {
             let error_msg = pg_result
                 .error_message()
                 .unwrap_or_else(|| "Unknown error".to_string());
-            return Err(ReplicationError::from_sqlstate(
-                &pg_result.error_sqlstate(),
+            return Err(ReplicationError::from_server(
+                pg_result.server_error(),
                 format!("UPLOAD_MANIFEST did not enter CopyIn mode: {error_msg}"),
             ));
         }
@@ -2193,8 +2196,8 @@ impl PgReplicationConnection {
             }
             let res = PgResult::new(raw);
             if !matches!(res.status(), ExecStatusType::PGRES_COMMAND_OK) && failure.is_none() {
-                failure = Some(ReplicationError::from_sqlstate(
-                    &res.error_sqlstate(),
+                failure = Some(ReplicationError::from_server(
+                    res.server_error(),
                     format!(
                         "UPLOAD_MANIFEST failed: {}",
                         res.error_message()
@@ -2421,18 +2424,42 @@ impl PgResult {
         }
     }
 
-    /// The result's SQLSTATE, or `""` when the server supplied no diagnostics.
+    /// The server's `ErrorResponse` behind this result, `None` when the failure
+    /// arose in libpq itself (which sets none of severity, SQLSTATE or message).
     ///
-    /// Unlike [`error_message`](Self::error_message), this is stable across
-    /// PostgreSQL major versions, so it is what `ReplicationError::from_sqlstate`
-    /// classifies on. Crate-internal: `exec` maps every non-OK result to `Err`, so callers never hold a failing result.
-    pub(crate) fn error_sqlstate(&self) -> String {
-        let ptr = unsafe { PQresultErrorField(self.result, PG_DIAG_SQLSTATE as i32) };
-        if ptr.is_null() {
-            String::new()
-        } else {
-            unsafe { CStr::from_ptr(ptr).to_string_lossy().into_owned() }
+    /// Unlike [`error_message`](Self::error_message), its SQLSTATE is stable
+    /// across PostgreSQL major versions, so it is what
+    /// `ReplicationError::from_server` classifies on. Crate-internal: `exec` maps every non-OK result to `Err`, so callers never hold a failing result.
+    pub(crate) fn server_error(&self) -> Option<ServerError> {
+        let text = |field: u8| {
+            self.error_field(field)
+                .map(|value| value.to_string_lossy().into_owned())
+        };
+        let severity = text(PG_DIAG_SEVERITY_NONLOCALIZED).or_else(|| text(PG_DIAG_SEVERITY));
+        let code = self.error_field(PG_DIAG_SQLSTATE);
+        let message = text(PG_DIAG_MESSAGE_PRIMARY);
+        if severity.is_none() && code.is_none() && message.is_none() {
+            return None;
         }
+        Some(ServerError {
+            severity: severity.unwrap_or_default(),
+            code: code
+                .and_then(|code| <[u8; 5]>::try_from(code.to_bytes()).ok())
+                .and_then(SqlState::new),
+            message: message.unwrap_or_default(),
+            detail: text(PG_DIAG_MESSAGE_DETAIL),
+            hint: text(PG_DIAG_MESSAGE_HINT),
+            routine: text(PG_DIAG_SOURCE_FUNCTION),
+        })
+    }
+
+    /// One `PQresultErrorField`, borrowed from the result.
+    fn error_field(&self, field: u8) -> Option<&CStr> {
+        // SAFETY: `PQresultErrorField` returns NULL or a NUL-terminated string
+        // owned by `self.result`, which is not modified after creation and freed
+        // only in `Drop`, so the borrow cannot outlive it.
+        let ptr = unsafe { PQresultErrorField(self.result, i32::from(field)) };
+        (!ptr.is_null()).then(|| unsafe { CStr::from_ptr(ptr) })
     }
 }
 
@@ -2509,9 +2536,11 @@ fn copy_end_status(conn: *mut PGconn) -> ReadResult {
                 let message = res
                     .error_message()
                     .unwrap_or_else(|| "Unknown error".to_string());
-                let sqlstate = res.error_sqlstate();
+                let server = res.server_error();
+                let code = server.as_ref().and_then(|server| server.code);
+                let sqlstate = code.as_ref().map_or("", SqlState::as_str);
                 warn!("COPY stream terminated by server [{sqlstate}]: {message}");
-                end = ReadResult::CopyFailed(sqlstate, message);
+                end = ReadResult::CopyFailed(server, message);
             }
             _ => {}
         }
@@ -2611,8 +2640,8 @@ fn drain_buffered_messages(
                 *copy_end = Some(CopyEnd::Done);
                 break;
             }
-            Ok(ReadResult::CopyFailed(sqlstate, message)) => {
-                *copy_end = Some(CopyEnd::Failed(sqlstate, message));
+            Ok(ReadResult::CopyFailed(server, message)) => {
+                *copy_end = Some(CopyEnd::Failed(server, message));
                 break;
             }
             // A -2 from PQgetCopyData is a real transport failure, not
@@ -3015,6 +3044,15 @@ mod tests {
     // CopyEnd latch
     // ========================================
 
+    fn response(code: &str) -> Option<ServerError> {
+        Some(ServerError {
+            severity: "ERROR".to_string(),
+            code: code.parse().ok(),
+            message: "gone".to_string(),
+            ..ServerError::default()
+        })
+    }
+
     /// A server-side end is reported as a *transient* error so the stream
     /// reconnects (it must never alias onto `Cancelled`, which the stream layer
     /// treats as a clean caller-requested stop); a server-terminated one keeps its
@@ -3023,27 +3061,27 @@ mod tests {
     fn test_copy_end_to_error() {
         let done = CopyEnd::Done.to_error();
         assert!(
-            matches!(done, ReplicationError::TransientConnection(_)),
+            matches!(done, ReplicationError::TransientConnection(_, None)),
             "server-side stream end must not look like user cancellation: {done:?}"
         );
         assert!(!done.is_cancelled());
         assert!(done.is_transient());
 
         let invalidated =
-            CopyEnd::Failed("55000".to_string(), "can no longer access slot".to_string())
-                .to_error();
-        assert!(matches!(invalidated, ReplicationError::ReplicationSlot(_)));
+            CopyEnd::Failed(response("55000"), "can no longer access slot".to_string()).to_error();
+        assert!(matches!(invalidated, ReplicationError::ReplicationSlot(..)));
         assert!(invalidated.is_permanent());
         assert!(invalidated.to_string().contains("55000"), "{invalidated}");
+        assert_eq!(invalidated.server_error(), response("55000").as_ref());
 
         // A walsender killed by `pg_terminate_backend()` reports 57P01 as an
         // ErrorResponse inside the still-open COPY stream. It must classify
         // transient so the stream reconnects: while it was `Protocol`, the
         // "unrecoverable decode error on a live connection" guard in
         // `next_event_with_retry` treated a routine restart as terminal.
-        let other = CopyEnd::Failed("57P01".to_string(), "terminating".to_string()).to_error();
+        let other = CopyEnd::Failed(response("57P01"), "terminating".to_string()).to_error();
         assert!(
-            matches!(other, ReplicationError::TransientConnection(_)),
+            matches!(other, ReplicationError::TransientConnection(..)),
             "{other:?}"
         );
         assert!(!other.is_permanent());
@@ -3105,7 +3143,7 @@ mod tests {
 
         let err = result.expect_err("a -2 transport failure must propagate as Err");
         assert!(
-            matches!(err, ReplicationError::TransientConnection(_)),
+            matches!(err, ReplicationError::TransientConnection(..)),
             "must classify transient so the stream reconnects: {err:?}"
         );
         assert!(err.to_string().contains("PQgetCopyData error"), "{err}");
@@ -3270,7 +3308,7 @@ mod tests {
         let mut conn = PgReplicationConnection::null_for_testing();
         set_copy_end(
             &mut conn,
-            CopyEnd::Failed("57P01".to_string(), "gone".to_string()),
+            CopyEnd::Failed(response("57P01"), "gone".to_string()),
         );
 
         let err = block_on(conn.pump_copy(&CancellationToken::new())).unwrap_err();
@@ -3441,7 +3479,7 @@ mod tests {
     /// The latch is sticky: once the stream is over, every read reports why.
     #[test]
     fn test_copy_end_latch_is_sticky() {
-        let end = CopyEnd::Failed("55000".to_string(), "gone".to_string());
+        let end = CopyEnd::Failed(response("55000"), "gone".to_string());
         assert_eq!(end.to_error().to_string(), end.to_error().to_string());
     }
 
@@ -3754,7 +3792,11 @@ mod tests {
         Reject(&'static str, &'static str),
     }
 
-    /// A PostgreSQL stand-in on plain threads, so it outlives any runtime a test builds. It counts startup packets, answers each with its greeting and, once a login is accepted, answers every simple query with one row. Dropping it stops the listener and waits for the sessions, which end when their clients hang up.
+    /// How a stand-in answers one simple Query after login, given the query text and the client's socket.
+    type Script =
+        std::sync::Arc<dyn Fn(&str, &mut std::net::TcpStream) -> std::io::Result<()> + Send + Sync>;
+
+    /// A PostgreSQL stand-in on plain threads, so it outlives any runtime a test builds. It counts startup packets, answers each with its greeting and, once a login is accepted, answers every query through its script. Dropping it stops the listener and waits for the sessions, which end when their clients hang up.
     struct StandIn {
         port: u16,
         startups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -3763,9 +3805,22 @@ mod tests {
     }
 
     impl StandIn {
+        /// A stand-in that answers every query with one row.
         fn new(greeting: Greeting) -> Self {
+            Self::scripted(greeting, Self::one_row)
+        }
+
+        fn scripted(
+            greeting: Greeting,
+            script: impl Fn(&str, &mut std::net::TcpStream) -> std::io::Result<()>
+                + Send
+                + Sync
+                + 'static,
+        ) -> Self {
             use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
             use std::sync::Arc;
+
+            let script: Script = Arc::new(script);
 
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
@@ -3775,12 +3830,13 @@ mod tests {
             let listener = std::thread::spawn(move || {
                 let mut sessions = Vec::new();
                 for stream in listener.incoming() {
-                    let (stream, counter) = (stream.unwrap(), Arc::clone(&counter));
+                    let (stream, counter, script) =
+                        (stream.unwrap(), Arc::clone(&counter), Arc::clone(&script));
                     if stop.load(Ordering::SeqCst) {
                         break;
                     }
                     sessions.push(std::thread::spawn(move || {
-                        let _ = Self::serve(stream, greeting, &counter);
+                        let _ = Self::serve(stream, greeting, &script, &counter);
                     }));
                 }
                 // A session ends when its client hangs up, so the test must drop its connections first.
@@ -3808,9 +3864,25 @@ mod tests {
             out
         }
 
+        /// One text column "x" holding "1".
+        fn one_row(_query: &str, sock: &mut std::net::TcpStream) -> std::io::Result<()> {
+            use std::io::Write;
+
+            let mut row_description = 1u16.to_be_bytes().to_vec();
+            row_description.extend_from_slice(b"x\0");
+            row_description.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 25, 255, 255]);
+            row_description.extend_from_slice(&[255, 255, 255, 255, 0, 0]);
+            let mut reply = Self::message(b'T', &row_description);
+            reply.extend(Self::message(b'D', &[0, 1, 0, 0, 0, 1, b'1']));
+            reply.extend(Self::message(b'C', b"SELECT 1\0"));
+            reply.extend(Self::message(b'Z', b"I"));
+            sock.write_all(&reply)
+        }
+
         fn serve(
             mut sock: std::net::TcpStream,
             greeting: Greeting,
+            script: &Script,
             startups: &std::sync::atomic::AtomicUsize,
         ) -> std::io::Result<()> {
             use std::io::{Read, Write};
@@ -3846,20 +3918,14 @@ mod tests {
             loop {
                 let mut kind = [0u8; 1];
                 sock.read_exact(&mut kind)?;
-                read_frame(&mut sock)?;
+                let body = read_frame(&mut sock)?;
+                // libpq only sends simple Queries and, on close, Terminate in these tests.
                 if kind[0] == b'X' {
                     return Ok(());
                 }
-                // One text column "x" holding "1".
-                let mut row_description = 1u16.to_be_bytes().to_vec();
-                row_description.extend_from_slice(b"x\0");
-                row_description.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 25, 255, 255]);
-                row_description.extend_from_slice(&[255, 255, 255, 255, 0, 0]);
-                let mut reply = Self::message(b'T', &row_description);
-                reply.extend(Self::message(b'D', &[0, 1, 0, 0, 0, 1, b'1']));
-                reply.extend(Self::message(b'C', b"SELECT 1\0"));
-                reply.extend(Self::message(b'Z', b"I"));
-                sock.write_all(&reply)?;
+                let query = CStr::from_bytes_until_nul(&body)
+                    .map_or(std::borrow::Cow::Borrowed(""), CStr::to_string_lossy);
+                script(&query, &mut sock)?;
             }
         }
     }
@@ -3938,7 +4004,7 @@ mod tests {
         )))
         .err()
         .expect("the server refuses every login");
-        assert!(matches!(err, ReplicationError::Authentication(_)), "{err}");
+        assert!(matches!(err, ReplicationError::Authentication(..)), "{err}");
     }
 
     /// A server that cannot accept connections yet, such as a standby still starting up, is passed over for the next host.
@@ -4000,6 +4066,139 @@ mod tests {
             assert!(reply.is_ok(), "dropped {drop_first}: {:?}", reply.err());
             drop(kept);
         }
+    }
+
+    /// A server that refuses `UPLOAD_MANIFEST` before CopyIn leaves its captured response on the error.
+    #[test]
+    fn upload_manifest_refused_before_copy_in_keeps_the_server_response() {
+        use std::io::Write;
+        let server = StandIn::scripted(Greeting::Accept { standby: false }, |query, sock| {
+            assert_eq!(query, "UPLOAD_MANIFEST");
+            let mut reply = StandIn::message(
+                b'E',
+                b"SERROR\0VERROR\0C42601\0Msyntax error at or near \"UPLOAD_MANIFEST\"\0\
+                  Rscanner_yyerror\0\0",
+            );
+            reply.extend(StandIn::message(b'Z', b"I"));
+            sock.write_all(&reply)
+        });
+        let mut conn = block_on(PgReplicationConnection::connect_async(&stand_in_conninfo(
+            &[&server],
+            "",
+        )))
+        .unwrap();
+
+        let err = conn.upload_manifest(b"{}").unwrap_err();
+        drop(conn);
+        assert!(
+            matches!(err, ReplicationError::PermanentConnection(..)),
+            "{err:?}"
+        );
+        assert_eq!(err.sqlstate(), Some(sqlstate::pg::SYNTAX_ERROR));
+        let response = err.server_error().expect("the server's response");
+        assert_eq!(response.severity, "ERROR");
+        assert_eq!(response.routine.as_deref(), Some("scanner_yyerror"));
+        assert!(
+            err.to_string()
+                .contains("UPLOAD_MANIFEST did not enter CopyIn mode"),
+            "{err}"
+        );
+    }
+
+    /// An ErrorResponse with a SQLSTATE but neither `S` nor `V`, as a hand-rolled proxy or mock may send, still classifies by its SQLSTATE.
+    #[test]
+    fn an_error_response_without_severity_classifies_by_its_sqlstate() {
+        use std::io::Write;
+        let server = StandIn::scripted(Greeting::Accept { standby: false }, |query, sock| {
+            let mut reply = StandIn::message(b'E', format!("C{query}\0Mrefused\0\0").as_bytes());
+            reply.extend(StandIn::message(b'Z', b"I"));
+            sock.write_all(&reply)
+        });
+        let mut conn = block_on(PgReplicationConnection::connect_async(&stand_in_conninfo(
+            &[&server],
+            "",
+        )))
+        .unwrap();
+
+        for (code, permanent) in [
+            ("28P01", true),
+            ("3D000", true),
+            ("42501", true),
+            ("55000", true),
+            ("57P01", false),
+            ("08006", false),
+        ] {
+            let Err(err) = block_on(conn.exec_async(code)) else {
+                panic!("{code} must fail");
+            };
+            assert_eq!(err.sqlstate(), Some(code.parse().unwrap()), "{err:?}");
+            assert_eq!(err.is_permanent(), permanent, "{err:?}");
+            assert_eq!(err.is_transient(), !permanent, "{err:?}");
+            assert!(err.to_string().contains(&format!("[{code}]")), "{err}");
+            let response = err.server_error().expect("the server's response");
+            assert_eq!(response.severity, "");
+            assert_eq!(response.message, "refused");
+        }
+    }
+
+    /// A COPY whose ErrorResponse arrives only after its CopyDone fails from the epilogue drain, and the response reaches the caller.
+    #[test]
+    fn copy_out_error_after_copy_done_keeps_the_server_response() {
+        use std::io::Write;
+        let (copy_done_seen, copy_done_rx) = std::sync::mpsc::channel::<()>();
+        let copy_done_rx = std::sync::Mutex::new(copy_done_rx);
+        let server = StandIn::scripted(Greeting::Accept { standby: false }, move |query, sock| {
+            assert!(query.starts_with("COPY"), "{query}");
+            // CopyOutResponse for one text column, a row, then CopyDone.
+            let mut copy = StandIn::message(b'H', &[0, 0, 1, 0, 0]);
+            copy.extend(StandIn::message(b'd', b"1\n"));
+            copy.extend(StandIn::message(b'c', b""));
+            sock.write_all(&copy)?;
+            // Sent with the CopyDone, the failure would be read by `copy_end_status` instead.
+            copy_done_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(std::io::Error::other)?;
+            let mut failure = StandIn::message(
+                b'E',
+                b"SERROR\0VERROR\0CXX001\0Minvalid page in block 0 of relation base/5/16384\0\
+                  RReadBuffer_common\0\0",
+            );
+            failure.extend(StandIn::message(b'Z', b"I"));
+            sock.write_all(&failure)
+        });
+        let conninfo = stand_in_conninfo(&[&server], "");
+        let token = CancellationToken::new();
+
+        let err = block_on(async {
+            let mut conn = PgReplicationConnection::connect_async(&conninfo)
+                .await
+                .unwrap();
+            conn.copy_out_begin_async("COPY t TO STDOUT").await.unwrap();
+            let row = conn.copy_out_next(&token).await.unwrap();
+            assert_eq!(row.as_deref(), Some(&b"1\n"[..]));
+            // `pump_copy` waits for a separately delivered CopyDone without draining the epilogue.
+            let end = tokio::time::timeout(Duration::from_secs(10), conn.pump_copy(&token))
+                .await
+                .expect("CopyDone never arrived")
+                .unwrap();
+            assert!(end.is_none(), "{end:?}");
+            assert_eq!(conn.copy_end(), Some(&CopyEnd::Done));
+            copy_done_seen.send(()).unwrap();
+            conn.copy_out_next(&token).await.unwrap_err()
+        });
+        assert!(matches!(err, ReplicationError::Protocol(..)), "{err:?}");
+        assert_eq!(err.sqlstate(), Some(sqlstate::pg::DATA_CORRUPTED));
+        assert_eq!(
+            err.server_error()
+                .and_then(|response| response.routine.as_deref()),
+            Some("ReadBuffer_common")
+        );
+        assert!(
+            err.to_string().contains("COPY OUT failed after CopyDone"),
+            "{err}"
+        );
     }
 
     /// `connect_timeout` follows libpq's `strtol` rules, and only libpq 16 and older raise 1 s to 2 s.

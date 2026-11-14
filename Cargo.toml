@@ -39,6 +39,7 @@ tracing = { version = "0.1.44", default-features = false }
 futures-core = { version = "0.3.34", default-features = false }
 memchr = { version = "2.8.3", default-features = false }
 smallvec = { version = "1.16.5", features = ["serde"] }
+sqlstate = "0.2"
 pg-walstream-macros = { workspace = true, optional = true }
 
 # libpq backend (opt-in) — pq-sys: raw FFI to the system libpq via pkg-config, with pre-generated bindings (no libclang/bindgen at build time).

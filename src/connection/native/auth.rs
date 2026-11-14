@@ -97,10 +97,8 @@ pub async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
             b'E' => {
                 // ErrorResponse during auth
                 let fields = super::error::parse_error_fields(&msg[5..]);
-                return Err(ReplicationError::from_sqlstate_startup(
-                    &fields.code,
-                    format!("Authentication failed: {fields}"),
-                ));
+                let message = format!("Authentication failed: {fields}");
+                return Err(ReplicationError::from_server_startup(fields, message));
             }
             _ => {
                 // Unexpected message during auth phase — skip
@@ -226,10 +224,10 @@ async fn handle_scram_sha256<S: AsyncRead + AsyncWrite + Unpin>(
     let msg2 = wire::read_message(stream, buf).await?;
     if msg2[0] == b'E' {
         let fields = super::error::parse_error_fields(&msg2[5..]);
-        return Err(ReplicationError::authentication(format!(
-            "SCRAM authentication failed: {}",
-            fields
-        )));
+        return Err(ReplicationError::Authentication(
+            format!("SCRAM authentication failed: {fields}").into_boxed_str(),
+            Some(Box::new(fields)),
+        ));
     }
     if msg2[0] != b'R' || msg2.len() < 9 {
         return Err(ReplicationError::protocol(
@@ -262,10 +260,10 @@ async fn handle_scram_sha256<S: AsyncRead + AsyncWrite + Unpin>(
     let msg3 = wire::read_message(stream, buf).await?;
     if msg3[0] == b'E' {
         let fields = super::error::parse_error_fields(&msg3[5..]);
-        return Err(ReplicationError::authentication(format!(
-            "SCRAM authentication failed: {}",
-            fields
-        )));
+        return Err(ReplicationError::Authentication(
+            format!("SCRAM authentication failed: {fields}").into_boxed_str(),
+            Some(Box::new(fields)),
+        ));
     }
     if msg3[0] != b'R' || msg3.len() < 9 {
         return Err(ReplicationError::protocol(
@@ -296,10 +294,10 @@ async fn handle_scram_sha256<S: AsyncRead + AsyncWrite + Unpin>(
         }
     } else if msg4[0] == b'E' {
         let fields = super::error::parse_error_fields(&msg4[5..]);
-        return Err(ReplicationError::authentication(format!(
-            "Authentication failed after SCRAM: {}",
-            fields
-        )));
+        return Err(ReplicationError::Authentication(
+            format!("Authentication failed after SCRAM: {fields}").into_boxed_str(),
+            Some(Box::new(fields)),
+        ));
     }
 
     Ok(())
@@ -474,6 +472,10 @@ mod tests {
                 || err.to_string().contains("Authentication"),
             "Expected authentication error, got: {err}"
         );
+        assert_eq!(
+            err.sqlstate(),
+            Some(sqlstate::pg::INVALID_AUTHORIZATION_SPECIFICATION)
+        );
     }
 
     #[tokio::test]
@@ -597,7 +599,17 @@ mod tests {
 
         let mut buf = BytesMut::new();
         // No TLS endpoint → should use SCRAM-SHA-256
-        let _ = authenticate(&mut client, &mut buf, "user", Some("pass"), None).await;
+        let err = authenticate(&mut client, &mut buf, "user", Some("pass"), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ReplicationError::Authentication(..)),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.server_error().map(|server| server.message.as_str()),
+            Some("test abort")
+        );
     }
 
     #[tokio::test]
@@ -687,5 +699,164 @@ mod tests {
             Some(fake_tls_hash),
         )
         .await;
+    }
+
+    // === SCRAM exchange failures ===
+
+    const SCRAM_PASSWORD: &str = "correct horse battery staple";
+    const SCRAM_SALT: [u8; 16] = *b"pg-walstream-slt";
+
+    /// Padded standard base64, the encoding SCRAM uses for salts and signatures.
+    fn base64(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let bits = chunk
+                .iter()
+                .enumerate()
+                .fold(0u32, |bits, (i, &b)| bits | u32::from(b) << (16 - 8 * i));
+            for i in 0..4 {
+                let sextet = usize::try_from((bits >> (18 - 6 * i)) & 63).unwrap();
+                out.push(if i <= chunk.len() {
+                    char::from(ALPHABET[sextet])
+                } else {
+                    '='
+                });
+            }
+        }
+        out
+    }
+
+    /// One frontend message read off the fake server's end: its type byte and body.
+    async fn read_frontend(server: &mut tokio::io::DuplexStream) -> (u8, Vec<u8>) {
+        let tag = server.read_u8().await.unwrap();
+        let len = usize::try_from(server.read_u32().await.unwrap()).unwrap();
+        let mut body = vec![0; len - 4];
+        server.read_exact(&mut body).await.unwrap();
+        (tag, body)
+    }
+
+    /// An Authentication message of `kind` carrying `data`.
+    fn auth_request(kind: i32, data: &[u8]) -> Vec<u8> {
+        let mut msg = vec![b'R'];
+        msg.extend_from_slice(&i32::try_from(8 + data.len()).unwrap().to_be_bytes());
+        msg.extend_from_slice(&kind.to_be_bytes());
+        msg.extend_from_slice(data);
+        msg
+    }
+
+    /// Plays a SCRAM-SHA-256 server for `SCRAM_PASSWORD`, then sends `failure`.
+    ///
+    /// With `verified` the client's proof is first answered by a valid
+    /// AuthenticationSASLFinal, so `failure` stands where AuthenticationOk belongs.
+    async fn scram_server(mut server: tokio::io::DuplexStream, verified: bool, failure: Vec<u8>) {
+        use aws_lc_rs::{hmac, pbkdf2};
+
+        server
+            .write_all(&build_auth_sasl(&["SCRAM-SHA-256"]))
+            .await
+            .unwrap();
+        let (tag, initial) = read_frontend(&mut server).await;
+        assert_eq!(tag, b'p');
+        // The mechanism name, then the length-prefixed client-first message `n,,n=,r=<nonce>`.
+        let mechanism_end = initial.iter().position(|&b| b == 0).unwrap();
+        let client_first = std::str::from_utf8(&initial[mechanism_end + 5..]).unwrap();
+        let client_first_bare = client_first.strip_prefix("n,,").unwrap();
+        let client_nonce = client_first_bare.split_once("r=").unwrap().1;
+        let server_first = format!(
+            "r={client_nonce}server-nonce,s={},i=4096",
+            base64(&SCRAM_SALT)
+        );
+        server
+            .write_all(&auth_request(11, server_first.as_bytes()))
+            .await
+            .unwrap();
+
+        let (tag, client_final) = read_frontend(&mut server).await;
+        assert_eq!(tag, b'p');
+        if verified {
+            let client_final = std::str::from_utf8(&client_final).unwrap();
+            let without_proof = client_final.rsplit_once(",p=").unwrap().0;
+            let mut salted = [0u8; 32];
+            pbkdf2::derive(
+                pbkdf2::PBKDF2_HMAC_SHA256,
+                core::num::NonZeroU32::new(4096).unwrap(),
+                &SCRAM_SALT,
+                SCRAM_PASSWORD.as_bytes(),
+                &mut salted,
+            );
+            let server_key = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, &salted), b"Server Key");
+            let auth_message = format!("{client_first_bare},{server_first},{without_proof}");
+            let signature = hmac::sign(
+                &hmac::Key::new(hmac::HMAC_SHA256, server_key.as_ref()),
+                auth_message.as_bytes(),
+            );
+            let server_final = format!("v={}", base64(signature.as_ref()));
+            server
+                .write_all(&auth_request(12, server_final.as_bytes()))
+                .await
+                .unwrap();
+        }
+        server.write_all(&failure).await.unwrap();
+        server.flush().await.unwrap();
+    }
+
+    /// A server that rejects the client's proof answers client-final with an
+    /// ErrorResponse, which reaches the caller with its SQLSTATE.
+    #[tokio::test]
+    async fn scram_rejected_proof_keeps_the_server_response() {
+        let (mut client, server) = tokio::io::duplex(8192);
+        let failure = build_error_response(
+            "FATAL",
+            "28P01",
+            "password authentication failed for user \"user\"",
+        );
+        let peer = tokio::spawn(scram_server(server, false, failure));
+
+        let mut buf = BytesMut::new();
+        let err = authenticate(&mut client, &mut buf, "user", Some(SCRAM_PASSWORD), None)
+            .await
+            .unwrap_err();
+        peer.await.unwrap();
+        assert!(
+            matches!(err, ReplicationError::Authentication(..)),
+            "{err:?}"
+        );
+        assert_eq!(err.sqlstate(), Some(sqlstate::pg::INVALID_PASSWORD));
+        assert_eq!(
+            err.to_string(),
+            "Authentication failed: SCRAM authentication failed: \
+             FATAL: password authentication failed for user \"user\" (SQLSTATE 28P01)"
+        );
+    }
+
+    /// A verified exchange can still end in an ErrorResponse where AuthenticationOk
+    /// belongs, and that response reaches the caller too.
+    #[tokio::test]
+    async fn scram_error_after_server_final_keeps_the_server_response() {
+        let (mut client, server) = tokio::io::duplex(8192);
+        let failure =
+            build_error_response("FATAL", "28000", "role \"user\" is not permitted to log in");
+        let peer = tokio::spawn(scram_server(server, true, failure));
+
+        let mut buf = BytesMut::new();
+        let err = authenticate(&mut client, &mut buf, "user", Some(SCRAM_PASSWORD), None)
+            .await
+            .unwrap_err();
+        peer.await.unwrap();
+        assert!(
+            matches!(err, ReplicationError::Authentication(..)),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.sqlstate(),
+            Some(sqlstate::pg::INVALID_AUTHORIZATION_SPECIFICATION)
+        );
+        assert_eq!(
+            err.to_string(),
+            "Authentication failed: Authentication failed after SCRAM: \
+             FATAL: role \"user\" is not permitted to log in (SQLSTATE 28000)"
+        );
     }
 }
