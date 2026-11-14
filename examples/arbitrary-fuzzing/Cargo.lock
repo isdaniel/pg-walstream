@@ -183,6 +183,7 @@ dependencies = [
  "memchr",
  "serde",
  "smallvec",
+ "sqlstate",
  "tracing",
 ]
 
@@ -260,6 +261,12 @@ checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
 dependencies = [
  "serde",
 ]
+
+[[package]]
+name = "sqlstate"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "858cea190fe7555971c35a5eb336858f1bf962a2bd7ceb8704fb1759b36af2cd"
 
 [[package]]
 name = "syn"

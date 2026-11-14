@@ -5,30 +5,77 @@
 
 use crate::prelude::*;
 use crate::types::Lsn;
+use sqlstate::SqlState;
+
+/// A PostgreSQL `ErrorResponse`, as the server sent it.
+///
+/// Carried by the [`ReplicationError`] variants a server error is classified
+/// into, and read with [`ReplicationError::server_error`]. `#[non_exhaustive]`
+/// because an `ErrorResponse` has more fields (position, schema, table,
+/// constraint, …) than are captured here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ServerError {
+    /// `ERROR`, `FATAL` or `PANIC`, not localized when the server sends the
+    /// `V` field (PostgreSQL 9.6+).
+    pub severity: String,
+    /// The SQLSTATE, `None` when the response carried no valid one.
+    pub code: Option<SqlState>,
+    /// The primary message, localized by the server's `lc_messages`.
+    pub message: String,
+    /// The `DETAIL` line.
+    pub detail: Option<String>,
+    /// The `HINT` line.
+    pub hint: Option<String>,
+    /// The server function that raised the error. Never localized, so it tells
+    /// apart two errors sharing a SQLSTATE.
+    pub routine: Option<String>,
+}
+
+impl core::fmt::Display for ServerError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let code = self.code.as_ref().map_or("", SqlState::as_str);
+        write!(f, "{}: {} (SQLSTATE {code})", self.severity, self.message)?;
+        if let Some(detail) = &self.detail {
+            write!(f, "\nDETAIL: {detail}")?;
+        }
+        if let Some(hint) = &self.hint {
+            write!(f, "\nHINT: {hint}")?;
+        }
+        if let Some(routine) = &self.routine {
+            write!(f, "\nROUTINE: {routine}")?;
+        }
+        Ok(())
+    }
+}
 
 /// Comprehensive error types for replication operations
+///
+/// The second field of `Protocol`, `TransientConnection`, `PermanentConnection`,
+/// `Authentication` and `ReplicationSlot` holds the server's `ErrorResponse` when
+/// the error came from one, and is `None` when the error arose locally.
 #[derive(Debug)]
 pub enum ReplicationError {
     /// Protocol parsing errors
-    Protocol(String),
+    Protocol(String, Option<Box<ServerError>>),
 
     /// Buffer operation errors
     Buffer(String),
 
     /// Connection errors that can be retried (transient)
-    TransientConnection(String),
+    TransientConnection(String, Option<Box<ServerError>>),
 
     /// Connection errors that should not be retried (permanent)
-    PermanentConnection(String),
+    PermanentConnection(String, Option<Box<ServerError>>),
 
     /// Replication connection errors
     ReplicationConnection(String),
 
     /// Authentication errors
-    Authentication(String),
+    Authentication(String, Option<Box<ServerError>>),
 
     /// Replication slot errors
-    ReplicationSlot(String),
+    ReplicationSlot(String, Option<Box<ServerError>>),
 
     /// Timeout errors
     Timeout(String),
@@ -64,13 +111,13 @@ pub enum ReplicationError {
 impl core::fmt::Display for ReplicationError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Protocol(msg) => write!(f, "Protocol parsing error: {msg}"),
+            Self::Protocol(msg, _) => write!(f, "Protocol parsing error: {msg}"),
             Self::Buffer(msg) => write!(f, "Buffer error: {msg}"),
-            Self::TransientConnection(msg) => write!(f, "Transient connection error: {msg}"),
-            Self::PermanentConnection(msg) => write!(f, "Permanent connection error: {msg}"),
+            Self::TransientConnection(msg, _) => write!(f, "Transient connection error: {msg}"),
+            Self::PermanentConnection(msg, _) => write!(f, "Permanent connection error: {msg}"),
             Self::ReplicationConnection(msg) => write!(f, "Replication connection error: {msg}"),
-            Self::Authentication(msg) => write!(f, "Authentication failed: {msg}"),
-            Self::ReplicationSlot(msg) => write!(f, "Replication slot error: {msg}"),
+            Self::Authentication(msg, _) => write!(f, "Authentication failed: {msg}"),
+            Self::ReplicationSlot(msg, _) => write!(f, "Replication slot error: {msg}"),
             Self::Timeout(msg) => write!(f, "Operation timed out: {msg}"),
             Self::Cancelled(msg) => write!(f, "Operation was cancelled: {msg}"),
             Self::Config(msg) => write!(f, "Configuration error: {msg}"),
@@ -122,7 +169,7 @@ impl serde::de::Error for ReplicationError {
 impl ReplicationError {
     /// Create a new protocol error
     pub fn protocol<S: Into<String>>(msg: S) -> Self {
-        ReplicationError::Protocol(msg.into())
+        ReplicationError::Protocol(msg.into(), None)
     }
 
     /// Create a new buffer error
@@ -132,12 +179,12 @@ impl ReplicationError {
 
     /// Create a new transient connection error (can be retried)
     pub fn transient_connection<S: Into<String>>(msg: S) -> Self {
-        ReplicationError::TransientConnection(msg.into())
+        ReplicationError::TransientConnection(msg.into(), None)
     }
 
     /// Create a new permanent connection error (should not be retried)
     pub fn permanent_connection<S: Into<String>>(msg: S) -> Self {
-        ReplicationError::PermanentConnection(msg.into())
+        ReplicationError::PermanentConnection(msg.into(), None)
     }
 
     /// Create a new replication connection error
@@ -147,15 +194,47 @@ impl ReplicationError {
 
     /// Create a new authentication error
     pub fn authentication<S: Into<String>>(msg: S) -> Self {
-        ReplicationError::Authentication(msg.into())
+        ReplicationError::Authentication(msg.into(), None)
     }
 
     /// Create a new replication slot error
     pub fn replication_slot<S: Into<String>>(msg: S) -> Self {
-        ReplicationError::ReplicationSlot(msg.into())
+        ReplicationError::ReplicationSlot(msg.into(), None)
     }
 
-    /// Classify a server error by its SQLSTATE.
+    /// The server's `ErrorResponse` behind this error, `None` when the error
+    /// arose locally.
+    pub fn server_error(&self) -> Option<&ServerError> {
+        match self {
+            Self::Protocol(_, server)
+            | Self::TransientConnection(_, server)
+            | Self::PermanentConnection(_, server)
+            | Self::Authentication(_, server)
+            | Self::ReplicationSlot(_, server) => server.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// The SQLSTATE the server reported, `None` when the error arose locally or
+    /// the response carried no code.
+    ///
+    /// Match it against the [`sqlstate::pg`] constants:
+    ///
+    /// ```
+    /// use pg_walstream::{sqlstate::pg, ReplicationError};
+    ///
+    /// fn binary_send_missing(err: &ReplicationError) -> bool {
+    ///     err.sqlstate() == Some(pg::UNDEFINED_FUNCTION)
+    /// }
+    ///
+    /// assert!(!binary_send_missing(&ReplicationError::protocol("local")));
+    /// ```
+    pub fn sqlstate(&self) -> Option<SqlState> {
+        self.server_error()?.code
+    }
+
+    /// Classify a server error by its SQLSTATE, keeping the response on the
+    /// returned error for [`server_error`](Self::server_error).
     ///
     /// Codes that retrying can never fix become permanent variants (which
     /// [`is_permanent`](Self::is_permanent) reports as `true`, stopping the retry
@@ -220,30 +299,48 @@ impl ReplicationError {
     /// invalidation from "can no longer get changes from" to "can no longer
     /// access", but the SQLSTATE is stable across major versions.
     ///
-    /// An empty `sqlstate` (no diagnostics available) yields a plain `Protocol`
-    /// error with no prefix.
+    /// A response without a SQLSTATE (or, on libpq, an error with no server
+    /// response at all) yields a plain `Protocol` error with no prefix.
     ///
     /// Crate-internal, and gated on a connection backend for the same reason as
     /// [`Self::stream_stopped`]: only the backends parse server diagnostics.
     #[cfg(any(feature = "libpq", feature = "rustls-tls"))]
-    pub(crate) fn from_sqlstate<S: Into<String>>(sqlstate: &str, msg: S) -> Self {
+    pub(crate) fn from_server<S: Into<String>>(server: Option<ServerError>, msg: S) -> Self {
+        use sqlstate::pg;
+
         let msg = msg.into();
-        match sqlstate {
-            "" => ReplicationError::Protocol(msg),
-            "55000" | "42704" => ReplicationError::ReplicationSlot(format!("[{sqlstate}] {msg}")),
-            "28000" | "28P01" => ReplicationError::Authentication(format!("[{sqlstate}] {msg}")),
-            "42501" | "3D000" | "42601" | "22023" | "F0000" => {
-                ReplicationError::PermanentConnection(format!("[{sqlstate}] {msg}"))
+        let Some(code) = server.as_ref().and_then(|server| server.code) else {
+            return ReplicationError::Protocol(msg, server.map(Box::new));
+        };
+        let msg = format!("[{code}] {msg}");
+        let server = server.map(Box::new);
+        match code {
+            pg::OBJECT_NOT_IN_PREREQUISITE_STATE | pg::UNDEFINED_OBJECT => {
+                ReplicationError::ReplicationSlot(msg, server)
             }
-            "57P01" | "57P02" | "57P03" | "53300" | "55006" | "40001" | "08000" | "08003"
-            | "08006" | "08P01" => {
-                ReplicationError::TransientConnection(format!("[{sqlstate}] {msg}"))
+            pg::INVALID_AUTHORIZATION_SPECIFICATION | pg::INVALID_PASSWORD => {
+                ReplicationError::Authentication(msg, server)
             }
-            _ => ReplicationError::Protocol(format!("[{sqlstate}] {msg}")),
+            pg::INSUFFICIENT_PRIVILEGE
+            | pg::INVALID_CATALOG_NAME
+            | pg::SYNTAX_ERROR
+            | pg::INVALID_PARAMETER_VALUE
+            | pg::CONFIG_FILE_ERROR => ReplicationError::PermanentConnection(msg, server),
+            pg::ADMIN_SHUTDOWN
+            | pg::CRASH_SHUTDOWN
+            | pg::CANNOT_CONNECT_NOW
+            | pg::TOO_MANY_CONNECTIONS
+            | pg::OBJECT_IN_USE
+            | pg::T_R_SERIALIZATION_FAILURE
+            | pg::CONNECTION_EXCEPTION
+            | pg::CONNECTION_DOES_NOT_EXIST
+            | pg::CONNECTION_FAILURE
+            | pg::PROTOCOL_VIOLATION => ReplicationError::TransientConnection(msg, server),
+            _ => ReplicationError::Protocol(msg, server),
         }
     }
 
-    /// [`from_sqlstate`](Self::from_sqlstate) for an ErrorResponse received during
+    /// [`from_server`](Self::from_server) for an ErrorResponse received during
     /// connection startup, before any replication command has been issued.
     ///
     /// Identical except that `55000` is **not** reported as
@@ -258,12 +355,16 @@ impl ReplicationError {
     /// `rustls-tls` only: the libpq backend never sees a raw startup ErrorResponse
     /// — `PQconnectdb` handles the startup exchange itself.
     #[cfg(feature = "rustls-tls")]
-    pub(crate) fn from_sqlstate_startup<S: Into<String>>(sqlstate: &str, msg: S) -> Self {
-        let msg = msg.into();
-        if sqlstate == "55000" {
-            return ReplicationError::PermanentConnection(format!("[{sqlstate}] {msg}"));
+    pub(crate) fn from_server_startup<S: Into<String>>(server: ServerError, msg: S) -> Self {
+        match server.code {
+            Some(code @ sqlstate::pg::OBJECT_NOT_IN_PREREQUISITE_STATE) => {
+                ReplicationError::PermanentConnection(
+                    format!("[{code}] {}", msg.into()),
+                    Some(Box::new(server)),
+                )
+            }
+            _ => Self::from_server(Some(server), msg),
         }
-        Self::from_sqlstate(sqlstate, msg)
     }
 
     /// Create a new timeout error
@@ -311,7 +412,7 @@ impl ReplicationError {
         }
         matches!(
             self,
-            ReplicationError::TransientConnection(_)
+            ReplicationError::TransientConnection(..)
                 | ReplicationError::Timeout(_)
                 | ReplicationError::ReplicationConnection(_)
                 | ReplicationError::Backend(_)
@@ -322,9 +423,9 @@ impl ReplicationError {
     pub fn is_permanent(&self) -> bool {
         matches!(
             self,
-            ReplicationError::PermanentConnection(_)
-                | ReplicationError::Authentication(_)
-                | ReplicationError::ReplicationSlot(_)
+            ReplicationError::PermanentConnection(..)
+                | ReplicationError::Authentication(..)
+                | ReplicationError::ReplicationSlot(..)
                 | ReplicationError::Config(_)
         )
     }
@@ -355,7 +456,10 @@ mod tests {
         let err = ReplicationError::protocol("test error");
         assert_eq!(err.to_string(), "Protocol parsing error: test error");
         match err {
-            ReplicationError::Protocol(msg) => assert_eq!(msg, "test error"),
+            ReplicationError::Protocol(msg, server) => {
+                assert_eq!(msg, "test error");
+                assert!(server.is_none());
+            }
             _ => panic!("Expected Protocol error"),
         }
     }
@@ -506,7 +610,7 @@ mod tests {
 
     #[test]
     fn test_error_display() {
-        let err = ReplicationError::Protocol("test".to_string());
+        let err = ReplicationError::Protocol("test".to_string(), None);
         assert!(format!("{err}").contains("Protocol parsing error"));
 
         let err = ReplicationError::Buffer("test".to_string());
@@ -616,14 +720,37 @@ mod stop_signal_tests {
     use super::*;
     use crate::types::Lsn;
 
+    fn response(code: &str) -> ServerError {
+        ServerError {
+            severity: "ERROR".to_string(),
+            code: Some(code.parse().expect("a valid SQLSTATE")),
+            message: "boom".to_string(),
+            ..ServerError::default()
+        }
+    }
+
+    fn classify(code: &str, msg: &str) -> ReplicationError {
+        ReplicationError::from_server(Some(response(code)), msg)
+    }
+
+    /// Whatever variant the code selects, the whole response stays on the error.
+    #[test]
+    fn from_server_keeps_the_response() {
+        for code in ["55000", "28P01", "42501", "57P01", "42883"] {
+            let err = classify(code, "m");
+            assert_eq!(err.server_error(), Some(&response(code)), "{err:?}");
+            assert_eq!(err.sqlstate(), Some(code.parse().unwrap()), "{err:?}");
+        }
+    }
+
     /// The two slot-fatal SQLSTATEs must become permanent errors so the retry
     /// loop gives up instead of reconnecting into the same dead slot.
     #[test]
-    fn test_from_sqlstate_slot_fatal_is_permanent() {
+    fn test_from_server_slot_fatal_is_permanent() {
         for code in ["55000", "42704"] {
-            let err = ReplicationError::from_sqlstate(code, "can no longer access slot");
+            let err = classify(code, "can no longer access slot");
             assert!(
-                matches!(err, ReplicationError::ReplicationSlot(_)),
+                matches!(err, ReplicationError::ReplicationSlot(..)),
                 "{code} should map to ReplicationSlot, got {err:?}"
             );
             assert!(err.is_permanent(), "{code} should be permanent");
@@ -639,13 +766,14 @@ mod stop_signal_tests {
     /// guard treat a routine restart as terminal, and left the native backend's
     /// `alive` flag set so recovery never armed.
     #[test]
-    fn test_from_sqlstate_other_codes_stay_retryable() {
+    fn test_from_server_other_codes_stay_retryable() {
         for code in [
-            "55006", "57P01", "57P02", "57P03", "53300", "40001", "08006",
+            "55006", "57P01", "57P02", "57P03", "53300", "40001", "08000", "08003", "08006",
+            "08P01",
         ] {
-            let err = ReplicationError::from_sqlstate(code, "boom");
+            let err = classify(code, "boom");
             assert!(
-                matches!(err, ReplicationError::TransientConnection(_)),
+                matches!(err, ReplicationError::TransientConnection(..)),
                 "{code} should be TransientConnection, got {err:?}"
             );
             assert!(!err.is_permanent(), "{code} should not be permanent");
@@ -656,29 +784,30 @@ mod stop_signal_tests {
 
     /// An unclassified code keeps the old `Protocol` fallback.
     #[test]
-    fn from_sqlstate_unknown_code_falls_back_to_protocol() {
-        let err = ReplicationError::from_sqlstate("XX999", "weird");
-        assert!(matches!(err, ReplicationError::Protocol(_)), "{err:?}");
+    fn from_server_unknown_code_falls_back_to_protocol() {
+        let err = classify("XX999", "weird");
+        assert!(matches!(err, ReplicationError::Protocol(..)), "{err:?}");
         assert!(!err.is_permanent());
+        assert_eq!(err.to_string(), "Protocol parsing error: [XX999] weird");
     }
 
     /// Credential and request failures fail identically on every attempt, so they
     /// must stop the retry loop instead of hammering the server (and writing one
     /// failed-login line per attempt to its log).
     #[test]
-    fn from_sqlstate_permanent_auth_and_request_codes() {
+    fn from_server_permanent_auth_and_request_codes() {
         for code in ["28000", "28P01"] {
-            let err = ReplicationError::from_sqlstate(code, "password authentication failed");
+            let err = classify(code, "password authentication failed");
             assert!(
-                matches!(err, ReplicationError::Authentication(_)),
+                matches!(err, ReplicationError::Authentication(..)),
                 "{code} should be Authentication, got {err:?}"
             );
             assert!(err.is_permanent(), "{code} must be permanent");
         }
         for code in ["42501", "3D000", "42601", "22023", "F0000"] {
-            let err = ReplicationError::from_sqlstate(code, "nope");
+            let err = classify(code, "nope");
             assert!(
-                matches!(err, ReplicationError::PermanentConnection(_)),
+                matches!(err, ReplicationError::PermanentConnection(..)),
                 "{code} should be PermanentConnection, got {err:?}"
             );
             assert!(err.is_permanent(), "{code} must be permanent");
@@ -692,28 +821,36 @@ mod stop_signal_tests {
     /// permanent either way, so only the diagnosis changes.
     #[cfg(feature = "rustls-tls")]
     #[test]
-    fn from_sqlstate_startup_does_not_blame_the_slot_for_55000() {
-        let err = ReplicationError::from_sqlstate_startup(
-            "55000",
+    fn from_server_startup_does_not_blame_the_slot_for_55000() {
+        let err = ReplicationError::from_server_startup(
+            response("55000"),
             "database \"app\" is not currently accepting connections",
         );
         assert!(
-            matches!(err, ReplicationError::PermanentConnection(_)),
+            matches!(err, ReplicationError::PermanentConnection(..)),
             "{err:?}"
         );
         assert!(err.is_permanent());
+        assert_eq!(err.server_error(), Some(&response("55000")));
+        assert_eq!(
+            err.to_string(),
+            "Permanent connection error: [55000] database \"app\" is not currently accepting connections"
+        );
 
         // Post-connect, 55000 still means the slot.
         assert!(matches!(
-            ReplicationError::from_sqlstate("55000", "can no longer access slot"),
-            ReplicationError::ReplicationSlot(_)
+            classify("55000", "can no longer access slot"),
+            ReplicationError::ReplicationSlot(..)
         ));
 
         // Every other code classifies identically on both paths.
         for code in ["28P01", "3D000", "57P03", "53300", "42704", "XX999"] {
             assert_eq!(
-                core::mem::discriminant(&ReplicationError::from_sqlstate_startup(code, "m")),
-                core::mem::discriminant(&ReplicationError::from_sqlstate(code, "m")),
+                core::mem::discriminant(&ReplicationError::from_server_startup(
+                    response(code),
+                    "m"
+                )),
+                core::mem::discriminant(&classify(code, "m")),
                 "{code} must classify the same at startup"
             );
         }
@@ -724,24 +861,36 @@ mod stop_signal_tests {
     /// while in recovery" — which clears when a standby is promoted. Classifying
     /// it permanent would break failover, so it must stay retryable.
     #[test]
-    fn from_sqlstate_feature_not_supported_stays_retryable() {
-        let err = ReplicationError::from_sqlstate(
-            "0A000",
-            "logical decoding cannot be used while in recovery",
-        );
-        assert!(matches!(err, ReplicationError::Protocol(_)), "{err:?}");
+    fn from_server_feature_not_supported_stays_retryable() {
+        let err = classify("0A000", "logical decoding cannot be used while in recovery");
+        assert!(matches!(err, ReplicationError::Protocol(..)), "{err:?}");
         assert!(
             !err.is_permanent(),
             "0A000 must stay retryable for failover"
         );
     }
 
-    /// No diagnostics available: no empty `[]` prefix in the message.
+    /// No SQLSTATE available: no empty `[]` prefix in the message, and a response
+    /// without a code is still kept.
     #[test]
-    fn test_from_sqlstate_empty_code() {
-        let err = ReplicationError::from_sqlstate("", "connection reset");
-        assert!(matches!(err, ReplicationError::Protocol(_)));
-        assert!(!err.to_string().contains('['), "{err}");
+    fn test_from_server_without_a_code() {
+        let err = ReplicationError::from_server(None, "connection reset");
+        assert!(
+            matches!(err, ReplicationError::Protocol(_, None)),
+            "{err:?}"
+        );
+        assert_eq!(err.to_string(), "Protocol parsing error: connection reset");
+
+        let codeless = ServerError {
+            severity: "FATAL".to_string(),
+            message: "pooler error".to_string(),
+            ..ServerError::default()
+        };
+        let err = ReplicationError::from_server(Some(codeless.clone()), "pooler error");
+        assert!(matches!(err, ReplicationError::Protocol(..)), "{err:?}");
+        assert_eq!(err.to_string(), "Protocol parsing error: pooler error");
+        assert_eq!(err.server_error(), Some(&codeless));
+        assert_eq!(err.sqlstate(), None);
     }
 
     #[test]

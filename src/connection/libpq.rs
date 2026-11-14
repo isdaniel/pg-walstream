@@ -29,11 +29,12 @@
 //!
 //! This ensures that no thread is blocked waiting for network I/O, maximizing
 //! throughput and enabling efficient concurrent processing of multiple replication streams.
-use crate::error::{ReplicationError, Result};
+use crate::error::{ReplicationError, Result, ServerError};
 use crate::protocol::build_hot_standby_feedback_message;
 use crate::types::{format_lsn, BaseBackupOptions, ReplicationSlotOptions, SlotType, XLogRecPtr};
 use bytes::{BufMut, Bytes, BytesMut};
 use pq_sys::*;
+use sqlstate::SqlState;
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
@@ -53,8 +54,8 @@ enum ReadResult {
     WouldBlock,
     /// COPY stream has ended gracefully
     CopyDone,
-    /// COPY stream was ended by a server error: `(sqlstate, message)`
-    CopyFailed(String, String),
+    /// COPY stream was ended by a server error: `(response, libpq message)`
+    CopyFailed(Option<ServerError>, String),
 }
 
 /// Result of draining all available messages from libpq
@@ -152,8 +153,8 @@ impl CopyMode {
 enum CopyEnd {
     /// Graceful CopyDone.
     Done,
-    /// The server terminated the stream: `(sqlstate, message)`.
-    Failed(String, String),
+    /// The server terminated the stream: `(response, libpq message)`.
+    Failed(Option<ServerError>, String),
 }
 
 impl CopyEnd {
@@ -169,8 +170,8 @@ impl CopyEnd {
             CopyEnd::Done => ReplicationError::transient_connection(
                 "replication stream ended by server (CopyDone)",
             ),
-            CopyEnd::Failed(sqlstate, message) => ReplicationError::from_sqlstate(
-                sqlstate,
+            CopyEnd::Failed(server, message) => ReplicationError::from_server(
+                server.clone(),
                 format!("replication stream terminated by server: {message}"),
             ),
         }
@@ -1178,8 +1179,8 @@ impl PgReplicationConnection {
             let error_msg = pg_result
                 .error_message()
                 .unwrap_or_else(|| "Unknown error".to_string());
-            return Err(ReplicationError::from_sqlstate(
-                &pg_result.error_sqlstate(),
+            return Err(ReplicationError::from_server(
+                pg_result.server_error(),
                 format!("Query execution failed: {error_msg}"),
             ));
         }
@@ -1423,10 +1424,14 @@ impl PgReplicationConnection {
                         let message = res
                             .error_message()
                             .unwrap_or_else(|| "Unknown error".to_string());
-                        let sqlstate = res.error_sqlstate();
-                        warn!("COPY OUT failed after CopyDone [{sqlstate}]: {message}");
-                        return Err(ReplicationError::from_sqlstate(
-                            &sqlstate,
+                        let server = res.server_error();
+                        let code = server.as_ref().and_then(|server| server.code);
+                        warn!(
+                            "COPY OUT failed after CopyDone [{}]: {message}",
+                            code.as_ref().map_or("", SqlState::as_str)
+                        );
+                        return Err(ReplicationError::from_server(
+                            server,
                             format!("COPY OUT failed after CopyDone: {message}"),
                         ));
                     }
@@ -2150,8 +2155,8 @@ impl PgReplicationConnection {
             let error_msg = pg_result
                 .error_message()
                 .unwrap_or_else(|| "Unknown error".to_string());
-            return Err(ReplicationError::from_sqlstate(
-                &pg_result.error_sqlstate(),
+            return Err(ReplicationError::from_server(
+                pg_result.server_error(),
                 format!("UPLOAD_MANIFEST did not enter CopyIn mode: {error_msg}"),
             ));
         }
@@ -2193,8 +2198,8 @@ impl PgReplicationConnection {
             }
             let res = PgResult::new(raw);
             if !matches!(res.status(), ExecStatusType::PGRES_COMMAND_OK) && failure.is_none() {
-                failure = Some(ReplicationError::from_sqlstate(
-                    &res.error_sqlstate(),
+                failure = Some(ReplicationError::from_server(
+                    res.server_error(),
                     format!(
                         "UPLOAD_MANIFEST failed: {}",
                         res.error_message()
@@ -2421,18 +2426,38 @@ impl PgResult {
         }
     }
 
-    /// The result's SQLSTATE, or `""` when the server supplied no diagnostics.
+    /// The server's `ErrorResponse` behind this result, `None` when the failure
+    /// arose in libpq itself (which sets no severity field).
     ///
-    /// Unlike [`error_message`](Self::error_message), this is stable across
-    /// PostgreSQL major versions, so it is what `ReplicationError::from_sqlstate`
-    /// classifies on. Crate-internal: `exec` maps every non-OK result to `Err`, so callers never hold a failing result.
-    pub(crate) fn error_sqlstate(&self) -> String {
-        let ptr = unsafe { PQresultErrorField(self.result, PG_DIAG_SQLSTATE as i32) };
-        if ptr.is_null() {
-            String::new()
-        } else {
-            unsafe { CStr::from_ptr(ptr).to_string_lossy().into_owned() }
-        }
+    /// Unlike [`error_message`](Self::error_message), its SQLSTATE is stable
+    /// across PostgreSQL major versions, so it is what
+    /// `ReplicationError::from_server` classifies on. Crate-internal: `exec` maps every non-OK result to `Err`, so callers never hold a failing result.
+    pub(crate) fn server_error(&self) -> Option<ServerError> {
+        let text = |field: u8| {
+            self.error_field(field)
+                .map(|value| value.to_string_lossy().into_owned())
+        };
+        let severity = text(PG_DIAG_SEVERITY_NONLOCALIZED).or_else(|| text(PG_DIAG_SEVERITY))?;
+        Some(ServerError {
+            severity,
+            code: self
+                .error_field(PG_DIAG_SQLSTATE)
+                .and_then(|code| <[u8; 5]>::try_from(code.to_bytes()).ok())
+                .and_then(SqlState::new),
+            message: text(PG_DIAG_MESSAGE_PRIMARY).unwrap_or_default(),
+            detail: text(PG_DIAG_MESSAGE_DETAIL),
+            hint: text(PG_DIAG_MESSAGE_HINT),
+            routine: text(PG_DIAG_SOURCE_FUNCTION),
+        })
+    }
+
+    /// One `PQresultErrorField`, borrowed from the result.
+    fn error_field(&self, field: u8) -> Option<&CStr> {
+        // SAFETY: `PQresultErrorField` returns NULL or a NUL-terminated string
+        // owned by `self.result`, which is not modified after creation and freed
+        // only in `Drop`, so the borrow cannot outlive it.
+        let ptr = unsafe { PQresultErrorField(self.result, i32::from(field)) };
+        (!ptr.is_null()).then(|| unsafe { CStr::from_ptr(ptr) })
     }
 }
 
@@ -2509,9 +2534,13 @@ fn copy_end_status(conn: *mut PGconn) -> ReadResult {
                 let message = res
                     .error_message()
                     .unwrap_or_else(|| "Unknown error".to_string());
-                let sqlstate = res.error_sqlstate();
-                warn!("COPY stream terminated by server [{sqlstate}]: {message}");
-                end = ReadResult::CopyFailed(sqlstate, message);
+                let server = res.server_error();
+                let code = server.as_ref().and_then(|server| server.code);
+                warn!(
+                    "COPY stream terminated by server [{}]: {message}",
+                    code.as_ref().map_or("", SqlState::as_str)
+                );
+                end = ReadResult::CopyFailed(server, message);
             }
             _ => {}
         }
@@ -2611,8 +2640,8 @@ fn drain_buffered_messages(
                 *copy_end = Some(CopyEnd::Done);
                 break;
             }
-            Ok(ReadResult::CopyFailed(sqlstate, message)) => {
-                *copy_end = Some(CopyEnd::Failed(sqlstate, message));
+            Ok(ReadResult::CopyFailed(server, message)) => {
+                *copy_end = Some(CopyEnd::Failed(server, message));
                 break;
             }
             // A -2 from PQgetCopyData is a real transport failure, not
@@ -3015,6 +3044,15 @@ mod tests {
     // CopyEnd latch
     // ========================================
 
+    fn response(code: &str) -> Option<ServerError> {
+        Some(ServerError {
+            severity: "ERROR".to_string(),
+            code: code.parse().ok(),
+            message: "gone".to_string(),
+            ..ServerError::default()
+        })
+    }
+
     /// A server-side end is reported as a *transient* error so the stream
     /// reconnects (it must never alias onto `Cancelled`, which the stream layer
     /// treats as a clean caller-requested stop); a server-terminated one keeps its
@@ -3023,27 +3061,27 @@ mod tests {
     fn test_copy_end_to_error() {
         let done = CopyEnd::Done.to_error();
         assert!(
-            matches!(done, ReplicationError::TransientConnection(_)),
+            matches!(done, ReplicationError::TransientConnection(_, None)),
             "server-side stream end must not look like user cancellation: {done:?}"
         );
         assert!(!done.is_cancelled());
         assert!(done.is_transient());
 
         let invalidated =
-            CopyEnd::Failed("55000".to_string(), "can no longer access slot".to_string())
-                .to_error();
-        assert!(matches!(invalidated, ReplicationError::ReplicationSlot(_)));
+            CopyEnd::Failed(response("55000"), "can no longer access slot".to_string()).to_error();
+        assert!(matches!(invalidated, ReplicationError::ReplicationSlot(..)));
         assert!(invalidated.is_permanent());
         assert!(invalidated.to_string().contains("55000"), "{invalidated}");
+        assert_eq!(invalidated.server_error(), response("55000").as_ref());
 
         // A walsender killed by `pg_terminate_backend()` reports 57P01 as an
         // ErrorResponse inside the still-open COPY stream. It must classify
         // transient so the stream reconnects: while it was `Protocol`, the
         // "unrecoverable decode error on a live connection" guard in
         // `next_event_with_retry` treated a routine restart as terminal.
-        let other = CopyEnd::Failed("57P01".to_string(), "terminating".to_string()).to_error();
+        let other = CopyEnd::Failed(response("57P01"), "terminating".to_string()).to_error();
         assert!(
-            matches!(other, ReplicationError::TransientConnection(_)),
+            matches!(other, ReplicationError::TransientConnection(..)),
             "{other:?}"
         );
         assert!(!other.is_permanent());
@@ -3105,7 +3143,7 @@ mod tests {
 
         let err = result.expect_err("a -2 transport failure must propagate as Err");
         assert!(
-            matches!(err, ReplicationError::TransientConnection(_)),
+            matches!(err, ReplicationError::TransientConnection(..)),
             "must classify transient so the stream reconnects: {err:?}"
         );
         assert!(err.to_string().contains("PQgetCopyData error"), "{err}");
@@ -3270,7 +3308,7 @@ mod tests {
         let mut conn = PgReplicationConnection::null_for_testing();
         set_copy_end(
             &mut conn,
-            CopyEnd::Failed("57P01".to_string(), "gone".to_string()),
+            CopyEnd::Failed(response("57P01"), "gone".to_string()),
         );
 
         let err = block_on(conn.pump_copy(&CancellationToken::new())).unwrap_err();
@@ -3441,7 +3479,7 @@ mod tests {
     /// The latch is sticky: once the stream is over, every read reports why.
     #[test]
     fn test_copy_end_latch_is_sticky() {
-        let end = CopyEnd::Failed("55000".to_string(), "gone".to_string());
+        let end = CopyEnd::Failed(response("55000"), "gone".to_string());
         assert_eq!(end.to_error().to_string(), end.to_error().to_string());
     }
 
@@ -3938,7 +3976,7 @@ mod tests {
         )))
         .err()
         .expect("the server refuses every login");
-        assert!(matches!(err, ReplicationError::Authentication(_)), "{err}");
+        assert!(matches!(err, ReplicationError::Authentication(..)), "{err}");
     }
 
     /// A server that cannot accept connections yet, such as a standby still starting up, is passed over for the next host.

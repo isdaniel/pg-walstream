@@ -162,7 +162,7 @@ async fn required_slot_errors_after_the_slot_is_dropped() {
         .await
         .expect_err("a missing slot must not be recreated");
     assert!(
-        matches!(error, ReplicationError::ReplicationSlot(_)),
+        matches!(error, ReplicationError::ReplicationSlot(..)),
         "{error:?}"
     );
     assert!(error.is_permanent());
@@ -182,7 +182,7 @@ async fn required_slot_errors_without_an_explicit_start_position() {
         .await
         .expect_err("slot must already exist");
     assert!(
-        matches!(error, ReplicationError::ReplicationSlot(_)),
+        matches!(error, ReplicationError::ReplicationSlot(..)),
         "{error:?}"
     );
     fixture.assert_slot_absent();
@@ -265,7 +265,7 @@ async fn required_slot_is_not_recreated_during_recovery() {
         .await
         .expect("recovery did not terminate");
         assert!(
-            matches!(error, ReplicationError::ReplicationSlot(_)),
+            matches!(error, ReplicationError::ReplicationSlot(..)),
             "{error:?}"
         );
         assert!(error.is_permanent());
