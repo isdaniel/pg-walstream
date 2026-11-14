@@ -62,6 +62,7 @@ If both backends are enabled, `rustls-tls` takes priority automatically.
 - **`send_feedback()` before `start()` returns `ReplicationError::Protocol`;** it returned `Ok(())`. After `start()` and before the first message it sends an all-zero status update instead of returning early, and `stop()` of a stream that was never started logs a warning.
 - **A cancelled command poisons the connection.** If the future of `start()`, `slot_confirmed_flush_lsn()` or `timeline_history()` is dropped before the reply arrives, every later command on that connection fails with `ReplicationError::PermanentConnection`; create a new stream.
 - **`EventStream::next_event` carries a reconnect across a dropped future.** A `timeout` or `select!` that cancels `next_event()` while the stream reconnects no longer restarts the reconnect from its first attempt; the next call resumes it, so a timeout shorter than a reconnect cannot starve it. While such a reconnect is parked, `inner()`, `inner_mut()` and `current_lsn()` panic until the next `next_event()` returns (as they already do after an abandoned `poll_next`); the feedback methods keep working.
+- **The minimum supported Rust version is 1.88.**
 
 ## Feature Flags
 

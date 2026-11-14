@@ -45,8 +45,8 @@ impl Context {
             self.buffer[k] = value;
             k += 1;
             if k == 0x40 {
-                for (item, chunk) in input.iter_mut().zip(self.buffer.chunks_exact(4)) {
-                    *item = u32::from_le_bytes(chunk.try_into().unwrap());
+                for (item, chunk) in input.iter_mut().zip(self.buffer.as_chunks::<4>().0) {
+                    *item = u32::from_le_bytes(*chunk);
                 }
                 transform(&mut self.state, &input);
                 k = 0;
@@ -60,18 +60,17 @@ impl Context {
         input[14] = self.count as u32;
         input[15] = (self.count >> 32) as u32;
         self.consume(&PADDING[..(if k < 56 { 56 - k } else { 120 - k })]);
-        for (item, chunk) in input.iter_mut().take(14).zip(self.buffer.chunks_exact(4)) {
-            *item = u32::from_le_bytes(chunk.try_into().unwrap());
+        for (item, chunk) in input
+            .iter_mut()
+            .take(14)
+            .zip(self.buffer.as_chunks::<4>().0)
+        {
+            *item = u32::from_le_bytes(*chunk);
         }
         transform(&mut self.state, &input);
         let mut digest = [0u8; 16];
-        let mut j = 0;
-        for i in 0..4 {
-            digest[j] = (self.state[i] & 0xff) as u8;
-            digest[j + 1] = ((self.state[i] >> 8) & 0xff) as u8;
-            digest[j + 2] = ((self.state[i] >> 16) & 0xff) as u8;
-            digest[j + 3] = ((self.state[i] >> 24) & 0xff) as u8;
-            j += 4;
+        for (bytes, word) in digest.as_chunks_mut::<4>().0.iter_mut().zip(self.state) {
+            *bytes = word.to_le_bytes();
         }
         digest
     }
