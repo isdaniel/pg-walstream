@@ -109,7 +109,7 @@ jobs:
       run: cargo test --lib --no-default-features --features libpq --verbose
 
   msrv:
-    name: MSRV (Rust 1.87)
+    name: MSRV (Rust 1.88)
     runs-on: ubuntu-latest
     # The library must build on the declared rust-version. Tests are not built here:
     # a dev-dependency (proptest 1.12) may need a newer compiler than the library does.
@@ -120,7 +120,7 @@ jobs:
     - name: Install Rust (MSRV)
       uses: dtolnay/rust-toolchain@master
       with:
-        toolchain: "1.87"
+        toolchain: "1.88"
 
     - name: Install dependencies
       run: |

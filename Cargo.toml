@@ -24,7 +24,7 @@ authors = ["danielshih <dog830228@gmail.com>"]
 license = "BSD-3-Clause"
 repository = "https://github.com/isdaniel/pg-walstream"
 homepage = "https://github.com/isdaniel/pg-walstream"
-rust-version = "1.87"
+rust-version = "1.88"
 
 [workspace.dependencies]
 pg-walstream-macros = { path = "macros", version = "=0.10.0" }
