@@ -348,7 +348,7 @@ async fn an_unknown_setting_in_options_does_not_blame_the_slot() {
         .err()
         .expect("an unknown setting must fail the connection");
     assert!(
-        !matches!(err, ReplicationError::ReplicationSlot(_)),
+        !matches!(err, ReplicationError::ReplicationSlot(..)),
         "{err:?}"
     );
     assert!(err.to_string().contains("not_a_real_setting"), "{err}");

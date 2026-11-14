@@ -4,6 +4,7 @@
 //! `stream.rs` works unchanged regardless of backend.
 
 use super::wire;
+use crate::error::ServerError;
 
 /// Result status matching the libpq `ExecStatusType` values used by callers.
 #[derive(Debug, Clone, PartialEq)]
@@ -22,8 +23,7 @@ pub struct NativePgResult {
     pub(crate) status: NativeResultStatus,
     pub(crate) columns: Vec<String>,
     pub(crate) rows: Vec<Vec<Option<Vec<u8>>>>,
-    pub(crate) error_msg: Option<String>,
-    pub(crate) error_code: Option<String>,
+    pub(crate) error: Option<ServerError>,
 }
 
 impl NativePgResult {
@@ -32,8 +32,7 @@ impl NativePgResult {
             status: NativeResultStatus::Empty,
             columns: Vec::new(),
             rows: Vec::new(),
-            error_msg: None,
-            error_code: None,
+            error: None,
         }
     }
 
@@ -85,15 +84,15 @@ impl NativePgResult {
 
     /// Get error message if any.
     pub fn error_message(&self) -> Option<String> {
-        self.error_msg.clone()
+        self.error.as_ref().map(ServerError::to_string)
     }
 
-    /// The SQLSTATE of the failing `ErrorResponse`, or `""` when there was none.
+    /// The failing `ErrorResponse`, or `None` when there was none.
     ///
-    /// Mirrors the libpq backend's `PgResult::error_sqlstate`, so both backends
-    /// can feed `ReplicationError::from_sqlstate`. Crate-internal: `exec` maps every non-OK result to `Err`, so callers never hold a failing result.
-    pub(crate) fn error_sqlstate(&self) -> String {
-        self.error_code.clone().unwrap_or_default()
+    /// Mirrors the libpq backend's `PgResult::server_error`, so both backends
+    /// can feed `ReplicationError::from_server`. Crate-internal: `exec` maps every non-OK result to `Err`, so callers never hold a failing result.
+    pub(crate) fn server_error(&self) -> Option<ServerError> {
+        self.error.clone()
     }
 
     // ── Internal parsing helpers ─────────────────────────────────────────
@@ -246,18 +245,26 @@ mod tests {
         assert_eq!(result.get_value(0, 1), None);
     }
 
-    /// The SQLSTATE survives onto the result, and an error-free result reports
-    /// an empty string rather than panicking.
+    /// The error message is the stored response, so both accessors agree.
     #[test]
-    fn test_error_sqlstate() {
+    fn test_server_error() {
         let mut r = NativePgResult::new();
-        assert_eq!(r.error_sqlstate(), "");
+        assert_eq!(r.server_error(), None);
+        assert_eq!(r.error_message(), None);
 
+        let error = ServerError {
+            severity: "ERROR".to_string(),
+            code: Some(sqlstate::pg::OBJECT_NOT_IN_PREREQUISITE_STATE),
+            message: "can no longer access replication slot".to_string(),
+            ..ServerError::default()
+        };
         r.status = NativeResultStatus::FatalError;
-        r.error_code = Some("55000".to_string());
-        r.error_msg = Some("can no longer access replication slot".to_string());
-        assert_eq!(r.error_sqlstate(), "55000");
-        assert!(r.error_message().unwrap().contains("no longer"));
+        r.error = Some(error.clone());
+        assert_eq!(r.server_error(), Some(error));
+        assert_eq!(
+            r.error_message().as_deref(),
+            Some("ERROR: can no longer access replication slot (SQLSTATE 55000)")
+        );
     }
 
     #[test]
@@ -271,22 +278,6 @@ mod tests {
         assert!(r.is_ok());
         r.status = NativeResultStatus::FatalError;
         assert!(!r.is_ok());
-    }
-
-    #[test]
-    fn test_error_message_some() {
-        let mut result = NativePgResult::new();
-        result.error_msg = Some("something went wrong".to_string());
-        assert_eq!(
-            result.error_message(),
-            Some("something went wrong".to_string())
-        );
-    }
-
-    #[test]
-    fn test_error_message_none() {
-        let result = NativePgResult::new();
-        assert_eq!(result.error_message(), None);
     }
 
     #[test]

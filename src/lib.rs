@@ -183,9 +183,10 @@ pub mod retry;
 
 // Re-export main types for convenience
 pub use buffer::{BufferReader, BufferWriter};
-pub use error::{ReplicationError, Result};
+pub use error::{ReplicationError, Result, ServerError};
 #[cfg(target_has_atomic = "64")]
 pub use lsn::SharedLsnFeedback;
+pub use sqlstate::{self, SqlState};
 
 // Re-export column value types
 pub use column_value::{ColumnValue, RowData};

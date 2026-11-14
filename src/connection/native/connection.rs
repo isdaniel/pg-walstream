@@ -327,7 +327,7 @@ impl Worker {
                             // and got `worker_gone()` → `Backend`, which
                             // `is_permanent()` reports as **retryable**. So a
                             // permanent SQLSTATE — a dropped or invalidated slot,
-                            // the cases `from_sqlstate` exists to classify — was
+                            // the cases `from_server` exists to classify — was
                             // laundered into a transient one and the stream
                             // reconnect-looped forever against a server that would
                             // never accept it. The variant is control flow here;
@@ -1047,8 +1047,8 @@ impl NativeConnection {
             let error_msg = result
                 .error_message()
                 .unwrap_or_else(|| "Unknown error".to_string());
-            return Err(ReplicationError::from_sqlstate(
-                &result.error_sqlstate(),
+            return Err(ReplicationError::from_server(
+                result.server_error(),
                 format!("Query execution failed: {error_msg}"),
             ));
         }
@@ -1117,8 +1117,8 @@ impl NativeConnection {
             let error_msg = result
                 .error_message()
                 .unwrap_or_else(|| "Unknown error".to_string());
-            return Err(ReplicationError::from_sqlstate(
-                &result.error_sqlstate(),
+            return Err(ReplicationError::from_server(
+                result.server_error(),
                 format!("START_REPLICATION did not enter COPY mode: {error_msg}"),
             ));
         }
@@ -1513,8 +1513,8 @@ impl NativeConnection {
                 let error_msg = result
                     .error_message()
                     .unwrap_or_else(|| "Unknown error".to_string());
-                return Err(ReplicationError::from_sqlstate(
-                    &result.error_sqlstate(),
+                return Err(ReplicationError::from_server(
+                    result.server_error(),
                     format!("START_REPLICATION did not enter COPY mode: {error_msg}"),
                 ));
             }
@@ -1539,8 +1539,8 @@ impl NativeConnection {
             let error_msg = result
                 .error_message()
                 .unwrap_or_else(|| "Unknown error".to_string());
-            return Err(ReplicationError::from_sqlstate(
-                &result.error_sqlstate(),
+            return Err(ReplicationError::from_server(
+                result.server_error(),
                 format!("UPLOAD_MANIFEST failed: {error_msg}"),
             ));
         }
@@ -1968,6 +1968,32 @@ mod tests {
 
     fn quote_sql_identifier(identifier: &str) -> String {
         crate::sql_builder::quote_ident(identifier).unwrap()
+    }
+
+    /// A failed query keeps the server's response on the error, next to the
+    /// unchanged message, so the caller can match the SQLSTATE.
+    #[test]
+    fn checked_keeps_the_server_response() {
+        let mut result = NativePgResult::new();
+        result.status = NativeResultStatus::FatalError;
+        result.error = Some(crate::connection::native::error::parse_error_fields(
+            b"SERROR\0C42883\0Mfunction nope() does not exist\0\
+              HNo function matches the given name and argument types.\0\0",
+        ));
+
+        let err = NativeConnection::checked("SELECT nope()", result).unwrap_err();
+        assert!(matches!(err, ReplicationError::Protocol(..)), "{err:?}");
+        assert_eq!(err.sqlstate(), Some(sqlstate::pg::UNDEFINED_FUNCTION));
+        assert_eq!(
+            err.server_error().and_then(|server| server.hint.as_deref()),
+            Some("No function matches the given name and argument types.")
+        );
+        assert_eq!(
+            err.to_string(),
+            "Protocol parsing error: [42883] Query execution failed: \
+             ERROR: function nope() does not exist (SQLSTATE 42883)\n\
+             HINT: No function matches the given name and argument types."
+        );
     }
 
     // === sanitize_sql_string_value ===
@@ -3080,6 +3106,39 @@ mod tests {
         assert!(result.is_ok());
         assert!(!conn.command_in_flight);
         drop(server.join().unwrap());
+    }
+
+    /// A refused physical START_REPLICATION keeps the server's response on the error.
+    #[test]
+    fn refused_physical_replication_keeps_the_server_response() {
+        use std::io::{Read, Write};
+        let (mut conn, mut peer) = NativeConnection::silent_for_testing();
+        let server = std::thread::spawn(move || {
+            let mut query = [0u8; 256];
+            let _ = peer.read(&mut query).unwrap();
+            let mut reply = tagged_frame(
+                b'E',
+                b"SERROR\0VERROR\0C42704\0Mreplication slot \"gone\" does not exist\0\0",
+            );
+            reply.extend_from_slice(&tagged_frame(b'Z', b"I"));
+            peer.write_all(&reply).unwrap();
+            peer
+        });
+
+        let err = conn
+            .start_physical_replication(Some("gone"), 0, None)
+            .unwrap_err();
+        drop(server.join().unwrap());
+        assert!(
+            matches!(err, ReplicationError::ReplicationSlot(..)),
+            "{err:?}"
+        );
+        assert_eq!(err.sqlstate(), Some(sqlstate::pg::UNDEFINED_OBJECT));
+        assert_eq!(
+            err.to_string(),
+            "Replication slot error: [42704] START_REPLICATION did not enter COPY mode: \
+             ERROR: replication slot \"gone\" does not exist (SQLSTATE 42704)"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
