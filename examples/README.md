@@ -245,6 +245,25 @@ OK — no gap, no duplicate: every row arrived exactly once
 
 Requires PostgreSQL 15+.
 
+### 11. binary-serde
+
+Shows how to ship `ChangeEvent`s between processes in a binary format: postcard,
+bincode 2, CBOR, MessagePack or JSON.
+
+**Features:**
+- Encodes one transaction (BEGIN, INSERT, UPDATE, DELETE, a logical message, COMMIT) in all five formats and checks that each reads the same events back
+- Writes many events back to back into one buffer and reads them one by one, the way a file, pipe or socket needs
+- Wraps an event in your own message type, with an ordinary enum (postcard) and with an internal tag (CBOR)
+- Decodes truncated and hostile bytes and shows they return an error instead of crashing, including bincode's `with_limit`
+
+**Run:**
+```bash
+cd examples/binary-serde
+cargo run
+```
+
+**No database required** — it builds its events in memory. The full guide, with the caveats is in the root README under "Shipping Events Between Processes".
+
 ## Prerequisites
 
 ### For Logical Replication Examples (basic_streaming, polling_example, safe_transaction_consumer)

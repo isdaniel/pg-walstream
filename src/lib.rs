@@ -155,6 +155,8 @@ pub mod types;
 pub mod handler;
 
 // Protocol implementation
+// `SharedLsnFeedback` needs `AtomicU64` (missing on thumbv7m/7em/8m and riscv32imac) and only the std streaming API uses it.
+#[cfg(target_has_atomic = "64")]
 pub mod lsn;
 pub mod pgoutput_encode;
 pub mod protocol;
@@ -182,6 +184,7 @@ pub mod retry;
 // Re-export main types for convenience
 pub use buffer::{BufferReader, BufferWriter};
 pub use error::{ReplicationError, Result};
+#[cfg(target_has_atomic = "64")]
 pub use lsn::SharedLsnFeedback;
 
 // Re-export column value types

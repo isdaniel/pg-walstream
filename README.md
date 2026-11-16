@@ -25,6 +25,7 @@ A high-performance Rust library for PostgreSQL logical and physical replication 
 - **Connection Management**: Built-in connection handling with exponential backoff retry logic
 - **Type-Safe API**: Strongly typed message parsing with comprehensive error handling
 - **Typed Row Deserialization**: Built-in `serde` deserializer maps WAL rows directly into user-defined Rust structs (numerics, `bool`, `String`, `Option<T>`, enums, bytes)
+- **Binary Serialization**: `ChangeEvent` round-trips through JSON, CBOR, MessagePack, postcard and bincode, so events can be shipped between processes in a compact format ([guide](#shipping-events-between-processes))
 - **High-Level Consumption Ergonomics**: `ReplicationStreamConfig::builder()`, an auto-acking `EventStream::for_each_event`, and a typed by-table `WalRouter` with an optional `#[derive(WalTable)]` layer (opt-in `derive` feature)
 - **Managed Initial Snapshot**: `LogicalReplicationStream::snapshot()` copies the published tables through the slot's exported snapshot and hands off to the stream with no gap and no duplicate window. The ordering invariant is enforced by the type system, and snapshot rows arrive as ordinary `ChangeEvent`s, so one set of handlers (or one `WalRouter`) serves both the snapshot and the live stream
 - **Aligned Snapshot**: `LogicalReplicationStream::capture_aligned` copies tables added while the stream runs, exact at a temporary side slot's consistent point `C`, and `next_event_before(C)` stops the running stream where that copy applies
@@ -55,7 +56,8 @@ If both backends are enabled, `rustls-tls` takes priority automatically.
 
 
 - **`ChangeEvent` has a new public field `xid: Option<u32>`.** Build events with `xid: None` and add `..` to struct patterns (`let ChangeEvent { event_type, lsn, .. } = event`). It is `Some` only for a `Relation`, `Type`, `Insert`, `Update`, `Delete`, `Truncate` or `Message` inside a streamed chunk.
-- **`ChangeEvent::encode` and `ChangeEvent::decode` (deprecated since 0.9.0) are removed.** Serialize events with `serde_json`; JSON written by 0.9 (no `xid` key) still deserializes, with `xid` as `None`. Bytes written by `encode` are not JSON and cannot be read after the upgrade, so convert them on 0.9 first. bincode and postcard cannot read a `ColumnValue`.
+- **`ChangeEvent::encode` and `ChangeEvent::decode` (deprecated since 0.9.0) are removed.** Serialize events with `serde_json`; JSON written by 0.9 (no `xid` key) still deserializes, with `xid` as `None`. Bytes written by `encode` are not JSON and cannot be read after the upgrade, so convert them on 0.9 first.
+- **`ChangeEvent` now round-trips through bincode and postcard, and CBOR and MessagePack bytes change.** A serde format whose serializer reports `is_human_readable() == false` gets a compact `ColumnValue` (`None` for NULL, otherwise a `Text` or `Binary` variant holding the raw bytes) and always writes `xid`. JSON is byte-identical to before. A CBOR or MessagePack event that holds a text or binary column cannot be read across the two versions in either direction (events without one decode both ways), so convert stored events to JSON with 0.10.0 before upgrading. With `rmp_serde`, calling `with_human_readable()` on both the serializer and the deserializer keeps the 0.10.0 bytes. bincode and postcard read fields and variants by position, so their bytes are only meant to be read by the pg_walstream version that wrote them; keep events you store long-term as JSON. See [Shipping Events Between Processes](#shipping-events-between-processes).
 - **`StreamingReplicationMessage::xid`, returned by `LogicalReplicationParser::parse_wal_message`, changes meaning inside a streamed chunk (protocol v2+).** For `Relation`, `Type`, `Insert`, `Update`, `Delete`, `Truncate` and `Message` it is now the xid pgoutput wrote before that change, which is a subtransaction's xid after a savepoint; it used to be the chunk's xid. A consumer that buffers rows by `xid` and flushes on `StreamCommit` must take the top-level xid from `StreamStart`, or it strands the savepoint's rows. A `Message` always carries the top-level xid.
 - **The `libpq` feature now also builds `socket2`,** which only `rustls-tls` needed before.
 - **`LogicalReplicationStream::new` now runs `IDENTIFY_SYSTEM`, which `start` ran before:** one more round trip at construction. A reply with no usable system identifier and timeline now fails `new` with `ReplicationError::PermanentConnection`, where `start` used to continue without it. `server_identity()` returns what it read.
@@ -75,7 +77,7 @@ pg-walstream provides two connection backends plus a `std` toggle, all selected 
 | `rustls-tls` | Yes | `cmake`, `gcc` (build-time only) | Default. Pure-Rust implementation using `rustls` with `aws-lc-rs` crypto backend for hardware-accelerated TLS. No libpq, no OpenSSL, no runtime C dependencies. Takes priority when both backends are enabled. Implies `std`. |
 | `derive` | No | None | Opt-in proc-macros (pull `syn`/`quote`) that bind a struct to a table — `#[derive(WalTable)] #[wal(table = "...")]` or the one-line attribute form `#[wal_table("...")]` — enabling the `WalRouter::on_insert_of::<T>` / `on_update_of::<T>` / `on_delete_of::<T>` table-inference methods. |
 
-> **Note:** The protocol parser, encoder, and types need no backend. Building with `default-features = false` gives a `no_std` plus `alloc` build of just those, suitable for wasm and embedded. A connection backend (`libpq` or `rustls-tls`) is required only for the live streaming and connection APIs, and pulls in `std`.
+> **Note:** The protocol parser, encoder, and types need no backend. Building with `default-features = false` gives a `no_std` plus `alloc` build of just those, suitable for wasm and embedded. It needs a target with pointer-sized atomics (for `alloc::sync::Arc`), so thumbv7m, thumbv7em, thumbv8m and riscv32imac build, while thumbv6m and riscv32imc do not. `SharedLsnFeedback` is part of the streaming API and needs 64-bit atomics, so it is left out on targets without them, such as thumbv7em. A connection backend (`libpq` or `rustls-tls`) is required only for the live streaming and connection APIs, and pulls in `std`.
 
 ## System Dependencies
 
@@ -142,6 +144,7 @@ The [`examples/`](examples/) directory contains runnable examples demonstrating 
 | [`binary-column-access`](examples/binary-column-access) | Lossless zero-copy `BYTEA` access via `PgResult::get_bytes`, contrasted with the lossy `get_value` |
 | [`raw-xlogdata`](examples/raw-xlogdata) | Undecoded pgoutput payload via `next_raw_event()` — bring your own decoder |
 | [`arbitrary-fuzzing`](examples/arbitrary-fuzzing) | Property-based fuzzing of all protocol types using the `arbitrary` crate |
+| [`binary-serde`](examples/binary-serde) | Ship `ChangeEvent`s between processes in postcard, bincode, CBOR, MessagePack or JSON — sizes, framing, envelopes and untrusted input (no database needed) |
 
 For more control, you can use the traditional polling approach:
 
@@ -223,6 +226,107 @@ With the `derive` feature, add `#[wal_table("...")]` (outermost attribute) to bi
 #[wal_table("typed_deser_users")]
 #[derive(Debug, Deserialize)]
 struct User { /* fields as above */ }
+```
+
+## Shipping Events Between Processes
+
+`ChangeEvent` implements serde's `Serialize` and `Deserialize`, so an event can be sent to another process, put on a queue or written to a file with a serde format. JSON, CBOR, MessagePack, postcard and bincode 2 are tested; other formats are not. Use JSON when the bytes must stay readable or outlive a release, and a compact format when size and speed matter. The sizes below are one 6-event transaction (BEGIN, INSERT, UPDATE, DELETE, a logical message, COMMIT) from the [`binary-serde`](examples/binary-serde) example:
+
+| Format | Crate | Transaction | Read across versions | Notes |
+|--------|-------|------------:|----------------------|-------|
+| JSON | `serde_json` | 1174 B (100%) | yes, bytes are unchanged | readable, any language; the one to store long-term |
+| CBOR | `ciborium` | 933 B (79%) | no, see the [upgrade notes](#installation) | self-describing, writes field names, other languages can read it |
+| MessagePack | `rmp-serde` | 498 B (42%) | no, see the [upgrade notes](#installation) | other languages can read it; `to_vec` writes fields as an array, `to_vec_named` keeps field names |
+| postcard | `postcard` | 349 B (30%) | same version on both ends | smallest, `no_std` friendly, Rust to Rust |
+| bincode 2 | `bincode` | 361 B (31%) | same version on both ends | Rust to Rust; the crate is unmaintained, so prefer postcard in new code |
+
+### Encode and decode
+
+```rust,ignore
+use pg_walstream::ChangeEvent;
+
+// postcard = { version = "1", features = ["use-std"] }
+let bytes: Vec<u8> = postcard::to_allocvec(&event)?;     // producer
+let event: ChangeEvent = postcard::from_bytes(&bytes)?;  // consumer
+```
+
+The other formats work the same way:
+
+```rust,ignore
+// JSON
+let bytes = serde_json::to_vec(&event)?;
+let event: ChangeEvent = serde_json::from_slice(&bytes)?;
+
+// CBOR
+let mut bytes = Vec::new();
+ciborium::into_writer(&event, &mut bytes)?;
+let event: ChangeEvent = ciborium::from_reader(&bytes[..])?;
+
+// MessagePack
+let bytes = rmp_serde::to_vec(&event)?;
+let event: ChangeEvent = rmp_serde::from_slice(&bytes)?;
+
+// bincode 2, with a limit above your largest row (see "Untrusted bytes" below)
+let config = bincode::config::standard().with_limit::<{ 1024 * 1024 }>();
+let bytes = bincode::serde::encode_to_vec(&event, config)?;
+let (event, _used): (ChangeEvent, usize) = bincode::serde::decode_from_slice(&bytes, config)?;
+```
+
+### From the replication stream
+
+Encode each event as it arrives and acknowledge it only after it has been handed off safely:
+
+```rust,ignore
+loop {
+    match stream.next_event_with_retry(&cancel_token).await {
+        Ok(event) => {
+            // One queue message per event needs no framing.
+            queue.send(postcard::to_allocvec(&event)?).await?;
+            stream.shared_lsn_feedback.update_applied_lsn(event.lsn.value());
+        }
+        Err(e) => {
+            eprintln!("stopping: {e}");
+            break;
+        }
+    }
+}
+```
+
+To write many events into one file or pipe, put them back to back. A postcard value ends where it ends, so the reader takes them one at a time:
+
+```rust,ignore
+let mut rest = &buffer[..];
+while !rest.is_empty() {
+    let (event, tail) = postcard::take_from_bytes::<ChangeEvent>(rest)?;
+    handle(event);
+    rest = tail;
+}
+```
+
+bincode's `decode_from_slice` also returns how many bytes it used. CBOR and MessagePack can be read from a reader one value at a time.
+
+### What changes on the wire
+
+serde lets a type write itself differently for text formats and binary ones, through `Serializer::is_human_readable()`. `ChangeEvent` does that:
+
+- **JSON** (human readable) is exactly what it always was: NULL is `null`, text is a JSON string, binary data and non-UTF-8 text are `{"$binary":"<hex>"}`, and `xid` is left out when it is `None`.
+- **Every other format** writes a column as `None` for NULL and otherwise as `Some` of `Text` or `Binary` holding the raw bytes. That needs no `deserialize_any`, which bincode and postcard do not implement, and `xid` is always written, because bincode and postcard read fields by position and a missing one would shift everything after it.
+
+### Things to know
+
+- **Same version for postcard and bincode.** They carry no field names and read fields and variants by position, so their bytes are meant to be read by the pg_walstream version that wrote them. MessagePack from `rmp_serde::to_vec` also writes fields by position (variants by name), so the same caution applies to it; CBOR and `rmp_serde::to_vec_named` write field names. Keep events you store long-term as JSON.
+- **Untrusted bytes.** Malformed bytes make JSON, CBOR, MessagePack and postcard return an error instead of panicking or aborting. None of them detects a corrupted value inside an otherwise well-formed event, which can decode as a different event, so add your own checksum if you need to catch that. When pg_walstream deserializes a row it reserves room for at most 1600 columns up front, whatever length the bytes claim. bincode 2 does not protect itself: its default configuration allocates whatever length a string or byte string claims, which can abort the process, so decode bytes you did not write yourself only with `with_limit`, as above. The limit applies to decoding and caps one event, so choose a value above your largest row; a bigger event fails with `LimitExceeded`.
+- **Your own envelope.** An ordinary enum around a `ChangeEvent` works with every format. `#[serde(tag = "...")]`, `#[serde(untagged)]` and `#[serde(flatten)]` work with JSON, CBOR and MessagePack, and never with postcard or bincode, which is serde's own limit.
+- **Non-UTF-8 text.** A PostgreSQL text column can hold bytes that are not UTF-8. JSON cannot write those as a string, so JSON reads them back as `Binary`; the other formats keep them as `Text`.
+- **Bytes written by 0.10.0.** CBOR and MessagePack bytes changed. Each column that is not NULL grows by five or six bytes (the `Text` or `Binary` tag) and `xid` is always written, so an INSERT with short values is noticeably larger (on two 12-column rows CBOR grew by 19% and 23%, MessagePack by 24% and 32%), while a BEGIN, COMMIT or logical message grows by a few percent. An event that holds a text or binary column cannot be read across the two versions in either direction; events without one decode both ways. With `rmp_serde`, calling `with_human_readable()` on both the serializer and the deserializer keeps the 0.10.0 bytes; CBOR has no such switch.
+
+### Try it
+
+The [`binary-serde`](examples/binary-serde) example needs no database. It encodes a small transaction in all five formats, checks that each reads the same events back, and shows the sizes, back-to-back framing, envelopes and a decode of hostile bytes:
+
+```bash
+cd examples/binary-serde
+cargo run
 ```
 
 ## LSN Tracking

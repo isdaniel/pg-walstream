@@ -578,7 +578,11 @@ pub use crate::column_value::{ColumnValue, RowData};
 // They are re-exported above so downstream code is unaffected.
 
 /// Represents the type of change event from PostgreSQL logical replication
+///
+/// bincode and postcard identify a variant by its position, so add new variants
+/// at the end.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// `event_type_variants_keep_their_index` pins each variant's index.
 // Built once per change on the hot path. Boxing the data variants to satisfy
 // large_enum_variant would add a per-row heap allocation, so the size gap is an
 // intentional tradeoff for the allocation-free path.
@@ -786,10 +790,16 @@ pub struct ReplicationSlotInfo {
 
 /// Represents a single change event from PostgreSQL logical replication
 ///
-/// To ship events between processes, serialize them with `serde_json`. bincode
-/// and postcard cannot read a [`ColumnValue`], whose deserializer relies on
-/// `deserialize_any`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// To ship events between processes, serialize them with `serde_json`, or with
+/// a compact format such as CBOR, MessagePack, bincode or postcard. A format
+/// that is not human-readable gets a compact [`ColumnValue`] and always carries
+/// `xid`; JSON is unchanged.
+///
+/// bincode and postcard read fields and variants by position, and `rmp_serde::to_vec` writes
+/// fields by position too (variants by name). Use those between processes running the same
+/// version, and keep events you store long-term as JSON. CBOR and `rmp_serde::to_vec_named`
+/// write field names.
+#[derive(Debug, Clone, Deserialize)]
 pub struct ChangeEvent {
     /// Type of the event with embedded data
     pub event_type: EventType,
@@ -808,8 +818,36 @@ pub struct ChangeEvent {
     /// `subtransaction_xid` differs from its `transaction_id` rolls back the
     /// changes with that `xid`, so it never names a `Message`. `None` outside a
     /// streamed chunk and for events that are not changes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub xid: Option<u32>,
+}
+
+impl Serialize for ChangeEvent {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> core::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        // Naming every field here makes a new `ChangeEvent` field a compile error, not a silent omission.
+        let ChangeEvent {
+            event_type,
+            lsn,
+            metadata,
+            xid,
+        } = self;
+        // A format that reads by position shifts every later field when one is left out, so only human-readable formats drop a `None` xid.
+        let skip_xid = xid.is_none() && serializer.is_human_readable();
+        let mut event = serializer.serialize_struct("ChangeEvent", if skip_xid { 3 } else { 4 })?;
+        event.serialize_field("event_type", event_type)?;
+        event.serialize_field("lsn", lsn)?;
+        event.serialize_field("metadata", metadata)?;
+        if skip_xid {
+            event.skip_field("xid")?;
+        } else {
+            event.serialize_field("xid", xid)?;
+        }
+        event.end()
+    }
 }
 
 impl ChangeEvent {
@@ -1486,8 +1524,10 @@ impl ChangeEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::column_value::hex_decode;
     use bytes::Bytes;
     use chrono::{TimeZone, Utc};
+    use serde::de::DeserializeOwned;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -2126,9 +2166,20 @@ mod tests {
         assert_eq!(decoded.metadata, event.metadata);
     }
 
-    /// One event per payload shape serde has to carry: row data, `Option`s, `Bytes`, timestamps and unit variants.
+    /// PostgreSQL timestamps, in microseconds since 2000-01-01 as the parser hands them to
+    /// `postgres_timestamp_to_chrono`: one with microseconds (2026-11-18T11:06:40.123456Z), one before
+    /// 1970 and the last microsecond of year 9999.
+    const WITH_MICROS: i64 = 848_315_200_123_456;
+    const BEFORE_1970: i64 = -1_946_684_800_000_000;
+    const LAST_MICROSECOND_OF_9999: i64 = 252_455_615_999_999_999;
+
+    /// One event per payload shape serde has to carry: row data, `Option`s, `Bytes`, timestamps and unit variants,
+    /// and every `EventType` variant at least once.
     fn serde_samples() -> Vec<EventType> {
         let ts = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let at = postgres_timestamp_to_chrono;
+        let lsn = Lsn::new;
+        let id = || vec![Arc::from("id")];
         let data = RowData::from_pairs(vec![
             ("id", ColumnValue::text("1")),
             ("note", ColumnValue::Null),
@@ -2167,6 +2218,155 @@ mod tests {
                 abort_timestamp: None,
             },
             EventType::StreamStop,
+            // The rest of the variants, and the `Option`s the other way round.
+            ChangeEvent::insert("public", "t", 7, RowData::new(), lsn(0)).event_type,
+            ChangeEvent::update(
+                "public",
+                "orders",
+                16384,
+                Some(wide_row()),
+                wide_row(),
+                ReplicaIdentity::Full,
+                id(),
+                lsn(0),
+            )
+            .event_type,
+            ChangeEvent::update(
+                "public",
+                "orders",
+                16384,
+                None,
+                wide_row(),
+                ReplicaIdentity::Default,
+                vec![],
+                lsn(0),
+            )
+            .event_type,
+            ChangeEvent::delete(
+                "public",
+                "orders",
+                16384,
+                wide_row(),
+                ReplicaIdentity::Index,
+                vec![Arc::from("id"), Arc::from("uuid")],
+                lsn(0),
+            )
+            .event_type,
+            ChangeEvent::truncate(
+                vec![Arc::from("public.a"), Arc::from("public.b")],
+                true,
+                false,
+                lsn(0),
+            )
+            .event_type,
+            ChangeEvent::begin(42, lsn(0x100), at(WITH_MICROS), lsn(0)).event_type,
+            ChangeEvent::begin(42, lsn(0x100), at(BEFORE_1970), lsn(0)).event_type,
+            ChangeEvent::begin(42, lsn(0x100), at(LAST_MICROSECOND_OF_9999), lsn(0)).event_type,
+            ChangeEvent::commit(at(WITH_MICROS), lsn(0), lsn(0x100), lsn(0x108)).event_type,
+            EventType::StreamStart {
+                transaction_id: 43,
+                first_segment: true,
+            },
+            EventType::StreamCommit {
+                transaction_id: 43,
+                commit_lsn: lsn(0x200),
+                end_lsn: lsn(0x208),
+                commit_timestamp: at(WITH_MICROS),
+            },
+            EventType::StreamAbort {
+                transaction_id: 43,
+                subtransaction_xid: 44,
+                abort_lsn: Some(lsn(7)),
+                abort_timestamp: Some(at(WITH_MICROS)),
+            },
+            EventType::StreamAbort {
+                transaction_id: 43,
+                subtransaction_xid: 43,
+                abort_lsn: None,
+                abort_timestamp: None,
+            },
+            ChangeEvent::relation(
+                16384,
+                "public",
+                "orders",
+                ReplicaIdentity::Default,
+                vec![
+                    RelationColumn {
+                        name: Arc::from("id"),
+                        type_id: 20,
+                        type_modifier: -1,
+                        is_key: true,
+                    },
+                    RelationColumn {
+                        name: Arc::from("note"),
+                        type_id: 25,
+                        type_modifier: -1,
+                        is_key: false,
+                    },
+                ],
+                lsn(0),
+            )
+            .event_type,
+            ChangeEvent::type_event(16500, "public", "mood", lsn(0)).event_type,
+            ChangeEvent::origin(lsn(0x55), "origin_1", lsn(0)).event_type,
+            ChangeEvent::message(
+                1,
+                lsn(u64::MAX),
+                "pfx",
+                Bytes::from_static(b"\x00\x01payload\xff"),
+                lsn(0),
+            )
+            .event_type,
+            ChangeEvent::begin_prepare(
+                50,
+                lsn(0x300),
+                lsn(0x308),
+                at(WITH_MICROS),
+                "gid-1",
+                lsn(0),
+            )
+            .event_type,
+            ChangeEvent::prepare(
+                0,
+                50,
+                lsn(0x300),
+                lsn(0x308),
+                at(WITH_MICROS),
+                "gid-1",
+                lsn(0),
+            )
+            .event_type,
+            ChangeEvent::commit_prepared(
+                0,
+                50,
+                lsn(0x400),
+                lsn(0x408),
+                at(WITH_MICROS),
+                "gid-1",
+                lsn(0),
+            )
+            .event_type,
+            ChangeEvent::rollback_prepared(
+                0,
+                50,
+                lsn(0x308),
+                lsn(0x500),
+                at(WITH_MICROS),
+                at(WITH_MICROS + 1_000_000),
+                "gid-1",
+                lsn(0),
+            )
+            .event_type,
+            ChangeEvent::stream_prepare(
+                0,
+                50,
+                lsn(0x300),
+                lsn(0x308),
+                at(WITH_MICROS),
+                "gid-1",
+                lsn(0),
+            )
+            .event_type,
         ]
     }
 
@@ -2224,6 +2424,827 @@ mod tests {
         for event_type in serde_samples() {
             let json = serde_json::to_value(event_with_xid(event_type.clone(), None)).unwrap();
             assert!(json.get("xid").is_none(), "{event_type:?}: {json}");
+        }
+    }
+
+    // serde formats: JSON stays byte-for-byte what it was; every other format must carry the same events without loss.
+
+    type Decoded<T> = std::result::Result<T, String>;
+
+    /// One serde format under test.
+    trait Format {
+        const NAME: &'static str;
+        /// What the format's serializer reports. It decides the shape of a `ColumnValue` and whether a
+        /// `None` xid is written.
+        const HUMAN_READABLE: bool;
+        fn encode<T: Serialize>(value: &T) -> Vec<u8>;
+        fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Decoded<T>;
+    }
+
+    struct Json;
+    impl Format for Json {
+        const NAME: &'static str = "json";
+        const HUMAN_READABLE: bool = true;
+        fn encode<T: Serialize>(value: &T) -> Vec<u8> {
+            serde_json::to_vec(value).unwrap()
+        }
+        fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Decoded<T> {
+            serde_json::from_slice(bytes).map_err(|e| e.to_string())
+        }
+    }
+
+    struct Cbor;
+    impl Format for Cbor {
+        const NAME: &'static str = "cbor";
+        const HUMAN_READABLE: bool = false;
+        fn encode<T: Serialize>(value: &T) -> Vec<u8> {
+            let mut out = Vec::new();
+            ciborium::into_writer(value, &mut out).unwrap();
+            out
+        }
+        fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Decoded<T> {
+            ciborium::from_reader(bytes).map_err(|e| e.to_string())
+        }
+    }
+
+    /// MessagePack as `rmp_serde::to_vec` writes it: structs are arrays.
+    struct MsgPack;
+    impl Format for MsgPack {
+        const NAME: &'static str = "msgpack";
+        const HUMAN_READABLE: bool = false;
+        fn encode<T: Serialize>(value: &T) -> Vec<u8> {
+            rmp_serde::to_vec(value).unwrap()
+        }
+        fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Decoded<T> {
+            rmp_serde::from_slice(bytes).map_err(|e| e.to_string())
+        }
+    }
+
+    /// MessagePack as `rmp_serde::to_vec_named` writes it: structs are maps.
+    struct MsgPackNamed;
+    impl Format for MsgPackNamed {
+        const NAME: &'static str = "msgpack_named";
+        const HUMAN_READABLE: bool = false;
+        fn encode<T: Serialize>(value: &T) -> Vec<u8> {
+            rmp_serde::to_vec_named(value).unwrap()
+        }
+        fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Decoded<T> {
+            rmp_serde::from_slice(bytes).map_err(|e| e.to_string())
+        }
+    }
+
+    /// MessagePack with `with_human_readable()` on both sides, which is how `rmp_serde` itself says to
+    /// read what older versions of it wrote, and gives the bytes pg_walstream 0.10.0 wrote.
+    struct MsgPackHumanReadable;
+    impl Format for MsgPackHumanReadable {
+        const NAME: &'static str = "msgpack_human_readable";
+        const HUMAN_READABLE: bool = true;
+        fn encode<T: Serialize>(value: &T) -> Vec<u8> {
+            let mut out = Vec::new();
+            value
+                .serialize(&mut rmp_serde::Serializer::new(&mut out).with_human_readable())
+                .unwrap();
+            out
+        }
+        fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Decoded<T> {
+            T::deserialize(&mut rmp_serde::Deserializer::new(bytes).with_human_readable())
+                .map_err(|e| e.to_string())
+        }
+    }
+
+    /// bincode 2 as it is configured by default: variable-width integers.
+    struct Bincode;
+    impl Format for Bincode {
+        const NAME: &'static str = "bincode";
+        const HUMAN_READABLE: bool = false;
+        fn encode<T: Serialize>(value: &T) -> Vec<u8> {
+            bincode::serde::encode_to_vec(value, bincode::config::standard()).unwrap()
+        }
+        fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Decoded<T> {
+            bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+                .map(|(value, _)| value)
+                .map_err(|e| e.to_string())
+        }
+    }
+
+    /// bincode 2 with `legacy()`, the configuration that was bincode 1's default: fixed-width integers.
+    struct BincodeLegacy;
+    impl Format for BincodeLegacy {
+        const NAME: &'static str = "bincode_legacy";
+        const HUMAN_READABLE: bool = false;
+        fn encode<T: Serialize>(value: &T) -> Vec<u8> {
+            bincode::serde::encode_to_vec(value, bincode::config::legacy()).unwrap()
+        }
+        fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Decoded<T> {
+            bincode::serde::decode_from_slice(bytes, bincode::config::legacy())
+                .map(|(value, _)| value)
+                .map_err(|e| e.to_string())
+        }
+    }
+
+    struct Postcard;
+    impl Format for Postcard {
+        const NAME: &'static str = "postcard";
+        const HUMAN_READABLE: bool = false;
+        fn encode<T: Serialize>(value: &T) -> Vec<u8> {
+            postcard::to_stdvec(value).unwrap()
+        }
+        fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Decoded<T> {
+            postcard::from_bytes(bytes).map_err(|e| e.to_string())
+        }
+    }
+
+    /// Runs `$body` once per format, with `$F` naming it.
+    macro_rules! each_format {
+        ($F:ident => $body:block) => {{
+            {
+                type $F = Json;
+                $body
+            }
+            {
+                type $F = Cbor;
+                $body
+            }
+            {
+                type $F = MsgPack;
+                $body
+            }
+            {
+                type $F = MsgPackNamed;
+                $body
+            }
+            {
+                type $F = MsgPackHumanReadable;
+                $body
+            }
+            {
+                type $F = Bincode;
+                $body
+            }
+            {
+                type $F = BincodeLegacy;
+                $body
+            }
+            {
+                type $F = Postcard;
+                $body
+            }
+        }};
+    }
+
+    /// The event from issue #148.
+    fn issue_event() -> ChangeEvent {
+        let data = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("1")),
+            ("note", ColumnValue::Null),
+        ]);
+        ChangeEvent::insert("public", "t", 1, data, Lsn::new(5))
+    }
+
+    /// A row holding every kind of value a column can carry. Its non-UTF-8 `Text` is why the samples
+    /// that JSON has to return exactly (`serde_samples`) do not use it.
+    fn edge_case_row() -> RowData {
+        RowData::from_pairs(vec![
+            ("id", ColumnValue::text("1")),
+            ("empty", ColumnValue::text("")),
+            ("unicode", ColumnValue::text("héllo 日本語 🚀")),
+            (
+                "escapes",
+                ColumnValue::text("quote \" backslash \\ newline \n tab \t"),
+            ),
+            ("long", ColumnValue::text(&"x".repeat(1024))),
+            (
+                "bytea",
+                ColumnValue::binary_bytes(Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef])),
+            ),
+            ("bytea_empty", ColumnValue::binary_bytes(Bytes::new())),
+            (
+                "not_utf8",
+                ColumnValue::text_bytes(Bytes::from_static(&[0xff, 0xfe, 0x41])),
+            ),
+            ("null", ColumnValue::Null),
+            // Text that spells how another form writes a value has to stay text.
+            ("looks_binary", ColumnValue::text("$binary")),
+            ("looks_hex", ColumnValue::text("deadbeef")),
+            ("looks_variant", ColumnValue::text("Text")),
+        ])
+    }
+
+    /// More columns than a `RowData` keeps inline, with a NULL among them. The names sort in the order
+    /// of the columns, because the xid tests above read a row back through `serde_json::Value`, whose
+    /// objects are sorted.
+    fn wide_row() -> RowData {
+        let mut row = RowData::with_capacity(12);
+        for i in 0..12 {
+            let value = if i == 9 {
+                ColumnValue::Null
+            } else {
+                ColumnValue::text(&format!("value {i}"))
+            };
+            row.push(Arc::from(format!("column_{i:02}")), value);
+        }
+        row
+    }
+
+    /// How many variants `EventType` has.
+    const VARIANTS: usize = 19;
+
+    /// The position of a variant in the declaration of `EventType`. The match has no wildcard, so
+    /// adding a variant stops compiling here until it is given its index.
+    fn variant_index(event_type: &EventType) -> usize {
+        match event_type {
+            EventType::Insert { .. } => 0,
+            EventType::Update { .. } => 1,
+            EventType::Delete { .. } => 2,
+            EventType::Truncate { .. } => 3,
+            EventType::Begin { .. } => 4,
+            EventType::Commit { .. } => 5,
+            EventType::StreamStart { .. } => 6,
+            EventType::StreamStop => 7,
+            EventType::StreamCommit { .. } => 8,
+            EventType::StreamAbort { .. } => 9,
+            EventType::Relation { .. } => 10,
+            EventType::Type { .. } => 11,
+            EventType::Origin { .. } => 12,
+            EventType::Message { .. } => 13,
+            EventType::BeginPrepare { .. } => 14,
+            EventType::Prepare { .. } => 15,
+            EventType::CommitPrepared { .. } => 16,
+            EventType::RollbackPrepared { .. } => 17,
+            EventType::StreamPrepare { .. } => 18,
+        }
+    }
+
+    /// `Text` that is not UTF-8 cannot be a JSON string, so a human-readable format writes it, and
+    /// reads it back, as `Binary`.
+    fn lossy_value(value: &ColumnValue) -> ColumnValue {
+        match value {
+            ColumnValue::Text(b) if value.as_str().is_none() => ColumnValue::Binary(b.clone()),
+            other => other.clone(),
+        }
+    }
+
+    fn lossy_row(row: &RowData) -> RowData {
+        let mut out = RowData::with_capacity(row.len());
+        for (name, value) in row.iter() {
+            out.push(name.clone(), lossy_value(value));
+        }
+        out
+    }
+
+    /// What `event` has to come back as: itself, except that a human-readable format loses the
+    /// difference between `Text` that is not UTF-8 and `Binary`.
+    fn expected<F: Format>(event: &ChangeEvent) -> ChangeEvent {
+        let mut event = event.clone();
+        if F::HUMAN_READABLE {
+            match &mut event.event_type {
+                EventType::Insert { data, .. } => *data = lossy_row(data),
+                EventType::Update {
+                    old_data, new_data, ..
+                } => {
+                    if let Some(old) = old_data {
+                        *old = lossy_row(old);
+                    }
+                    *new_data = lossy_row(new_data);
+                }
+                EventType::Delete { old_data, .. } => *old_data = lossy_row(old_data),
+                _ => {}
+            }
+        }
+        event
+    }
+
+    /// `ChangeEvent` has no `PartialEq`, so compare it field by field.
+    fn assert_same(back: &ChangeEvent, want: &ChangeEvent, what: &str) {
+        let ChangeEvent {
+            event_type,
+            lsn,
+            metadata,
+            xid,
+        } = want;
+        assert_eq!(&back.event_type, event_type, "{what}: event_type");
+        assert_eq!(&back.lsn, lsn, "{what}: lsn");
+        assert_eq!(&back.metadata, metadata, "{what}: metadata");
+        assert_eq!(&back.xid, xid, "{what}: xid");
+    }
+
+    /// The reproduction from issue #148: it panicked in both calls. It was written for bincode 1, whose
+    /// default configuration is bincode 2's `legacy()`, so both configurations are tried.
+    #[test]
+    fn issue_148_change_event_round_trips_through_bincode_and_postcard() {
+        let event = issue_event();
+
+        let bytes = Bincode::encode(&event);
+        assert_same(&Bincode::decode(&bytes).unwrap(), &event, "bincode");
+
+        let bytes = BincodeLegacy::encode(&event);
+        assert_same(
+            &BincodeLegacy::decode(&bytes).unwrap(),
+            &event,
+            "bincode legacy",
+        );
+
+        let bytes = postcard::to_stdvec(&event).unwrap();
+        let back: ChangeEvent = postcard::from_bytes(&bytes).unwrap();
+        assert_same(&back, &event, "postcard");
+    }
+
+    #[test]
+    fn every_event_type_round_trips_through_every_format() {
+        let edge = ChangeEvent::insert("public", "t", 7, edge_case_row(), Lsn::new(0)).event_type;
+        let metadata = BTreeMap::from([("source".to_string(), "test".to_string())]);
+        for event_type in serde_samples().into_iter().chain([edge]) {
+            let variant = variant_index(&event_type);
+            for (xid, metadata, lsn) in [
+                (None, None, 0x10),
+                (Some(746), Some(metadata.clone()), 0x0016_B374_D848),
+                (Some(u32::MAX), None, u64::MAX),
+            ] {
+                let event = ChangeEvent {
+                    lsn: Lsn::new(lsn),
+                    metadata,
+                    ..event_with_xid(event_type.clone(), xid)
+                };
+                each_format!(F => {
+                    let bytes = F::encode(&event);
+                    let back = F::decode::<ChangeEvent>(&bytes)
+                        .unwrap_or_else(|e| panic!("{}: variant {variant}: {e}", F::NAME));
+                    assert_same(&back, &expected::<F>(&event), F::NAME);
+                });
+            }
+        }
+    }
+
+    /// A column value is `Text` or `Binary` whatever the format, except that JSON cannot tell
+    /// non-UTF-8 `Text` from `Binary`.
+    #[test]
+    fn non_utf8_text_stays_text_unless_the_format_is_human_readable() {
+        let value = ColumnValue::text_bytes(Bytes::from_static(&[0xff, 0xfe]));
+        each_format!(F => {
+            let back = F::decode::<ColumnValue>(&F::encode(&value)).unwrap();
+            let want = if F::HUMAN_READABLE {
+                ColumnValue::binary_bytes(Bytes::from_static(&[0xff, 0xfe]))
+            } else {
+                value.clone()
+            };
+            assert_eq!(back, want, "{}", F::NAME);
+        });
+    }
+
+    /// `events` written back to back with bincode under `config`, then read back one by one.
+    fn bincode_back_to_back<C: bincode::config::Config>(
+        events: &[ChangeEvent],
+        config: C,
+        name: &str,
+    ) {
+        let buf: Vec<u8> = events
+            .iter()
+            .flat_map(|e| bincode::serde::encode_to_vec(e, config).unwrap())
+            .collect();
+        let mut rest = &buf[..];
+        for want in events {
+            let (back, used): (ChangeEvent, usize) =
+                bincode::serde::decode_from_slice(rest, config).unwrap();
+            assert_same(&back, want, name);
+            rest = &rest[used..];
+        }
+        assert!(rest.is_empty(), "{name} left {} bytes", rest.len());
+    }
+
+    /// Events written back to back must stay aligned: one field left out would shift every later one.
+    #[test]
+    fn events_written_back_to_back_stay_aligned() {
+        let events: Vec<ChangeEvent> = serde_samples()
+            .into_iter()
+            .map(|event_type| event_with_xid(event_type, None))
+            .collect();
+
+        let buf: Vec<u8> = events.iter().flat_map(Postcard::encode).collect();
+        let mut rest = &buf[..];
+        for want in &events {
+            let (back, tail) = postcard::take_from_bytes::<ChangeEvent>(rest).unwrap();
+            assert_same(&back, want, "postcard");
+            rest = tail;
+        }
+        assert!(rest.is_empty(), "postcard left {} bytes", rest.len());
+
+        bincode_back_to_back(&events, bincode::config::standard(), "bincode");
+        bincode_back_to_back(&events, bincode::config::legacy(), "bincode legacy");
+
+        let buf: Vec<u8> = events.iter().flat_map(Cbor::encode).collect();
+        let mut rest = &buf[..];
+        for want in &events {
+            let back: ChangeEvent = ciborium::from_reader(&mut rest).unwrap();
+            assert_same(&back, want, "cbor");
+        }
+        assert!(rest.is_empty(), "cbor left {} bytes", rest.len());
+
+        let buf: Vec<u8> = events.iter().flat_map(MsgPack::encode).collect();
+        let mut rest = &buf[..];
+        for want in &events {
+            let back: ChangeEvent = rmp_serde::from_read(&mut rest).unwrap();
+            assert_same(&back, want, "msgpack");
+        }
+        assert!(rest.is_empty(), "msgpack left {} bytes", rest.len());
+    }
+
+    /// Every strict prefix of an encoded event is an error, never a panic and never a shorter event.
+    #[test]
+    fn a_truncated_event_is_an_error() {
+        let wide_update = serde_samples()
+            .into_iter()
+            .find(|t| {
+                matches!(
+                    t,
+                    EventType::Update {
+                        old_data: Some(_),
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let wide = event_with_xid(wide_update, Some(5));
+        each_format!(F => {
+            let bytes = F::encode(&wide);
+            assert!(
+                F::decode::<ChangeEvent>(&bytes).is_ok(),
+                "{}: the whole event has to decode",
+                F::NAME
+            );
+            for len in 0..bytes.len() {
+                assert!(
+                    F::decode::<ChangeEvent>(&bytes[..len]).is_err(),
+                    "{}: accepted {len} of {} bytes",
+                    F::NAME,
+                    bytes.len()
+                );
+            }
+        });
+    }
+
+    // bincode and postcard read by position, so what follows is their contract.
+
+    #[test]
+    fn the_samples_cover_every_event_type_variant() {
+        let mut seen = [false; VARIANTS];
+        for event_type in serde_samples() {
+            seen[variant_index(&event_type)] = true;
+        }
+        assert_eq!(
+            seen, [true; VARIANTS],
+            "add a sample of the new variant to `serde_samples`"
+        );
+    }
+
+    #[test]
+    fn event_type_variants_keep_their_index() {
+        for event_type in serde_samples() {
+            let index = variant_index(&event_type);
+            let why =
+                "postcard and bincode identify a variant by its position, so a new `EventType` \
+                       variant goes at the end of the enum, never in the middle";
+            assert_eq!(
+                usize::from(postcard::to_stdvec(&event_type).unwrap()[0]),
+                index,
+                "{why}: {event_type:?}"
+            );
+            // Variable-width: an index below 251 is one byte. Fixed-width: four bytes, little endian.
+            assert_eq!(
+                usize::from(Bincode::encode(&event_type)[0]),
+                index,
+                "{why}: {event_type:?}"
+            );
+            assert_eq!(
+                BincodeLegacy::encode(&event_type)[..4],
+                (index as u32).to_le_bytes(),
+                "{why}: {event_type:?}"
+            );
+        }
+    }
+
+    /// The issue's event in postcard, byte by byte.
+    #[test]
+    fn postcard_layout_of_the_issue_event_is_pinned() {
+        #[rustfmt::skip]
+        let layout: &[u8] = &[
+            0x00,                                        // EventType::Insert
+            0x06, b'p', b'u', b'b', b'l', b'i', b'c',    // schema
+            0x01, b't',                                  // table
+            0x01,                                        // relation_oid
+            0x02,                                        // row: two columns
+            0x02, b'i', b'd',                            //   name
+            0x01, 0x00, 0x01, b'1',                      //   Some(Text(b"1"))
+            0x04, b'n', b'o', b't', b'e',                //   name
+            0x00,                                        //   None, which is NULL
+            0x05,                                        // lsn
+            0x00,                                        // metadata: None
+            0x00,                                        // xid: None
+        ];
+        let event = issue_event();
+        assert_eq!(postcard::to_stdvec(&event).unwrap(), layout);
+        assert_same(&postcard::from_bytes(layout).unwrap(), &event, "postcard");
+    }
+
+    // What pg_walstream 0.10.0 wrote, captured from it.
+
+    #[test]
+    fn json_is_byte_identical_to_0_10_0() {
+        let mut with_xid = ChangeEvent::insert(
+            "public",
+            "t",
+            3,
+            RowData::from_pairs(vec![
+                ("id", ColumnValue::text("1")),
+                ("note", ColumnValue::Null),
+            ]),
+            Lsn::new(9),
+        )
+        .with_metadata(BTreeMap::from([("src".to_string(), "test".to_string())]));
+        with_xid.xid = Some(777);
+
+        let tagged = ChangeEvent::insert(
+            "public",
+            "t",
+            1,
+            RowData::from_pairs(vec![
+                (
+                    "bytea",
+                    ColumnValue::binary_bytes(Bytes::from_static(&[0xde, 0xad])),
+                ),
+                (
+                    "raw",
+                    ColumnValue::text_bytes(Bytes::from_static(&[0xff, 0xfe])),
+                ),
+                ("n", ColumnValue::Null),
+                ("t", ColumnValue::text("x")),
+            ]),
+            Lsn::new(5),
+        );
+
+        let cases = [
+            (
+                issue_event(),
+                r#"{"event_type":{"Insert":{"schema":"public","table":"t","relation_oid":1,"data":{"id":"1","note":null}}},"lsn":5,"metadata":null}"#,
+            ),
+            (
+                with_xid,
+                r#"{"event_type":{"Insert":{"schema":"public","table":"t","relation_oid":3,"data":{"id":"1","note":null}}},"lsn":9,"metadata":{"src":"test"},"xid":777}"#,
+            ),
+            (
+                tagged,
+                r#"{"event_type":{"Insert":{"schema":"public","table":"t","relation_oid":1,"data":{"bytea":{"$binary":"dead"},"raw":{"$binary":"fffe"},"n":null,"t":"x"}}},"lsn":5,"metadata":null}"#,
+            ),
+        ];
+        for (event, json) in cases {
+            assert_eq!(String::from_utf8(Json::encode(&event)).unwrap(), json);
+            assert_same(
+                &Json::decode(json.as_bytes()).unwrap(),
+                &expected::<Json>(&event),
+                json,
+            );
+        }
+    }
+
+    /// 0.10.0 wrote a struct without a `None` xid: CBOR as a three-entry map and MessagePack as a
+    /// three-element array. Events with no row data do not change shape, so they still read.
+    #[test]
+    fn cbor_and_messagepack_events_without_row_data_written_by_0_10_0_still_decode() {
+        let lsn = Lsn::new(0x0016_B374_D848);
+        let cases = [
+            (
+                "stream_stop",
+                ChangeEvent {
+                    lsn,
+                    ..event_with_xid(EventType::StreamStop, None)
+                },
+                "a36a6576656e745f747970656a53747265616d53746f70636c736e1b00000016b374d848686d65746164617461f6",
+                "93aa53747265616d53746f70cf00000016b374d848c0",
+            ),
+            (
+                "commit",
+                ChangeEvent::commit(
+                    postgres_timestamp_to_chrono(WITH_MICROS),
+                    lsn,
+                    Lsn::new(0x100),
+                    Lsn::new(0x108),
+                ),
+                "a36a6576656e745f74797065a166436f6d6d6974a370636f6d6d69745f74696d657374616d70781b323032362d31312d31385431313a30363a34302e3132333435365a6a636f6d6d69745f6c736e19010067656e645f6c736e190108636c736e1b00000016b374d848686d65746164617461f6",
+                "9381a6436f6d6d697493bb323032362d31312d31385431313a30363a34302e3132333435365acd0100cd0108cf00000016b374d848c0",
+            ),
+            (
+                "truncate",
+                ChangeEvent::truncate(
+                    vec![Arc::from("public.a"), Arc::from("public.b")],
+                    true,
+                    false,
+                    lsn,
+                ),
+                "a36a6576656e745f74797065a1685472756e63617465a3667461626c657382687075626c69632e61687075626c69632e626763617363616465f570726573746172745f6964656e74697479f4636c736e1b00000016b374d848686d65746164617461f6",
+                "9381a85472756e636174659392a87075626c69632e61a87075626c69632e62c3c2cf00000016b374d848c0",
+            ),
+            (
+                "message",
+                ChangeEvent::message(
+                    1,
+                    Lsn::new(0x66),
+                    "pfx",
+                    Bytes::from_static(b"\x00\x01payload\xff"),
+                    lsn,
+                ),
+                "a36a6576656e745f74797065a1674d657373616765a465666c616773016b6d6573736167655f6c736e1866667072656669786370667867636f6e74656e744a00017061796c6f6164ff636c736e1b00000016b374d848686d65746164617461f6",
+                "9381a74d657373616765940166a3706678c40a00017061796c6f6164ffcf00000016b374d848c0",
+            ),
+        ];
+        for (name, want, cbor, msgpack) in cases {
+            assert_same(
+                &Cbor::decode(&hex_decode(cbor).unwrap()).unwrap(),
+                &want,
+                name,
+            );
+            assert_same(
+                &MsgPack::decode(&hex_decode(msgpack).unwrap()).unwrap(),
+                &want,
+                name,
+            );
+        }
+    }
+
+    /// `with_human_readable()` is the way to keep MessagePack bytes as 0.10.0 wrote them; the default
+    /// configuration writes the compact form, which is different.
+    #[test]
+    fn messagepack_human_readable_keeps_the_0_10_0_bytes() {
+        let legacy =
+            hex_decode("9381a6496e7365727494a67075626c6963a1740182a26964a131a46e6f7465c005c0")
+                .unwrap();
+        let event = issue_event();
+
+        assert_eq!(MsgPackHumanReadable::encode(&event), legacy);
+        assert_same(
+            &MsgPackHumanReadable::decode(&legacy).unwrap(),
+            &event,
+            "msgpack_human_readable",
+        );
+        assert_ne!(MsgPack::encode(&event), legacy);
+    }
+
+    // A deserializer that buffers its input.
+
+    /// `#[serde(tag)]`, `untagged` and `flatten` buffer their input first, and the buffer reports
+    /// itself human-readable even over CBOR or MessagePack, so the reader has to take the compact form
+    /// there too. An application that wraps a `ChangeEvent` in an envelope like these works today.
+    ///
+    /// The envelopes stand for an application's own types, so their size is not boxed away.
+    #[derive(Serialize, Deserialize)]
+    #[serde(tag = "kind")]
+    #[allow(clippy::large_enum_variant)]
+    enum Tagged {
+        Change(ChangeEvent),
+        Heartbeat { at: u64 },
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(untagged)]
+    #[allow(clippy::large_enum_variant)]
+    enum Untagged {
+        Change(ChangeEvent),
+        Heartbeat(u64),
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct Flattened {
+        sequence: u32,
+        #[serde(flatten)]
+        change: ChangeEvent,
+    }
+
+    fn envelope_round_trips<F: Format>(event: &ChangeEvent) {
+        let want = expected::<F>(event);
+
+        match F::decode(&F::encode(&Tagged::Change(event.clone()))).unwrap() {
+            Tagged::Change(back) => assert_same(&back, &want, F::NAME),
+            Tagged::Heartbeat { .. } => panic!("{}: a change came back as a heartbeat", F::NAME),
+        }
+        assert!(matches!(
+            F::decode(&F::encode(&Tagged::Heartbeat { at: 9 })).unwrap(),
+            Tagged::Heartbeat { at: 9 }
+        ));
+
+        match F::decode(&F::encode(&Untagged::Change(event.clone()))).unwrap() {
+            Untagged::Change(back) => assert_same(&back, &want, F::NAME),
+            Untagged::Heartbeat(_) => panic!("{}: a change came back as a heartbeat", F::NAME),
+        }
+        assert!(matches!(
+            F::decode(&F::encode(&Untagged::Heartbeat(9))).unwrap(),
+            Untagged::Heartbeat(9)
+        ));
+
+        let flat = Flattened {
+            sequence: 3,
+            change: event.clone(),
+        };
+        let back: Flattened = F::decode(&F::encode(&flat)).unwrap();
+        assert_eq!(back.sequence, 3, "{}", F::NAME);
+        assert_same(&back.change, &want, F::NAME);
+    }
+
+    #[test]
+    fn a_change_event_inside_an_envelope_round_trips() {
+        for event in [
+            issue_event(),
+            ChangeEvent {
+                xid: Some(746),
+                ..ChangeEvent::insert("public", "t", 2, edge_case_row(), Lsn::new(0))
+            },
+            ChangeEvent::message(
+                1,
+                Lsn::new(7),
+                "pfx",
+                Bytes::from_static(b"\x00\x01payload\xff"),
+                Lsn::new(0x10),
+            ),
+        ] {
+            envelope_round_trips::<Json>(&event);
+            envelope_round_trips::<Cbor>(&event);
+            envelope_round_trips::<MsgPack>(&event);
+            envelope_round_trips::<MsgPackNamed>(&event);
+        }
+    }
+
+    // Generated cases.
+
+    fn arb_column_value() -> impl proptest::strategy::Strategy<Value = ColumnValue> {
+        use proptest::prelude::{any, Strategy};
+        proptest::prop_oneof![
+            proptest::strategy::Just(ColumnValue::Null),
+            ".{0,24}".prop_map(|s| ColumnValue::text(&s)),
+            proptest::collection::vec(any::<u8>(), 0..24)
+                .prop_map(|b| ColumnValue::text_bytes(Bytes::from(b))),
+            proptest::collection::vec(any::<u8>(), 0..24)
+                .prop_map(|b| ColumnValue::binary_bytes(Bytes::from(b))),
+        ]
+    }
+
+    fn arb_row_data() -> impl proptest::strategy::Strategy<Value = RowData> {
+        use proptest::prelude::Strategy;
+        proptest::collection::vec((".{0,12}", arb_column_value()), 0..8).prop_map(|columns| {
+            let mut row = RowData::with_capacity(columns.len());
+            for (name, value) in columns {
+                row.push(Arc::from(name), value);
+            }
+            row
+        })
+    }
+
+    fn arb_change_event() -> impl proptest::strategy::Strategy<Value = ChangeEvent> {
+        use proptest::prelude::{any, Strategy};
+        (
+            (
+                arb_row_data(),
+                proptest::option::of(arb_row_data()),
+                arb_row_data(),
+            ),
+            (any::<u64>(), proptest::option::of(any::<u32>())),
+            proptest::option::of(proptest::collection::btree_map(".{0,6}", ".{0,6}", 0..3)),
+            0..3u8,
+        )
+            .prop_map(|((new, old, other), (lsn, xid), metadata, kind)| {
+                let lsn = Lsn::new(lsn);
+                let id = vec![Arc::from("id")];
+                let mut event = match kind {
+                    0 => ChangeEvent::insert("public", "t", 1, new, lsn),
+                    1 => ChangeEvent::update(
+                        "public",
+                        "t",
+                        1,
+                        old,
+                        new,
+                        ReplicaIdentity::Full,
+                        id,
+                        lsn,
+                    ),
+                    _ => ChangeEvent::delete(
+                        "public",
+                        "t",
+                        1,
+                        other,
+                        ReplicaIdentity::Default,
+                        vec![],
+                        lsn,
+                    ),
+                };
+                event.metadata = metadata;
+                event.xid = xid;
+                event
+            })
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn any_change_event_round_trips_through_every_format(event in arb_change_event()) {
+            each_format!(F => {
+                let back = F::decode::<ChangeEvent>(&F::encode(&event)).unwrap();
+                assert_same(&back, &expected::<F>(&event), F::NAME);
+            });
         }
     }
 

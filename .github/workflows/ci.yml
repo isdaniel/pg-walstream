@@ -25,7 +25,7 @@ jobs:
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
       with:
-        targets: wasm32-unknown-unknown, aarch64-unknown-none
+        targets: wasm32-unknown-unknown, aarch64-unknown-none, thumbv7em-none-eabihf
 
     - name: Build no_std (alloc) on the host
       run: cargo build --no-default-features
@@ -35,6 +35,10 @@ jobs:
 
     - name: Build no_std (alloc) for aarch64-unknown-none (bare-metal)
       run: cargo build --no-default-features --lib --target aarch64-unknown-none
+
+    # Cortex-M4/M7: pointer-sized atomics but no 64-bit ones, which `SharedLsnFeedback` needs.
+    - name: Build no_std (alloc) for thumbv7em-none-eabihf (bare-metal, no 64-bit atomics)
+      run: cargo build --no-default-features --lib --target thumbv7em-none-eabihf
 
     - name: Clippy no_std (alloc)
       run: cargo clippy --no-default-features --lib -- -D warnings

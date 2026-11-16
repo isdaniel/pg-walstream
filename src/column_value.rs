@@ -25,7 +25,7 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
 }
 
 /// Decode a hex string to bytes. Returns `Err` on invalid hex.
-fn hex_decode(hex: &str) -> core::result::Result<Vec<u8>, &'static str> {
+pub(crate) fn hex_decode(hex: &str) -> core::result::Result<Vec<u8>, &'static str> {
     if !hex.len().is_multiple_of(2) {
         return Err("odd hex length");
     }
@@ -68,6 +68,13 @@ fn hex_nibble(b: u8) -> Option<u8> {
 /// and `Null` emits JSON `null`.
 ///
 /// The tagged-object format is unambiguous: a `Text` value whose content happens to look like hex will always round-trip correctly.
+///
+/// A format whose serializer reports `is_human_readable() == false` (CBOR,
+/// MessagePack, bincode, postcard) gets a compact form instead: `None` for
+/// `Null`, otherwise `Some` of a `Text` or `Binary` variant holding the raw
+/// bytes. The JSON form needs `deserialize_any`, which bincode and postcard do
+/// not implement; the compact one does not, and `Text` that is not UTF-8
+/// stays `Text`.
 ///
 /// # Example
 ///
@@ -238,11 +245,29 @@ impl PartialEq<&str> for ColumnValue {
     }
 }
 
+/// What a format that is not human-readable sees for a non-null [`ColumnValue`]:
+/// borrowed to write, owned to read. `Null` is the `None` around it, so a reader
+/// tells the two apart without `deserialize_any`. The variant order is the
+/// postcard and bincode wire format.
+#[derive(Serialize, Deserialize)]
+#[serde(rename = "ColumnValue")]
+enum Compact<B> {
+    Text(B),
+    Binary(B),
+}
+
 impl Serialize for ColumnValue {
     fn serialize<S: serde::Serializer>(
         &self,
         serializer: S,
     ) -> core::result::Result<S::Ok, S::Error> {
+        if !serializer.is_human_readable() {
+            return match self {
+                Self::Null => serializer.serialize_none(),
+                Self::Text(b) => serializer.serialize_some(&Compact::Text(b)),
+                Self::Binary(b) => serializer.serialize_some(&Compact::Binary(b)),
+            };
+        }
         match self {
             Self::Null => serializer.serialize_none(),
             Self::Text(b) => match core::str::from_utf8(b) {
@@ -267,6 +292,14 @@ impl<'de> Deserialize<'de> for ColumnValue {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> core::result::Result<Self, D::Error> {
+        if !deserializer.is_human_readable() {
+            return Ok(match Option::<Compact<Bytes>>::deserialize(deserializer)? {
+                None => ColumnValue::Null,
+                Some(Compact::Text(b)) => ColumnValue::Text(b),
+                Some(Compact::Binary(b)) => ColumnValue::Binary(b),
+            });
+        }
+
         struct Visitor;
 
         impl<'de> serde::de::Visitor<'de> for Visitor {
@@ -303,18 +336,23 @@ impl<'de> Deserialize<'de> for ColumnValue {
                 mut map: M,
             ) -> core::result::Result<ColumnValue, M::Error> {
                 use serde::de::Error;
-                let key: String = map
-                    .next_key()?
-                    .ok_or_else(|| M::Error::custom("expected \"$binary\" key in tagged object"))?;
-                if key != "$binary" {
-                    return Err(M::Error::custom(format!(
-                        r#"unknown key "{key}", expected "$binary""#
-                    )));
+                let key: String = map.next_key()?.ok_or_else(|| {
+                    M::Error::custom(r#"expected a "$binary", "Text" or "Binary" key"#)
+                })?;
+                match key.as_str() {
+                    "$binary" => {
+                        let hex: String = map.next_value()?;
+                        let bytes = hex_decode(&hex).map_err(|e| {
+                            M::Error::custom(format!("invalid hex in $binary: {e}"))
+                        })?;
+                        Ok(ColumnValue::Binary(Bytes::from(bytes)))
+                    }
+                    "Text" => map.next_value().map(ColumnValue::Text),
+                    "Binary" => map.next_value().map(ColumnValue::Binary),
+                    _ => Err(M::Error::custom(format!(
+                        r#"unknown key "{key}", expected "$binary", "Text" or "Binary""#
+                    ))),
                 }
-                let hex: String = map.next_value()?;
-                let bytes = hex_decode(&hex)
-                    .map_err(|e| M::Error::custom(format!("invalid hex in $binary: {e}")))?;
-                Ok(ColumnValue::Binary(Bytes::from(bytes)))
             }
         }
 
@@ -609,6 +647,11 @@ impl Serialize for RowData {
     }
 }
 
+/// The most columns a `RowData` reserves room for before it has read any of them. PostgreSQL allows
+/// 1600 per table (`MaxHeapAttributeNumber`), and the length a format reports for a map comes from
+/// its input, so it is clamped rather than trusted: a corrupt length must not size the allocation.
+const MAX_PREALLOCATED_COLUMNS: usize = 1600;
+
 impl<'de> Deserialize<'de> for RowData {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
@@ -626,7 +669,8 @@ impl<'de> Deserialize<'de> for RowData {
                 self,
                 mut map: M,
             ) -> core::result::Result<RowData, M::Error> {
-                let mut cols = SmallVec::with_capacity(map.size_hint().unwrap_or(0));
+                let hint = map.size_hint().unwrap_or(0).min(MAX_PREALLOCATED_COLUMNS);
+                let mut cols = SmallVec::with_capacity(hint);
                 while let Some((k, v)) = map.next_entry::<String, ColumnValue>()? {
                     cols.push((Arc::from(k), v));
                 }
@@ -1097,6 +1141,18 @@ mod tests {
     }
 
     #[test]
+    fn serde_json_reader_accepts_the_compact_map() {
+        let text: ColumnValue = serde_json::from_str(r#"{"Text":"abc"}"#).unwrap();
+        assert_eq!(text, ColumnValue::text("abc"));
+
+        let binary: ColumnValue = serde_json::from_str(r#"{"Binary":[1,2,255]}"#).unwrap();
+        assert_eq!(
+            binary,
+            ColumnValue::Binary(Bytes::from_static(&[1, 2, 255]))
+        );
+    }
+
+    #[test]
     fn serde_text_invalid_utf8_round_trips_as_binary() {
         let cv = ColumnValue::Text(Bytes::from_static(&[0xff, 0xfe]));
         let json = serde_json::to_string(&cv).unwrap();
@@ -1110,6 +1166,26 @@ mod tests {
         assert!(serde_json::from_str::<ColumnValue>(r#"{"nope":"x"}"#).is_err());
         assert!(serde_json::from_str::<ColumnValue>(r#"{"$binary":"zz"}"#).is_err());
         assert!(serde_json::from_str::<ColumnValue>("42").is_err());
+        for bad in [
+            r#"{}"#,
+            r#"{"Text":5}"#,
+            r#"{"Binary":"zz","Text":"a"}"#,
+            r#"{"Text":"a","Binary":"b"}"#,
+            r#"{"Null":null}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ColumnValue>(bad).is_err(),
+                "accepted {bad}"
+            );
+        }
+
+        let message = serde_json::from_str::<ColumnValue>(r#"{"Other":"x"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("Other") && message.contains("Text") && message.contains("Binary"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -1133,5 +1209,94 @@ mod tests {
         let back: RowData = serde_json::from_str(&json).unwrap();
         assert_eq!(row, back);
         assert!(serde_json::from_str::<RowData>("42").is_err());
+    }
+
+    /// What a single column is in postcard: `None` for NULL, else `Some` of the variant and its bytes.
+    #[test]
+    fn postcard_layout_of_a_column_value_is_pinned() {
+        let cases: [(ColumnValue, &[u8]); 4] = [
+            (ColumnValue::Null, &[0x00]),
+            (ColumnValue::text("1"), &[0x01, 0x00, 0x01, b'1']),
+            (
+                ColumnValue::binary_bytes(Bytes::from_static(&[0xde])),
+                &[0x01, 0x01, 0x01, 0xde],
+            ),
+            (
+                ColumnValue::text_bytes(Bytes::from_static(&[0xff, 0xfe])),
+                &[0x01, 0x00, 0x02, 0xff, 0xfe],
+            ),
+        ];
+        for (value, layout) in cases {
+            assert_eq!(postcard::to_stdvec(&value).unwrap(), layout, "{value:?}");
+            assert_eq!(postcard::from_bytes::<ColumnValue>(layout).unwrap(), value);
+        }
+    }
+
+    /// A `MapAccess` that claims to hold `claimed` entries and holds none.
+    struct ClaimsEntries {
+        claimed: usize,
+    }
+
+    impl<'de> serde::de::MapAccess<'de> for ClaimsEntries {
+        type Error = serde::de::value::Error;
+
+        fn next_key_seed<K: serde::de::DeserializeSeed<'de>>(
+            &mut self,
+            _seed: K,
+        ) -> core::result::Result<Option<K::Value>, Self::Error> {
+            Ok(None)
+        }
+
+        fn next_value_seed<V: serde::de::DeserializeSeed<'de>>(
+            &mut self,
+            _seed: V,
+        ) -> core::result::Result<V::Value, Self::Error> {
+            unreachable!("there is no key to take a value for")
+        }
+
+        fn size_hint(&self) -> Option<usize> {
+            Some(self.claimed)
+        }
+    }
+
+    /// The length a format reports for a map comes from the input, so it must not size an allocation.
+    /// `usize::MAX` entries would panic with a capacity overflow, and a smaller claim that no machine can
+    /// satisfy would abort the whole process.
+    #[test]
+    fn rowdata_deserialize_does_not_allocate_for_the_entries_a_map_claims() {
+        use serde::de::value::MapAccessDeserializer;
+
+        for claimed in [0, 1, MAX_PREALLOCATED_COLUMNS, usize::MAX] {
+            let row = RowData::deserialize(MapAccessDeserializer::new(ClaimsEntries { claimed }))
+                .unwrap_or_else(|e| panic!("a map claiming {claimed} entries: {e}"));
+            assert!(row.is_empty(), "claimed {claimed}");
+        }
+    }
+
+    /// The same, from the bytes: postcard writes the number of entries first, here `u64::MAX`.
+    #[test]
+    fn a_postcard_row_claiming_u64_max_columns_is_an_error() {
+        let bytes = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01];
+        assert!(postcard::from_bytes::<RowData>(&bytes).is_err());
+    }
+
+    /// The cap only limits what is reserved up front: a row with more columns than it keeps all of them,
+    /// in order, whether the format reports its length (postcard) or does not (JSON).
+    #[test]
+    fn rowdata_wider_than_the_preallocation_cap_keeps_every_column() {
+        let mut row = RowData::with_capacity(MAX_PREALLOCATED_COLUMNS + 100);
+        for i in 0..MAX_PREALLOCATED_COLUMNS + 100 {
+            let value = if i % 7 == 0 {
+                ColumnValue::Null
+            } else {
+                ColumnValue::text(&format!("v{i}"))
+            };
+            row.push(Arc::from(format!("c{i}")), value);
+        }
+
+        let back: RowData = postcard::from_bytes(&postcard::to_stdvec(&row).unwrap()).unwrap();
+        assert_eq!(back, row, "postcard");
+        let back: RowData = serde_json::from_str(&serde_json::to_string(&row).unwrap()).unwrap();
+        assert_eq!(back, row, "json");
     }
 }
