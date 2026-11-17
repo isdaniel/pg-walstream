@@ -335,6 +335,64 @@ async fn a_stream_resumes_after_its_walsender_is_terminated() {
     );
 }
 
+/// The counters behind `stream.metrics()` follow a real stream: WAL read, the lag between what
+/// was received and what the consumer applied, a status update sent, and one reconnect after the
+/// walsender is terminated.
+#[tokio::test]
+#[ignore = "requires live PostgreSQL with wal_level=logical"]
+async fn metrics_follow_a_real_stream_through_a_reconnect() {
+    let mut fixture = Fixture::new("it_reconnect_metrics");
+    let mut stream = LogicalReplicationStream::new(&replication_conn_string(), fixture.config())
+        .await
+        .expect("stream");
+    stream.start(None).await.expect("start");
+    let metrics = stream.metrics();
+    assert_eq!(metrics.snapshot().wal_messages, 0);
+    assert_eq!(metrics.snapshot().reconnects, 0);
+
+    fixture.insert(1);
+    assert_eq!(read_until(&mut stream, 1).await, [1]);
+    let first = metrics.snapshot();
+    assert!(first.wal_messages >= 3, "begin, insert, commit: {first:?}");
+    assert!(first.wal_bytes > 25 * first.wal_messages, "{first:?}");
+    assert_eq!(first.received_lsn, stream.current_lsn());
+    assert!(first.applied_lsn > 0, "read_until acknowledged: {first:?}");
+    assert_eq!(first.reconnects, 0);
+
+    // Read a commit without acknowledging it: the lag is the WAL received since the last ack.
+    fixture.insert(2);
+    let cancel = CancellationToken::new();
+    let commit = tokio::time::timeout(READ_TIMEOUT, async {
+        loop {
+            let event = stream.next_event_with_retry(&cancel).await.expect("event");
+            if let EventType::Commit { end_lsn, .. } = event.event_type {
+                break end_lsn;
+            }
+        }
+    })
+    .await
+    .expect("the commit of row 2 never arrived");
+    let unacked = metrics.snapshot();
+    assert!(unacked.lag_bytes() > 0, "{unacked:?}");
+    assert!(unacked.received_lsn > first.received_lsn, "{unacked:?}");
+    stream
+        .shared_lsn_feedback
+        .update_applied_lsn(commit.value());
+    let acked = metrics.snapshot();
+    assert_eq!(acked.applied_lsn, commit.value());
+    assert!(acked.lag_bytes() < unacked.lag_bytes(), "{acked:?}");
+
+    fixture.terminate_walsender();
+    fixture.insert(3);
+    assert_eq!(read_until(&mut stream, 3).await, [3]);
+    let second = metrics.snapshot();
+    assert_eq!(second.reconnects, 1, "{second:?}");
+    assert!(second.wal_messages > acked.wal_messages, "{second:?}");
+
+    stream.send_feedback().await.expect("feedback");
+    assert_eq!(metrics.snapshot().feedback_sent, second.feedback_sent + 1);
+}
+
 /// Two terminations in a row through `EventStream::next_event` under `timeout`: the loop
 /// recovers more than once, and each recovery leaves the next read working.
 #[tokio::test]

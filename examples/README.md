@@ -264,6 +264,29 @@ cargo run
 
 **No database required** — it builds its events in memory. The full guide, with the caveats is in the root README under "Shipping Events Between Processes".
 
+### 12. stream-metrics
+
+Shows how code outside the stream reads its metrics: `stream.metrics()` (or `event_stream.metrics()`) returns a cloneable handle that any task can snapshot while the stream is being polled.
+
+**Features:**
+- A reporter task prints the message and byte rates (the difference of two snapshots), the unacknowledged bytes, keepalives, status updates and reconnects every few seconds
+- Acknowledges at each `Commit`, so the unacknowledged bytes climb through an open transaction and drop back at its commit
+- Optionally serves the same numbers in the Prometheus text format (`METRICS_ADDR`), with nothing but `tokio`
+- Prints a final summary after the stream has ended, from the same handle
+
+**Run:**
+```bash
+cd examples/stream-metrics
+export DATABASE_URL="postgresql://postgres:password@localhost:5432/postgres?replication=database"
+cargo run
+
+# A slow handler (20 ms per event) makes a large transaction visible, and /metrics can be scraped meanwhile
+HANDLER_DELAY_MS=20 METRICS_ADDR=127.0.0.1:9187 cargo run
+curl -s http://127.0.0.1:9187/metrics
+```
+
+Needs the publication `metrics_example_pub` (`CREATE PUBLICATION metrics_example_pub FOR ALL TABLES;`). The semantics of `lag_bytes()` are in the root README under "Metrics".
+
 ## Prerequisites
 
 ### For Logical Replication Examples (basic_streaming, polling_example, safe_transaction_consumer)

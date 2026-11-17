@@ -15,6 +15,7 @@
 
 use crate::error::{ReplicationError, Result};
 use crate::lsn::SharedLsnFeedback;
+use crate::metrics::{Counters, StreamMetrics};
 use crate::types::{
     ChangeEvent, EventType, Lsn, Oid, ReplicationSlotOptions, SlotType, TimestampTz,
 };
@@ -55,6 +56,8 @@ pub struct LogicalReplicationStream {
     keepalive_wal_end: Lsn,
     /// Raised when a reconnect starts and lowered when one succeeds, so a reconnect a caller dropped mid-way leaves it raised.
     recovering: bool,
+    /// Tallies behind [`metrics`](Self::metrics). Only this stream writes them.
+    counters: Arc<Counters>,
 }
 
 /// A `'w'` frame held back at a boundary, with the commit position that stopped it.
@@ -1007,6 +1010,7 @@ impl LogicalReplicationStream {
             held: None,
             keepalive_wal_end: Lsn::new(0),
             recovering: false,
+            counters: Arc::default(),
         })
     }
 
@@ -1713,6 +1717,7 @@ impl LogicalReplicationStream {
         self.parser.reset();
 
         self.recovering = false;
+        self.counters.reconnected();
         info!("Replication connection recovered and restarted");
         Ok(())
     }
@@ -1975,6 +1980,8 @@ impl LogicalReplicationStream {
         if wal_end > 0 {
             self.state.update_received_lsn(wal_end);
         }
+        self.counters
+            .wal_frame(data.len(), self.state.last_received_lsn);
 
         Ok((wal_start, wal_end, send_time))
     }
@@ -2038,6 +2045,7 @@ impl LogicalReplicationStream {
         );
 
         self.state.update_received_lsn(keepalive.wal_end);
+        self.counters.keepalive(self.state.last_received_lsn);
         self.keepalive_wal_end = self.keepalive_wal_end.max(Lsn::new(keepalive.wal_end));
 
         // Bounded replay, idle-server terminal.
@@ -2157,6 +2165,7 @@ impl LogicalReplicationStream {
         // Record the LSN values we sent for intelligent throttling
         self.state
             .mark_feedback_sent_with_lsn(flushed_lsn, applied_lsn);
+        self.counters.feedback_sent();
 
         debug!(
             "Sent feedback: received={}, flushed={}, applied={}",
@@ -2184,6 +2193,31 @@ impl LogicalReplicationStream {
     /// Get the current LSN position
     pub fn current_lsn(&self) -> XLogRecPtr {
         self.state.last_received_lsn
+    }
+
+    /// A handle on this stream's counters and positions that another task can read.
+    ///
+    /// Take it before [`into_stream`](Self::into_stream) moves the stream, or ask the
+    /// [`EventStream`] for it. See [`StreamMetrics`].
+    ///
+    /// ```no_run
+    /// # use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig};
+    /// # async fn example(stream: LogicalReplicationStream) {
+    /// let metrics = stream.metrics();
+    /// tokio::spawn(async move {
+    ///     loop {
+    ///         let m = metrics.snapshot();
+    ///         println!("{} messages, {} bytes unacknowledged", m.wal_messages, m.lag_bytes());
+    ///         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    ///     }
+    /// });
+    /// # }
+    /// ```
+    pub fn metrics(&self) -> StreamMetrics {
+        StreamMetrics::new(
+            Arc::clone(&self.counters),
+            Arc::clone(&self.shared_lsn_feedback),
+        )
     }
 
     /// Returns the exported snapshot name from slot creation, if available.
@@ -2421,6 +2455,7 @@ impl LogicalReplicationStream {
     /// ```
     pub fn into_stream(self, cancellation_token: CancellationToken) -> EventStream {
         let shared_feedback = Arc::clone(&self.shared_lsn_feedback);
+        let metrics = self.metrics();
         EventStream {
             state: StreamState::Ready {
                 stream: Box::new(self),
@@ -2428,6 +2463,7 @@ impl LogicalReplicationStream {
             },
             cancellation_token,
             shared_feedback,
+            metrics,
             held: None,
         }
     }
@@ -2606,6 +2642,8 @@ pub struct EventStream {
     /// Cached reference to the shared LSN feedback so callers can always
     /// update/read LSN values even while the stream is parked in a poll.
     shared_feedback: Arc<SharedLsnFeedback>,
+    /// Cached like `shared_feedback`, so the counters stay readable while the stream is parked in a poll.
+    metrics: StreamMetrics,
     /// An event a parked poll read at or past a boundary, delivered by the next read.
     held: Option<ChangeEvent>,
 }
@@ -2886,6 +2924,13 @@ impl EventStream {
     #[inline]
     pub fn get_feedback_lsn(&self) -> (XLogRecPtr, XLogRecPtr) {
         self.shared_feedback.get_feedback_lsn()
+    }
+
+    /// A handle on this stream's counters and positions. Always safe to call, even while the stream is parked in a poll.
+    ///
+    /// See [`StreamMetrics`].
+    pub fn metrics(&self) -> StreamMetrics {
+        self.metrics.clone()
     }
 
     /// Returns whether this stream has terminated.
@@ -5325,6 +5370,7 @@ pub(crate) mod tests {
             held: None,
             keepalive_wal_end: Lsn::new(0),
             recovering: false,
+            counters: Arc::default(),
         }
     }
 
@@ -10223,6 +10269,67 @@ pub(crate) mod tests {
         let (flushed, applied) = original_feedback.get_feedback_lsn();
         assert_eq!(applied, 5000);
         assert_eq!(flushed, 5000);
+    }
+
+    /// Every XLogData frame and keepalive the stream reads reaches a handle taken
+    /// before the stream moves into an `EventStream`, and the `EventStream` hands
+    /// out the same counters.
+    #[tokio::test]
+    async fn metrics_follow_the_frames_the_stream_reads() {
+        use crate::metrics::MetricsSnapshot;
+
+        let mut stream = create_test_stream(create_test_config());
+        let handle = stream.metrics();
+        assert_eq!(handle.snapshot(), MetricsSnapshot::default());
+
+        let frame = build_wal_message(0x1000, 0x5000, b"abc");
+        let frame_len = frame.len() as u64;
+        stream.decode_raw_frame(Bytes::from(frame)).unwrap();
+        stream
+            .process_keepalive_message(&build_keepalive_message(0x6000, false))
+            .await
+            .unwrap();
+
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.wal_messages, 1);
+        assert_eq!(snapshot.wal_bytes, frame_len);
+        assert_eq!(snapshot.keepalives, 1);
+        assert_eq!(snapshot.received_lsn, 0x6000);
+        assert_eq!(snapshot.received_lsn, stream.current_lsn());
+        assert_eq!(snapshot.first_received_lsn, 0x5000);
+        assert_eq!(
+            snapshot.lag_bytes(),
+            0x1000,
+            "counted from the first position"
+        );
+
+        let event_stream = stream.into_stream(CancellationToken::new());
+        event_stream.update_applied_lsn(0x5800);
+        assert_eq!(event_stream.metrics().snapshot().lag_bytes(), 0x800);
+        assert_eq!(handle.snapshot(), event_stream.metrics().snapshot());
+    }
+
+    /// A frame the parser rejects was not read as WAL, and a frame whose `wal_end`
+    /// is zero does not move the received position back.
+    #[test]
+    fn metrics_ignore_bad_frames_and_never_move_received_backwards() {
+        let mut stream = create_test_stream(create_test_config());
+        let handle = stream.metrics();
+
+        assert!(stream
+            .decode_raw_frame(Bytes::from_static(b"w too short"))
+            .is_err());
+        assert_eq!(handle.snapshot().wal_messages, 0);
+
+        stream
+            .decode_raw_frame(Bytes::from(build_wal_message(1, 0x5000, b"x")))
+            .unwrap();
+        stream
+            .decode_raw_frame(Bytes::from(build_wal_message(2, 0, b"y")))
+            .unwrap();
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.wal_messages, 2);
+        assert_eq!(snapshot.received_lsn, 0x5000);
     }
 
     #[test]

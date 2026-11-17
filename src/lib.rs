@@ -171,6 +171,9 @@ pub(crate) mod copy_text;
 pub mod stream;
 
 #[cfg(any(feature = "libpq", feature = "rustls-tls"))]
+mod metrics;
+
+#[cfg(any(feature = "libpq", feature = "rustls-tls"))]
 pub mod snapshot;
 
 #[cfg(any(feature = "libpq", feature = "rustls-tls"))]
@@ -239,6 +242,8 @@ pub use pgoutput_encode::{
 };
 
 // Re-export stream types
+#[cfg(any(feature = "libpq", feature = "rustls-tls"))]
+pub use metrics::{MetricsSnapshot, StreamMetrics};
 #[cfg(any(feature = "libpq", feature = "rustls-tls"))]
 pub use stream::{
     EventStream, EventStreamRef, LogicalReplicationStream, OriginFilter, RawXLogData,

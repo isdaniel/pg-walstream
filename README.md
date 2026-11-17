@@ -100,6 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | [`typed-deserialization`](examples/typed-deserialization) | INSERT/UPDATE/DELETE events into your own structs via `serde` |
 | [`derive-router`](examples/derive-router) | `#[derive(WalTable)]` and `WalRouter` table inference (`derive` feature) |
 | [`binary-serde`](examples/binary-serde) | Ship `ChangeEvent`s between processes in five formats (no database needed) |
+| [`stream-metrics`](examples/stream-metrics) | Read `stream.metrics()` from other tasks: rates, unacknowledged bytes, reconnects, a Prometheus text endpoint |
 | [`raw-xlogdata`](examples/raw-xlogdata) | Undecoded pgoutput payload via `next_raw_event()` |
 | [`binary-column-access`](examples/binary-column-access) | Lossless zero-copy `BYTEA` access via `PgResult::get_bytes` |
 | [`pg-basebackup`](examples/pg-basebackup) | Physical backup tool using `BASE_BACKUP` with tar extraction and progress |
@@ -197,6 +198,27 @@ To shorten the wait without a code change, shorten `wal_sender_timeout` for the 
 | Server | `wal_sender_timeout = '4s'` in `postgresql.conf` |
 
 The trade-off is that the same value is how long the stream may go without answering before the server disconnects it. Choose `T = 2 × the delay you accept`, and keep it above the longest pause your consumer takes between reads (a handler that blocks, a slow downstream write). A disconnected stream is recovered by `next_event_with_retry`, which reconnects and resumes from the last confirmed position, but it costs a reconnect and a replay of the unconfirmed transactions. Measured on PostgreSQL 17 with the native backend: `T` of 4, 10 and 20 s reported an idle acknowledgement after 2, 5 and 10 s, and a 10 s pause between reads disconnected the stream at `T = 4 s` but not at `T = 20 s`.
+
+## Metrics
+
+`stream.metrics()` (also on `EventStream`) returns a cloneable handle that any task can read while the stream is being polled, with no lock on the read path:
+
+```rust
+let metrics = stream.metrics(); // before `into_stream`, or `event_stream.metrics()`
+tokio::spawn(async move {
+    loop {
+        let m = metrics.snapshot();
+        println!("{} msgs, {} B, {} reconnects, {} B unacknowledged", m.wal_messages, m.wal_bytes, m.reconnects, m.lag_bytes());
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    }
+});
+```
+
+A snapshot holds `wal_messages`, `wal_bytes`, `keepalives`, `feedback_sent` and `reconnects` (counted since the stream was created, replays after a reconnect included), plus `received_lsn` and the consumer's `flushed_lsn` and `applied_lsn`. A `Copy` struct of totals, so a rate is the difference of two snapshots. The handle stays readable after the stream has ended and across reconnects.
+
+`lag_bytes()` is the WAL read off the wire that the consumer has not marked applied yet, counted from where the stream started until `applied_lsn` passes it. It is the consumer's own progress, not what the server has confirmed: a status update carries an acknowledgement to the server later, so a restart right after one can still replay that much. Read it with two more caveats. The stream reads on demand, so a consumer that falls behind leaves its backlog in the socket buffer and on the server, where this does not see it: watch the message rate, and `pg_replication_slots` (or `pg_current_wal_lsn()`) on the server. What `lag_bytes()` does show is the work in flight, for example the open transaction when you acknowledge at each commit. And it grows while the stream is idle and the rest of the database writes WAL, because keepalive positions are not acknowledged until the consumer acknowledges something.
+
+The counters cost a few relaxed loads and stores per XLogData frame (+8 instructions, 120 to 128, measured with callgrind in an isolated decode loop). [`examples/stream-metrics`](examples/stream-metrics) is a runnable program: periodic rates, the lag at each commit, and a Prometheus text endpoint.
 
 ## Initial Snapshot
 
