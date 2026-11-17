@@ -146,6 +146,35 @@ jobs:
     - name: Check (libpq / pq-sys)
       run: cargo check --locked --lib --no-default-features --features libpq
 
+  loom:
+    name: Loom (SharedLsnFeedback)
+    runs-on: ubuntu-latest
+    # Exhaustive interleaving check of the lock-free LSN tracker. loom replaces the std
+    # atomics, and tokio compiles differently under `--cfg loom`, so this uses the
+    # backend-free feature set. The test filter is required: other tests are not
+    # written for loom's atomics.
+    timeout-minutes: 15
+    env:
+      RUSTFLAGS: --cfg loom
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo registry
+      uses: actions/cache@v5
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+        key: ${{ runner.os }}-cargo-loom-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-loom-
+
+    - name: Run loom models
+      run: cargo test --lib --release --no-default-features --features std lsn::loom_tests
+
   examples:
     name: Examples build
     runs-on: ubuntu-latest

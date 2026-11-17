@@ -30,6 +30,13 @@ cargo clippy --no-default-features --lib -- -D warnings          # no_std
 # `--features derive` is required, or the number won't match CI's gate.
 cargo llvm-cov --lib --features derive --summary-only
 cargo llvm-cov --lib --features derive --lcov --output-path lcov.info
+
+# Loom: model-check SharedLsnFeedback. Backend-free feature set (tokio changes under
+# `--cfg loom`) and the test filter are both required.
+RUSTFLAGS='--cfg loom' cargo test --lib --release --no-default-features --features std lsn::loom_tests
+
+# Mutation testing of src/lsn.rs (cargo install cargo-mutants; scope in .cargo/mutants.toml)
+cargo mutants
 ```
 
 Check results by **exit code**, not by grepping for `error`: cargo indents
@@ -157,6 +164,7 @@ read as a CodSpeed regression.
 - Unit tests pass on default, `derive` and `libpq`
 - Code coverage ≥ 90% total lines, via `cargo llvm-cov --lib --features derive`
 - `cargo doc --no-deps --all-features` warning-free
+- Loom models of `SharedLsnFeedback` pass (`loom` job in `ci-checks.yml`); cargo-mutants runs weekly, not per PR
 - Integration tests require PostgreSQL 15+ with logical replication enabled
 - The 90% gate reads only the default-backend unit pass, so `src/connection/libpq.rs` is invisible to it. Codecov merges both backends' unit passes with the integration suites run on PostgreSQL 18.
 - A new `integration-tests/*.rs` file needs a `[[test]]` stanza in `Cargo.toml`

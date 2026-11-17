@@ -1,0 +1,27 @@
+name: Mutants
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 03 * * 1' # Mondays 03:17 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  mutants:
+    name: cargo-mutants (src/lsn.rs)
+    runs-on: ubuntu-latest
+    # Scope and exclusions live in .cargo/mutants.toml. Not run per PR: every mutant is a rebuild.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked
+
+      - name: Run cargo-mutants
+        run: cargo mutants
