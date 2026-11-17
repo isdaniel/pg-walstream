@@ -300,6 +300,11 @@ jobs:
           POSTGRES_DB: test_walstream
         ports:
           - 5432:5432
+        # The server's Unix-domain socket, for the `unix_socket` suite. The server
+        # creates the socket file world-connectable and the image's entrypoint lets other
+        # users enter the directory, so the runner can connect (checked on PG 15-18).
+        volumes:
+          - /tmp/pg-socket:/var/run/postgresql
         options: >-
           --health-cmd "pg_isready -U postgres"
           --health-interval 10s
@@ -397,6 +402,7 @@ jobs:
       env:
         DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/test_walstream?replication=database&connect_timeout=10"
         DATABASE_URL_REGULAR: "postgresql://postgres:postgres@localhost:5432/test_walstream?connect_timeout=10"
+        PG_UNIX_SOCKET_DIR: /tmp/pg-socket
         PGPASSWORD: postgres
         RUST_BACKTRACE: 1
         TEST_RUNNER: ${{ matrix.coverage && 'cargo llvm-cov --no-report' || 'cargo test' }}
@@ -440,7 +446,9 @@ jobs:
             # connect, identity check and START_REPLICATION. `binary_serde` round-trips
             # the events each backend's own COPY ingress produced (a reusable copy on
             # libpq, zero-copy slices on native) through every serde format.
-            error_classification|upload_manifest|initial_snapshot|require_existing_slot|unread_stream_feedback|aligned_snapshot|startup_metadata|startup_params|idle_feedback|reconnect_recovery|binary_serde)
+            # `unix_socket` connects through the socket directory the service mounts
+            # at `PG_UNIX_SOCKET_DIR`, once through each backend's own transport.
+            error_classification|upload_manifest|initial_snapshot|require_existing_slot|unread_stream_feedback|aligned_snapshot|startup_metadata|startup_params|idle_feedback|reconnect_recovery|binary_serde|unix_socket)
               variants=("" "--no-default-features --features libpq") ;;
             *) variants=("") ;;
           esac

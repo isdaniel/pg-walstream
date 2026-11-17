@@ -8,6 +8,7 @@ use crate::error::ReplicationError;
 /// Parsed connection configuration.
 #[derive(Clone)]
 pub struct ConnInfo {
+    /// Server name or address. A value starting with `/` is the directory of a Unix-domain socket, `<host>/.s.PGSQL.<port>`, as in libpq. Empty means `localhost`, not libpq's default socket directory.
     pub host: String,
     pub port: u16,
     pub user: String,
@@ -224,9 +225,9 @@ impl ConnInfo {
             }
             (addr.to_string(), port)
         } else if let Some((h, p)) = host_port.rsplit_once(':') {
-            (h.to_string(), parse_port(p)?)
+            (url_decode(h), parse_port(p)?)
         } else {
-            (host_port.to_string(), 5432)
+            (url_decode(host_port), 5432)
         };
 
         // Split db from query params. The user fallback is applied AFTER the
@@ -350,9 +351,10 @@ impl ConnInfo {
         }
 
         // `postgresql:///mydb` has no authority at all. libpq reads an empty host
-        // as "use the Unix socket"; this backend is TCP-only, so fall back to the
-        // same default the key/value path uses rather than handing
-        // `TcpStream::connect(":5432")` an unparsable address.
+        // as "use the default Unix socket directory"; this backend takes a socket
+        // only from an explicit `/dir` host, so fall back to the same default the
+        // key/value path uses rather than handing `TcpStream::connect(":5432")`
+        // an unparsable address.
         if host.is_empty() {
             host = "localhost".to_string();
         }
@@ -1936,6 +1938,60 @@ mod tests {
         assert_eq!(ci.keepalives_interval, 10);
         assert_eq!(ci.keepalives_count, 3);
         assert_eq!(ci.connect_timeout, 0);
+    }
+
+    /// A `host` that starts with `/` is a Unix-domain socket directory, spelled
+    /// plainly, as a query parameter or percent-encoded in the authority, as libpq
+    /// accepts it. The port still defaults to 5432.
+    #[test]
+    fn a_slash_host_is_kept_as_a_socket_directory_in_every_syntax() {
+        for (dsn, host, port) in [
+            (
+                "host=/var/run/postgresql dbname=db",
+                "/var/run/postgresql",
+                5432,
+            ),
+            (
+                "host=/var/run/postgresql port=6543",
+                "/var/run/postgresql",
+                6543,
+            ),
+            ("host='/tmp/my sockets' port=5433", "/tmp/my sockets", 5433),
+            (
+                "postgresql:///db?host=/var/run/postgresql",
+                "/var/run/postgresql",
+                5432,
+            ),
+            (
+                "postgresql://%2Fvar%2Frun%2Fpostgresql/db",
+                "/var/run/postgresql",
+                5432,
+            ),
+            (
+                "postgresql://u@%2Ftmp%2Fmy%20sockets:5433/db",
+                "/tmp/my sockets",
+                5433,
+            ),
+            (
+                "postgresql:///db?host=%2Ftmp%2Fmy%20sockets&port=5433",
+                "/tmp/my sockets",
+                5433,
+            ),
+        ] {
+            let ci = ConnInfo::parse(dsn).unwrap();
+            assert_eq!((ci.host.as_str(), ci.port), (host, port), "{dsn}");
+        }
+    }
+
+    /// An empty host still means `localhost`: libpq's default socket directory is
+    /// not looked up, only an explicit `/dir` host reaches a socket.
+    #[test]
+    fn an_empty_host_stays_localhost() {
+        assert_eq!(
+            ConnInfo::parse("postgresql:///db").unwrap().host,
+            "localhost"
+        );
+        assert_eq!(ConnInfo::parse("dbname=db").unwrap().host, "localhost");
     }
 
     // === Debug redaction ===

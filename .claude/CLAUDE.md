@@ -58,7 +58,7 @@ src/
 └── connection/      # PostgreSQL connection backends
     ├── mod.rs
     ├── libpq.rs     # libpq FFI backend (opt-in)
-    └── native/      # Pure-Rust rustls-tls backend (default)
+    └── native/      # Pure-Rust rustls-tls backend (default); a `/dir` host is a Unix-domain socket (`Transport::Unix`, no TLS, as libpq)
         └── copy_out.rs  # CopyOut state machine (separate from copy.rs)
 
 macros/              # pg-walstream-macros proc-macro crate (opt-in `derive` feature)

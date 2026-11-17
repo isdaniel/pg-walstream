@@ -16,6 +16,8 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 use tokio::net::TcpStream;
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tokio_rustls::TlsConnector;
 
 /// Lazily-initialized, cached crypto provider.
@@ -48,7 +50,7 @@ fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
 /// (`MIN_HEADROOM > TLS_BUF_SIZE`) to this value at compile time, guaranteeing tokio's `BufReader` always bypasses its buffer on the CopyData hot path.
 pub(crate) const TLS_BUF_SIZE: usize = 65_536;
 
-/// The transport layer — either plain TCP or TLS-wrapped TCP.
+/// The transport layer — plain TCP, TLS-wrapped TCP, or a Unix-domain socket.
 ///
 /// The TLS variant wraps the `TlsStream` in a `BufReader` to reduce read
 /// syscall frequency during high-throughput WAL streaming.
@@ -59,6 +61,9 @@ pub(crate) const TLS_BUF_SIZE: usize = 65_536;
 pub enum Transport {
     Plain(TcpStream),
     Tls(BufReader<tokio_rustls::client::TlsStream<TcpStream>>),
+    /// libpq never uses TLS over a Unix socket, and neither does this.
+    #[cfg(unix)]
+    Unix(UnixStream),
 }
 
 impl Transport {
@@ -80,7 +85,7 @@ impl Transport {
                 let hash = compute_tls_server_end_point_hash(ee_cert_der.as_ref())?;
                 Some(hash)
             }
-            Transport::Plain(_) => None,
+            _ => None,
         }
     }
 }
@@ -162,6 +167,8 @@ impl AsyncRead for Transport {
         match self.get_mut() {
             Transport::Plain(ref mut s) => std::pin::Pin::new(s).poll_read(cx, buf),
             Transport::Tls(ref mut s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            #[cfg(unix)]
+            Transport::Unix(ref mut s) => std::pin::Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -175,6 +182,8 @@ impl AsyncWrite for Transport {
         match self.get_mut() {
             Transport::Plain(ref mut s) => std::pin::Pin::new(s).poll_write(cx, buf),
             Transport::Tls(ref mut s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            #[cfg(unix)]
+            Transport::Unix(ref mut s) => std::pin::Pin::new(s).poll_write(cx, buf),
         }
     }
 
@@ -185,6 +194,8 @@ impl AsyncWrite for Transport {
         match self.get_mut() {
             Transport::Plain(ref mut s) => std::pin::Pin::new(s).poll_flush(cx),
             Transport::Tls(ref mut s) => std::pin::Pin::new(s).poll_flush(cx),
+            #[cfg(unix)]
+            Transport::Unix(ref mut s) => std::pin::Pin::new(s).poll_flush(cx),
         }
     }
 
@@ -195,6 +206,8 @@ impl AsyncWrite for Transport {
         match self.get_mut() {
             Transport::Plain(ref mut s) => std::pin::Pin::new(s).poll_shutdown(cx),
             Transport::Tls(ref mut s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            #[cfg(unix)]
+            Transport::Unix(ref mut s) => std::pin::Pin::new(s).poll_shutdown(cx),
         }
     }
 }
@@ -233,6 +246,10 @@ pub async fn connect(info: &ConnInfo) -> Result<(Transport, i32, BytesMut), Repl
 }
 
 async fn connect_inner(info: &ConnInfo) -> Result<(Transport, i32, BytesMut), ReplicationError> {
+    if info.host.starts_with('/') {
+        return connect_unix(info).await;
+    }
+
     let addr = format!("{}:{}", info.host, info.port);
 
     let tcp = tcp_connect(&addr, info).await?;
@@ -258,6 +275,32 @@ async fn connect_inner(info: &ConnInfo) -> Result<(Transport, i32, BytesMut), Re
     let server_version = startup_and_auth(&mut transport, &mut buf, info).await?;
 
     Ok((transport, server_version, buf))
+}
+
+/// A `host` starting with `/` is the directory of a Unix-domain socket, as in libpq:
+/// the server is at `<host>/.s.PGSQL.<port>`. libpq skips TLS on it whatever `sslmode`
+/// says, and TCP keepalive and `tcp_user_timeout` do not apply.
+#[cfg(unix)]
+async fn connect_unix(info: &ConnInfo) -> Result<(Transport, i32, BytesMut), ReplicationError> {
+    let path = format!("{}/.s.PGSQL.{}", info.host, info.port);
+    let stream = UnixStream::connect(&path).await.map_err(|e| {
+        ReplicationError::transient_connection(format!(
+            "Failed to connect to Unix socket {path}: {e}"
+        ))
+    })?;
+
+    let mut transport = Transport::Unix(stream);
+    let mut buf = BytesMut::with_capacity(8192);
+    let server_version = startup_and_auth(&mut transport, &mut buf, info).await?;
+    Ok((transport, server_version, buf))
+}
+
+#[cfg(not(unix))]
+async fn connect_unix(info: &ConnInfo) -> Result<(Transport, i32, BytesMut), ReplicationError> {
+    Err(ReplicationError::config(format!(
+        "host \"{}\" names a Unix-domain socket directory, which this platform does not support",
+        info.host
+    )))
 }
 
 /// Open a TCP connection with optional timeout, TCP_NODELAY, and keepalive.
@@ -1057,6 +1100,67 @@ mod tests {
                 "{want:?} missing from {pairs:?}"
             );
         }
+    }
+
+    /// A `host` that starts with `/` is a socket directory: the startup message goes
+    /// straight over `<host>/.s.PGSQL.<port>`, with no SSLRequest whatever `sslmode`
+    /// says (libpq does the same), and TCP-only settings do not break the connect.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connect_speaks_the_startup_handshake_over_a_unix_socket() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = std::env::temp_dir().join(format!("pgws-u{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let listener = tokio::net::UnixListener::bind(dir.join(".s.PGSQL.6543")).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            let mut len = [0u8; 4];
+            peer.read_exact(&mut len).await.unwrap();
+            let mut msg = len.to_vec();
+            msg.resize(i32::from_be_bytes(len) as usize, 0);
+            peer.read_exact(&mut msg[4..]).await.unwrap();
+
+            let version = b"server_version\x0017.0\x00";
+            let mut reply = vec![b'R', 0, 0, 0, 8, 0, 0, 0, 0, b'S'];
+            reply.extend((4 + version.len() as i32).to_be_bytes());
+            reply.extend(version);
+            reply.extend([b'Z', 0, 0, 0, 5, b'I']);
+            peer.write_all(&reply).await.unwrap();
+            msg
+        });
+
+        let mut info = test_conninfo(SslMode::VerifyFull, None);
+        info.host = dir.to_str().unwrap().to_string();
+        info.port = 6543;
+        info.tcp_user_timeout = 1000;
+        let (transport, server_version, _) = connect(&info).await.unwrap();
+        let first = server.await.unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(matches!(transport, Transport::Unix(_)));
+        assert_eq!(server_version, 170000);
+        assert_eq!(i32::from_be_bytes(first[4..8].try_into().unwrap()), 196608);
+        assert!(startup_pairs(&first).contains(&("user".to_string(), "test".to_string())));
+    }
+
+    /// A socket that is not there is a connection error like a refused TCP connect,
+    /// so the stream keeps retrying; it names the path the server was looked for at.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_missing_unix_socket_is_a_transient_error_naming_the_path() {
+        let mut info = test_conninfo(SslMode::Prefer, None);
+        info.host = "/nonexistent-pgws-dir".to_string();
+        let err = connect(&info).await.err().expect("no socket there");
+        assert!(
+            matches!(err, ReplicationError::TransientConnection(_)),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("/nonexistent-pgws-dir/.s.PGSQL.5432"),
+            "{err}"
+        );
     }
 
     /// Reads the option back off a real socket, so it fails on the two traps the

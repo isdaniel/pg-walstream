@@ -322,6 +322,18 @@ postgresql://user:pass@host/db?replication=database&application_name=orders-cdc&
 - `options` pins GUCs for the session. The text of a decoded `timestamptz`, date or interval follows the walsender's `TimeZone`, `DateStyle` and `IntervalStyle`, so pin them when the same value must render the same wherever it is read. `client_encoding` cannot be changed this way: the stream decodes UTF-8.
 - `PGAPPNAME` and `PGOPTIONS` are not read; of the environment variables only `PGPASSWORD` is.
 
+## Unix-Domain Sockets
+
+A `host` that starts with `/` is the directory of a Unix-domain socket, as in libpq: the server is reached at `<host>/.s.PGSQL.<port>`. Both backends accept it (libpq always did; the native backend used to look the path up as a host name).
+
+```text
+host=/var/run/postgresql user=cdc dbname=app replication=database
+postgresql:///app?host=/var/run/postgresql&replication=database
+postgresql://cdc@%2Fvar%2Frun%2Fpostgresql/app?replication=database
+```
+
+As in libpq, `sslmode` has no effect over a socket (no TLS is used, `verify-full` included), and `keepalives*` and `tcp_user_timeout` do not apply. An empty `host` still means `localhost`: libpq's default socket directory is not looked up, so name the directory.
+
 ## PostgreSQL Setup
 
 ```conf
