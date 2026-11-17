@@ -1,0 +1,10 @@
+[package]
+name = "stream-metrics"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Reads a replication stream's metrics from other tasks: periodic rates and lag, and a Prometheus text endpoint"
+
+[dependencies]
+pg_walstream = { path = "../.." }
+tokio = { version = "1.49.0", features = ["full"] }
