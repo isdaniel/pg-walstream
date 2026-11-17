@@ -11,116 +11,43 @@ A high-performance Rust library for PostgreSQL logical and physical replication 
 
 ## Features
 
-- **Full Logical Replication Support**: Implements PostgreSQL logical replication protocol versions 1-4
-- **Physical Replication Support**: Stream raw WAL data for standby servers and PITR
-- **Base Backup Support**: Full `BASE_BACKUP` command with progress, compression, and manifest options
-- **Pure-Rust Backend (default)**: The default `rustls-tls` backend needs no libpq and no OpenSSL, using `aws-lc-rs` for hardware-accelerated TLS (AES-NI, AVX2, SHA-NI). 
-- **TLS/SSL Support**: All PostgreSQL SSL modes (`disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`)
-- **Authentication**: Cleartext, MD5, and SCRAM-SHA-256 authentication methods
-- **Streaming Transactions**: Support for streaming large transactions (protocol v2+). Each streamed change carries the xid of its subtransaction in `ChangeEvent::xid`, so a `StreamAbort` for a rolled-back savepoint names exactly the changes to drop, except a `Message`, which always carries the top-level xid
-- **Two-Phase Commit**: Prepared transaction support (protocol v3+)
-- **Parallel Streaming**: Multi-stream parallel replication (protocol v4+)
-- **Zero-Copy Operations**: Efficient buffer management using the `bytes` crate with drain-loop batch queue optimization. The libpq backend copies each COPY message into a reusable `BytesMut` buffer, then reference-counts it downstream as `Bytes` (no per-message heap allocation after warmup)
-- **Thread-Safe LSN Tracking**: Atomic LSN feedback for producer-consumer patterns
-- **Connection Management**: Built-in connection handling with exponential backoff retry logic
-- **Type-Safe API**: Strongly typed message parsing with comprehensive error handling
-- **Typed Row Deserialization**: Built-in `serde` deserializer maps WAL rows directly into user-defined Rust structs (numerics, `bool`, `String`, `Option<T>`, enums, bytes)
-- **Binary Serialization**: `ChangeEvent` round-trips through JSON, CBOR, MessagePack, postcard and bincode, so events can be shipped between processes in a compact format ([guide](#shipping-events-between-processes))
-- **High-Level Consumption Ergonomics**: `ReplicationStreamConfig::builder()`, an auto-acking `EventStream::for_each_event`, and a typed by-table `WalRouter` with an optional `#[derive(WalTable)]` layer (opt-in `derive` feature)
-- **Managed Initial Snapshot**: `LogicalReplicationStream::snapshot()` copies the published tables through the slot's exported snapshot and hands off to the stream with no gap and no duplicate window. The ordering invariant is enforced by the type system, and snapshot rows arrive as ordinary `ChangeEvent`s, so one set of handlers (or one `WalRouter`) serves both the snapshot and the live stream
-- **Aligned Snapshot**: `LogicalReplicationStream::capture_aligned` copies tables added while the stream runs, exact at a temporary side slot's consistent point `C`, and `next_event_before(C)` stops the running stream where that copy applies
-- **Bounded Replay**: `ReplicationStreamConfig::with_stop_at_lsn` streams to a target LSN, delivers the crossing transaction in full, then ends cleanly with `ReplicationError::StreamStopped`
-- **Raw XLogData Access**: `LogicalReplicationStream::next_raw_event` yields the undecoded pgoutput payload plus WAL positions (`RawXLogData`) for consumers that bring their own decoder — keepalives, feedback, and cancellation still handled, no auto-ack
-- **Replication Slot Management**: Create, alter, read, and drop slots with full option support
-- **Hot Standby Feedback**: Send hot standby feedback messages for physical replication
+- **Logical replication**: pgoutput protocol versions 1-4, including streaming of large transactions (v2+), two-phase commit (v3+) and parallel streaming (v4+). Each streamed change carries its subtransaction's xid in `ChangeEvent::xid`.
+- **Physical replication**: raw WAL streaming for standbys and PITR, `BASE_BACKUP` with progress, compression and manifest options, and hot standby feedback.
+- **Two connection backends**: a pure-Rust default (`rustls-tls`: no libpq, no OpenSSL, `aws-lc-rs` for TLS) and an opt-in `libpq` backend. All SSL modes; cleartext, MD5 and SCRAM-SHA-256 authentication.
+- **Typed consumption**: a `serde` deserializer maps rows into your structs, `ReplicationStreamConfig::builder()` configures the stream, `EventStream::for_each_event` acknowledges automatically, and `WalRouter` (with the opt-in `#[derive(WalTable)]`) routes events by table.
+- **Managed initial snapshot**: `snapshot()` copies the published tables, then hands off to the stream with no gap and no duplicate window. `capture_aligned` does the same for tables added while the stream runs.
+- **Bounded replay and raw access**: `with_stop_at_lsn` streams to a target LSN and ends cleanly; `next_raw_event` yields the undecoded pgoutput payload for your own decoder.
+- **Binary serialization**: `ChangeEvent` round-trips through JSON, CBOR, MessagePack, postcard and bincode ([guide](#shipping-events-between-processes)).
+- **Reliable feedback and recovery**: thread-safe `SharedLsnFeedback`, exponential-backoff reconnect, replication slot management.
+- **Zero-copy parsing** on the `bytes` crate, and a `no_std` + `alloc` parser-only build for wasm and embedded targets.
 
 ## Installation
-
-Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
 pg_walstream = "0.10"
 ```
 
-By default, this uses the pure-Rust `rustls-tls` backend — no libpq and no OpenSSL, only `cmake` + a C compiler at build time (for `aws-lc-rs`).
-
-To use the C **libpq** backend instead (bound by `pq-sys`; requires system libpq):
+The default `rustls-tls` backend is pure Rust: it needs only `cmake` and a C compiler at build time (for `aws-lc-rs`) and nothing at runtime (`sudo apt-get install cmake gcc`). To use the C **libpq** backend instead (bound by `pq-sys`):
 
 ```toml
-[dependencies]
 pg_walstream = { version = "0.10", default-features = false, features = ["libpq"] }
 ```
 
-If both backends are enabled, `rustls-tls` takes priority automatically.
+It needs the system libpq: `sudo apt-get install libpq-dev libssl-dev` (Debian/Ubuntu) or `sudo dnf install postgresql-devel` (RHEL/Fedora). If both backends are enabled, `rustls-tls` takes priority.
 
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `std` | Yes | Standard library. Without it (`default-features = false`) you get a `no_std` + `alloc` build of the protocol parser, encoder and types, which compiles for wasm and embedded targets. |
+| `rustls-tls` | Yes | Pure-Rust backend: `rustls` with `aws-lc-rs`. Implies `std`. |
+| `libpq` | No | libpq via FFI, bound by `pq-sys` (pre-generated bindings, no libclang). Implies `std`. |
+| `derive` | No | `#[derive(WalTable)] #[wal(table = "...")]` and the one-line `#[wal_table("...")]`, enabling `WalRouter::on_insert_of::<T>` / `on_update_of` / `on_delete_of`. |
 
-- **`ChangeEvent` has a new public field `xid: Option<u32>`.** Build events with `xid: None` and add `..` to struct patterns (`let ChangeEvent { event_type, lsn, .. } = event`). It is `Some` only for a `Relation`, `Type`, `Insert`, `Update`, `Delete`, `Truncate` or `Message` inside a streamed chunk.
-- **`ChangeEvent::encode` and `ChangeEvent::decode` (deprecated since 0.9.0) are removed.** Serialize events with `serde_json`; JSON written by 0.9 (no `xid` key) still deserializes, with `xid` as `None`. Bytes written by `encode` are not JSON and cannot be read after the upgrade, so convert them on 0.9 first.
-- **`ChangeEvent` now round-trips through bincode and postcard, and CBOR and MessagePack bytes change.** A serde format whose serializer reports `is_human_readable() == false` gets a compact `ColumnValue` (`None` for NULL, otherwise a `Text` or `Binary` variant holding the raw bytes) and always writes `xid`. JSON is byte-identical to before. A CBOR or MessagePack event that holds a text or binary column cannot be read across the two versions in either direction (events without one decode both ways), so convert stored events to JSON with 0.10.0 before upgrading. With `rmp_serde`, calling `with_human_readable()` on both the serializer and the deserializer keeps the 0.10.0 bytes. bincode and postcard read fields and variants by position, so their bytes are only meant to be read by the pg_walstream version that wrote them; keep events you store long-term as JSON. See [Shipping Events Between Processes](#shipping-events-between-processes).
-- **`StreamingReplicationMessage::xid`, returned by `LogicalReplicationParser::parse_wal_message`, changes meaning inside a streamed chunk (protocol v2+).** For `Relation`, `Type`, `Insert`, `Update`, `Delete`, `Truncate` and `Message` it is now the xid pgoutput wrote before that change, which is a subtransaction's xid after a savepoint; it used to be the chunk's xid. A consumer that buffers rows by `xid` and flushes on `StreamCommit` must take the top-level xid from `StreamStart`, or it strands the savepoint's rows. A `Message` always carries the top-level xid.
-- **The `libpq` feature now also builds `socket2`,** which only `rustls-tls` needed before.
-- **`LogicalReplicationStream::new` now runs `IDENTIFY_SYSTEM`, which `start` ran before:** one more round trip at construction. A reply with no usable system identifier and timeline now fails `new` with `ReplicationError::PermanentConnection`, where `start` used to continue without it. `server_identity()` returns what it read.
-- **`send_feedback()` before `start()` returns `ReplicationError::Protocol`;** it returned `Ok(())`. After `start()` and before the first message it sends an all-zero status update instead of returning early, and `stop()` of a stream that was never started logs a warning.
-- **A cancelled command poisons the connection.** If the future of `start()`, `slot_confirmed_flush_lsn()` or `timeline_history()` is dropped before the reply arrives, every later command on that connection fails with `ReplicationError::PermanentConnection`; create a new stream.
-- **`EventStream::next_event` carries a reconnect across a dropped future.** A `timeout` or `select!` that cancels `next_event()` while the stream reconnects no longer restarts the reconnect from its first attempt; the next call resumes it, so a timeout shorter than a reconnect cannot starve it. While such a reconnect is parked, `inner()`, `inner_mut()` and `current_lsn()` panic until the next `next_event()` returns (as they already do after an abandoned `poll_next`); the feedback methods keep working.
-- **The minimum supported Rust version is 1.88.**
+The `no_std` build needs a target with pointer-sized atomics (thumbv7m, thumbv7em, thumbv8m and riscv32imac build; thumbv6m and riscv32imc do not). `SharedLsnFeedback` also needs 64-bit atomics, so it is left out on targets without them, such as thumbv7em. A connection backend is required only for the live streaming and connection APIs.
 
-## Feature Flags
+### TLS trust store
 
-pg-walstream provides two connection backends plus a `std` toggle, all selected at compile time. `rustls-tls` is the default; `libpq` is opt-in. When both are enabled, `rustls-tls` takes priority:
-
-| Feature | Default | C Dependencies | Description |
-|---------|---------|----------------|-------------|
-| `std` | Yes | None | Standard library support. Disable with `default-features = false` for a `no_std` plus `alloc` parser-only build (no connection layer) that compiles for `wasm32-unknown-unknown` and embedded targets. |
-| `libpq` | No | `libpq-dev` + OpenSSL | Opt-in. PostgreSQL's C client library via FFI, bound by `pq-sys` (pre-generated bindings — no libclang). Battle-tested. Enable with `--no-default-features --features libpq`. Implies `std`. |
-| `rustls-tls` | Yes | `cmake`, `gcc` (build-time only) | Default. Pure-Rust implementation using `rustls` with `aws-lc-rs` crypto backend for hardware-accelerated TLS. No libpq, no OpenSSL, no runtime C dependencies. Takes priority when both backends are enabled. Implies `std`. |
-| `derive` | No | None | Opt-in proc-macros (pull `syn`/`quote`) that bind a struct to a table — `#[derive(WalTable)] #[wal(table = "...")]` or the one-line attribute form `#[wal_table("...")]` — enabling the `WalRouter::on_insert_of::<T>` / `on_update_of::<T>` / `on_delete_of::<T>` table-inference methods. |
-
-> **Note:** The protocol parser, encoder, and types need no backend. Building with `default-features = false` gives a `no_std` plus `alloc` build of just those, suitable for wasm and embedded. It needs a target with pointer-sized atomics (for `alloc::sync::Arc`), so thumbv7m, thumbv7em, thumbv8m and riscv32imac build, while thumbv6m and riscv32imc do not. `SharedLsnFeedback` is part of the streaming API and needs 64-bit atomics, so it is left out on targets without them, such as thumbv7em. A connection backend (`libpq` or `rustls-tls`) is required only for the live streaming and connection APIs, and pulls in `std`.
-
-## System Dependencies
-
-System dependencies are **only required** for the opt-in `libpq` feature. The default `rustls-tls` backend requires only `cmake` and a C compiler at build time (for the `aws-lc-rs` crypto library), with no runtime dependencies.
-
-### For `libpq` feature (opt-in)
-
-**Ubuntu/Debian:**
-```bash
-sudo apt-get install libpq-dev libssl-dev
-```
-
-**CentOS/RHEL/Fedora:**
-```bash
-sudo yum install postgresql-devel
-# or
-sudo dnf install postgresql-devel
-```
-
-### For `rustls-tls` feature
-
-Requires `cmake` and a C compiler at build time for `aws-lc-rs` (hardware-accelerated cryptography):
-
-**Ubuntu/Debian:**
-
-```bash
-sudo apt-get install cmake gcc
-```
-
-Then add to `Cargo.toml`:
-
-```toml
-pg_walstream = { version = "0.10", features = ["rustls-tls"] }
-```
-
-#### TLS trust store
-
-When `sslmode` is `verify-ca` or `verify-full`, the `rustls-tls` backend builds its root certificate store as follows:
-
-1. If `sslrootcert` is set, it loads **only** those CAs from the PEM file (exclusive).
-2. Otherwise, it loads the [Mozilla CA bundle](https://wiki.mozilla.org/CA/Included_Certificates) shipped via `webpki-roots`.
-
-The OS trust store is **not** consulted. If your PostgreSQL server is signed by a corporate/internal CA that is only present in the OS trust store (e.g. `/etc/ssl/certs`), you must point `sslrootcert` at that CA explicitly — for example:
+When `sslmode` is `verify-ca` or `verify-full`, the `rustls-tls` backend loads **only** the CAs in `sslrootcert` if it is set, and otherwise the [Mozilla CA bundle](https://wiki.mozilla.org/CA/Included_Certificates) shipped via `webpki-roots`. The OS trust store is **not** consulted, so a server signed by a corporate CA that lives only there needs `sslrootcert` pointed at it:
 
 ```text
 postgresql://user:pass@host/db?sslmode=verify-full&sslrootcert=/etc/ssl/certs/corporate-ca.pem
@@ -128,82 +55,59 @@ postgresql://user:pass@host/db?sslmode=verify-full&sslrootcert=/etc/ssl/certs/co
 
 ## Quick Start
 
-The [`examples/`](examples/) directory contains runnable examples demonstrating various usage patterns:
-
-| Example | Description |
-|---------|-------------|
-| [`basic-streaming`](examples/basic-streaming) | High-level `futures::Stream` API with stream combinators (`filter`, `take_while`) |
-| [`initial-snapshot`](examples/initial-snapshot) | Copy existing rows, then stream changes with no gap and no duplicate — `stream.snapshot()` |
-| [`polling`](examples/polling) | Manual polling loop using `next_event()` for custom integration scenarios |
-| [`safe-transaction-consumer`](examples/safe-transaction-consumer) | Production-grade transaction-aware CDC consumer with ordered commits and safe LSN feedback |
-| [`rate-limited-streaming`](examples/rate-limited-streaming) | Rate-limited consumption using `tokio_stream::StreamExt::throttle` |
-| [`tokio-spawn-streaming`](examples/tokio-spawn-streaming) | Producer/consumer pattern via `tokio::spawn` with `mpsc` channel (demonstrates `Send` safety) |
-| [`typed-deserialization`](examples/typed-deserialization) | Map INSERT/UPDATE/DELETE events directly into user-defined Rust structs via `serde` |
-| [`derive-router`](examples/derive-router) | `#[derive(WalTable)]` + `WalRouter` table-inference (`on_*_of::<T>`) — the `derive` feature |
-| [`pg-basebackup`](examples/pg-basebackup) | Full physical backup tool using `BASE_BACKUP` with tar extraction and progress reporting |
-| [`binary-column-access`](examples/binary-column-access) | Lossless zero-copy `BYTEA` access via `PgResult::get_bytes`, contrasted with the lossy `get_value` |
-| [`raw-xlogdata`](examples/raw-xlogdata) | Undecoded pgoutput payload via `next_raw_event()` — bring your own decoder |
-| [`arbitrary-fuzzing`](examples/arbitrary-fuzzing) | Property-based fuzzing of all protocol types using the `arbitrary` crate |
-| [`binary-serde`](examples/binary-serde) | Ship `ChangeEvent`s between processes in postcard, bincode, CBOR, MessagePack or JSON — sizes, framing, envelopes and untrusted input (no database needed) |
-
-For more control, you can use the traditional polling approach:
-
 ```rust
 use pg_walstream::{
-    LogicalReplicationStream, ReplicationStreamConfig, RetryConfig, StreamingMode,
-    SharedLsnFeedback, CancellationToken,
+    CancellationToken, LogicalReplicationStream, ReplicationError, ReplicationStreamConfig,
 };
-use std::sync::Arc;
-use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = ReplicationStreamConfig::new(
-        "my_slot".to_string(),
-        "my_publication".to_string(),
-        2, StreamingMode::On,
-        Duration::from_secs(10),
-        Duration::from_secs(30),
-        Duration::from_secs(60),
-        RetryConfig::default(),
-    );
+    let config = ReplicationStreamConfig::builder("my_slot", "my_publication");
 
     let mut stream = LogicalReplicationStream::new(
         "postgresql://postgres:password@localhost:5432/mydb?replication=database",
         config,
-    ).await?;
-
+    )
+    .await?;
     stream.start(None).await?;
 
-    let cancel_token = CancellationToken::new();
-
-    // Traditional polling loop with automatic retry
+    let cancel = CancellationToken::new();
     loop {
-        match stream.next_event_with_retry(&cancel_token).await {
+        match stream.next_event_with_retry(&cancel).await {
             Ok(event) => {
-                println!("Received event: {:?}", event);
+                println!("{event:?}");
+                // Acknowledge only once the event is safely handled.
                 stream.shared_lsn_feedback.update_applied_lsn(event.lsn.value());
             }
-            Err(e) if matches!(e, pg_walstream::ReplicationError::Cancelled(_)) => {
-                println!("Cancelled, shutting down gracefully");
-                break;
-            }
-            Err(e) => {
-                eprintln!("Error: {}", e);
-                break;
-            }
+            Err(ReplicationError::Cancelled(_)) => break,
+            Err(e) => return Err(e.into()),
         }
     }
-
     Ok(())
 }
 ```
 
+`ReplicationStreamConfig` has `with_*` methods for the rest (protocol version, feedback interval, retry policy and more). The [`examples/`](examples/) directory has runnable programs:
+
+| Example | Description |
+|---------|-------------|
+| [`basic-streaming`](examples/basic-streaming) | `futures::Stream` API with combinators (`filter`, `take_while`) |
+| [`polling`](examples/polling) | Manual `next_event()` loop for custom integration |
+| [`initial-snapshot`](examples/initial-snapshot) | Copy existing rows, then stream changes with no gap and no duplicate |
+| [`safe-transaction-consumer`](examples/safe-transaction-consumer) | Production-grade, transaction-aware consumer with ordered commits and safe LSN feedback |
+| [`rate-limited-streaming`](examples/rate-limited-streaming) | Rate-limited consumption with `tokio_stream::StreamExt::throttle` |
+| [`tokio-spawn-streaming`](examples/tokio-spawn-streaming) | Producer/consumer across tasks with an `mpsc` channel (`Send` safety) |
+| [`typed-deserialization`](examples/typed-deserialization) | INSERT/UPDATE/DELETE events into your own structs via `serde` |
+| [`derive-router`](examples/derive-router) | `#[derive(WalTable)]` and `WalRouter` table inference (`derive` feature) |
+| [`binary-serde`](examples/binary-serde) | Ship `ChangeEvent`s between processes in five formats (no database needed) |
+| [`raw-xlogdata`](examples/raw-xlogdata) | Undecoded pgoutput payload via `next_raw_event()` |
+| [`binary-column-access`](examples/binary-column-access) | Lossless zero-copy `BYTEA` access via `PgResult::get_bytes` |
+| [`pg-basebackup`](examples/pg-basebackup) | Physical backup tool using `BASE_BACKUP` with tar extraction and progress |
+| [`arbitrary-fuzzing`](examples/arbitrary-fuzzing) | Property-based fuzzing of all protocol types with `arbitrary` |
+
 ## Mapping Columns to Struct Fields
 
-Rows are keyed by their real PostgreSQL column names. When a struct field name
-differs from its column, use serde's `#[serde(rename = "...")]` — no extra
-attribute is needed:
+Rows are keyed by their real PostgreSQL column names. When a struct field name differs from its column, use serde's `#[serde(rename = "...")]`:
 
 ```rust
 use serde::Deserialize;
@@ -230,17 +134,15 @@ struct User { /* fields as above */ }
 
 ## Shipping Events Between Processes
 
-`ChangeEvent` implements serde's `Serialize` and `Deserialize`, so an event can be sent to another process, put on a queue or written to a file with a serde format. JSON, CBOR, MessagePack, postcard and bincode 2 are tested; other formats are not. Use JSON when the bytes must stay readable or outlive a release, and a compact format when size and speed matter. The sizes below are one 6-event transaction (BEGIN, INSERT, UPDATE, DELETE, a logical message, COMMIT) from the [`binary-serde`](examples/binary-serde) example:
+`ChangeEvent` implements serde's `Serialize` and `Deserialize`, so an event can go to another process, a queue or a file in a serde format. JSON, CBOR, MessagePack, postcard and bincode 2 are tested; other formats are not. Use JSON when the bytes must stay readable or outlive a release, and a compact format when size and speed matter. Sizes for one 6-event transaction (BEGIN, INSERT, UPDATE, DELETE, a logical message, COMMIT) from the [`binary-serde`](examples/binary-serde) example:
 
 | Format | Crate | Transaction | Read across versions | Notes |
 |--------|-------|------------:|----------------------|-------|
 | JSON | `serde_json` | 1174 B (100%) | yes, bytes are unchanged | readable, any language; the one to store long-term |
-| CBOR | `ciborium` | 933 B (79%) | no, see the [upgrade notes](#installation) | self-describing, writes field names, other languages can read it |
-| MessagePack | `rmp-serde` | 498 B (42%) | no, see the [upgrade notes](#installation) | other languages can read it; `to_vec` writes fields as an array, `to_vec_named` keeps field names |
+| CBOR | `ciborium` | 933 B (79%) | no, see [Upgrading](#upgrading-from-09) | self-describing, writes field names |
+| MessagePack | `rmp-serde` | 498 B (42%) | no, see [Upgrading](#upgrading-from-09) | `to_vec` writes fields as an array, `to_vec_named` keeps field names |
 | postcard | `postcard` | 349 B (30%) | same version on both ends | smallest, `no_std` friendly, Rust to Rust |
 | bincode 2 | `bincode` | 361 B (31%) | same version on both ends | Rust to Rust; the crate is unmaintained, so prefer postcard in new code |
-
-### Encode and decode
 
 ```rust,ignore
 use pg_walstream::ChangeEvent;
@@ -250,84 +152,15 @@ let bytes: Vec<u8> = postcard::to_allocvec(&event)?;     // producer
 let event: ChangeEvent = postcard::from_bytes(&bytes)?;  // consumer
 ```
 
-The other formats work the same way:
+The other formats work the same way (`serde_json::to_vec`, `ciborium::into_writer`, `rmp_serde::to_vec`, `bincode::serde::encode_to_vec`). Encode each event as it arrives and call `update_applied_lsn` only after it has been handed off safely. To write many events into one file, put them back to back and read them with `postcard::take_from_bytes` (or bincode's `decode_from_slice`).
 
-```rust,ignore
-// JSON
-let bytes = serde_json::to_vec(&event)?;
-let event: ChangeEvent = serde_json::from_slice(&bytes)?;
+- **Same version for postcard and bincode.** They carry no field names and read fields and variants by position, so their bytes are meant to be read by the pg_walstream version that wrote them. MessagePack from `rmp_serde::to_vec` also writes fields by position. Keep events you store long-term as JSON.
+- **Untrusted bytes.** Malformed bytes make JSON, CBOR, MessagePack and postcard return an error instead of panicking, and a row reserves room for at most 1600 columns up front whatever length the bytes claim. None of them detects a corrupted value inside an otherwise well-formed event, so add your own checksum if you need that. bincode 2's default configuration allocates whatever length a string claims, which can abort the process: decode bytes you did not write yourself only with a limit above your largest row, `bincode::config::standard().with_limit::<{ 1024 * 1024 }>()`.
+- **Your own envelope.** An ordinary enum around a `ChangeEvent` works with every format. `#[serde(tag = "...")]`, `#[serde(untagged)]` and `#[serde(flatten)]` work with JSON, CBOR and MessagePack, never with postcard or bincode (serde's own limit).
+- **What changes on the wire.** JSON is exactly what it always was: `null` for NULL, a string for text, `{"$binary":"<hex>"}` for binary data and non-UTF-8 text, and `xid` left out when `None`. Every other format writes a column as `None` for NULL and otherwise as `Some` of `Text` or `Binary` holding the raw bytes, and always writes `xid`.
+- **Non-UTF-8 text.** A PostgreSQL text column can hold bytes that are not UTF-8. JSON reads them back as `Binary`; the other formats keep them as `Text`.
 
-// CBOR
-let mut bytes = Vec::new();
-ciborium::into_writer(&event, &mut bytes)?;
-let event: ChangeEvent = ciborium::from_reader(&bytes[..])?;
-
-// MessagePack
-let bytes = rmp_serde::to_vec(&event)?;
-let event: ChangeEvent = rmp_serde::from_slice(&bytes)?;
-
-// bincode 2, with a limit above your largest row (see "Untrusted bytes" below)
-let config = bincode::config::standard().with_limit::<{ 1024 * 1024 }>();
-let bytes = bincode::serde::encode_to_vec(&event, config)?;
-let (event, _used): (ChangeEvent, usize) = bincode::serde::decode_from_slice(&bytes, config)?;
-```
-
-### From the replication stream
-
-Encode each event as it arrives and acknowledge it only after it has been handed off safely:
-
-```rust,ignore
-loop {
-    match stream.next_event_with_retry(&cancel_token).await {
-        Ok(event) => {
-            // One queue message per event needs no framing.
-            queue.send(postcard::to_allocvec(&event)?).await?;
-            stream.shared_lsn_feedback.update_applied_lsn(event.lsn.value());
-        }
-        Err(e) => {
-            eprintln!("stopping: {e}");
-            break;
-        }
-    }
-}
-```
-
-To write many events into one file or pipe, put them back to back. A postcard value ends where it ends, so the reader takes them one at a time:
-
-```rust,ignore
-let mut rest = &buffer[..];
-while !rest.is_empty() {
-    let (event, tail) = postcard::take_from_bytes::<ChangeEvent>(rest)?;
-    handle(event);
-    rest = tail;
-}
-```
-
-bincode's `decode_from_slice` also returns how many bytes it used. CBOR and MessagePack can be read from a reader one value at a time.
-
-### What changes on the wire
-
-serde lets a type write itself differently for text formats and binary ones, through `Serializer::is_human_readable()`. `ChangeEvent` does that:
-
-- **JSON** (human readable) is exactly what it always was: NULL is `null`, text is a JSON string, binary data and non-UTF-8 text are `{"$binary":"<hex>"}`, and `xid` is left out when it is `None`.
-- **Every other format** writes a column as `None` for NULL and otherwise as `Some` of `Text` or `Binary` holding the raw bytes. That needs no `deserialize_any`, which bincode and postcard do not implement, and `xid` is always written, because bincode and postcard read fields by position and a missing one would shift everything after it.
-
-### Things to know
-
-- **Same version for postcard and bincode.** They carry no field names and read fields and variants by position, so their bytes are meant to be read by the pg_walstream version that wrote them. MessagePack from `rmp_serde::to_vec` also writes fields by position (variants by name), so the same caution applies to it; CBOR and `rmp_serde::to_vec_named` write field names. Keep events you store long-term as JSON.
-- **Untrusted bytes.** Malformed bytes make JSON, CBOR, MessagePack and postcard return an error instead of panicking or aborting. None of them detects a corrupted value inside an otherwise well-formed event, which can decode as a different event, so add your own checksum if you need to catch that. When pg_walstream deserializes a row it reserves room for at most 1600 columns up front, whatever length the bytes claim. bincode 2 does not protect itself: its default configuration allocates whatever length a string or byte string claims, which can abort the process, so decode bytes you did not write yourself only with `with_limit`, as above. The limit applies to decoding and caps one event, so choose a value above your largest row; a bigger event fails with `LimitExceeded`.
-- **Your own envelope.** An ordinary enum around a `ChangeEvent` works with every format. `#[serde(tag = "...")]`, `#[serde(untagged)]` and `#[serde(flatten)]` work with JSON, CBOR and MessagePack, and never with postcard or bincode, which is serde's own limit.
-- **Non-UTF-8 text.** A PostgreSQL text column can hold bytes that are not UTF-8. JSON cannot write those as a string, so JSON reads them back as `Binary`; the other formats keep them as `Text`.
-- **Bytes written by 0.10.0.** CBOR and MessagePack bytes changed. Each column that is not NULL grows by five or six bytes (the `Text` or `Binary` tag) and `xid` is always written, so an INSERT with short values is noticeably larger (on two 12-column rows CBOR grew by 19% and 23%, MessagePack by 24% and 32%), while a BEGIN, COMMIT or logical message grows by a few percent. An event that holds a text or binary column cannot be read across the two versions in either direction; events without one decode both ways. With `rmp_serde`, calling `with_human_readable()` on both the serializer and the deserializer keeps the 0.10.0 bytes; CBOR has no such switch.
-
-### Try it
-
-The [`binary-serde`](examples/binary-serde) example needs no database. It encodes a small transaction in all five formats, checks that each reads the same events back, and shows the sizes, back-to-back framing, envelopes and a decode of hostile bytes:
-
-```bash
-cd examples/binary-serde
-cargo run
-```
+The [`binary-serde`](examples/binary-serde) example needs no database. It encodes a small transaction in all five formats, checks that each reads the same events back, and shows framing, envelopes and a decode of hostile bytes (`cd examples/binary-serde && cargo run`).
 
 ## LSN Tracking
 
@@ -335,7 +168,6 @@ Thread-safe LSN tracking for feedback to PostgreSQL:
 
 ```rust
 use pg_walstream::SharedLsnFeedback;
-use std::sync::Arc;
 
 let feedback = SharedLsnFeedback::new_shared();
 
@@ -345,6 +177,26 @@ let (flushed_lsn, applied_lsn) = feedback.get_feedback_lsn();
 // Consumer thread: update LSN after processing
 feedback.update_applied_lsn(commit_lsn);
 ```
+
+The stream sends this to PostgreSQL itself: at the first check after `feedback_interval` while messages flow (the check runs every 128th message), and whenever the server asks for a reply. A check sends only if a position moved; a reply the server asks for is always answered.
+
+### Acknowledging promptly on an idle stream
+
+The stream sends feedback only while it is being read, and an idle stream has no message to trigger a check. An acknowledgement raised while nothing arrives is therefore reported when the server next asks for a reply, every `wal_sender_timeout / 2` (30 s with the default 60 s). Nothing is lost and the connection stays up as long as the stream answers those requests, so this is slow, not unsafe. It matters when something waits on the slot's `confirmed_flush_lsn`:
+
+- a consumer named in `synchronous_standby_names`: other sessions' `COMMIT` waits for its flush position (measured at 28 s per commit);
+- a server with `wal_sender_timeout = 0`: it never asks, so an idle stream's acknowledgement is not reported at all;
+- a cutover or monitor that waits for the slot to catch up.
+
+To shorten the wait without a code change, shorten `wal_sender_timeout` for the replication connection: the server then asks every `T / 2`. The parameter can be set per session on PostgreSQL 14 to 18 (the versions checked), so any of these works, and the first two override the server-wide value, `0` included:
+
+| Where | How |
+|---|---|
+| Connection string | `...?replication=database&options=-c%20wal_sender_timeout%3D4s` |
+| Role | `ALTER ROLE cdc SET wal_sender_timeout = '4s'` |
+| Server | `wal_sender_timeout = '4s'` in `postgresql.conf` |
+
+The trade-off is that the same value is how long the stream may go without answering before the server disconnects it. Choose `T = 2 × the delay you accept`, and keep it above the longest pause your consumer takes between reads (a handler that blocks, a slow downstream write). A disconnected stream is recovered by `next_event_with_retry`, which reconnects and resumes from the last confirmed position, but it costs a reconnect and a replay of the unconfirmed transactions. Measured on PostgreSQL 17 with the native backend: `T` of 4, 10 and 20 s reported an idle acknowledgement after 2, 5 and 10 s, and a 10 s pause between reads disconnected the stream at `T = 4 s` but not at `T = 20 s`.
 
 ## Initial Snapshot
 
@@ -360,7 +212,7 @@ let stream = LogicalReplicationStream::new(conn_str, config).await?;
 let sink = Arc::new(sink);
 
 let mut stream = match stream.snapshot().await? {
-    // The slot already existed, so there is nothing to copy — the normal
+    // The slot already existed, so there is nothing to copy: the normal
     // "resume an existing subscription" path. Not an error.
     SnapshotOutcome::Unavailable(stream) => stream,
 
@@ -380,11 +232,7 @@ let mut stream = match stream.snapshot().await? {
 stream.start(None).await?;
 ```
 
-`snapshot()` sets `SNAPSHOT 'export'` on the slot itself — there is no flag to remember and no builder-ordering rule to get wrong.
-
-Snapshot rows arrive as ordinary `ChangeEvent::Insert`s carrying the slot's
-consistent point as their LSN, so an existing `WalRouter` works across both
-phases with the same handlers:
+`snapshot()` sets `SNAPSHOT 'export'` on the slot itself, so there is no flag to remember and no builder-ordering rule to get wrong. Snapshot rows arrive as ordinary `ChangeEvent::Insert`s carrying the slot's consistent point as their LSN, so an existing `WalRouter` works across both phases with the same handlers:
 
 ```rust
 let mut router = WalRouter::new();
@@ -403,18 +251,15 @@ stream.start(None).await?;
 router.run(&mut stream.into_stream(token)).await?;  // live phase, same handlers
 ```
 
-> Use `snapshot.rows()` instead of `.events()` to iterate `SnapshotRow`s (`.data`, `.relation`, `.lsn`) without the `ChangeEvent` wrapper. To copy only part of a large publication, bind the snapshot as `mut` and call `snapshot.retain_tables(..)` before `.events()`/`.rows()`.
+A complete, runnable version, including a row inserted *during* the handoff window to prove it arrives exactly once, is in [`examples/initial-snapshot`](examples/initial-snapshot).
 
-A complete, runnable version of the above — including a row inserted *during* the handoff window to prove it arrives exactly once — is in [`examples/initial-snapshot`](examples/initial-snapshot).
-> **A failed snapshot cannot be resumed.** The exported snapshot is `REPEATABLE READ`; continuing against an expired one would silently mix rows from two points in time. You own the retry policy; the library owns the retry *start point*, which is always the beginning. A failed or dropped snapshot handle makes a best-effort attempt to drop its slot — a failure to drop is logged, not returned — so a retry normally gets a fresh export instead of finding the slot present and silently proceeding with no baseline.
-
-> **Holding a snapshot handle blocks `VACUUM`.** The handle keeps a `REPEATABLE READ` transaction open, pinning the database's `xmin` — no dead tuple newer than the snapshot can be reclaimed, across the whole database, for as long as you hold it. Copy promptly.
+- Use `snapshot.rows()` instead of `.events()` to iterate `SnapshotRow`s (`.data`, `.relation`, `.lsn`) without the `ChangeEvent` wrapper. To copy only part of a large publication, bind the snapshot as `mut` and call `snapshot.retain_tables(..)` before `.events()` or `.rows()`.
+- **A failed snapshot cannot be resumed.** The exported snapshot is `REPEATABLE READ`; continuing against an expired one would silently mix rows from two points in time. You own the retry policy; the retry always starts from the beginning. A failed or dropped snapshot handle makes a best-effort attempt to drop its slot (a failure to drop is logged, not returned), so a retry normally gets a fresh export.
+- **Holding a snapshot handle blocks `VACUUM`.** The handle keeps a `REPEATABLE READ` transaction open, pinning the database's `xmin` for as long as you hold it. Copy promptly.
 
 ### Tables added while the stream runs
 
-`capture_aligned` copies extra tables through a temporary side slot's exported snapshot, exact at its consistent point `C`. Commit the `ALTER PUBLICATION ... ADD TABLE` first. A table added while the capture waits can lose a row written before the `ALTER` committed.
-
-The walsender drops a stream that sends no status update for `wal_sender_timeout`, so keep calling `send_feedback()` while the capture waits and while the copy loads. The capture future borrows nothing from the stream. Do not read the stream until the capture returns, because a read can pass `C`, which `next_event_before` cannot undo:
+`capture_aligned` copies extra tables through a temporary side slot's exported snapshot, exact at its consistent point `C`, and `next_event_before(C)` returns `None` once every transaction committed below `C` has been delivered. Commit the `ALTER PUBLICATION ... ADD TABLE` first. The walsender drops a stream that sends no status update for `wal_sender_timeout`, so keep calling `send_feedback()` while the capture waits and the copy loads. Do not read the stream until the capture returns, because a read can pass `C`, which `next_event_before` cannot undo:
 
 ```rust
 let capture = stream.capture_aligned(&[("public", "orders")]);
@@ -446,13 +291,12 @@ copy.finish()?;
 // stream.next_event(&cancel) continues at the first transaction committed at or past c.
 ```
 
-`next_event_before(C)` returns `None` once every transaction committed below `C` has been delivered. Decide each transaction at its commit event. Below `C`, apply it without the copied tables' rows, which the copy already holds. At or past `C`, apply it in full, after the copy. A transaction that ends in `RollbackPrepared` or in a `StreamAbort` of the whole transaction is dropped. A `StreamAbort` of a subtransaction drops the buffered changes whose `ChangeEvent::xid` equals its `subtransaction_xid`, except a `Message`, which always carries the top-level xid. Streamed chunks, `BeginPrepare` through `Prepare`, and `StreamPrepare` can arrive before the `None` for a transaction that commits at or past `C`, so buffer each transaction until its commit event. `EventStream::next_event_before` does the same with retries.
+- **Decide each transaction at its commit event.** Below `C`, apply it without the copied tables' rows, which the copy already holds; at or past `C`, apply it in full, after the copy. Buffer each transaction until its commit event, because streamed chunks and prepared transactions can arrive before the `None`.
+- **Acknowledge each transaction you decided below `C` before the copy loads.** A reconnect replays from the acknowledged position, so without it every transaction delivered before the `None` is applied twice (50 of 50 in a measured idle-database run). `EventStream::next_event_before` reconnects without telling you, so also start a buffered transaction over when a `Begin`, a `BeginPrepare` or a `StreamStart` with `first_segment` arrives for one you already hold (a precaution: that replay of a streamed transaction was not reproduced).
+- **The copy pins `xmin` and holds an `ACCESS SHARE` lock on each copied table until `finish()`.** Reads and writes go on, but a `TRUNCATE`, `ALTER TABLE`, `DROP`, `VACUUM FULL` or `CLUSTER` on those tables waits, and writes behind it wait with it. Give that DDL a `lock_timeout`, or run it before the capture or after the copy.
+- **`capture` has no deadline of its own.** Slot creation waits for the transactions open when it starts, so end the blocker or cancel the walsender with `pg_cancel_backend`.
 
-Acknowledge each transaction you decided below `C` (`update_applied_lsn` with its commit event's `lsn`, or `EventStream::update_applied_lsn`) before the copy loads. A reconnect replays from the acknowledged position, so without it every transaction delivered before the `None` arrives again after the copy and is applied twice: 50 of 50 transactions in a measured idle-database run, none with the acknowledgement. `EventStream::next_event_before` reconnects without telling you, so also start a buffered transaction over when a `Begin`, a `BeginPrepare` or a `StreamStart` with `first_segment` arrives for one you already hold. That replay of a streamed transaction was not reproduced, so treat it as a precaution.
-
-The capture holds a second replication connection and a temporary slot until slot creation ends. `capture_aligned` fails with a permanent error, before creating the slot, if that connection reaches another cluster or timeline than the stream's, which a connection string with several hosts can cause. Slot creation waits for the transactions open when it starts and can also wait for ones that start during the wait, a prepared transaction left open included. `capture` has no deadline of its own: end the blocker, or cancel the walsender from a second connection with `SELECT pg_cancel_backend(active_pid) FROM pg_replication_slots WHERE slot_name LIKE 'pg_walstream_aligned_%'`. Dropping the capture future closes its connections, but a slot creation already sent keeps its walsender waiting on the server, so abandoned captures behind a long transaction can exhaust `max_wal_senders`. `with_cancellation` covers only the copy loop, and `next_row()` is not cancel-safe where a table's `COPY` starts, so do not race it in a `select!` that can drop it.
-
-The copy pins `xmin` until `finish()`, and it holds an `ACCESS SHARE` lock on each copied table from `capture` on. Reads and writes go on, but a `TRUNCATE`, `ALTER TABLE`, `DROP`, `VACUUM FULL` or `CLUSTER` on those tables waits until `finish()` or drop, and writes issued behind a waiting one wait with it (an `ALTER TABLE` waited 2.4 s, an `INSERT` behind it failed with `55P03` at its 2 s `lock_timeout`). Give that DDL a `lock_timeout`, or run it before the capture or after the copy. The lock is what keeps the copy exact: a `COPY` reads the table's current file, so a `TRUNCATE` or rewriting `ALTER TABLE` committed after `C` would otherwise return it empty. If such a command is in flight when `capture` asks for its lock, or committed after `C`, `capture` fails and you capture again.
+The rustdoc of `LogicalReplicationStream::capture_aligned` has the full list of hazards (connection limits, cancel safety, lock behaviour, abort handling).
 
 ## Connection Timeouts
 
@@ -461,55 +305,43 @@ Three conninfo options bound three different things, and they are easy to mistak
 | Option | Unit | Bounds |
 |---|---|---|
 | `connect_timeout` | seconds | Only the TCP connect. On the native backend TLS negotiation and startup/auth are **not** covered; libpq bounds the whole handshake with each address, then tries the next host. |
-| `keepalives_idle` / `_interval` / `_count` | seconds | An **idle** connection. Defaults `120`/`10`/`3` — roughly 150 s to notice a peer that vanished while nothing was in flight. |
-| `tcp_user_timeout` | **milliseconds** | An unacknowledged **write**. This is the only one that bounds a blocking round-trip — including the `DROP_REPLICATION_SLOT` that snapshot cleanup runs from `Drop`. Linux-family only; `0` (the default) disables it. |
+| `keepalives_idle` / `_interval` / `_count` | seconds | An **idle** connection. Defaults `120`/`10`/`3`: roughly 150 s to notice a peer that vanished while nothing was in flight. |
+| `tcp_user_timeout` | **milliseconds** | An unacknowledged **write**. This is the only one that bounds a blocking round-trip, including the `DROP_REPLICATION_SLOT` that snapshot cleanup runs from `Drop`. Linux-family only; `0` (the default) disables it. |
 
-If a stuck destructor or a wedged blocking command matters to you, `tcp_user_timeout` is the knob — keepalives will not do it, because a connection waiting for a reply is not idle. The async stream methods (`new`, `start`, `snapshot`, and reconnects) never block their thread, so an enclosing `tokio::time::timeout` also bounds them. A connection whose command was cancelled refuses further commands and must be dropped.
+If a stuck destructor or a wedged blocking command matters to you, `tcp_user_timeout` is the knob, because a connection waiting for a reply is not idle and keepalives will not help. Set it deliberately: an aggressive value tears down healthy long-lived replication connections during ordinary transient stalls. The async stream methods (`new`, `start`, `snapshot`, and reconnects) never block their thread, so an enclosing `tokio::time::timeout` also bounds them. A connection whose command was cancelled refuses further commands and must be dropped.
 
-> Set it deliberately. An aggressive `tcp_user_timeout` tears down healthy long-lived replication connections during ordinary transient stalls, which is usually worse than the delay it prevents.
+## Session Parameters
+
+`application_name` and `options` in the connection string reach the server's startup message on both backends:
+
+```text
+postgresql://user:pass@host/db?replication=database&application_name=orders-cdc&options=-c%20TimeZone%3DUTC
+```
+
+- `application_name` names the walsender in `pg_stat_activity` and `pg_stat_replication`, and is what `synchronous_standby_names` matches (the consumer counts as a synchronous standby once it has acknowledged a position). `fallback_application_name` applies only when it is absent.
+- `options` pins GUCs for the session. The text of a decoded `timestamptz`, date or interval follows the walsender's `TimeZone`, `DateStyle` and `IntervalStyle`, so pin them when the same value must render the same wherever it is read. `client_encoding` cannot be changed this way: the stream decodes UTF-8.
+- `PGAPPNAME` and `PGOPTIONS` are not read; of the environment variables only `PGPASSWORD` is.
 
 ## PostgreSQL Setup
 
-Before using this library, you need to configure PostgreSQL for replication:
-
-### 1. Configure PostgreSQL
-
-Edit `postgresql.conf`:
-
 ```conf
+# postgresql.conf (restart required)
 wal_level = logical
 max_replication_slots = 4
 max_wal_senders = 4
 ```
 
-Restart PostgreSQL after making these changes.
-
-### 2. Create a Publication
-
 ```sql
--- Create a publication for specific tables
+-- A publication for specific tables (or FOR ALL TABLES)
 CREATE PUBLICATION my_publication FOR TABLE users, orders;
 
--- Or publish all tables
-CREATE PUBLICATION my_publication FOR ALL TABLES;
-```
-
-### 3. Create Replication User
-
-```sql
--- Create a user with replication privileges
+-- A user with replication privileges
 CREATE USER replication_user WITH REPLICATION PASSWORD 'secure_password';
-
--- Grant necessary permissions
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO replication_user;
 GRANT USAGE ON SCHEMA public TO replication_user;
 ```
 
-### 4. Replication Slot Options
-
-`start()` creates missing slots by default. Set `ReplicationStreamConfig::with_existing_slot_required(true)` to refuse automatic creation on startup and recovery, while explicit `ensure_replication_slot()` and `snapshot()` can still create slots. Slot creation SQL follows the connected PostgreSQL version.
-- **PG14**: Legacy positional keyword syntax (`EXPORT_SNAPSHOT`, `NOEXPORT_SNAPSHOT`, `USE_SNAPSHOT`, `TWO_PHASE`, `RESERVE_WAL`)
-- **PG15+**: Modern parenthesized options syntax (`(SNAPSHOT 'export', TWO_PHASE true, ...)`)
+`start()` creates a missing slot by default. Set `ReplicationStreamConfig::with_existing_slot_required(true)` to refuse automatic creation on startup and recovery, while explicit `ensure_replication_slot()` and `snapshot()` can still create slots. Slot creation SQL follows the connected PostgreSQL version (legacy keyword syntax on PG14, parenthesized options on PG15+).
 
 | Option | Description | PG Version |
 |--------|-------------|------------|
@@ -519,220 +351,50 @@ GRANT USAGE ON SCHEMA public TO replication_user;
 | `snapshot` | Snapshot behavior: `"export"`, `"use"`, or `"nothing"` | 14+ |
 | `failover` | Enable slot synchronization to standbys for HA | 16+ |
 
-> **Note:** If both `two_phase` and `snapshot` are set, `two_phase` takes priority. An option newer than the connected server is rejected client-side with the required version in the message, before any SQL is sent.
-
-`failover` slots also need the standby configured for slot sync: `sync_replication_slots = on`, `hot_standby_feedback = on`, and a `primary_conninfo` that **includes `dbname`** (`pg_basebackup -R` omits it). After a promotion the consumer only changes its connection string — the slot is already there.
+If both `two_phase` and `snapshot` are set, `two_phase` takes priority. An option newer than the connected server is rejected client-side with the required version in the message, before any SQL is sent. `failover` slots also need the standby configured for slot sync: `sync_replication_slots = on`, `hot_standby_feedback = on`, and a `primary_conninfo` that **includes `dbname`** (`pg_basebackup -R` omits it). After a promotion the consumer only changes its connection string, because the slot is already there.
 
 ## Message Types
 
-The library supports all PostgreSQL logical replication message types:
-
-### Protocol Version 1 Messages
-
-- **BEGIN**: Transaction start
-- **COMMIT**: Transaction commit
-- **ORIGIN**: Replication origin
-- **RELATION**: Table schema definition
-- **TYPE**: Data type definition
-- **INSERT**: Row insertion
-- **UPDATE**: Row update
-- **DELETE**: Row deletion
-- **TRUNCATE**: Table truncation
-- **MESSAGE**: Generic message
-
-### Protocol Version 2+ Messages (Streaming)
-
-- **STREAM_START**: Streaming transaction start
-- **STREAM_STOP**: Streaming transaction segment end
-- **STREAM_COMMIT**: Streaming transaction commit
-- **STREAM_ABORT**: Streaming transaction abort
-
-### Protocol Version 3+ Messages (Two-Phase Commit)
-
-- **BEGIN_PREPARE**: Prepared transaction start
-- **PREPARE**: Transaction prepare
-- **COMMIT_PREPARED**: Commit prepared transaction
-- **ROLLBACK_PREPARED**: Rollback prepared transaction
-- **STREAM_PREPARE**: Stream prepare message
+The parser handles every pgoutput message: `BEGIN`, `COMMIT`, `ORIGIN`, `RELATION`, `TYPE`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE` and `MESSAGE` (protocol v1); `STREAM_START`, `STREAM_STOP`, `STREAM_COMMIT` and `STREAM_ABORT` (v2+); `BEGIN_PREPARE`, `PREPARE`, `COMMIT_PREPARED`, `ROLLBACK_PREPARED` and `STREAM_PREPARE` (v3+). The formats are in [Logical Replication Message Formats](https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html).
 
 ## Architecture
 
-```
-┌──────────────────────────────────────────┐
-│          Application Layer               │
-│  (Your CDC / Replication Logic)          │
-└──────────────┬───────────────────────────┘
-               │
-┌──────────────▼───────────────────────────┐
-│    LogicalReplicationStream              │
-│  - Connection management & retry         │
-│  - Event processing & LSN feedback       │
-│  - Managed initial snapshot + handoff    │
-└──────────────┬───────────────────────────┘
-               │
-┌──────────────▼───────────────────────────┐
-│  LogicalReplicationParser                │
-│  - Protocol v1-v4 parsing                │
-│  - Zero-copy message deserialization     │
-│  - Streaming transaction support         │
-└──────────────┬───────────────────────────┘
-               │
-┌──────────────▼───────────────────────────┐
-│     PgReplicationConnection              │
-│  ┌─────────────────┬──────────────────┐  │
-│  │  libpq backend  │ rustls-tls       │  │
-│  │  (C FFI)        │ (pure Rust)      │  │
-│  │                 │                  │  │
-│  │  pq-sys         │ rustls +         │  │
-│  │                 │ aws-lc-rs +      │  │
-│  │                 │ postgres-protocol│  │
-│  └─────────────────┴──────────────────┘  │
-│  Compile-time feature flag selection     │
-└──────────────┬───────────────────────────┘
-               │
-┌──────────────▼───────────────────────────┐
-│     BufferReader / BufferWriter          │
-│  - Zero-copy operations (bytes crate)    │
-│  - Binary protocol handling              │
-│  - Drain-loop batch queue optimization   │
-└──────────────────────────────────────────┘
-```
+From the top down:
 
-## Backend Comparison & Stress Test
+- **`LogicalReplicationStream`**: connection management and retry, event processing and LSN feedback, snapshot handoff. `EventStream` and `WalRouter` build on it.
+- **`LogicalReplicationParser`**: protocol v1-v4 parsing, zero-copy, streaming transactions.
+- **`PgReplicationConnection`**: libpq (C FFI via `pq-sys`) or `rustls-tls` (`rustls` + `aws-lc-rs` + `postgres-protocol`), chosen at compile time.
+- **`BufferReader` / `BufferWriter`**: zero-copy binary protocol handling on the `bytes` crate.
 
-Progressive writer concurrency ramp (16 – 192 writers) plus a fixed scenario set, comparing the two connection backends.
+## Choosing a Backend
 
-- **Backend A**: rustls-tls (aws-lc-rs crypto)
-- **Backend B**: libpq (OpenSSL)
-
-**Test environment:** an 8-vCPU Linux VM (TCP-tuned per [Linux VM TCP Tuning](#linux-vm-tcp-tuning-for-production): 64 MB buffers, BBR) streaming from a **remote Azure PostgreSQL Flexible Server 18.6** across regions (~50 ms RTT). Each scenario ran 10 s warmup + 30 s measure. Process CPU/RSS reflect **only the pg-walstream consumer** — the write generator runs as a separate OS process.
-
-> **The `sslmode` you measure under decides the result.** Without TLS the two
-> backends are a statistical tie. With TLS, rustls-tls uses **~2.2x less CPU**
-> for the same event rate. Always state the sslmode alongside any backend number.
-
-## 1. CPU Efficiency (DML events/sec per 1% CPU)
-
-The primary efficiency metric: DML events processed per 1% of consumer CPU. Higher is better.
-
-| Scenario | rustls plain | libpq plain | rustls TLS | libpq TLS | libpq CPU vs rustls (TLS) |
-|----------|----------:|----------:|----------:|----------:|----------:|
-| Baseline | 6,670 | 7,135 | 3,759 | 1,739 | 2.13x |
-| Batch-100 | 2,080 | 1,940 | 1,633 | 996 | 1.61x |
-| Batch-5000 | 7,992 | 7,126 | 4,764 | 1,789 | 2.63x |
-| 4-Writers | 6,995 | 7,093 | 4,052 | 2,098 | 1.84x |
-| Wide-20col | 2,162 | 2,102 | 1,609 | 1,067 | 1.51x |
-| Payload-2KB | 2,279 | 2,165 | 1,611 | 1,104 | 1.46x |
-| Mixed-DML | 2,926 | 2,946 | 2,458 | 1,370 | 1.79x |
-| Stress-16w | 6,088 | 6,437 | 3,917 | 1,800 | 2.62x |
-| Stress-32w | 6,237 | 6,335 | 3,979 | 1,810 | 2.40x |
-| Stress-48w | 5,630 | 6,190 | 3,854 | 1,647 | 2.23x |
-| Stress-64w | 5,615 | 5,737 | 3,779 | 1,642 | 2.12x |
-| Stress-96w | 5,546 | 5,534 | 3,524 | 1,568 | 2.24x |
-| Stress-128w | 5,328 | 5,852 | 3,356 | 1,566 | 2.25x |
-| Stress-192w | 5,554 | 5,457 | 3,754 | 1,511 | 2.33x |
-
-Median over CPU-bound scenarios:
+The `sslmode` you measure under decides the result. Without TLS the two backends are a statistical tie; with TLS, `rustls-tls` needs about 2.2x less CPU for the same event rate. DML events per 1% of consumer CPU (higher is better), median over CPU-bound scenarios, streaming from a remote Azure PostgreSQL 18.6 over a ~50 ms link:
 
 | `sslmode` | rustls-tls | libpq | Ratio |
 |---|---:|---:|---:|
-| `disable` (no TLS) | 5,859 | 6,262 | **0.98x — tie** |
+| `disable` (no TLS) | 5,859 | 6,262 | **0.98x, a tie** |
 | `require` (TLS) | 3,817 | 1,693 | **2.22x rustls-tls** |
 
-Without TLS, per-scenario ratios scatter 0.90x – 1.12x with no directional lean — noise. TLS efficiency retained: **rustls-tls 66%, libpq 28%**.
-
-## 2. Why: OpenSSL per-call overhead, not crypto
-
-`perf` on the consumer during 4-Writers with TLS enabled:
-
-| | libpq | rustls-tls |
-|---|---:|---:|
-| TLS library share of process CPU | **20.79%** (libcrypto + libssl) | 12.48% (aws-lc-rs, static) |
-| ...of which is actual AES-GCM | **0.84%** | most of it |
-
-libpq spends ~20 points of CPU on TLS **bookkeeping** and under 1 point on real
-crypto. The hot OpenSSL symbols are all per-call setup — `ERR_clear_error`
-(1.67%, which libpq calls before every read), `BIO_ctrl`, `EVP_CIPHER_CTX_ctrl`.
-`libpq.so` itself is only 2.39%, so libpq's own code is cheap; the cost is the
-OpenSSL call sequence it performs per read. pg-walstream issues one
-`PQgetCopyData` per WAL message, so this **scales with message count, not bytes**.
-
-Measured against libpq 18.6 / OpenSSL 3.0.2. A newer OpenSSL would likely narrow this gap but not close it, since the per-read error-stack clear is libpq's own code.
-
-## 3. Throughput and Resources
-
-Throughput here is bounded by the write generator and the ~50 ms link, not by the consumer — so both backends land in the same range. The difference is the CPU spent getting there.
-
-| Metric | rustls-tls | libpq |
-|--------|------:|------:|
-| Peak DML events/sec (no TLS) | 213,392 | 202,347 |
-| Peak DML events/sec (TLS) | 161,151 | 156,813 |
-| CPU% at TLS peak | **38.9** | **80.9** |
-| Avg RSS (MB) | 15.7 | 17.0 |
-| P50 inter-event latency | 1 µs | 1 µs |
-
-RSS and latency show no backend advantage.
-
-## 4. Choosing a backend
-
-- **TLS link (any managed Postgres: Azure, RDS, Cloud SQL)** → prefer the default
-  **rustls-tls**; it needs roughly half the consumer CPU.
-- **TLS terminated elsewhere** (private network, sidecar/proxy) → the backends are a tie; choose on operational grounds (libpq needs `libpq-dev` at runtime; rustls-tls is pure Rust with native SCRAM).
-
-For a detailed comparison across PostgreSQL 16 and 18 with different optimizations (binary mode, direct TLS, COPY protocol), see the [Load Test Comparison Report](LOAD_TEST_COMPARISON.md).
-
-## Linux VM TCP Tuning for Production
-
-When streaming WAL over high-latency links (e.g., cross-region Azure PostgreSQL), the default Linux TCP buffer sizes can become the throughput bottleneck. The kernel's default `rmem_max` of 208 KB limits the TCP receive window, which — combined with round-trip latency — caps throughput via the **Bandwidth-Delay Product (BDP)**:
-
-### Recommended sysctl Settings
-
-```conf
-# --- TCP buffer sizes ---
-# Allow up to 64 MB per-socket receive/send buffers (kernel will auto-tune within this ceiling)
-net.core.rmem_max = 67108864
-net.core.wmem_max = 67108864
-
-# TCP auto-tuning ranges: min / default / max (bytes)
-# The kernel dynamically adjusts each socket's buffer within these bounds
-net.ipv4.tcp_rmem = 4096 262144 67108864
-net.ipv4.tcp_wmem = 4096 262144 67108864
-
-# --- Congestion control ---
-# BBR provides significantly better throughput than cubic on high-latency links
-net.ipv4.tcp_congestion_control = bbr
-
-# --- Packet backlog ---
-# Increase the NIC receive queue (helps at high packet rates)
-net.core.netdev_max_backlog = 5000
-```
-
-Apply immediately:
-
-```bash
-sudo sysctl --system
-```
-
-### Why Each Parameter Matters
-
-| Parameter | Default | Recommended | Why |
-|-----------|---------|-------------|-----|
-| `rmem_max` | 208 KB | 64 MB | Caps TCP receive window; directly limits throughput on high-RTT links |
-| `wmem_max` | 208 KB | 64 MB | Caps TCP send window; limits outbound throughput for feedback messages |
-| `tcp_rmem` (max) | 6 MB | 64 MB | Per-socket auto-tuned receive buffer ceiling |
-| `tcp_wmem` (max) | 4 MB | 64 MB | Per-socket auto-tuned send buffer ceiling |
-| `tcp_congestion_control` | cubic | bbr | BBR reacts to actual bandwidth, not packet loss; better on cloud networks |
-| `netdev_max_backlog` | 1000 | 5000 | Prevents packet drops under burst traffic at NIC level |
-
-> **Note:** These settings affect all TCP connections on the VM, not just pg-walstream. The kernel auto-tunes actual buffer usage within the configured ceiling, so idle connections do not consume 64 MB each.
+The gap is OpenSSL's per-call bookkeeping, not crypto: with TLS, libpq spends about 20% of process CPU in OpenSSL, of which 0.84% is AES-GCM, and the cost scales with message count because pg-walstream issues one `PQgetCopyData` per WAL message. So on a TLS link (any managed PostgreSQL) prefer the default `rustls-tls`; with TLS terminated elsewhere the backends tie, so choose on operational grounds (libpq needs `libpq-dev` at runtime; `rustls-tls` is pure Rust with native SCRAM). Per-scenario results, throughput and the host tuning used are in [`load-tests/README.md`](load-tests/README.md); a comparison across PostgreSQL 16 and 18 with different optimizations is in the [Load Test Comparison Report](LOAD_TEST_COMPARISON.md).
 
 ## Limitations
 
-- Requires PostgreSQL 14 or later for full protocol support
-- Logical replication slot must be created before streaming
-- Binary protocol only (no text-based protocol support)
-- Requires `replication` permission for the database user
-- A reconnect that lands on a different cluster or a new timeline (failover, PITR) is rejected as a permanent error rather than resumed: an LSN is only meaningful within one cluster on one timeline. Compare the confirmed LSN against the switchpoint in `TIMELINE_HISTORY <tli>` to decide whether to resume or re-sync
+- Requires PostgreSQL 14 or later, and the `replication` permission for the database user.
+- Decodes the binary `pgoutput` protocol only; other output plugins (`wal2json`, `test_decoding`) are not supported.
+- A reconnect that lands on a different cluster or a new timeline (failover, PITR) is rejected as a permanent error rather than resumed: an LSN is only meaningful within one cluster on one timeline. Compare the confirmed LSN against the switchpoint in `TIMELINE_HISTORY <tli>` to decide whether to resume or re-sync.
+
+## Upgrading from 0.9
+
+- **`ChangeEvent` has a new public field `xid: Option<u32>`.** Build events with `xid: None` and add `..` to struct patterns (`let ChangeEvent { event_type, lsn, .. } = event`). It is `Some` only for a `Relation`, `Type`, `Insert`, `Update`, `Delete`, `Truncate` or `Message` inside a streamed chunk.
+- **`ChangeEvent::encode` and `ChangeEvent::decode` (deprecated since 0.9.0) are removed.** Serialize events with `serde_json`; JSON written by 0.9 (no `xid` key) still deserializes, with `xid` as `None`. Bytes written by `encode` are not JSON and cannot be read after the upgrade, so convert them on 0.9 first.
+- **`ChangeEvent` now round-trips through bincode and postcard, and CBOR and MessagePack bytes change.** A serde format whose serializer reports `is_human_readable() == false` gets a compact `ColumnValue` (`None` for NULL, otherwise a `Text` or `Binary` variant holding the raw bytes) and always writes `xid`. JSON is byte-identical to before. A CBOR or MessagePack event that holds a text or binary column cannot be read across the two versions in either direction (events without one decode both ways), and an INSERT with short values grew by 19-32% on two 12-column rows, so convert stored events to JSON with 0.10.0 before upgrading. With `rmp_serde`, calling `with_human_readable()` on both the serializer and the deserializer keeps the 0.10.0 bytes. bincode and postcard bytes are only meant to be read by the pg_walstream version that wrote them; keep events you store long-term as JSON. See [Shipping Events Between Processes](#shipping-events-between-processes).
+- **`StreamingReplicationMessage::xid`, returned by `LogicalReplicationParser::parse_wal_message`, changes meaning inside a streamed chunk (protocol v2+).** For `Relation`, `Type`, `Insert`, `Update`, `Delete`, `Truncate` and `Message` it is now the xid pgoutput wrote before that change, which is a subtransaction's xid after a savepoint; it used to be the chunk's xid. A consumer that buffers rows by `xid` and flushes on `StreamCommit` must take the top-level xid from `StreamStart`, or it strands the savepoint's rows. A `Message` always carries the top-level xid.
+- **The `libpq` feature now also builds `socket2`,** which only `rustls-tls` needed before.
+- **`LogicalReplicationStream::new` now runs `IDENTIFY_SYSTEM`, which `start` ran before:** one more round trip at construction. A reply with no usable system identifier and timeline now fails `new` with `ReplicationError::PermanentConnection`, where `start` used to continue without it. `server_identity()` returns what it read.
+- **`send_feedback()` before `start()` returns `ReplicationError::Protocol`;** it returned `Ok(())`. After `start()` and before the first message it sends an all-zero status update instead of returning early, and `stop()` of a stream that was never started logs a warning.
+- **A cancelled command poisons the connection.** If the future of `start()`, `slot_confirmed_flush_lsn()` or `timeline_history()` is dropped before the reply arrives, every later command on that connection fails with `ReplicationError::PermanentConnection`; create a new stream.
+- **`EventStream::next_event` carries a reconnect across a dropped future.** A `timeout` or `select!` that cancels `next_event()` while the stream reconnects no longer restarts the reconnect from its first attempt; the next call resumes it, so a timeout shorter than a reconnect cannot starve it. While such a reconnect is parked, `inner()`, `inner_mut()` and `current_lsn()` panic until the next `next_event()` returns (as they already do after an abandoned `poll_next`); the feedback methods keep working.
+- **The minimum supported Rust version is 1.88.**
 
 ## Resources
 
@@ -740,14 +402,8 @@ sudo sysctl --system
 - [Logical Replication Message Formats](https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html)
 - [Replication Protocol](https://www.postgresql.org/docs/current/protocol-replication.html)
 
-## Contributing
+## Contributing and License
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). This project is licensed under the [BSD 3-Clause License](LICENSE).
 
-## License
-
-This project is licensed under the [BSD 3-Clause License](LICENSE).
-
-## Author
-
-Daniel Shih (dog830228@gmail.com)
+Author: Daniel Shih (dog830228@gmail.com)

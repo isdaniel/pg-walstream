@@ -7,7 +7,7 @@
 //! 4. Authentication delegation to `auth.rs`
 //! 5. Backend parameter processing until ReadyForQuery
 
-use super::conninfo::{ConnInfo, SslMode, SslNegotiation, SSLROOTCERT_SYSTEM};
+use super::conninfo::{ConnInfo, ReplicationMode, SslMode, SslNegotiation, SSLROOTCERT_SYSTEM};
 use super::wire;
 use crate::error::ReplicationError;
 use bytes::BytesMut;
@@ -728,6 +728,34 @@ impl rustls::client::danger::ServerCertVerifier for NoHostnameVerifier {
     }
 }
 
+/// The StartupMessage for `info`.
+///
+/// `options` goes out verbatim and `application_name` already resolved against
+/// `fallback_application_name`, as libpq sends them; neither is sent when unset.
+///
+/// `client_encoding` must stay: the server applies `options` first and the other
+/// parameters after it, so this is what keeps a `-c client_encoding=...` in
+/// `options` from making the stream's UTF-8 decoding read mojibake.
+fn build_startup(info: &ConnInfo) -> Result<BytesMut, ReplicationError> {
+    let mut params: Vec<(&str, &str)> = vec![
+        ("user", &info.user),
+        ("database", &info.dbname),
+        ("client_encoding", "UTF8"),
+    ];
+    match info.replication {
+        ReplicationMode::Database => params.push(("replication", "database")),
+        ReplicationMode::Physical => params.push(("replication", "true")),
+        ReplicationMode::None => {}
+    }
+    if let Some(options) = &info.options {
+        params.push(("options", options));
+    }
+    if let Some(name) = &info.application_name {
+        params.push(("application_name", name));
+    }
+    wire::build_startup_message(&params)
+}
+
 /// Send the StartupMessage and handle authentication + parameter negotiation.
 ///
 /// Returns the server version number (e.g. 160001 for 16.1).
@@ -736,27 +764,7 @@ async fn startup_and_auth(
     buf: &mut BytesMut,
     info: &ConnInfo,
 ) -> Result<i32, ReplicationError> {
-    // Build startup parameters
-    let replication_str;
-    let mut params: Vec<(&str, &str)> = vec![
-        ("user", &info.user),
-        ("database", &info.dbname),
-        ("client_encoding", "UTF8"),
-    ];
-
-    match info.replication {
-        super::conninfo::ReplicationMode::Database => {
-            replication_str = "database".to_string();
-            params.push(("replication", &replication_str));
-        }
-        super::conninfo::ReplicationMode::Physical => {
-            replication_str = "true".to_string();
-            params.push(("replication", &replication_str));
-        }
-        super::conninfo::ReplicationMode::None => {}
-    }
-
-    let startup_msg = wire::build_startup_message(&params);
+    let startup_msg = build_startup(info)?;
     wire::write_all(transport, &startup_msg).await?;
     wire::flush(transport).await?;
 
@@ -911,12 +919,143 @@ mod tests {
             sslrootcert,
             sslnegotiation: super::super::conninfo::SslNegotiation::Postgres,
             replication: super::super::conninfo::ReplicationMode::None,
+            application_name: None,
+            options: None,
             connect_timeout: 0,
             keepalives: true,
             keepalives_idle: 120,
             keepalives_interval: 10,
             keepalives_count: 3,
             tcp_user_timeout: 0,
+        }
+    }
+
+    /// The `(key, value)` pairs a server reads out of a StartupMessage.
+    fn startup_pairs(msg: &[u8]) -> Vec<(String, String)> {
+        let mut rest = &msg[8..]; // length, then protocol version
+        let mut pairs = Vec::new();
+        while rest.first().is_some_and(|b| *b != 0) {
+            let (key, n) = wire::read_cstring(rest);
+            rest = &rest[n..];
+            let (value, n) = wire::read_cstring(rest);
+            rest = &rest[n..];
+            pairs.push((key.to_string(), value.to_string()));
+        }
+        pairs
+    }
+
+    /// `application_name` and `options` are session parameters the libpq backend
+    /// has always sent. The native backend parsed them and dropped them, so the
+    /// walsender showed no name in `pg_stat_activity` and a pinned `TimeZone`
+    /// never applied.
+    #[test]
+    fn the_startup_message_carries_application_name_and_options() {
+        let mut info = test_conninfo(SslMode::Disable, None);
+        info.replication = ReplicationMode::Database;
+        info.application_name = Some("pgws cdc".to_string());
+        info.options = Some("-c TimeZone=Asia/Tokyo -c lock_timeout=2s".to_string());
+
+        let mut pairs = startup_pairs(&build_startup(&info).unwrap());
+        pairs.sort();
+
+        let want = [
+            ("application_name", "pgws cdc"),
+            ("client_encoding", "UTF8"),
+            ("database", "test"),
+            ("options", "-c TimeZone=Asia/Tokyo -c lock_timeout=2s"),
+            ("replication", "database"),
+            ("user", "test"),
+        ];
+        assert_eq!(
+            pairs,
+            want.map(|(k, v)| (k.to_string(), v.to_string())),
+            "the server must read exactly these parameters"
+        );
+    }
+
+    /// The replication mode is still the one the connection string asked for: `database`
+    /// for a logical session, `true` for a physical one.
+    #[test]
+    fn the_startup_message_keeps_the_replication_mode() {
+        for (mode, want) in [
+            (ReplicationMode::Database, Some("database")),
+            (ReplicationMode::Physical, Some("true")),
+            (ReplicationMode::None, None),
+        ] {
+            let mut info = test_conninfo(SslMode::Disable, None);
+            info.replication = mode;
+            let pairs = startup_pairs(&build_startup(&info).unwrap());
+            let sent = pairs.iter().find(|(k, _)| k == "replication");
+            assert_eq!(sent.map(|(_, v)| v.as_str()), want, "{mode:?}");
+        }
+    }
+
+    /// Nothing is sent for what was not asked for, so a plain connection string
+    /// still produces the startup message it always did.
+    #[test]
+    fn unset_session_parameters_are_not_sent() {
+        let pairs = startup_pairs(&build_startup(&test_conninfo(SslMode::Disable, None)).unwrap());
+        let mut keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["client_encoding", "database", "user"]);
+    }
+
+    /// `%00` decodes to a real NUL (libpq refuses it, `url_decode` passes it
+    /// through), and a quoted key=value string can hold one too. The startup
+    /// message is where a NUL does harm: it ends a value early and the rest is read
+    /// as further parameters. These switched the session to replication mode, or
+    /// set `options`, from a string that asked for neither.
+    #[test]
+    fn a_nul_in_the_connection_string_cannot_inject_startup_parameters() {
+        for dsn in [
+            "postgresql://u%00replication%00database@h/db",
+            "postgresql://u@h/db?application_name=x%00options%00-c%20search_path%3Devil",
+            "host=h options='-c a=b\0application_name\0evil'",
+        ] {
+            let info = ConnInfo::parse(dsn).unwrap();
+            let err = build_startup(&info).unwrap_err();
+            assert!(
+                matches!(err, ReplicationError::Config(_)),
+                "{dsn:?}: expected a Config error, got {err:?}"
+            );
+        }
+    }
+
+    /// The parameters reach the socket, not only the builder: this is what a
+    /// server reads off a real connection.
+    #[tokio::test]
+    async fn connect_sends_the_session_parameters_to_the_server() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            let mut len = [0u8; 4];
+            peer.read_exact(&mut len).await.unwrap();
+            let mut msg = len.to_vec();
+            msg.resize(i32::from_be_bytes(len) as usize, 0);
+            peer.read_exact(&mut msg[4..]).await.unwrap();
+            msg // dropping `peer` here ends the handshake
+        });
+
+        let mut info = test_conninfo(SslMode::Disable, None);
+        info.host = addr.ip().to_string();
+        info.port = addr.port();
+        info.application_name = Some("pgws-wire".to_string());
+        info.options = Some("-c TimeZone=Asia/Tokyo".to_string());
+
+        // The peer hangs up instead of authenticating: only what it received matters.
+        assert!(connect(&info).await.is_err());
+        let pairs = startup_pairs(&server.await.unwrap());
+        for want in [
+            ("application_name", "pgws-wire"),
+            ("options", "-c TimeZone=Asia/Tokyo"),
+        ] {
+            assert!(
+                pairs.contains(&(want.0.to_string(), want.1.to_string())),
+                "{want:?} missing from {pairs:?}"
+            );
         }
     }
 

@@ -80,8 +80,114 @@ by the consumer:
 - **CPU-bound** — the only scenarios where a backend efficiency comparison is
   meaningful.
 
-Tune the host first when testing across regions; see *Linux VM TCP Tuning* in the
-[root README](../README.md).
+Tune the host first when testing across regions; see
+[Linux VM TCP tuning](#linux-vm-tcp-tuning-for-production) below.
+
+## Reference results
+
+Environment: an 8-vCPU Linux VM (TCP-tuned as below: 64 MB buffers, BBR) streaming
+from a **remote Azure PostgreSQL Flexible Server 18.6** across regions (~50 ms RTT).
+Each scenario ran 10 s warmup + 30 s measure. Process CPU/RSS reflect **only the
+pg-walstream consumer**: the write generator runs as a separate OS process.
+Backend A is rustls-tls (aws-lc-rs); backend B is libpq 18.6 with OpenSSL 3.0.2.
+
+### CPU efficiency (DML events/sec per 1% CPU)
+
+The primary efficiency metric: DML events processed per 1% of consumer CPU. Higher is better.
+
+| Scenario | rustls plain | libpq plain | rustls TLS | libpq TLS | libpq CPU vs rustls (TLS) |
+|----------|----------:|----------:|----------:|----------:|----------:|
+| Baseline | 6,670 | 7,135 | 3,759 | 1,739 | 2.13x |
+| Batch-100 | 2,080 | 1,940 | 1,633 | 996 | 1.61x |
+| Batch-5000 | 7,992 | 7,126 | 4,764 | 1,789 | 2.63x |
+| 4-Writers | 6,995 | 7,093 | 4,052 | 2,098 | 1.84x |
+| Wide-20col | 2,162 | 2,102 | 1,609 | 1,067 | 1.51x |
+| Payload-2KB | 2,279 | 2,165 | 1,611 | 1,104 | 1.46x |
+| Mixed-DML | 2,926 | 2,946 | 2,458 | 1,370 | 1.79x |
+| Stress-16w | 6,088 | 6,437 | 3,917 | 1,800 | 2.62x |
+| Stress-32w | 6,237 | 6,335 | 3,979 | 1,810 | 2.40x |
+| Stress-48w | 5,630 | 6,190 | 3,854 | 1,647 | 2.23x |
+| Stress-64w | 5,615 | 5,737 | 3,779 | 1,642 | 2.12x |
+| Stress-96w | 5,546 | 5,534 | 3,524 | 1,568 | 2.24x |
+| Stress-128w | 5,328 | 5,852 | 3,356 | 1,566 | 2.25x |
+| Stress-192w | 5,554 | 5,457 | 3,754 | 1,511 | 2.33x |
+
+Without TLS, per-scenario ratios scatter 0.90x - 1.12x with no directional lean:
+noise. TLS efficiency retained: **rustls-tls 66%, libpq 28%**.
+
+### Why: OpenSSL per-call overhead, not crypto
+
+`perf` on the consumer during 4-Writers with TLS enabled:
+
+| | libpq | rustls-tls |
+|---|---:|---:|
+| TLS library share of process CPU | **20.79%** (libcrypto + libssl) | 12.48% (aws-lc-rs, static) |
+| ...of which is actual AES-GCM | **0.84%** | most of it |
+
+libpq spends ~20 points of CPU on TLS **bookkeeping** and under 1 point on real
+crypto. The hot OpenSSL symbols are all per-call setup: `ERR_clear_error` (1.67%,
+which libpq calls before every read), `BIO_ctrl`, `EVP_CIPHER_CTX_ctrl`. `libpq.so`
+itself is only 2.39%, so libpq's own code is cheap; the cost is the OpenSSL call
+sequence it performs per read. A newer OpenSSL would likely narrow this gap but not
+close it, since the per-read error-stack clear is libpq's own code.
+
+### Throughput and resources
+
+Throughput is bounded by the write generator and the ~50 ms link, not by the
+consumer, so both backends land in the same range. The difference is the CPU spent
+getting there.
+
+| Metric | rustls-tls | libpq |
+|--------|------:|------:|
+| Peak DML events/sec (no TLS) | 213,392 | 202,347 |
+| Peak DML events/sec (TLS) | 161,151 | 156,813 |
+| CPU% at TLS peak | **38.9** | **80.9** |
+| Avg RSS (MB) | 15.7 | 17.0 |
+| P50 inter-event latency | 1 µs | 1 µs |
+
+RSS and latency show no backend advantage.
+
+## Linux VM TCP tuning for production
+
+When streaming WAL over high-latency links (e.g., cross-region Azure PostgreSQL), the
+default Linux TCP buffer sizes can become the throughput bottleneck. The kernel's
+default `rmem_max` of 208 KB limits the TCP receive window, which, combined with
+round-trip latency, caps throughput via the **Bandwidth-Delay Product (BDP)**:
+
+```conf
+# --- TCP buffer sizes ---
+# Allow up to 64 MB per-socket receive/send buffers (kernel will auto-tune within this ceiling)
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+
+# TCP auto-tuning ranges: min / default / max (bytes)
+# The kernel dynamically adjusts each socket's buffer within these bounds
+net.ipv4.tcp_rmem = 4096 262144 67108864
+net.ipv4.tcp_wmem = 4096 262144 67108864
+
+# --- Congestion control ---
+# BBR provides significantly better throughput than cubic on high-latency links
+net.ipv4.tcp_congestion_control = bbr
+
+# --- Packet backlog ---
+# Increase the NIC receive queue (helps at high packet rates)
+net.core.netdev_max_backlog = 5000
+```
+
+Apply immediately with `sudo sysctl --system`.
+
+| Parameter | Default | Recommended | Why |
+|-----------|---------|-------------|-----|
+| `rmem_max` | 208 KB | 64 MB | Caps TCP receive window; directly limits throughput on high-RTT links |
+| `wmem_max` | 208 KB | 64 MB | Caps TCP send window; limits outbound throughput for feedback messages |
+| `tcp_rmem` (max) | 6 MB | 64 MB | Per-socket auto-tuned receive buffer ceiling |
+| `tcp_wmem` (max) | 4 MB | 64 MB | Per-socket auto-tuned send buffer ceiling |
+| `tcp_congestion_control` | cubic | bbr | BBR reacts to actual bandwidth, not packet loss; better on cloud networks |
+| `netdev_max_backlog` | 1000 | 5000 | Prevents packet drops under burst traffic at NIC level |
+
+> **Note:** These settings affect all TCP connections on the VM, not just pg-walstream.
+> The kernel auto-tunes actual buffer usage within the configured ceiling, so idle
+> connections do not consume 64 MB each.
 
 ## Layout
 
