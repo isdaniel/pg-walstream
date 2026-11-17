@@ -530,8 +530,10 @@ mod tests {
     }
 }
 
-/// Exhaustive interleaving checks: `RUSTFLAGS='--cfg loom' cargo test --lib --release lsn::loom_tests`.
-/// The filter is required, because other tests are not meant to run on loom's atomics.
+/// Exhaustive interleaving checks: `RUSTFLAGS='--cfg loom' cargo test --lib --release
+/// --no-default-features --features std lsn::loom_tests`. Both are required: the feature set,
+/// because tokio drops `net` under `--cfg loom`; the filter, because other tests are not meant
+/// to run on loom's atomics.
 #[cfg(all(test, loom))]
 mod loom_tests {
     use super::*;
