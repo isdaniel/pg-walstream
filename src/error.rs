@@ -246,11 +246,13 @@ impl ReplicationError {
     /// [`from_sqlstate`](Self::from_sqlstate) for an ErrorResponse received during
     /// connection startup, before any replication command has been issued.
     ///
-    /// Identical except that `55000` is **not** reported as
+    /// Identical except that `55000` and `42704` are **not** reported as
     /// [`ReplicationSlot`](Self::ReplicationSlot). At startup the server has not
     /// looked at a slot: `CheckMyDatabase` (postinit.c) raises `55000` for
     /// `database "%s" is not currently accepting connections` and
-    /// `cannot connect to invalid database "%s"`. Routing those to `ReplicationSlot`
+    /// `cannot connect to invalid database "%s"`, and a `-c name=value` in the
+    /// connection string's `options` that names no setting raises `42704`
+    /// (`unrecognized configuration parameter`). Routing those to `ReplicationSlot`
     /// — documented as "invalidated / does not exist, drop it and re-sync" — points
     /// an operator at a perfectly healthy slot. Both variants are permanent, so this
     /// changes the diagnosis, not the control flow.
@@ -260,7 +262,7 @@ impl ReplicationError {
     #[cfg(feature = "rustls-tls")]
     pub(crate) fn from_sqlstate_startup<S: Into<String>>(sqlstate: &str, msg: S) -> Self {
         let msg = msg.into();
-        if sqlstate == "55000" {
+        if matches!(sqlstate, "55000" | "42704") {
             return ReplicationError::PermanentConnection(format!("[{sqlstate}] {msg}"));
         }
         Self::from_sqlstate(sqlstate, msg)
@@ -686,31 +688,45 @@ mod stop_signal_tests {
     }
 
     /// At startup the server has not looked at a slot: `CheckMyDatabase` raises
-    /// 55000 for `database "..." is not currently accepting connections`.
-    /// Reporting that as `ReplicationSlot` — documented as "invalidated, drop it
-    /// and re-sync" — sends an operator to destroy a healthy slot. Still
-    /// permanent either way, so only the diagnosis changes.
+    /// 55000 for `database "..." is not currently accepting connections`, and an
+    /// `options` string naming an unknown setting raises 42704 (`unrecognized
+    /// configuration parameter`). Reporting either as `ReplicationSlot` —
+    /// documented as "invalidated, drop it and re-sync" — sends an operator to
+    /// destroy a healthy slot. Still permanent either way, so only the diagnosis
+    /// changes.
     #[cfg(feature = "rustls-tls")]
     #[test]
-    fn from_sqlstate_startup_does_not_blame_the_slot_for_55000() {
-        let err = ReplicationError::from_sqlstate_startup(
-            "55000",
-            "database \"app\" is not currently accepting connections",
-        );
-        assert!(
-            matches!(err, ReplicationError::PermanentConnection(_)),
-            "{err:?}"
-        );
-        assert!(err.is_permanent());
+    fn from_sqlstate_startup_does_not_blame_the_slot() {
+        for (code, msg) in [
+            (
+                "55000",
+                "database \"app\" is not currently accepting connections",
+            ),
+            (
+                "42704",
+                "unrecognized configuration parameter \"not_a_guc\"",
+            ),
+        ] {
+            let err = ReplicationError::from_sqlstate_startup(code, msg);
+            assert!(
+                matches!(err, ReplicationError::PermanentConnection(_)),
+                "{code}: {err:?}"
+            );
+            assert!(err.is_permanent());
+            assert!(err.to_string().contains(code), "{code}: {err}");
 
-        // Post-connect, 55000 still means the slot.
-        assert!(matches!(
-            ReplicationError::from_sqlstate("55000", "can no longer access slot"),
-            ReplicationError::ReplicationSlot(_)
-        ));
+            // Post-connect, the same codes still mean the slot.
+            assert!(
+                matches!(
+                    ReplicationError::from_sqlstate(code, "slot problem"),
+                    ReplicationError::ReplicationSlot(_)
+                ),
+                "{code} must still mean the slot after connect"
+            );
+        }
 
         // Every other code classifies identically on both paths.
-        for code in ["28P01", "3D000", "57P03", "53300", "42704", "XX999"] {
+        for code in ["28P01", "3D000", "57P03", "53300", "XX999"] {
             assert_eq!(
                 core::mem::discriminant(&ReplicationError::from_sqlstate_startup(code, "m")),
                 core::mem::discriminant(&ReplicationError::from_sqlstate(code, "m")),

@@ -20,7 +20,7 @@ pub struct ConnInfo {
     pub replication: ReplicationMode,
     /// `application_name` for the startup message: what `pg_stat_activity` and `pg_stat_replication` show, and what `synchronous_standby_names` matches. Already resolved against `fallback_application_name` as libpq does; `None` when neither is set or the result is empty. libpq's `PGAPPNAME` is not read, as with every environment variable but `PGPASSWORD`.
     pub application_name: Option<String>,
-    /// `options` for the startup message, passed to the server verbatim (`-c TimeZone=UTC -c lock_timeout=5s`): GUCs pinned for this session, so decoded text renders as it would on any connection with the same settings. `None` when unset or empty; `PGOPTIONS` is not read.
+    /// `options` for the startup message, passed to the server verbatim (`-c TimeZone=UTC -c lock_timeout=5s`): GUCs pinned for this session, so decoded text renders as it would on any connection with the same settings. `None` when unset or empty; `PGOPTIONS` is not read. Redacted in `Debug`, like `password`: a custom setting can carry a secret.
     pub options: Option<String>,
     /// Connection timeout in seconds (0 = disabled). Maps to libpq's `connect_timeout`.
     pub connect_timeout: u64,
@@ -101,7 +101,14 @@ impl std::fmt::Debug for ConnInfo {
             .field("sslnegotiation", &self.sslnegotiation)
             .field("replication", &self.replication)
             .field("application_name", &self.application_name)
-            .field("options", &self.options)
+            .field(
+                "options",
+                if self.options.is_some() {
+                    &"<REDACTED>"
+                } else {
+                    &"None"
+                },
+            )
             .field("connect_timeout", &self.connect_timeout)
             .field("keepalives", &self.keepalives)
             .field("keepalives_idle", &self.keepalives_idle)
@@ -554,9 +561,11 @@ impl ConnInfo {
 /// Resolve the session parameters the way libpq sends them.
 ///
 /// An empty value counts as not given, so `application_name=` falls back to
-/// `fallback_application_name`, whatever order the two are written in (measured on
-/// libpq 18.7: `application_name=&fallback_application_name=fb` names the session
-/// `fb`). An empty name or `options` is never sent.
+/// `fallback_application_name`, whatever order the two are written in. That is
+/// libpq's parameter-array API (`PQconnectStartParams`, which the libpq backend's
+/// `connect_async` uses; measured on libpq 18.7: `application_name=&fallback_application_name=fb`
+/// names the session `fb`). `PQconnectdb` given the same string keeps the empty
+/// name. An empty name or `options` is never sent.
 fn session_params(
     application_name: Option<String>,
     fallback_application_name: Option<String>,
@@ -1237,8 +1246,9 @@ mod tests {
 
     /// libpq sends `application_name` if given and `fallback_application_name`
     /// otherwise, whatever order they are written in. An empty value counts as not
-    /// given (measured on libpq 18.7: `application_name=&fallback_application_name=fb`
-    /// names the session `fb`), and an empty name or `options` is never sent.
+    /// given, as in `PQconnectStartParams` (measured on libpq 18.7:
+    /// `application_name=&fallback_application_name=fb` names the session `fb`),
+    /// and an empty name or `options` is never sent.
     #[test]
     fn fallback_application_name_applies_only_without_application_name() {
         for (args, want) in [
@@ -1942,6 +1952,29 @@ mod tests {
             debug_output.contains("REDACTED"),
             "Debug output should contain REDACTED: {debug_output}"
         );
+    }
+
+    #[test]
+    fn test_debug_redacts_options() {
+        let ci = ConnInfo::parse("postgresql://user@host/db?options=-c%20custom.token%3Dhunter2")
+            .unwrap();
+        let debug_output = format!("{:?}", ci);
+        assert!(
+            !debug_output.contains("hunter2"),
+            "Debug output should not contain options: {debug_output}"
+        );
+        assert!(
+            debug_output.contains("options: \"<REDACTED>\""),
+            "Debug output should redact options: {debug_output}"
+        );
+        // The value itself is still what the startup message carries.
+        assert_eq!(ci.options.as_deref(), Some("-c custom.token=hunter2"));
+
+        let unset = format!(
+            "{:?}",
+            ConnInfo::parse("postgresql://user@host/db").unwrap()
+        );
+        assert!(unset.contains("options: \"None\""), "{unset}");
     }
 
     #[test]

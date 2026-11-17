@@ -20,7 +20,7 @@
 use core::time::Duration;
 use pg_walstream::{
     CancellationToken, EventType, LogicalReplicationStream, PgReplicationConnection,
-    ReplicationStreamConfig, RetryConfig,
+    ReplicationError, ReplicationStreamConfig, RetryConfig,
 };
 
 fn replication_conn_string() -> String {
@@ -143,10 +143,18 @@ impl Fixture {
         .expect("the Insert never arrived")
     }
 
-    async fn finish(mut self, mut stream: LogicalReplicationStream) {
+    async fn finish(self, mut stream: LogicalReplicationStream) {
         stream.stop().await.expect("stop");
         drop(stream);
-        for _ in 0..100 {
+    }
+}
+
+/// Also runs when a test panics, so a failed assertion leaves no slot, publication
+/// or table behind. The slot cannot be dropped while its walsender is still
+/// shutting down, hence the wait.
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        for _ in 0..200 {
             let dropped = self.admin.exec(&format!(
                 "SELECT pg_drop_replication_slot('{0}') WHERE EXISTS \
                  (SELECT 1 FROM pg_replication_slots WHERE slot_name = '{0}')",
@@ -155,7 +163,7 @@ impl Fixture {
             if dropped.is_ok() {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            std::thread::sleep(Duration::from_millis(50));
         }
         let _ = self.admin.exec(&format!(
             "DROP PUBLICATION IF EXISTS {0}; DROP TABLE IF EXISTS {1}",
@@ -184,7 +192,8 @@ async fn application_name_names_the_walsender() {
 }
 
 /// `fallback_application_name` is used only when `application_name` is absent
-/// (an empty one counts as absent), whichever is written first, as in libpq.
+/// (an empty one counts as absent), whichever is written first, as in libpq's
+/// parameter-array API (`PQconnectStartParams`), which the stream's connect uses.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a live PostgreSQL with wal_level = logical"]
 async fn fallback_application_name_applies_only_without_application_name() {
@@ -227,27 +236,32 @@ async fn fallback_application_name_applies_only_without_application_name() {
 /// `options` pins GUCs for the session, so decoded text renders the way it would
 /// on any connection with the same settings. `TimeZone` is the visible one: the
 /// text of a `timestamptz` is rendered in the walsender's time zone.
+///
+/// Both connections pin their settings, so the result does not depend on the
+/// server's, database's or role's defaults (`DateStyle` is pinned too: it decides
+/// how a `timestamptz` is written).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a live PostgreSQL with wal_level = logical"]
 async fn options_pin_the_time_zone_of_decoded_text() {
     let instant = "'2026-01-01 00:00:00+00'";
     let base = replication_conn_string();
 
-    // First the server's own rendering, so the pinned one cannot match by accident.
+    // First a control pinned to another zone, so the Tokyo one cannot match by accident.
     let mut fixture = Fixture::new("tz_default", "id integer PRIMARY KEY, ts timestamptz");
-    let mut stream = fixture.start(&base).await;
-    let unpinned = fixture
+    let url = with_params(&base, "options=-c%20TimeZone%3DUTC%20-c%20DateStyle%3DISO");
+    let mut stream = fixture.start(&url).await;
+    let control = fixture
         .decoded(&mut stream, &format!("1, {instant}"), "ts")
         .await
         .expect("timestamptz text");
     fixture.finish(stream).await;
-    assert_ne!(
-        unpinned, "2026-01-01 09:00:00+09",
-        "the server default must differ from the pinned zone for this test to prove anything"
-    );
+    assert_eq!(control, "2026-01-01 00:00:00+00");
 
     let mut fixture = Fixture::new("tz_pinned", "id integer PRIMARY KEY, ts timestamptz");
-    let url = with_params(&base, "options=-c%20TimeZone%3DAsia/Tokyo");
+    let url = with_params(
+        &base,
+        "options=-c%20TimeZone%3DAsia/Tokyo%20-c%20DateStyle%3DISO",
+    );
     let mut stream = fixture.start(&url).await;
     let pinned = fixture
         .decoded(&mut stream, &format!("1, {instant}"), "ts")
@@ -258,7 +272,8 @@ async fn options_pin_the_time_zone_of_decoded_text() {
 }
 
 /// `DateStyle` and `IntervalStyle` pin the text of dates and intervals the same way,
-/// several `-c` settings in one `options` string included.
+/// several `-c` settings in one `options` string included. The control pins the
+/// ISO/postgres styles, so the result does not depend on the server's defaults.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a live PostgreSQL with wal_level = logical"]
 async fn options_pin_the_date_and_interval_styles_of_decoded_text() {
@@ -266,9 +281,13 @@ async fn options_pin_the_date_and_interval_styles_of_decoded_text() {
     let columns = "id integer PRIMARY KEY, d date, iv interval";
     let base = replication_conn_string();
 
-    // First the server's own rendering, so the pinned one cannot match by accident.
+    // First a control pinned to the other styles, so the pinned one cannot match by accident.
     let mut fixture = Fixture::new("style_default", columns);
-    let mut stream = fixture.start(&base).await;
+    let url = with_params(
+        &base,
+        "options=-c%20DateStyle%3DISO%20-c%20IntervalStyle%3Dpostgres",
+    );
+    let mut stream = fixture.start(&url).await;
     let [date, interval] = fixture
         .decoded_columns(&mut stream, values, ["d", "iv"])
         .await;
@@ -306,4 +325,31 @@ async fn options_cannot_change_the_client_encoding() {
         .await;
     fixture.finish(stream).await;
     assert_eq!(note.as_deref(), Some("\u{e9}t\u{e9}"));
+}
+
+/// An `options` string naming a setting the server does not know fails the
+/// connection (SQLSTATE 42704). No slot has been looked at yet, so it must not
+/// surface as a `ReplicationSlot` error, which tells an operator to drop the slot
+/// and re-sync.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a live PostgreSQL with wal_level = logical"]
+async fn an_unknown_setting_in_options_does_not_blame_the_slot() {
+    let url = with_params(
+        &replication_conn_string(),
+        "options=-c%20not_a_real_setting%3D1",
+    );
+    let config = ReplicationStreamConfig::builder("it_params_badopt", "it_params_badopt")
+        .with_retry_config(RetryConfig {
+            max_attempts: 1,
+            ..RetryConfig::default()
+        });
+    let err = LogicalReplicationStream::new(&url, config)
+        .await
+        .err()
+        .expect("an unknown setting must fail the connection");
+    assert!(
+        !matches!(err, ReplicationError::ReplicationSlot(_)),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("not_a_real_setting"), "{err}");
 }
