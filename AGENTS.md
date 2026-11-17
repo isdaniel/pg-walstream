@@ -25,6 +25,13 @@ cargo clippy --no-default-features --lib -- -D warnings          # no_std
 
 # Coverage — `--features derive` is required or your number won't match CI.
 cargo llvm-cov --lib --features derive --summary-only
+
+# Loom: model-check SharedLsnFeedback. Backend-free feature set (tokio changes under
+# `--cfg loom`) and the test filter are both required.
+RUSTFLAGS='--cfg loom' cargo test --lib --release --no-default-features --features std lsn::loom_tests
+
+# Mutation testing of src/lsn.rs (cargo install cargo-mutants; scope in .cargo/mutants.toml)
+cargo mutants
 ```
 
 `make before-git-push` runs check + `make lint` (all three clippy configurations)
@@ -164,7 +171,9 @@ read as a CodSpeed regression. If a `parse_*` regression appears, check
 
 `cargo fmt` clean · all three clippy configurations clean · `cargo test --lib`
 passes on default, `derive` and `libpq` · coverage ≥ 90% total lines
-(`cargo llvm-cov --lib --features derive`) · `cargo doc` warning-free.
+(`cargo llvm-cov --lib --features derive`) · `cargo doc` warning-free · loom
+models of `SharedLsnFeedback` pass (`loom` job in `ci-checks.yml`; cargo-mutants
+runs weekly, not per PR).
 
 The 90% gate reads only that default-backend unit pass, so `src/connection/libpq.rs` (gated on `libpq` *without* `rustls-tls` in `connection/mod.rs`) is invisible to it. Codecov receives the default and libpq unit passes merged, plus the integration suites run instrumented on PostgreSQL 18, and its patch check covers both backends.
 
