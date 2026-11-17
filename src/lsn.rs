@@ -14,7 +14,10 @@
 
 use crate::types::{CachePadded, Lsn, XLogRecPtr};
 use crate::{format_lsn, prelude::*};
+#[cfg(not(loom))]
 use core::sync::atomic::{AtomicU64, Ordering};
+#[cfg(loom)]
+use loom::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, info};
 
 /// Thread-safe tracker for LSN positions used in replication feedback
@@ -524,5 +527,91 @@ mod tests {
         feedback.update_applied_lsn(500);
         assert_eq!(feedback.get_applied_lsn(), 500);
         assert_eq!(feedback.get_flushed_lsn(), 500);
+    }
+}
+
+/// Exhaustive interleaving checks: `RUSTFLAGS='--cfg loom' cargo test --lib --release lsn::loom_tests`.
+/// The filter is required, because other tests are not meant to run on loom's atomics.
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use super::*;
+    use loom::sync::atomic::AtomicUsize;
+    use loom::sync::Arc;
+    use loom::thread;
+
+    #[test]
+    fn concurrent_appliers_end_at_the_max_with_flushed_dragged_along() {
+        loom::model(|| {
+            let fb = Arc::new(SharedLsnFeedback::new());
+            let (a, b) = (Arc::clone(&fb), Arc::clone(&fb));
+            let t1 = thread::spawn(move || a.update_applied_lsn(10));
+            let t2 = thread::spawn(move || b.update_applied_lsn(20));
+            t1.join().unwrap();
+            t2.join().unwrap();
+            assert_eq!(fb.get_applied_lsn(), 20);
+            assert_eq!(fb.get_flushed_lsn(), 20);
+        });
+    }
+
+    /// A reader landing between `update_applied_lsn`'s two RMWs must still get
+    /// `flushed >= applied`, and neither value may go backwards between reads.
+    #[test]
+    fn feedback_never_reports_replay_ahead_of_flush() {
+        loom::model(|| {
+            let fb = Arc::new(SharedLsnFeedback::new());
+            let writer = Arc::clone(&fb);
+            let t = thread::spawn(move || {
+                writer.update_applied_lsn(10);
+                writer.update_applied_lsn(20);
+            });
+            let (f1, a1) = fb.get_feedback_lsn();
+            let (f2, a2) = fb.get_feedback_lsn();
+            assert!(
+                f1 >= a1 && f2 >= a2,
+                "flush behind replay: {f1}/{a1} {f2}/{a2}"
+            );
+            assert!(
+                f2 >= f1 && a2 >= a1,
+                "went backwards: {f1}/{a1} -> {f2}/{a2}"
+            );
+            t.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn flushed_ends_at_the_max_of_everything_submitted() {
+        loom::model(|| {
+            let fb = Arc::new(SharedLsnFeedback::new());
+            let (a, b) = (Arc::clone(&fb), Arc::clone(&fb));
+            let t1 = thread::spawn(move || a.update_flushed_lsn(30));
+            let t2 = thread::spawn(move || b.update_applied_lsn(20));
+            fb.update_flushed_lsn(10);
+            t1.join().unwrap();
+            t2.join().unwrap();
+            assert_eq!(fb.get_flushed_lsn(), 30);
+            assert_eq!(fb.get_applied_lsn(), 20);
+        });
+    }
+
+    /// Whatever the consumer wrote before reporting an LSN is visible to a
+    /// reader that observes it: the `Release` stores and `Acquire` loads.
+    #[test]
+    fn an_observed_lsn_publishes_what_was_written_before_it() {
+        loom::model(|| {
+            let fb = Arc::new(SharedLsnFeedback::new());
+            let data = Arc::new(AtomicUsize::new(0));
+            let (writer, written) = (Arc::clone(&fb), Arc::clone(&data));
+            let t = thread::spawn(move || {
+                written.store(1, core::sync::atomic::Ordering::Relaxed);
+                writer.update_applied_lsn(10);
+            });
+            if fb.get_applied_lsn() == 10 {
+                assert_eq!(data.load(core::sync::atomic::Ordering::Relaxed), 1);
+            }
+            if fb.get_flushed_lsn() == 10 {
+                assert_eq!(data.load(core::sync::atomic::Ordering::Relaxed), 1);
+            }
+            t.join().unwrap();
+        });
     }
 }

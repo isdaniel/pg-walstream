@@ -1,0 +1,6 @@
+# Only the lock-free LSN tracker: a surviving mutant there is a missing test.
+examine_globs = ["src/lsn.rs"]
+# `log_state` only logs; `Default::default()` is `new()`, so that `new_shared` mutant is equivalent.
+exclude_re = ["log_state", "new_shared"]
+# The integration tests need a backend; the lib tests are the whole check here.
+additional_cargo_args = ["--no-default-features", "--features", "std", "--lib"]
