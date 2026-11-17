@@ -210,6 +210,14 @@ name = "startup_metadata"
 path = "integration-tests/startup_metadata.rs"
 
 [[test]]
+name = "startup_params"
+path = "integration-tests/startup_params.rs"
+
+[[test]]
+name = "idle_feedback"
+path = "integration-tests/idle_feedback.rs"
+
+[[test]]
 name = "libpq_async_connect"
 path = "integration-tests/libpq_async_connect.rs"
 

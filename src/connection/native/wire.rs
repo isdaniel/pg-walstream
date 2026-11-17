@@ -114,7 +114,23 @@ pub async fn flush<W: AsyncWrite + Unpin>(writer: &mut W) -> Result<(), Replicat
 /// Build a startup message (no tag byte, starts with length).
 ///
 /// Format: `[Int32: length][Int32: protocol version 3.0][key\0value\0 pairs][\0]`
-pub fn build_startup_message(params: &[(&str, &str)]) -> BytesMut {
+///
+/// A key or value holding a NUL is refused with a `Config` error. Each is a
+/// NUL-terminated string on the wire, so the NUL would end it early and the rest
+/// would be read as further parameters: `postgresql://u%00replication%00database@h/db`
+/// would switch the session to replication mode. libpq cannot express one at all
+/// (C strings, and its URI parser refuses `%00`). The error names the parameter,
+/// never the value.
+pub fn build_startup_message(params: &[(&str, &str)]) -> Result<BytesMut, ReplicationError> {
+    if let Some((key, _)) = params
+        .iter()
+        .find(|(key, value)| key.contains('\0') || value.contains('\0'))
+    {
+        return Err(ReplicationError::config(format!(
+            "startup parameter {key:?} contains a NUL byte"
+        )));
+    }
+
     let mut body = BytesMut::new();
     body.put_i32(196608); // protocol version 3.0 = 3 << 16 | 0
     for (key, val) in params {
@@ -128,7 +144,7 @@ pub fn build_startup_message(params: &[(&str, &str)]) -> BytesMut {
     let mut msg = BytesMut::with_capacity(4 + body.len());
     msg.put_i32((4 + body.len()) as i32);
     msg.put(body);
-    msg
+    Ok(msg)
 }
 
 /// Build an SSLRequest message.
@@ -247,11 +263,32 @@ mod tests {
 
     #[test]
     fn test_build_startup_message() {
-        let msg = build_startup_message(&[("user", "test"), ("database", "mydb")]);
+        let msg = build_startup_message(&[("user", "test"), ("database", "mydb")]).unwrap();
         let len = i32::from_be_bytes(msg[0..4].try_into().unwrap());
         assert_eq!(len as usize, msg.len());
         let proto = i32::from_be_bytes(msg[4..8].try_into().unwrap());
         assert_eq!(proto, 196608); // v3.0
+    }
+
+    /// Each key and value is a NUL-terminated string on the wire, so a NUL inside
+    /// one ends it early and the rest is read as further parameters. The server
+    /// must see exactly the parameters that were passed in, or refuse to be sent
+    /// any.
+    #[test]
+    fn build_startup_message_refuses_a_nul_in_a_key_or_value() {
+        for params in [
+            [("user", "u\0replication\0database")],
+            [("us\0er", "u")],
+            [("user", "\0")],
+        ] {
+            let err = build_startup_message(&params).unwrap_err();
+            assert!(matches!(err, ReplicationError::Config(_)), "{err:?}");
+            assert!(err.is_permanent(), "a config error must not be retried");
+        }
+        // The value is never echoed: `options` and friends can carry secrets.
+        let err = build_startup_message(&[("options", "-c secret\0")]).unwrap_err();
+        assert!(!err.to_string().contains("secret"), "{err}");
+        assert!(err.to_string().contains("options"), "{err}");
     }
 
     #[test]

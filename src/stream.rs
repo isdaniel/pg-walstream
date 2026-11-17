@@ -598,7 +598,7 @@ impl ReplicationStreamConfig {
     /// * `protocol_version` - Protocol version (1-4). Version 2+ supports streaming transactions
     /// * `streaming_mode` - Streaming mode for logical decoding (off/on/parallel).
     ///   `on` requires protocol version >= 2; `parallel` requires protocol version >= 4.
-    /// * `feedback_interval` - How often to send status feedback to PostgreSQL
+    /// * `feedback_interval` - How often to send status feedback to PostgreSQL. See [`with_feedback_interval`](Self::with_feedback_interval)
     /// * `connection_timeout` - Time budget for connecting: the per-address `connect_timeout`, and the limit on retries between attempts. See [`with_connection_timeout`](Self::with_connection_timeout)
     /// * `health_check_interval` - How often to check connection health
     /// * `retry_config` - Configuration for connection retry behavior
@@ -818,6 +818,18 @@ impl ReplicationStreamConfig {
     }
 
     /// Set how often status feedback is sent to PostgreSQL.
+    ///
+    /// The interval is checked once per 128 messages, so it paces a stream that is
+    /// receiving: an acknowledged LSN goes out at the first check after the interval has
+    /// passed, and only if an acknowledgement moved a position. It does not wake an idle
+    /// stream. With nothing arriving, an acknowledgement is reported when the server next
+    /// asks for a reply, every `wal_sender_timeout / 2` (30 s by default); the README's
+    /// "Acknowledging promptly on an idle stream" shortens that without code changes.
+    ///
+    /// The stream sends feedback only while it is being read: a consumer that stops
+    /// calling `next_event` for longer than the server's `wal_sender_timeout` is
+    /// disconnected unless it calls [`send_feedback`](LogicalReplicationStream::send_feedback)
+    /// meanwhile.
     #[inline]
     pub fn with_feedback_interval(mut self, d: Duration) -> Self {
         self.feedback_interval = d;

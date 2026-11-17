@@ -18,6 +18,10 @@ pub struct ConnInfo {
     /// TLS negotiation mode. `Postgres` (default) uses the standard SSLRequest, round-trip; `Direct` skips it for PostgreSQL 17+ (saves one round-trip).
     pub sslnegotiation: SslNegotiation,
     pub replication: ReplicationMode,
+    /// `application_name` for the startup message: what `pg_stat_activity` and `pg_stat_replication` show, and what `synchronous_standby_names` matches. Already resolved against `fallback_application_name` as libpq does; `None` when neither is set or the result is empty. libpq's `PGAPPNAME` is not read, as with every environment variable but `PGPASSWORD`.
+    pub application_name: Option<String>,
+    /// `options` for the startup message, passed to the server verbatim (`-c TimeZone=UTC -c lock_timeout=5s`): GUCs pinned for this session, so decoded text renders as it would on any connection with the same settings. `None` when unset or empty; `PGOPTIONS` is not read.
+    pub options: Option<String>,
     /// Connection timeout in seconds (0 = disabled). Maps to libpq's `connect_timeout`.
     pub connect_timeout: u64,
     /// Whether TCP keepalives are enabled (default: true). Maps to `keepalives`.
@@ -96,6 +100,8 @@ impl std::fmt::Debug for ConnInfo {
             .field("sslrootcert", &self.sslrootcert)
             .field("sslnegotiation", &self.sslnegotiation)
             .field("replication", &self.replication)
+            .field("application_name", &self.application_name)
+            .field("options", &self.options)
             .field("connect_timeout", &self.connect_timeout)
             .field("keepalives", &self.keepalives)
             .field("keepalives_idle", &self.keepalives_idle)
@@ -232,6 +238,9 @@ impl ConnInfo {
         let mut replication = ReplicationMode::None;
         let mut sslrootcert: Option<String> = None;
         let mut sslnegotiation = SslNegotiation::Postgres;
+        let mut application_name: Option<String> = None;
+        let mut fallback_application_name: Option<String> = None;
+        let mut options: Option<String> = None;
         let mut connect_timeout: u64 = 0;
         let mut keepalives = true;
         let mut keepalives_idle: u64 = 120;
@@ -291,6 +300,11 @@ impl ConnInfo {
                     "user" => user = val.to_string(),
                     "password" => password = Some(val.to_string()),
                     "dbname" => dbname = val.to_string(),
+                    "application_name" => application_name = Some(val.to_string()),
+                    "fallback_application_name" => {
+                        fallback_application_name = Some(val.to_string());
+                    }
+                    "options" => options = Some(val.to_string()),
                     // libpq translates both of these to sslmode; dropping them is
                     // the same silent downgrade this arm exists to prevent.
                     // `requiressl` is handled in `conninfo_storeval`; `ssl=true`
@@ -341,6 +355,8 @@ impl ConnInfo {
 
         let sslmode =
             resolve_sslrootcert_system(sslmode, sslmode_explicit, sslrootcert.as_deref())?;
+        let (application_name, options) =
+            session_params(application_name, fallback_application_name, options);
 
         Ok(ConnInfo {
             host,
@@ -352,6 +368,8 @@ impl ConnInfo {
             sslrootcert,
             sslnegotiation,
             replication,
+            application_name,
+            options,
             connect_timeout,
             keepalives,
             keepalives_idle,
@@ -372,6 +390,9 @@ impl ConnInfo {
         let mut replication = ReplicationMode::None;
         let mut sslrootcert: Option<String> = None;
         let mut sslnegotiation = SslNegotiation::Postgres;
+        let mut application_name: Option<String> = None;
+        let mut fallback_application_name: Option<String> = None;
+        let mut options: Option<String> = None;
         let mut connect_timeout: u64 = 0;
         let mut keepalives = true;
         let mut keepalives_idle: u64 = 120;
@@ -459,6 +480,9 @@ impl ConnInfo {
                 "user" => user = value,
                 "password" => password = Some(value),
                 "dbname" | "database" => dbname = Some(value),
+                "application_name" => application_name = Some(value),
+                "fallback_application_name" => fallback_application_name = Some(value),
+                "options" => options = Some(value),
                 "sslmode" => {
                     sslmode = parse_sslmode(&value)?;
                     sslmode_explicit = true;
@@ -502,6 +526,8 @@ impl ConnInfo {
 
         let sslmode =
             resolve_sslrootcert_system(sslmode, sslmode_explicit, sslrootcert.as_deref())?;
+        let (application_name, options) =
+            session_params(application_name, fallback_application_name, options);
 
         Ok(ConnInfo {
             host,
@@ -513,6 +539,8 @@ impl ConnInfo {
             sslrootcert,
             sslnegotiation,
             replication,
+            application_name,
+            options,
             connect_timeout,
             keepalives,
             keepalives_idle,
@@ -521,6 +549,24 @@ impl ConnInfo {
             tcp_user_timeout,
         })
     }
+}
+
+/// Resolve the session parameters the way libpq sends them.
+///
+/// An empty value counts as not given, so `application_name=` falls back to
+/// `fallback_application_name`, whatever order the two are written in (measured on
+/// libpq 18.7: `application_name=&fallback_application_name=fb` names the session
+/// `fb`). An empty name or `options` is never sent.
+fn session_params(
+    application_name: Option<String>,
+    fallback_application_name: Option<String>,
+    options: Option<String>,
+) -> (Option<String>, Option<String>) {
+    let given = |value: Option<String>| value.filter(|value| !value.is_empty());
+    (
+        given(application_name).or_else(|| given(fallback_application_name)),
+        given(options),
+    )
 }
 
 /// libpq's reserved `sslrootcert` value meaning "use the SSL implementation's
@@ -639,16 +685,18 @@ fn parse_sslmode(s: &str) -> Result<SslMode, ReplicationError> {
 /// backend — which hands the conninfo to `PQconnectdb` verbatim — honoured it:
 /// the same string bounded a dead round-trip on one backend and not the other,
 /// with no diagnostic. When adding a keyword here, ask whether ignoring it
-/// changes *behaviour*, not just whether it is safe to ignore.
+/// changes *behaviour*, not just whether it is safe to ignore. `options` was the
+/// same mistake: it sat here while the libpq backend applied it, so a pinned
+/// `TimeZone` changed the text of every decoded `timestamptz` on one backend only.
+/// It, `application_name` and `fallback_application_name` are handled in the two
+/// match arms now.
 const IGNORED_OPTIONS: &[&str] = &[
-    "application_name",
     // `require` only: `auth.rs` DOES negotiate SCRAM-SHA-256-PLUS with
     // `tls-server-end-point` binding when the server offers it — what is missing
     // is the *enforcement* (erroring when the server declines PLUS), so we cannot
     // honour `require`, but the mechanism itself is implemented.
     "channel_binding",
     "client_encoding",
-    "fallback_application_name",
     "gssdelegation",
     "gssencmode", // `require` only: no GSSAPI transport encryption here
     "gsslib",
@@ -656,7 +704,6 @@ const IGNORED_OPTIONS: &[&str] = &[
     "load_balance_hosts",
     "max_protocol_version",
     "min_protocol_version",
-    "options",
     "passfile",
     "servicefile",
     "ssl_max_protocol_version",
@@ -1123,7 +1170,6 @@ mod tests {
     #[test]
     fn libpq_options_we_do_not_implement_still_parse() {
         for kv in [
-            "application_name=myapp",
             "client_encoding=UTF8",
             "target_session_attrs=read-write",
             "passfile=/x/.pgpass",
@@ -1135,7 +1181,6 @@ mod tests {
             "gsslib=gssapi",
             "krbsrvname=postgres",
             "load_balance_hosts=random",
-            "fallback_application_name=fb",
             "sslkeylogfile=/tmp/k",
             "min_protocol_version=3.0",
             // Value-sensitive: the loose forms are all satisfiable.
@@ -1155,11 +1200,71 @@ mod tests {
                 "URI rejected: {kv}"
             );
         }
+    }
 
-        // `options` carries a space, so each syntax has to escape it the way
-        // libpq does: single quotes in key=value, percent-encoding in a URI.
-        assert!(ConnInfo::parse("host=h options='-c statement_timeout=0'").is_ok());
-        assert!(ConnInfo::parse("postgresql://u@h/db?options=-c%20statement_timeout%3D0").is_ok());
+    /// `application_name` and `options` were parsed and dropped, so the native
+    /// backend ignored what the libpq backend honours: the session never got its
+    /// name, and a pinned `TimeZone` changed the text of every decoded
+    /// `timestamptz`. `options` carries a space, so each syntax escapes it the way
+    /// libpq does: single quotes in key=value, percent-encoding in a URI.
+    #[test]
+    fn application_name_and_options_are_kept_in_both_syntaxes() {
+        let kv = ConnInfo::parse(
+            "host=h application_name='my app' options='-c TimeZone=Asia/Tokyo -c lock_timeout=2s'",
+        )
+        .unwrap();
+        let uri = ConnInfo::parse(
+            "postgresql://u@h/db?application_name=my%20app\
+             &options=-c%20TimeZone%3DAsia/Tokyo%20-c%20lock_timeout%3D2s",
+        )
+        .unwrap();
+        for ci in [kv, uri] {
+            assert_eq!(ci.application_name.as_deref(), Some("my app"));
+            assert_eq!(
+                ci.options.as_deref(),
+                Some("-c TimeZone=Asia/Tokyo -c lock_timeout=2s")
+            );
+        }
+
+        // Unset stays unset: nothing is invented for the startup message.
+        let ci = ConnInfo::parse("host=h").unwrap();
+        assert_eq!((ci.application_name, ci.options), (None, None));
+
+        // A literal `@` in the value is not a credentials designator.
+        let ci = ConnInfo::parse("postgresql://pg.internal/db?application_name=svc@prod").unwrap();
+        assert_eq!(ci.application_name.as_deref(), Some("svc@prod"));
+    }
+
+    /// libpq sends `application_name` if given and `fallback_application_name`
+    /// otherwise, whatever order they are written in. An empty value counts as not
+    /// given (measured on libpq 18.7: `application_name=&fallback_application_name=fb`
+    /// names the session `fb`), and an empty name or `options` is never sent.
+    #[test]
+    fn fallback_application_name_applies_only_without_application_name() {
+        for (args, want) in [
+            ("fallback_application_name=fb", Some("fb")),
+            (
+                "application_name=app fallback_application_name=fb",
+                Some("app"),
+            ),
+            (
+                "fallback_application_name=fb application_name=app",
+                Some("app"),
+            ),
+            (
+                "application_name='' fallback_application_name=fb",
+                Some("fb"),
+            ),
+            ("application_name=", None),
+            ("options=''", None),
+        ] {
+            let ci = ConnInfo::parse(&format!("host=h {args}")).unwrap();
+            assert_eq!(ci.application_name.as_deref(), want, "{args}");
+            assert_eq!(ci.options, None, "{args}");
+            let uri_args = args.replace(' ', "&").replace("''", "");
+            let ci = ConnInfo::parse(&format!("postgresql://u@h/db?{uri_args}")).unwrap();
+            assert_eq!(ci.application_name.as_deref(), want, "{uri_args}");
+        }
     }
 
     /// Every fail-OPEN option must be refused in both syntaxes, and the message
