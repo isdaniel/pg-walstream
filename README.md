@@ -100,7 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | [`typed-deserialization`](examples/typed-deserialization) | INSERT/UPDATE/DELETE events into your own structs via `serde` |
 | [`derive-router`](examples/derive-router) | `#[derive(WalTable)]` and `WalRouter` table inference (`derive` feature) |
 | [`binary-serde`](examples/binary-serde) | Ship `ChangeEvent`s between processes in five formats (no database needed) |
-| [`stream-metrics`](examples/stream-metrics) | Read `stream.metrics()` from other tasks: rates, unacknowledged bytes, reconnects, a Prometheus text endpoint |
+| [`stream-metrics`](examples/stream-metrics) | Read `stream.metrics()` from other tasks: rates, lag and unconfirmed bytes, reconnects, a Prometheus text endpoint |
 | [`raw-xlogdata`](examples/raw-xlogdata) | Undecoded pgoutput payload via `next_raw_event()` |
 | [`binary-column-access`](examples/binary-column-access) | Lossless zero-copy `BYTEA` access via `PgResult::get_bytes` |
 | [`pg-basebackup`](examples/pg-basebackup) | Physical backup tool using `BASE_BACKUP` with tar extraction and progress |
@@ -201,24 +201,35 @@ The trade-off is that the same value is how long the stream may go without answe
 
 ## Metrics
 
-`stream.metrics()` (also on `EventStream`) returns a cloneable handle that any task can read while the stream is being polled, with no lock on the read path:
+`stream.metrics()` (also on `EventStream`) returns a cloneable handle any task can read while the stream is polled. `snapshot()` returns a `Copy` struct of totals, so a rate is the difference of two snapshots; counters include replays after a reconnect.
 
 ```rust
 let metrics = stream.metrics(); // before `into_stream`, or `event_stream.metrics()`
 tokio::spawn(async move {
     loop {
         let m = metrics.snapshot();
-        println!("{} msgs, {} B, {} reconnects, {} B unacknowledged", m.wal_messages, m.wal_bytes, m.reconnects, m.lag_bytes());
+        println!("{} msgs, {} reconnects, {} B unacked", m.wal_messages, m.reconnects, m.lag_bytes());
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
     }
 });
 ```
 
-A snapshot holds `wal_messages`, `wal_bytes`, `keepalives`, `feedback_sent` and `reconnects` (counted since the stream was created, replays after a reconnect included), plus `received_lsn` and the consumer's `flushed_lsn` and `applied_lsn`. A `Copy` struct of totals, so a rate is the difference of two snapshots. The handle stays readable after the stream has ended and across reconnects.
+| Watch | Fields |
+|---|---|
+| Data flowing | `wal_messages`, `wal_bytes`, `commits`, `keepalives`, `last_server_time` |
+| Work in flight (read, not yet acknowledged) | `lag_bytes()` |
+| Consumer behind | not visible to the client; on the server, `pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)` from `pg_replication_slots` |
+| Server hearing from the consumer | `unconfirmed_bytes()`, `feedback_sent`, `feedback_failures` |
+| Connection health | `reconnects`, `reconnect_attempts`, `reconnect_failures`, `recovering`, `last_error` |
+| Raw positions and times | `received_lsn`, `flushed_lsn`, `applied_lsn`, `sent_flushed_lsn`, `last_commit_time`, `last_feedback_time` |
 
-`lag_bytes()` is the WAL read off the wire that the consumer has not marked applied yet, counted from where the stream started until `applied_lsn` passes it. It is the consumer's own progress, not what the server has confirmed: a status update carries an acknowledgement to the server later, so a restart right after one can still replay that much. Read it with two more caveats. The stream reads on demand, so a consumer that falls behind leaves its backlog in the socket buffer and on the server, where this does not see it: watch the message rate, and `pg_replication_slots` (or `pg_current_wal_lsn()`) on the server. What `lag_bytes()` does show is the work in flight, for example the open transaction when you acknowledge at each commit. And it grows while the stream is idle and the rest of the database writes WAL, because keepalive positions are not acknowledged until the consumer acknowledges something.
+- **`lag_bytes()`**: WAL distance from the last data frame to the consumer's `applied_lsn`: the work in flight, such as the open transaction when you acknowledge at each commit. Keepalives are excluded, so an idle stream does not drift. It is the consumer's own progress, not how far behind the consumer is: the stream reads on demand, so a consumer that falls behind leaves its backlog in the socket and on the server, where this does not see it. Watch the message rate and `last_server_time`, and the slot on the server.
+- **`unconfirmed_bytes()`**: distance from the server's latest position (keepalives included) to the flushed position the last status update reported. On an idle stream it grows with writes elsewhere in the database; an acknowledgement moves its start to the position the consumer acknowledged, not to the server's latest.
+- **`feedback_sent`** standing still is normal on an idle stream: a periodic update is skipped while the positions it would report have not changed. A growing `feedback_failures` is the sign that updates are not getting through.
+- **`last_error`** stays set after the stream recovers: alert on it changing, not on it being set, and read it with `reconnects`.
+- **`last_server_time`** is the server's clock: compare it with itself over time, not with `now`.
 
-The counters cost a few relaxed loads and stores per XLogData frame (+8 instructions, 120 to 128, measured with callgrind in an isolated decode loop). [`examples/stream-metrics`](examples/stream-metrics) is a runnable program: periodic rates, the lag at each commit, and a Prometheus text endpoint.
+The client cannot see what the server retains for the slot or whether it was invalidated: query `pg_replication_slots` (`wal_status = 'lost'` is final and works on every supported version). Prefer the metrics above to the `*_lag` columns of `pg_stat_replication`, which for a logical slot are sampled only at transaction ends and go stale. Every field is documented on `MetricsSnapshot`; [`examples/stream-metrics`](examples/stream-metrics) adds a Prometheus text endpoint.
 
 ## Initial Snapshot
 

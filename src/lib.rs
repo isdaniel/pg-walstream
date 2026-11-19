@@ -243,7 +243,7 @@ pub use pgoutput_encode::{
 
 // Re-export stream types
 #[cfg(any(feature = "libpq", feature = "rustls-tls"))]
-pub use metrics::{MetricsSnapshot, StreamMetrics};
+pub use metrics::{ErrorClass, MetricsSnapshot, StreamMetrics};
 #[cfg(any(feature = "libpq", feature = "rustls-tls"))]
 pub use stream::{
     EventStream, EventStreamRef, LogicalReplicationStream, OriginFilter, RawXLogData,

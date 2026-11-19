@@ -891,16 +891,35 @@ fn reached_stop_lsn(stop_at: Option<Lsn>, event: &ChangeEvent) -> Option<Lsn> {
     (end_lsn >= target).then_some(end_lsn)
 }
 
+/// Where the commit position sits in the body of a `Commit`, `CommitPrepared` or `StreamCommit`, by its type byte. The end position and then the commit timestamp follow it.
+#[inline]
+fn commit_position_offset(kind: u8) -> Option<usize> {
+    use crate::message_types::{COMMIT, COMMIT_PREPARED, STREAM_COMMIT};
+    match kind {
+        COMMIT | COMMIT_PREPARED => Some(2),
+        STREAM_COMMIT => Some(6),
+        _ => None,
+    }
+}
+
+/// The commit timestamp of a `Commit`, `StreamCommit` or `CommitPrepared` message body, read from its bytes.
+#[inline]
+fn payload_commit_time(payload: &[u8]) -> Option<TimestampTz> {
+    // Past the commit position and the end position, 8 bytes each.
+    let at = commit_position_offset(*payload.first()?)? + 16;
+    let bytes: [u8; 8] = payload.get(at..at + 8)?.try_into().ok()?;
+    Some(TimestampTz::from_be_bytes(bytes))
+}
+
 /// [`EventType::commit_lsn`] read straight from a `'w'` frame's pgoutput bytes, so a frame can be held without touching the parser.
 #[inline]
 fn frame_commit_lsn(frame: &[u8]) -> Option<Lsn> {
-    use crate::message_types::{BEGIN, COMMIT, COMMIT_PREPARED, STREAM_COMMIT};
     let payload = frame.get(25..)?;
-    let at = match *payload.first()? {
-        BEGIN => 1,
-        COMMIT | COMMIT_PREPARED => 2,
-        STREAM_COMMIT => 6,
-        _ => return None,
+    let kind = *payload.first()?;
+    let at = if kind == crate::message_types::BEGIN {
+        1
+    } else {
+        commit_position_offset(kind)?
     };
     let bytes: [u8; 8] = payload.get(at..at + 8)?.try_into().ok()?;
     Some(Lsn::new(u64::from_be_bytes(bytes)))
@@ -1468,6 +1487,12 @@ impl LogicalReplicationStream {
             .await
     }
 
+    /// `error`, noted in the metrics as the one the stream last met.
+    fn noted(&self, error: ReplicationError) -> ReplicationError {
+        self.counters.error(&error);
+        error
+    }
+
     async fn next_event_until(
         &mut self,
         cancellation_token: &CancellationToken,
@@ -1475,20 +1500,27 @@ impl LogicalReplicationStream {
     ) -> Result<Option<ChangeEvent>> {
         // Loop until we get a valid event or encounter an error/cancellation
         loop {
-            let Some(data) = self.next_wal_frame(cancellation_token, boundary).await? else {
-                return Ok(None);
+            // Matched, not `map_err`'d: moving the event through the adapter measured +130 instructions per frame.
+            let data = match self.next_wal_frame(cancellation_token, boundary).await {
+                Ok(Some(data)) => data,
+                Ok(None) => return Ok(None),
+                Err(e) => return Err(self.noted(e)),
             };
             // 'w' WAL data message (zero-copy: Bytes slicing avoids copies).
-            if let Some(event) = self.process_wal_message(data)? {
-                // Bounded replay: if this event is a commit boundary that reaches
-                // stop_at_lsn, remember it — the full crossing transaction is
-                // still delivered now; the NEXT call terminates.
-                if let Some(reached) = reached_stop_lsn(self.config.stop_at_lsn, &event) {
-                    self.replay_stop.arm(reached);
+            match self.process_wal_message(data) {
+                Ok(Some(event)) => {
+                    // Bounded replay: if this event is a commit boundary that reaches
+                    // stop_at_lsn, remember it — the full crossing transaction is
+                    // still delivered now; the NEXT call terminates.
+                    if let Some(reached) = reached_stop_lsn(self.config.stop_at_lsn, &event) {
+                        self.replay_stop.arm(reached);
+                    }
+                    return Ok(Some(event));
                 }
-                return Ok(Some(event));
+                // Control message with no ChangeEvent (e.g. Relation) → next frame.
+                Ok(None) => {}
+                Err(e) => return Err(self.noted(e)),
             }
-            // Control message with no ChangeEvent (e.g. Relation) → next frame.
         }
     }
 
@@ -1542,10 +1574,15 @@ impl LogicalReplicationStream {
         &mut self,
         cancellation_token: &CancellationToken,
     ) -> Result<RawXLogData> {
-        let Some(data) = self.next_wal_frame(cancellation_token, None).await? else {
-            unreachable!("a read without a boundary never stops at one");
+        let data = match self.next_wal_frame(cancellation_token, None).await {
+            Ok(Some(data)) => data,
+            Ok(None) => unreachable!("a read without a boundary never stops at one"),
+            Err(e) => return Err(self.noted(e)),
         };
-        let raw = self.decode_raw_frame(data)?;
+        let raw = match self.decode_raw_frame(data) {
+            Ok(raw) => raw,
+            Err(e) => return Err(self.noted(e)),
+        };
 
         // Transport-level bounded replay: arm the terminal when this message's wal_end reaches the configured stop LSN. The next `next_wal_frame` call sends CopyDone once and returns StreamStopped. Armed here (not in the decoder) so the decoder stays policy-free and the typed path can reuse it; mirrors how `next_event` arms the commit-boundary stop.
         if let Some(stop) = self.config.stop_at_lsn {
@@ -1632,6 +1669,16 @@ impl LogicalReplicationStream {
 
     /// Recover connection after a failure
     async fn recover_connection(&mut self) -> Result<()> {
+        self.counters.recovery_started();
+        let result = self.reconnect().await;
+        match &result {
+            Ok(()) => self.counters.reconnected(),
+            Err(_) => self.counters.recovery_failed(),
+        }
+        result
+    }
+
+    async fn reconnect(&mut self) -> Result<()> {
         info!("Attempting to recover replication connection");
         self.recovering = true;
         // The new connection resends everything from the applied position, held frame included.
@@ -1717,7 +1764,6 @@ impl LogicalReplicationStream {
         self.parser.reset();
 
         self.recovering = false;
-        self.counters.reconnected();
         info!("Replication connection recovered and restarted");
         Ok(())
     }
@@ -1819,9 +1865,9 @@ impl LogicalReplicationStream {
                 biased;
                 health = self.check_connection_health() => health,
                 _ = cancellation_token.cancelled() => {
-                    return Err(ReplicationError::cancelled(
+                    return Err(self.noted(ReplicationError::cancelled(
                         "Operation cancelled during reconnect"
-                    ));
+                    )));
                 }
             };
             if let Err(e) = health {
@@ -1910,12 +1956,13 @@ impl LogicalReplicationStream {
                     biased;
                     recovery = self.recover_connection_boxed() => recovery,
                     _ = cancellation_token.cancelled() => {
-                        return Err(ReplicationError::cancelled(
+                        return Err(self.noted(ReplicationError::cancelled(
                             "Operation cancelled during reconnect"
-                        ));
+                        )));
                     }
                 };
                 if let Err(recovery_err) = recovery {
+                    self.counters.error(&recovery_err);
                     // Only a *permanent* recovery failure ends the stream.
                     // Returning on a transient one skipped the backoff
                     // below and handed the consumer an error it would
@@ -1945,9 +1992,9 @@ impl LogicalReplicationStream {
                 biased;
                 _ = tokio::time::sleep(delay) => {},
                 _ = cancellation_token.cancelled() => {
-                    return Err(ReplicationError::cancelled(
+                    return Err(self.noted(ReplicationError::cancelled(
                         "Operation cancelled during retry backoff"
-                    ));
+                    )));
                 }
             }
         }
@@ -1981,7 +2028,7 @@ impl LogicalReplicationStream {
             self.state.update_received_lsn(wal_end);
         }
         self.counters
-            .wal_frame(data.len(), self.state.last_received_lsn);
+            .wal_frame(data.len(), wal_end, self.state.last_received_lsn, send_time);
 
         Ok((wal_start, wal_end, send_time))
     }
@@ -2000,7 +2047,12 @@ impl LogicalReplicationStream {
             return Ok(None);
         }
 
+        // Read from the bytes, as `frame_commit_lsn` does: matching the parsed message would borrow it, and that costs more than the tally.
+        let commit_time = payload_commit_time(&raw.data);
         let replication_message = self.parser.parse_wal_message_bytes(raw.data)?;
+        if let Some(time) = commit_time {
+            self.counters.commit(time);
+        }
         crate::protocol::message_to_change_event(
             &mut self.state,
             replication_message,
@@ -2045,7 +2097,8 @@ impl LogicalReplicationStream {
         );
 
         self.state.update_received_lsn(keepalive.wal_end);
-        self.counters.keepalive(self.state.last_received_lsn);
+        self.counters
+            .keepalive(self.state.last_received_lsn, keepalive.timestamp);
         self.keepalive_wal_end = self.keepalive_wal_end.max(Lsn::new(keepalive.wal_end));
 
         // Bounded replay, idle-server terminal.
@@ -2153,19 +2206,24 @@ impl LogicalReplicationStream {
         // This allows the consumer to update these values after committing to destination.
         let (flushed_lsn, applied_lsn) = self.capped_feedback_lsns();
 
-        self.connection
+        if let Err(e) = self
+            .connection
             .send_standby_status_update(
                 self.state.last_received_lsn,
                 flushed_lsn,
                 applied_lsn,
                 false, // Don't request reply
             )
-            .await?;
+            .await
+        {
+            self.counters.feedback_failed();
+            return Err(e);
+        }
 
         // Record the LSN values we sent for intelligent throttling
         self.state
             .mark_feedback_sent_with_lsn(flushed_lsn, applied_lsn);
-        self.counters.feedback_sent();
+        self.counters.feedback_sent(flushed_lsn);
 
         debug!(
             "Sent feedback: received={}, flushed={}, applied={}",
@@ -2207,7 +2265,7 @@ impl LogicalReplicationStream {
     /// tokio::spawn(async move {
     ///     loop {
     ///         let m = metrics.snapshot();
-    ///         println!("{} messages, {} bytes unacknowledged", m.wal_messages, m.lag_bytes());
+    ///         println!("{} messages, {} bytes unacked", m.wal_messages, m.lag_bytes());
     ///         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
     ///     }
     /// });
@@ -5932,6 +5990,10 @@ pub(crate) mod tests {
             matches!(err, ReplicationError::StreamStopped(l) if l == Lsn::new(0x200)),
             "retry wrapper must pass StreamStopped through unretried, got {err:?}"
         );
+        assert_eq!(
+            stream.metrics().snapshot().last_error,
+            crate::ErrorClass::Stopped
+        );
     }
 
     /// A stream whose reads fail (the test connection is never in COPY mode) and whose
@@ -5964,6 +6026,19 @@ pub(crate) mod tests {
             waited >= Duration::from_secs(3) && waited < Duration::from_millis(3100),
             "1 s + 2 s of backoff between three attempts, waited {waited:?}"
         );
+
+        // Two recoveries, one between each pair of attempts, both failed: still disconnected.
+        let snapshot = stream.metrics().snapshot();
+        assert_eq!(
+            (
+                snapshot.reconnect_attempts,
+                snapshot.reconnect_failures,
+                snapshot.reconnects
+            ),
+            (2, 2, 0)
+        );
+        assert!(snapshot.recovering);
+        assert_eq!(snapshot.last_error, crate::ErrorClass::Other);
     }
 
     /// Cancelling while the loop sleeps between attempts ends it at once, not after the delay.
@@ -5988,6 +6063,37 @@ pub(crate) mod tests {
         assert!(
             waited < Duration::from_secs(1),
             "cancelled at 500 ms, yet waited {waited:?}"
+        );
+        assert_eq!(
+            stream.metrics().snapshot().last_error,
+            crate::ErrorClass::Cancelled,
+            "the read error that led to the backoff is not what the stream ended on"
+        );
+    }
+
+    /// A recovery that fails for good ends the read with that error, and the snapshot names it
+    /// rather than the read error that led to the recovery. (The native conninfo parser rejects
+    /// the bad `sslmode` for good; libpq reports it as a connection failure to retry.)
+    #[cfg(feature = "rustls-tls")]
+    #[tokio::test(start_paused = true)]
+    async fn a_permanent_recovery_failure_is_the_last_error() {
+        let mut stream = stream_that_cannot_read_or_reconnect();
+        stream.retry_handler = ReplicationConnectionRetry::new(
+            RetryConfig::default(),
+            "postgresql://u@127.0.0.1:1/db?replication=database&sslmode=bogus".to_string(),
+        );
+
+        let err = stream
+            .next_event_with_retry(&CancellationToken::new())
+            .await
+            .unwrap_err();
+
+        assert!(err.is_permanent(), "{err:?}");
+        let snapshot = stream.metrics().snapshot();
+        assert_eq!(snapshot.last_error, crate::ErrorClass::Permanent);
+        assert_eq!(
+            (snapshot.reconnect_attempts, snapshot.reconnect_failures),
+            (1, 1)
         );
     }
 
@@ -6106,6 +6212,76 @@ pub(crate) mod tests {
         );
     }
 
+    /// The reads a caller drives itself hand their error back, and the snapshot names it too.
+    #[tokio::test]
+    async fn direct_reads_record_the_error_they_return() {
+        let token = CancellationToken::new();
+        let boundary = Lsn::new(0x100);
+        let class = |stream: &LogicalReplicationStream| stream.metrics().snapshot().last_error;
+
+        let mut stream = stream_that_cannot_read_or_reconnect();
+        stream.next_event(&token).await.unwrap_err();
+        assert_eq!(class(&stream), crate::ErrorClass::Other);
+
+        let mut stream = stream_that_cannot_read_or_reconnect();
+        stream
+            .next_event_before(boundary, &token)
+            .await
+            .unwrap_err();
+        assert_eq!(class(&stream), crate::ErrorClass::Other);
+
+        let mut stream = stream_that_cannot_read_or_reconnect();
+        stream.next_raw_event(&token).await.unwrap_err();
+        assert_eq!(class(&stream), crate::ErrorClass::Other);
+
+        // A frame too short to decode is recorded by the raw reader too, not only a failed read.
+        let mut stream = create_test_stream_with_frames(
+            create_test_config(),
+            vec![bytes::Bytes::from_static(b"w")],
+        );
+        stream.next_raw_event(&token).await.unwrap_err();
+        assert_eq!(class(&stream), crate::ErrorClass::Other);
+
+        token.cancel();
+        stream.next_raw_event(&token).await.unwrap_err();
+        assert_eq!(class(&stream), crate::ErrorClass::Cancelled);
+    }
+
+    /// A read the token cancels while the loop is reconnecting ends as `Cancelled`, whether the
+    /// reconnect was the loop's own (after a read error) or the health check's.
+    #[tokio::test]
+    async fn cancelling_a_reconnect_records_cancelled() {
+        for health_check in [false, true] {
+            let (port, _) = counting_server(false).await;
+            let mut config = ReplicationStreamConfig::builder("slot", "pub")
+                .with_connection_timeout(Duration::from_secs(60));
+            if health_check {
+                config = config.with_health_check_interval(Duration::ZERO);
+            }
+            let mut stream = create_test_stream(config);
+            stream.retry_handler =
+                ReplicationConnectionRetry::new(RetryConfig::default(), conninfo_for(port));
+            let token = CancellationToken::new();
+            let cancel = async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                token.cancel();
+            };
+
+            let (result, ()) = tokio::join!(stream.next_event_with_retry(&token), cancel);
+
+            let err = result.unwrap_err();
+            assert!(
+                matches!(&err, ReplicationError::Cancelled(m) if m.contains("reconnect")),
+                "health_check={health_check}: {err:?}"
+            );
+            assert_eq!(
+                stream.metrics().snapshot().last_error,
+                crate::ErrorClass::Cancelled,
+                "health_check={health_check}"
+            );
+        }
+    }
+
     /// A stream whose startup command was cancelled before the silent peer answered, which
     /// leaves its connection refusing every later command.
     #[cfg(feature = "rustls-tls")]
@@ -6208,6 +6384,17 @@ pub(crate) mod tests {
 
         assert!(!matches!(err, ReplicationError::Timeout(_)), "{err:?}");
         assert_eq!(dialed.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        let snapshot = stream.metrics().snapshot();
+        assert_eq!(
+            (
+                snapshot.reconnect_attempts,
+                snapshot.reconnect_failures,
+                snapshot.reconnects
+            ),
+            (1, 1, 0)
+        );
+        assert!(snapshot.recovering);
     }
 
     /// The server-side `ErrorResponse` a COPY stream ends with, as the wire carries it.
@@ -7454,6 +7641,13 @@ pub(crate) mod tests {
         let mut stream = create_test_stream(create_test_config());
         let err = stream.send_feedback().await.unwrap_err();
         assert!(matches!(err, ReplicationError::Protocol(..)), "{err:?}");
+
+        // A failed write is counted as a failure, not as a status update sent.
+        let snapshot = stream.metrics().snapshot();
+        assert_eq!(snapshot.feedback_failures, 1);
+        assert_eq!(snapshot.feedback_sent, 0);
+        assert_eq!(snapshot.sent_flushed_lsn, 0);
+        assert_eq!(snapshot.last_feedback_time, 0);
     }
 
     #[test]
@@ -9636,6 +9830,48 @@ pub(crate) mod tests {
         }
     }
 
+    /// The commit timestamp read from the bytes is the one the parser decodes, for each message that commits.
+    #[tokio::test]
+    async fn payload_commit_time_agrees_with_the_parsed_timestamp() {
+        for (frame, _) in golden_commit_frames() {
+            let mut stream =
+                create_test_stream_with_frames(protocol_v4_config(), vec![frame.clone()]);
+            let event = stream.next_event(&CancellationToken::new()).await.unwrap();
+            let parsed = match event.event_type {
+                EventType::Commit {
+                    commit_timestamp, ..
+                }
+                | EventType::StreamCommit {
+                    commit_timestamp, ..
+                }
+                | EventType::CommitPrepared {
+                    commit_timestamp, ..
+                } => Some(commit_timestamp),
+                _ => None,
+            };
+            let peeked = payload_commit_time(&frame[25..]).map(crate::postgres_timestamp_to_chrono);
+            assert_eq!(peeked, parsed, "{}", frame[25] as char);
+            assert_eq!(peeked.is_some(), frame[25] != b'B');
+        }
+    }
+
+    #[test]
+    fn payload_commit_time_needs_a_whole_commit_message() {
+        assert_eq!(payload_commit_time(&[]), None);
+        for kind in *b"CKc" {
+            let body = [&[kind][..], &[0u8; 40]].concat();
+            assert_eq!(payload_commit_time(&body[..10]), None, "{}", kind as char);
+        }
+        let (frame, _) = &golden_commit_frames()[1];
+        assert_eq!(
+            payload_commit_time(&frame[25..25 + 25]),
+            None,
+            "one byte short"
+        );
+        assert_eq!(payload_commit_time(&frame[25..25 + 26]), Some(0x7777));
+        assert_eq!(payload_commit_time(&[b'I'; 40]), None);
+    }
+
     /// The byte-level peek reads the commit position, never `end_lsn`, and only from commit-carrying messages.
     #[test]
     fn frame_commit_lsn_reads_the_commit_position_of_commit_carrying_messages() {
@@ -9689,6 +9925,36 @@ pub(crate) mod tests {
                 timestamp: 0,
                 xid: 7,
                 gid: "g".to_string(),
+            },
+            LogicalReplicationMessage::BeginPrepare {
+                prepare_lsn: commit,
+                end_lsn: end,
+                timestamp: 0,
+                xid: 7,
+                gid: "g".to_string(),
+            },
+            LogicalReplicationMessage::StreamPrepare {
+                flags: 0,
+                prepare_lsn: commit,
+                end_lsn: end,
+                timestamp: 0,
+                xid: 7,
+                gid: "g".to_string(),
+            },
+            LogicalReplicationMessage::RollbackPrepared {
+                flags: 0,
+                prepare_end_lsn: commit,
+                rollback_end_lsn: end,
+                prepare_timestamp: 0,
+                rollback_timestamp: 0,
+                xid: 7,
+                gid: "g".to_string(),
+            },
+            LogicalReplicationMessage::StreamAbort {
+                xid: 7,
+                subtransaction_xid: 8,
+                abort_lsn: Some(end),
+                abort_timestamp: Some(0),
             },
         ];
         for message in other {
@@ -10085,6 +10351,26 @@ pub(crate) mod tests {
         assert!(!events.state.is_polling(), "the stream must be taken back");
     }
 
+    /// `current_lsn()` and `inner()` panic while a poll holds the stream; the metrics handle must not.
+    #[tokio::test]
+    async fn event_stream_metrics_are_readable_while_a_poll_is_parked() {
+        let mut events =
+            create_test_stream(create_test_config()).into_stream(CancellationToken::new());
+        let before = events.metrics();
+        events
+            .state
+            .park_with_result(Err(ReplicationError::protocol("parked failure")));
+        assert!(events.state.is_polling());
+
+        let parked = events.metrics();
+        assert_eq!(
+            parked.snapshot(),
+            crate::metrics::MetricsSnapshot::default()
+        );
+        assert_eq!(before.snapshot(), parked.snapshot());
+        assert!(events.state.is_polling(), "reading metrics must not unpark");
+    }
+
     #[tokio::test]
     async fn next_raw_event_returns_seeded_wal_payload() {
         let payload = build_begin_payload(0x2000, 7);
@@ -10296,16 +10582,21 @@ pub(crate) mod tests {
         assert_eq!(snapshot.keepalives, 1);
         assert_eq!(snapshot.received_lsn, 0x6000);
         assert_eq!(snapshot.received_lsn, stream.current_lsn());
-        assert_eq!(snapshot.first_received_lsn, 0x5000);
+        assert_eq!(snapshot.lag_bytes(), 0, "nothing past the first frame");
         assert_eq!(
-            snapshot.lag_bytes(),
+            snapshot.unconfirmed_bytes(),
             0x1000,
             "counted from the first position"
         );
 
+        stream
+            .decode_raw_frame(Bytes::from(build_wal_message(0x5000, 0x6800, b"def")))
+            .unwrap();
+        assert_eq!(handle.snapshot().lag_bytes(), 0x1800);
+
         let event_stream = stream.into_stream(CancellationToken::new());
         event_stream.update_applied_lsn(0x5800);
-        assert_eq!(event_stream.metrics().snapshot().lag_bytes(), 0x800);
+        assert_eq!(event_stream.metrics().snapshot().lag_bytes(), 0x1000);
         assert_eq!(handle.snapshot(), event_stream.metrics().snapshot());
     }
 
@@ -10322,14 +10613,77 @@ pub(crate) mod tests {
         assert_eq!(handle.snapshot().wal_messages, 0);
 
         stream
+            .decode_raw_frame(Bytes::from(build_wal_message(1, 0x1000, b"w")))
+            .unwrap();
+        stream
             .decode_raw_frame(Bytes::from(build_wal_message(1, 0x5000, b"x")))
             .unwrap();
         stream
             .decode_raw_frame(Bytes::from(build_wal_message(2, 0, b"y")))
             .unwrap();
+        stream
+            .decode_raw_frame(Bytes::from(build_wal_message(3, 0x4000, b"z")))
+            .unwrap();
         let snapshot = handle.snapshot();
-        assert_eq!(snapshot.wal_messages, 2);
+        assert_eq!(snapshot.wal_messages, 4);
         assert_eq!(snapshot.received_lsn, 0x5000);
+        assert_eq!(
+            snapshot.lag_bytes(),
+            0x4000,
+            "a lower position is no step back"
+        );
+    }
+
+    /// Keepalives carry the server's WAL end, which moves whenever any table in the database
+    /// writes. They do not grow the data lag of a stream that has received nothing new, and they
+    /// do grow what no status update has confirmed.
+    #[tokio::test]
+    async fn idle_keepalives_do_not_grow_lag_bytes() {
+        let mut stream = create_test_stream(create_test_config());
+        let handle = stream.metrics();
+        stream
+            .process_keepalive_message(&build_keepalive_message(26_000_000, false))
+            .await
+            .unwrap();
+        stream
+            .decode_raw_frame(Bytes::from(build_wal_message(1, 26_000_500, b"x")))
+            .unwrap();
+        stream
+            .process_keepalive_message(&build_keepalive_message(27_000_000, false))
+            .await
+            .unwrap();
+
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.received_lsn, 27_000_000);
+        assert_eq!(snapshot.lag_bytes(), 500);
+        assert_eq!(snapshot.unconfirmed_bytes(), 1_000_000);
+    }
+
+    /// The server's clock as it stamps each frame and keepalive, and each transaction commit,
+    /// reach the snapshot; `Begin` and the rest do not count as commits.
+    #[tokio::test]
+    async fn metrics_carry_server_times_and_count_commits() {
+        let mut stream = create_test_stream(protocol_v4_config());
+        let handle = stream.metrics();
+
+        let mut frame = build_wal_message(1, 0x2000, b"x");
+        frame[17..25].copy_from_slice(&7_000i64.to_be_bytes());
+        stream.decode_raw_frame(Bytes::from(frame)).unwrap();
+        assert_eq!(handle.snapshot().last_server_time, 7_000);
+
+        let mut keepalive = build_keepalive_message(0x3000, false);
+        keepalive[9..17].copy_from_slice(&9_000i64.to_be_bytes());
+        stream.process_keepalive_message(&keepalive).await.unwrap();
+        assert_eq!(handle.snapshot().last_server_time, 9_000);
+        assert_eq!(handle.snapshot().commits, 0);
+
+        // B, C, c, K: only the three that commit a transaction count, stamped 0x7777.
+        for (frame, _) in golden_commit_frames() {
+            stream.process_wal_message(frame).unwrap();
+        }
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.commits, 3);
+        assert_eq!(snapshot.last_commit_time, 0x7777);
     }
 
     #[test]

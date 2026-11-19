@@ -358,6 +358,12 @@ async fn metrics_follow_a_real_stream_through_a_reconnect() {
     assert_eq!(first.received_lsn, stream.current_lsn());
     assert!(first.applied_lsn > 0, "read_until acknowledged: {first:?}");
     assert_eq!(first.reconnects, 0);
+    assert!(first.commits >= 1, "{first:?}");
+    assert!(
+        first.last_server_time > 0 && first.last_commit_time > 0,
+        "{first:?}"
+    );
+    assert_eq!(first.last_error, pg_walstream::ErrorClass::None);
 
     // Read a commit without acknowledging it: the lag is the WAL received since the last ack.
     fixture.insert(2);
@@ -387,10 +393,28 @@ async fn metrics_follow_a_real_stream_through_a_reconnect() {
     assert_eq!(read_until(&mut stream, 3).await, [3]);
     let second = metrics.snapshot();
     assert_eq!(second.reconnects, 1, "{second:?}");
+    assert_eq!(
+        (second.reconnect_attempts, second.reconnect_failures),
+        (1, 0),
+        "{second:?}"
+    );
+    assert!(!second.recovering, "{second:?}");
+    assert_eq!(
+        second.last_error,
+        pg_walstream::ErrorClass::Transient,
+        "{second:?}"
+    );
     assert!(second.wal_messages > acked.wal_messages, "{second:?}");
 
     stream.send_feedback().await.expect("feedback");
-    assert_eq!(metrics.snapshot().feedback_sent, second.feedback_sent + 1);
+    let sent = metrics.snapshot();
+    assert_eq!(sent.feedback_sent, second.feedback_sent + 1);
+    assert_eq!(sent.feedback_failures, 0);
+    assert!(
+        sent.sent_flushed_lsn > 0 && sent.sent_flushed_lsn <= sent.received_lsn,
+        "{sent:?}"
+    );
+    assert!(sent.last_feedback_time > 0, "{sent:?}");
 }
 
 /// Two terminations in a row through `EventStream::next_event` under `timeout`: the loop

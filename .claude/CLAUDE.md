@@ -58,7 +58,7 @@ src/
 ├── types.rs         # Type aliases, CachePadded, ChangeEvent, Lsn
 ├── error.rs         # ReplicationError enum
 ├── lsn.rs           # Thread-safe SharedLsnFeedback (atomic CAS)
-├── metrics.rs       # StreamMetrics/MetricsSnapshot: counters + lag, single-writer relaxed atomics (+8 instructions per XLogData frame)
+├── metrics.rs       # StreamMetrics/MetricsSnapshot: counters, lags, sent position, recovery state; single-writer relaxed atomics (+13 instructions per XLogData frame in the decode, no net increase through next_event by callgrind)
 ├── copy_text.rs     # COPY TEXT decoder (crate-private, snapshot only)
 ├── snapshot/        # Managed initial snapshot (plan.rs / table_copy.rs / rows.rs / events.rs) + aligned.rs (tables added to a running stream)
 ├── sql_builder.rs   # SQL statement builders (CREATE SLOT, etc.)
