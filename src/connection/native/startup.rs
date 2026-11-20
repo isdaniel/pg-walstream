@@ -235,13 +235,22 @@ pub async fn connect(info: &ConnInfo) -> Result<(Transport, i32, BytesMut), Repl
 async fn connect_inner(info: &ConnInfo) -> Result<(Transport, i32, BytesMut), ReplicationError> {
     let addr = format!("{}:{}", info.host, info.port);
 
+    // Whatever is wrong locally with the TLS setup (an unusable client identity, unreadable
+    // root certificates) is a configuration error, settled before a socket is opened: the
+    // plaintext fallback below is for a server or network that cannot do TLS, and must not
+    // answer a bad `sslcert`/`sslkey` by quietly dropping encryption.
+    let tls = match info.sslmode {
+        SslMode::Disable => None,
+        _ => Some(Arc::new(build_tls_config(info)?)),
+    };
+
     let tcp = tcp_connect(&addr, info).await?;
 
-    let mut transport = match info.sslmode {
-        SslMode::Disable => Transport::Plain(tcp),
-        SslMode::Prefer | SslMode::Allow => {
+    let mut transport = match tls {
+        None => Transport::Plain(tcp),
+        Some(tls) if matches!(info.sslmode, SslMode::Prefer | SslMode::Allow) => {
             // For prefer/allow: attempt TLS, but fall back to a new plaintext.
-            match negotiate_tls(tcp, info).await {
+            match negotiate_tls(tcp, info, tls).await {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::debug!("TLS negotiation failed, falling back to plain: {e}");
@@ -250,7 +259,7 @@ async fn connect_inner(info: &ConnInfo) -> Result<(Transport, i32, BytesMut), Re
                 }
             }
         }
-        _ => negotiate_tls(tcp, info).await?,
+        Some(tls) => negotiate_tls(tcp, info, tls).await?,
     };
 
     // Perform startup + auth
@@ -380,11 +389,15 @@ fn configure_tcp_user_timeout(_tcp: &TcpStream, info: &ConnInfo) {
 /// - **Postgres** (default): Send SSLRequest, wait for `'S'`/`'N'`, then handshake.
 /// - **Direct** (PG 17+): Skip SSLRequest, send TLS ClientHello immediately with
 ///   ALPN `"postgresql"`. Falls back to standard negotiation on failure.
-async fn negotiate_tls(tcp: TcpStream, info: &ConnInfo) -> Result<Transport, ReplicationError> {
+async fn negotiate_tls(
+    tcp: TcpStream,
+    info: &ConnInfo,
+    tls: Arc<rustls::ClientConfig>,
+) -> Result<Transport, ReplicationError> {
     if info.sslnegotiation == SslNegotiation::Direct {
         // Direct mode: attempt TLS handshake immediately with ALPN.
         // On failure, fall back to standard SSLRequest negotiation with a fresh connection.
-        match negotiate_tls_direct(tcp, info).await {
+        match negotiate_tls_direct(tcp, info, &tls).await {
             Ok(transport) => return Ok(transport),
             Err(e) => {
                 tracing::debug!(
@@ -394,18 +407,19 @@ async fn negotiate_tls(tcp: TcpStream, info: &ConnInfo) -> Result<Transport, Rep
                 // Open a new one for the standard SSLRequest fallback.
                 let addr = format!("{}:{}", info.host, info.port);
                 let tcp = tcp_connect(&addr, info).await?;
-                return negotiate_tls_standard(tcp, info).await;
+                return negotiate_tls_standard(tcp, info, tls).await;
             }
         }
     }
 
-    negotiate_tls_standard(tcp, info).await
+    negotiate_tls_standard(tcp, info, tls).await
 }
 
 /// Standard PostgreSQL TLS negotiation via SSLRequest.
 async fn negotiate_tls_standard(
     mut tcp: TcpStream,
     info: &ConnInfo,
+    tls: Arc<rustls::ClientConfig>,
 ) -> Result<Transport, ReplicationError> {
     // Send SSLRequest
     let ssl_req = wire::build_ssl_request();
@@ -417,8 +431,7 @@ async fn negotiate_tls_standard(
     match response {
         b'S' => {
             // Server supports SSL — do the handshake
-            let tls_config = build_tls_config(info)?;
-            let connector = TlsConnector::from(Arc::new(tls_config));
+            let connector = TlsConnector::from(tls);
 
             let server_name = rustls::pki_types::ServerName::try_from(info.host.as_str())
                 .map_err(|e| {
@@ -469,8 +482,9 @@ async fn negotiate_tls_standard(
 async fn negotiate_tls_direct(
     tcp: TcpStream,
     info: &ConnInfo,
+    tls: &rustls::ClientConfig,
 ) -> Result<Transport, ReplicationError> {
-    let mut tls_config = build_tls_config(info)?;
+    let mut tls_config = tls.clone();
 
     // Set ALPN to "postgresql" — this is how the server distinguishes a direct
     // TLS PostgreSQL connection from other protocols.
@@ -519,9 +533,8 @@ fn build_tls_config(info: &ConnInfo) -> Result<rustls::ClientConfig, Replication
                         "Failed to configure TLS protocol versions: {e}"
                     ))
                 })?
-                .with_root_certificates(root_store)
-                .with_no_client_auth();
-            Ok(config)
+                .with_root_certificates(root_store);
+            with_client_identity(config, info)
         }
         SslMode::VerifyCa => {
             // Verify cert chain but NOT hostname.
@@ -536,9 +549,8 @@ fn build_tls_config(info: &ConnInfo) -> Result<rustls::ClientConfig, Replication
                     ))
                 })?
                 .dangerous()
-                .with_custom_certificate_verifier(Arc::new(verifier))
-                .with_no_client_auth();
-            Ok(config)
+                .with_custom_certificate_verifier(Arc::new(verifier));
+            with_client_identity(config, info)
         }
         SslMode::Require | SslMode::Prefer | SslMode::Allow => {
             // Encrypt but skip certificate verification entirely.
@@ -551,13 +563,118 @@ fn build_tls_config(info: &ConnInfo) -> Result<rustls::ClientConfig, Replication
                     ))
                 })?
                 .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoVerification(provider)))
-                .with_no_client_auth();
-            Ok(config)
+                .with_custom_certificate_verifier(Arc::new(NoVerification(provider)));
+            with_client_identity(config, info)
         }
         SslMode::Disable => {
             unreachable!("TLS config not needed when sslmode=disable")
         }
+    }
+}
+
+/// Finish a `ClientConfig`, presenting the `sslcert`/`sslkey` pair if there is one.
+///
+/// rustls sends it only when the server asks for a certificate, so it is harmless against a server that does not.
+fn with_client_identity(
+    builder: rustls::ConfigBuilder<rustls::ClientConfig, rustls::client::WantsClientCert>,
+    info: &ConnInfo,
+) -> Result<rustls::ClientConfig, ReplicationError> {
+    let (Some(cert_path), Some(key_path)) = (info.sslcert.as_deref(), info.sslkey.as_deref())
+    else {
+        return Ok(builder.with_no_client_auth());
+    };
+    let Some((chain, key)) = load_client_identity(cert_path, key_path)? else {
+        return Ok(builder.with_no_client_auth());
+    };
+    builder.with_client_auth_cert(chain, key).map_err(|e| {
+        ReplicationError::permanent_connection(format!(
+            "sslcert '{cert_path}' and sslkey '{key_path}' cannot be used as a client identity: {e}"
+        ))
+    })
+}
+
+/// The certificate chain and private key of a client identity.
+type ClientIdentity = (
+    Vec<rustls::pki_types::CertificateDer<'static>>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+);
+
+/// Read the client certificate chain and private key, at every connect so a rotated pair is picked up on reconnect.
+///
+/// `Ok(None)` when `sslcert` names a file that does not exist: libpq carries on without a client certificate then (`initialize_SSL`), so a connection string with a stale path keeps working as it did before the pair was used. A certificate that exists but cannot be used, or a missing key, is an error.
+///
+/// The key may be PKCS#8, PKCS#1 (`RSA PRIVATE KEY`) or SEC1 (`EC PRIVATE KEY`). An encrypted one is refused by name: decrypting it needs `sslpassword`, which this backend does not support. Errors name the path and say what is wrong with the file, never what is in it.
+fn load_client_identity(
+    cert_path: &str,
+    key_path: &str,
+) -> Result<Option<ClientIdentity>, ReplicationError> {
+    let unreadable = |what: &str, path: &str, why: &dyn std::fmt::Display| {
+        ReplicationError::permanent_connection(format!("Failed to read {what} '{path}': {why}"))
+    };
+
+    let cert_pem = match std::fs::read(cert_path) {
+        Ok(pem) => pem,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            tracing::warn!("sslcert '{cert_path}' does not exist: no client certificate is sent");
+            return Ok(None);
+        }
+        Err(e) => return Err(unreadable("sslcert file", cert_path, &e)),
+    };
+    let chain = rustls::pki_types::CertificateDer::pem_slice_iter(&cert_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
+            unreadable(
+                "PEM certificates from sslcert file",
+                cert_path,
+                &pem_problem(&e),
+            )
+        })?;
+    if chain.is_empty() {
+        return Err(ReplicationError::permanent_connection(format!(
+            "No certificates found in sslcert file '{cert_path}'"
+        )));
+    }
+
+    let key_pem = std::fs::read(key_path).map_err(|e| unreadable("sslkey file", key_path, &e))?;
+    // The markers of an encrypted key, not the bare word: a comment may say it.
+    const ENCRYPTED_MARKERS: [&[u8]; 2] =
+        [b"BEGIN ENCRYPTED PRIVATE KEY", b"Proc-Type: 4,ENCRYPTED"];
+    if ENCRYPTED_MARKERS
+        .iter()
+        .any(|marker| find_subsequence(&key_pem, marker).is_some())
+    {
+        return Err(ReplicationError::permanent_connection(format!(
+            "sslkey '{key_path}' is encrypted, and the native backend cannot decrypt it \
+             (sslpassword is not supported): decrypt it, or use the `libpq` backend"
+        )));
+    }
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(&key_pem).map_err(|e| {
+        unreadable(
+            "a PEM private key from sslkey file",
+            key_path,
+            &pem_problem(&e),
+        )
+    })?;
+    Ok(Some((chain, key)))
+}
+
+/// What is wrong with a PEM file, without any of its content.
+///
+/// pki-types puts the offending line into its error text, and for a file that lost its newlines (a pasted or environment-variable secret) the parser takes the whole key for the section label, so its message would carry the key as a list of byte values into a log line written on every connect attempt.
+fn pem_problem(e: &rustls::pki_types::pem::Error) -> String {
+    use rustls::pki_types::pem::Error;
+    match e {
+        Error::Io(io) => format!("I/O error: {io}"),
+        Error::NoItemsFound => "it holds no PEM section of the expected kind".to_string(),
+        Error::Base64Decode(_) => "a section's base64 body is invalid".to_string(),
+        Error::MissingSectionEnd { .. } => "a section has no matching END line".to_string(),
+        Error::IllegalSectionStart { .. } => "a BEGIN line is malformed".to_string(),
+        _ => "it is not valid PEM".to_string(),
     }
 }
 
@@ -905,6 +1022,320 @@ mod tests {
         assert!(err.to_string().contains("/nonexistent/ca.pem"), "{err}");
     }
 
+    const TESTDATA: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/connection/native/testdata"
+    );
+
+    fn fixture(name: &str) -> String {
+        format!("{TESTDATA}/{name}")
+    }
+
+    fn info_with_identity(sslmode: SslMode, cert: &str, key: &str) -> ConnInfo {
+        let mut info = test_conninfo(sslmode, None);
+        info.sslcert = Some(fixture(cert));
+        info.sslkey = Some(fixture(key));
+        info
+    }
+
+    const VERIFYING_AND_NOT: [SslMode; 3] =
+        [SslMode::Require, SslMode::VerifyCa, SslMode::VerifyFull];
+
+    /// Every `ClientConfig` builder presents the pair, for each key encoding rustls reads.
+    #[test]
+    fn client_identity_is_configured_in_every_tls_mode() {
+        for (cert, key) in [
+            ("client_ec.crt", "client_ec_pkcs8.key"),
+            ("client_ec.crt", "client_ec_sec1.key"),
+            ("client_rsa.crt", "client_rsa_pkcs1.key"),
+        ] {
+            for mode in VERIFYING_AND_NOT {
+                let config = build_tls_config(&info_with_identity(mode, cert, key))
+                    .unwrap_or_else(|e| panic!("{mode:?} {key}: {e}"));
+                assert!(
+                    config.client_auth_cert_resolver.has_certs(),
+                    "{mode:?} {key}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_client_identity_means_no_client_auth() {
+        for mode in VERIFYING_AND_NOT {
+            let config = build_tls_config(&test_conninfo(mode, None)).unwrap();
+            assert!(!config.client_auth_cert_resolver.has_certs(), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn the_whole_certificate_chain_is_loaded() {
+        let bundle = std::env::temp_dir().join(format!("pgws-chain-{}.pem", std::process::id()));
+        let both = [
+            std::fs::read_to_string(fixture("client_ec.crt")).unwrap(),
+            std::fs::read_to_string(fixture("client_rsa.crt")).unwrap(),
+        ]
+        .concat();
+        std::fs::write(&bundle, both).unwrap();
+        let loaded =
+            load_client_identity(bundle.to_str().unwrap(), &fixture("client_ec_pkcs8.key"));
+        std::fs::remove_file(&bundle).unwrap();
+        assert_eq!(
+            loaded
+                .unwrap()
+                .expect("a certificate file that exists")
+                .0
+                .len(),
+            2
+        );
+    }
+
+    /// Each failure is permanent (retrying a bad file cannot fix it) and names the file;
+    /// none echoes any of the key material.
+    #[test]
+    fn unusable_client_identities_fail_permanently_naming_the_file() {
+        let key_body = std::fs::read_to_string(fixture("client_ec_pkcs8.key"))
+            .unwrap()
+            .lines()
+            .nth(1)
+            .unwrap()
+            .to_string();
+        for (cert, key, expect) in [
+            ("client_ec.crt", "missing.key", "missing.key"),
+            (
+                "client_ec_pkcs8.key",
+                "client_ec_pkcs8.key",
+                "No certificates found",
+            ),
+            ("client_ec.crt", "client_ec.crt", "PEM private key"),
+            ("client_ec.crt", "client_ec_encrypted.key", "is encrypted"),
+            (
+                "client_ec.crt",
+                "other_ec_pkcs8.key",
+                "cannot be used as a client identity",
+            ),
+            (
+                "client_rsa.crt",
+                "client_ec_pkcs8.key",
+                "cannot be used as a client identity",
+            ),
+        ] {
+            let err = build_tls_config(&info_with_identity(SslMode::VerifyFull, cert, key))
+                .expect_err(&format!("{cert} + {key} must be refused"));
+            let shown = err.to_string();
+            assert!(err.is_permanent(), "{cert} + {key}: {shown}");
+            assert!(shown.contains(expect), "{cert} + {key}: {shown}");
+            assert!(
+                !shown.contains(&key_body),
+                "{cert} + {key} echoed key material"
+            );
+        }
+    }
+
+    /// A scratch file that removes itself, so a failing assertion cannot leave it behind.
+    struct TempFile(std::path::PathBuf);
+    impl TempFile {
+        fn new(name: &str, contents: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("pgws-{}-{name}", std::process::id()));
+            std::fs::write(&path, contents).unwrap();
+            Self(path)
+        }
+        fn path(&self) -> String {
+            self.0.to_str().unwrap().to_string()
+        }
+    }
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// A key file that lost its newlines (a pasted or environment-variable secret) makes the
+    /// PEM parser fold the whole content into its error text. That text is logged on every
+    /// connect attempt, so none of it may reach our message, whichever of `sslcert` and
+    /// `sslkey` the file is given as.
+    #[test]
+    fn a_key_file_without_newlines_never_reaches_the_error_message() {
+        let original = std::fs::read_to_string(fixture("client_ec_pkcs8.key")).unwrap();
+        let body: String = original
+            .lines()
+            .filter(|l| !l.starts_with("-----"))
+            .collect();
+        // The same bytes as pki-types renders them: a decimal list.
+        let decimal = format!("{:?}", &body.as_bytes()[..24]);
+        let decimal = decimal.trim_matches(['[', ']']);
+        let one_line = TempFile::new("oneline.key", &original.lines().collect::<String>());
+        for (cert, key) in [
+            (one_line.path(), fixture("client_ec_pkcs8.key")),
+            (fixture("client_ec.crt"), one_line.path()),
+        ] {
+            let mut info = test_conninfo(SslMode::VerifyFull, None);
+            info.sslcert = Some(cert.clone());
+            info.sslkey = Some(key.clone());
+            let shown = build_tls_config(&info)
+                .expect_err("a mangled file must be refused")
+                .to_string();
+            assert!(
+                !shown.contains(&body[..24]),
+                "{cert} + {key} leaked the key: {shown}"
+            );
+            assert!(
+                !shown.contains(decimal),
+                "{cert} + {key} leaked the key: {shown}"
+            );
+        }
+    }
+
+    /// A certificate file that is PEM in name only is refused, naming the file and what is
+    /// wrong, not what it holds.
+    #[test]
+    fn a_corrupt_certificate_file_is_refused_without_echoing_it() {
+        let junk = "notbase64-0123456789-SECRETMARKER";
+        let corrupt = TempFile::new(
+            "corrupt.crt",
+            &format!("-----BEGIN CERTIFICATE-----\n!!{junk}!!\n-----END CERTIFICATE-----\n"),
+        );
+        let mut info = test_conninfo(SslMode::VerifyFull, None);
+        info.sslcert = Some(corrupt.path());
+        info.sslkey = Some(fixture("client_ec_pkcs8.key"));
+        let err = build_tls_config(&info).expect_err("a corrupt certificate must be refused");
+        let shown = err.to_string();
+        assert!(err.is_permanent(), "{shown}");
+        assert!(shown.contains(&corrupt.path()), "{shown}");
+        assert!(shown.contains("base64 body is invalid"), "{shown}");
+        assert!(!shown.contains(junk), "{shown}");
+    }
+
+    /// Only a real encrypted-key marker refuses a key, not the word anywhere in the file.
+    #[test]
+    fn encrypted_keys_are_recognised_by_their_markers_not_by_the_word() {
+        let plain = std::fs::read_to_string(fixture("client_ec_pkcs8.key")).unwrap();
+        let commented = TempFile::new("commented.key", &format!("# not ENCRYPTED\n{plain}"));
+        let loaded = load_client_identity(&fixture("client_ec.crt"), &commented.path());
+        assert!(
+            loaded.is_ok(),
+            "a plain key with a comment was refused: {:?}",
+            loaded.err()
+        );
+
+        let legacy = TempFile::new(
+            "legacy.key",
+            "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,00\n\nAAAA\n-----END RSA PRIVATE KEY-----\n",
+        );
+        for key in [fixture("client_ec_encrypted.key"), legacy.path()] {
+            let err = load_client_identity(&fixture("client_ec.crt"), &key).unwrap_err();
+            assert!(err.to_string().contains("is encrypted"), "{key}: {err}");
+        }
+    }
+
+    /// A broken client identity is a configuration error. Under `sslmode=prefer` and `allow`,
+    /// where any TLS-negotiation failure used to be answered by retrying in plaintext, it must
+    /// not be: the connection stays an error, and nothing is sent in the clear. It is settled
+    /// before a socket is opened, so the server sees no connection at all.
+    #[tokio::test]
+    async fn a_broken_client_identity_is_an_error_not_a_plaintext_fallback() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for mode in [SslMode::Prefer, SslMode::Allow, SslMode::Require] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let seen = Arc::new(std::sync::Mutex::new(Vec::<[u8; 8]>::new()));
+            let log = seen.clone();
+            let server = tokio::spawn(async move {
+                // Answers an SSLRequest with 'S', as a TLS-capable server does.
+                while let Ok((mut peer, _)) = listener.accept().await {
+                    let mut first = [0u8; 8];
+                    if peer.read_exact(&mut first).await.is_ok() {
+                        log.lock().unwrap().push(first);
+                        if first[4..] == 80877103u32.to_be_bytes() {
+                            let _ = peer.write_all(b"S").await;
+                        }
+                    }
+                }
+            });
+            for (cert, key) in [
+                ("client_ec.crt", "missing.key"),
+                ("client_ec.crt", "other_ec_pkcs8.key"),
+                ("client_ec.crt", "client_ec_encrypted.key"),
+            ] {
+                let mut info = info_with_identity(mode, cert, key);
+                info.host = addr.ip().to_string();
+                info.port = addr.port();
+                let Err(err) = connect(&info).await else {
+                    panic!("{mode:?} {key}: a broken identity must refuse the connection");
+                };
+                assert!(err.to_string().contains(key), "{mode:?} {key}: {err}");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            server.abort();
+            let seen = seen.lock().unwrap().clone();
+            assert!(
+                seen.is_empty(),
+                "{mode:?}: a socket was opened for a configuration error: {seen:?}"
+            );
+        }
+    }
+
+    /// The other half of the same rule: a good identity must not stop `prefer` from doing what
+    /// it is for, so a server without TLS still gets the plaintext startup.
+    #[tokio::test]
+    async fn prefer_with_a_good_identity_still_falls_back_when_the_server_has_no_tls() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            let mut ssl_request = [0u8; 8];
+            peer.read_exact(&mut ssl_request).await.unwrap();
+            peer.write_all(b"N").await.unwrap();
+            let mut len = [0u8; 4];
+            peer.read_exact(&mut len).await.unwrap();
+            let mut msg = len.to_vec();
+            msg.resize(i32::from_be_bytes(len) as usize, 0);
+            peer.read_exact(&mut msg[4..]).await.unwrap();
+            msg
+        });
+        let mut info = info_with_identity(SslMode::Prefer, "client_ec.crt", "client_ec_pkcs8.key");
+        info.host = addr.ip().to_string();
+        info.port = addr.port();
+        assert!(
+            connect(&info).await.is_err(),
+            "the peer hangs up after the startup"
+        );
+        let pairs = startup_pairs(&server.await.unwrap());
+        assert!(
+            pairs.contains(&("user".to_string(), "test".to_string())),
+            "{pairs:?}"
+        );
+    }
+
+    /// libpq carries on without a client certificate when `sslcert` names a file that does not
+    /// exist (`initialize_SSL` in fe-secure-openssl.c), and so did this backend before it
+    /// started sending certificates: a connection string with a stale path must keep working.
+    /// A certificate that is there but unusable, or a missing key, is still an error.
+    #[test]
+    fn a_missing_sslcert_sends_no_client_certificate() {
+        for mode in VERIFYING_AND_NOT {
+            let config = build_tls_config(&info_with_identity(
+                mode,
+                "missing.crt",
+                "client_ec_pkcs8.key",
+            ))
+            .unwrap_or_else(|e| panic!("{mode:?}: {e}"));
+            assert!(!config.client_auth_cert_resolver.has_certs(), "{mode:?}");
+        }
+        assert!(
+            build_tls_config(&info_with_identity(
+                SslMode::Require,
+                "client_ec.crt",
+                "missing.key"
+            ))
+            .is_err(),
+            "a certificate without its key stays an error"
+        );
+    }
+
     /// Create a ConnInfo with test defaults, allowing override of specific fields.
     fn test_conninfo(sslmode: SslMode, sslrootcert: Option<String>) -> ConnInfo {
         ConnInfo {
@@ -915,6 +1346,8 @@ mod tests {
             dbname: "test".to_string(),
             sslmode,
             sslrootcert,
+            sslcert: None,
+            sslkey: None,
             sslnegotiation: super::super::conninfo::SslNegotiation::Postgres,
             replication: super::super::conninfo::ReplicationMode::None,
             application_name: None,

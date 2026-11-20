@@ -53,6 +53,22 @@ When `sslmode` is `verify-ca` or `verify-full`, the `rustls-tls` backend loads *
 postgresql://user:pass@host/db?sslmode=verify-full&sslrootcert=/etc/ssl/certs/corporate-ca.pem
 ```
 
+### Client certificates
+
+For a server that authenticates by certificate (`hostssl ... cert`), the `rustls-tls` backend presents the pair named by `sslcert` and `sslkey`, much as libpq does:
+
+```text
+postgresql://cdc@host/db?sslmode=verify-full&sslrootcert=/etc/ssl/ca.pem&sslcert=/etc/ssl/cdc.crt&sslkey=/etc/ssl/cdc.key
+```
+
+- Both are PEM files and both are required: libpq's default `~/.postgresql/postgresql.{crt,key}` is never read, `sslcert` without `sslkey` is a configuration error, and a lone `sslkey` is ignored. Put intermediate certificates after the leaf in the `sslcert` file and the whole chain is sent.
+- The key may be PKCS#8, PKCS#1 (`RSA PRIVATE KEY`) or SEC1 (`EC PRIVATE KEY`) in PEM, not DER; RSA, ECDSA (P-256 and P-384) and Ed25519 keys authenticate. An encrypted key is refused by name (`sslpassword` is not supported): decrypt it first, or use the `libpq` backend.
+- The certificate must be X.509 v3. `openssl x509 -req` without `-extfile` issues a v1 certificate, which rustls refuses to present, so the handshake fails with `UnsupportedCertVersion`.
+- Both files are read again on every connect, so a rotated pair is used by the next reconnect. A `sslcert` that does not exist means no certificate is sent, as in libpq, so a stale path does not break a connection that never needed one. A certificate that exists but cannot be used, a missing or encrypted key, or a pair that does not match is a connection error under every `sslmode`, `prefer` and `allow` included: it is never answered by retrying in plaintext. These errors are retried like any connection failure (five attempts by default, about 15 s) and then returned with the file and the reason; each attempt logs them too. If `connection_timeout` is shorter than the retries take, the error you get back is a `Timeout` instead. With `sslmode=disable` both options are ignored.
+- The pair is offered in every `sslmode`, but `require`, `prefer` and `allow` do not verify the server, so there the certificate goes to whatever answers; use `verify-ca` or `verify-full` to know who receives it.
+- `sslcertmode=disable` keeps the pair off the wire. `sslcertmode=require` is refused here, because this backend does not check that the server asked for a certificate.
+- Unlike libpq, the key file's permissions are not checked, and the `PGSSLCERT`, `PGSSLKEY` and `PGSSLCERTMODE` environment variables are not read (nor is any environment variable but `PGPASSWORD`).
+
 ## Quick Start
 
 ```rust

@@ -598,6 +598,28 @@ jobs:
           -out /tmp/pg-ssl/wrong-ca.crt \
           -subj "/CN=wrong-ca"
 
+        # Client certificates for ssl_client_cert: the role `certuser` is authenticated by
+        # its certificate alone. One pair is signed by the server's CA, one by the wrong CA.
+        # X.509 v3 is required: without -extfile openssl issues a v1 certificate, which
+        # rustls refuses to present as a client identity (UnsupportedCertVersion).
+        printf 'basicConstraints=CA:FALSE\nextendedKeyUsage=clientAuth\n' > /tmp/pg-ssl/client.ext
+        for pair in "client:ca" "untrusted-client:wrong-ca"; do
+          name=${pair%%:*}
+          signer=${pair##*:}
+          openssl req -new -nodes \
+            -newkey rsa:2048 \
+            -keyout /tmp/pg-ssl/$name.key \
+            -out /tmp/pg-ssl/$name.csr \
+            -subj "/CN=certuser"
+          openssl x509 -req -days 365 \
+            -in /tmp/pg-ssl/$name.csr \
+            -CA /tmp/pg-ssl/$signer.crt \
+            -CAkey /tmp/pg-ssl/$signer.key \
+            -CAcreateserial \
+            -extfile /tmp/pg-ssl/client.ext \
+            -out /tmp/pg-ssl/$name.crt
+        done
+
     - name: Verify generated certificates
       run: |
         echo "=== CA Certificate ==="
@@ -648,6 +670,16 @@ jobs:
           sleep 2
         done
 
+        # A role that only a client certificate can authenticate (ssl_client_cert). The
+        # rules go first so they win over the image's own, which would ask a passwordless
+        # role for a password, and `reject` stops a plaintext connection from falling
+        # through to those.
+        psql -h localhost -U postgres -d test_walstream -c "CREATE ROLE certuser LOGIN REPLICATION;"
+        docker exec $CONTAINER_ID bash -c \
+          'cp "$PGDATA/pg_hba.conf" /tmp/pg_hba.orig &&
+           { printf "hostssl all certuser all cert\nhost all certuser all reject\n"; cat /tmp/pg_hba.orig; } > "$PGDATA/pg_hba.conf"'
+        psql -h localhost -U postgres -d test_walstream -c "SELECT pg_reload_conf();"
+
     - name: Verify PostgreSQL SSL and replication config
       env:
         PGPASSWORD: postgres
@@ -678,6 +710,10 @@ jobs:
         DATABASE_URL_REGULAR: "postgresql://postgres:postgres@localhost:5432/test_walstream?connect_timeout=10"
         SSL_CA_CERT_PATH: "/tmp/pg-ssl/ca.crt"
         SSL_WRONG_CA_CERT_PATH: "/tmp/pg-ssl/wrong-ca.crt"
+        SSL_CLIENT_CERT_PATH: "/tmp/pg-ssl/client.crt"
+        SSL_CLIENT_KEY_PATH: "/tmp/pg-ssl/client.key"
+        SSL_UNTRUSTED_CLIENT_CERT_PATH: "/tmp/pg-ssl/untrusted-client.crt"
+        SSL_UNTRUSTED_CLIENT_KEY_PATH: "/tmp/pg-ssl/untrusted-client.key"
         RUST_BACKTRACE: 1
       # Same filesystem enumeration as the integration job, over the `ssl_*`
       # half of the partition: a new SSL suite is picked up automatically.
