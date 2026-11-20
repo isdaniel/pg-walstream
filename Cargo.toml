@@ -230,6 +230,10 @@ name = "idle_feedback"
 path = "integration-tests/idle_feedback.rs"
 
 [[test]]
+name = "handler_feedback"
+path = "integration-tests/handler_feedback.rs"
+
+[[test]]
 name = "libpq_async_connect"
 path = "integration-tests/libpq_async_connect.rs"
 

@@ -103,7 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`ReplicationStreamConfig` has `with_*` methods for the rest (protocol version, feedback interval, retry policy and more). The [`examples/`](examples/) directory has runnable programs:
+`ReplicationStreamConfig` has `with_*` methods for the rest (protocol version, feedback interval, retry policy and more). To stream from several publications at once, use `with_publications(["orders", "Sales"])`: each name is taken literally, so case, commas, spaces and quotes need no escaping. The [`examples/`](examples/) directory has runnable programs:
 
 | Example | Description |
 |---------|-------------|
@@ -213,7 +213,7 @@ To shorten the wait without a code change, shorten `wal_sender_timeout` for the 
 | Role | `ALTER ROLE cdc SET wal_sender_timeout = '4s'` |
 | Server | `wal_sender_timeout = '4s'` in `postgresql.conf` |
 
-The trade-off is that the same value is how long the stream may go without answering before the server disconnects it. Choose `T = 2 × the delay you accept`, and keep it above the longest pause your consumer takes between reads (a handler that blocks, a slow downstream write). A disconnected stream is recovered by `next_event_with_retry`, which reconnects and resumes from the last confirmed position, but it costs a reconnect and a replay of the unconfirmed transactions. Measured on PostgreSQL 17 with the native backend: `T` of 4, 10 and 20 s reported an idle acknowledgement after 2, 5 and 10 s, and a 10 s pause between reads disconnected the stream at `T = 4 s` but not at `T = 20 s`.
+The trade-off is that the same value is how long the stream may go without answering before the server disconnects it. Choose `T = 2 × the delay you accept`, and keep it above the longest pause your consumer takes between reads in a loop you wrote yourself around `next_event` (a blocking step, a slow downstream write). Handlers run by `for_each_event` or `WalRouter::run` are covered: while one is pending the stream sends a status update every `feedback_interval`, repeating the last position you acknowledged and never the event being handled, so a slow handler does not disconnect it. That holds only while the handler is awaiting: one that blocks the thread (a synchronous call, a long loop without an `.await`) is a single poll and sends nothing, so move that work to `spawn_blocking`. A handler that never returns is not detected either: the updates keep the connection looking healthy, `pg_replication_slots.active` stays true and the slot's WAL piles up, so give a handler that can hang its own `tokio::time::timeout`. Measured on PostgreSQL 17 with `wal_sender_timeout = 5s` and a 14 s handler: the stream was disconnected in 3 of 3 runs before, and in 0 of 3 with the updates. A hand-written `next_event` loop gets none of this and must call `send_feedback` itself. A disconnected stream is recovered by `next_event_with_retry`, which reconnects and resumes from the last confirmed position, but it costs a reconnect and a replay of the unconfirmed transactions. Measured on PostgreSQL 17 with the native backend: `T` of 4, 10 and 20 s reported an idle acknowledgement after 2, 5 and 10 s, and a 10 s pause between reads disconnected the stream at `T = 4 s` but not at `T = 20 s`.
 
 ## Metrics
 

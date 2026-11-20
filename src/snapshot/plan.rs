@@ -599,6 +599,39 @@ mod tests {
         }
     }
 
+    /// `with_publications` is the writer and `split_publication_names` the reader of one
+    /// format; the names a caller gives must come back unchanged, whatever they contain.
+    #[test]
+    fn with_publications_round_trips_through_the_server_rules() {
+        let lists: [&[&str]; 9] = [
+            &["a"],
+            &["a", "B"],
+            &["Sales", "a,b", " pad "],
+            &["q\"uote", "\"", "\"\""],
+            &["o'brien", "semi;colon", "back\\slash"],
+            &["tab\tname", "new\nline"],
+            &["日本語", "ünï"],
+            &["x\x0bvt"],
+            &["", "after-empty"],
+        ];
+        for names in lists {
+            let config = crate::stream::ReplicationStreamConfig::builder("s", "ignored")
+                .with_publications(names);
+            for version in [PG17 - 1, PG17, PG18] {
+                // Names with a vertical tab are only literal below PG17 (the server skips
+                // it as whitespace from there on), which is the split rule's doing.
+                if version >= PG17 && names.iter().any(|n| n.contains('\x0b')) {
+                    continue;
+                }
+                assert_eq!(
+                    split_publication_names(version, &config.publication_name).unwrap(),
+                    names,
+                    "{names:?} on {version}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn split_publication_names_rejects_malformed_lists() {
         for input in [

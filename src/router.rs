@@ -2,7 +2,7 @@
 //! client-ergonomics design.
 
 use crate::error::{ReplicationError, Result};
-use crate::stream::{EventSource, EventStream};
+use crate::stream::{await_with_feedback, EventSource, EventStream};
 use crate::types::{ChangeEvent, EventType};
 use core::future::Future;
 use core::pin::Pin;
@@ -165,6 +165,9 @@ impl WalRouter {
 
     /// Drive an [`EventStream`]: dispatch each event, auto-advance applied LSN
     /// after each `Ok`, and exit gracefully on cancellation.
+    ///
+    /// While a handler is pending, a status update goes out every `feedback_interval`
+    /// (see [`for_each_event`](EventStream::for_each_event) for what that does and does not cover).
     pub async fn run(&mut self, es: &mut EventStream) -> Result<()> {
         self.run_over(es).await
     }
@@ -175,7 +178,7 @@ impl WalRouter {
             match source.recv().await {
                 Ok(ev) => {
                     let lsn = ev.lsn.value();
-                    self.dispatch(&ev).await?;
+                    await_with_feedback(source, self.dispatch(&ev)).await?;
                     source.ack(lsn);
                 }
                 Err(ReplicationError::Cancelled(_)) => return Ok(()),
@@ -521,6 +524,50 @@ mod tests {
             last_ack: AtomicU64::new(0),
         };
         assert!(router.run_over(&mut src).await.is_err());
+    }
+
+    /// Counts the status updates `run_over` sends while a handler is pending.
+    struct TickingSource {
+        events: VecDeque<Result<ChangeEvent>>,
+        feedbacks: u32,
+    }
+    impl EventSource for TickingSource {
+        async fn recv(&mut self) -> Result<ChangeEvent> {
+            self.events
+                .pop_front()
+                .unwrap_or_else(|| Err(ReplicationError::Cancelled("drained".into())))
+        }
+        fn ack(&self, _lsn: XLogRecPtr) {}
+        fn feedback_interval(&self) -> Option<std::time::Duration> {
+            Some(std::time::Duration::from_secs(10))
+        }
+        async fn send_feedback(&mut self) -> Result<()> {
+            self.feedbacks += 1;
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_over_sends_feedback_while_a_handler_is_pending() {
+        let mut router = WalRouter::new();
+        router.on_insert::<Row, _, _>("users", |_r| async {
+            tokio::time::sleep(std::time::Duration::from_secs(25)).await;
+            Ok(())
+        });
+        let mut src = TickingSource {
+            events: vec![Ok(ins("users", "1", 10)), Ok(ins("other", "2", 20))].into(),
+            feedbacks: 0,
+        };
+        router.run_over(&mut src).await.unwrap();
+        // 10 s and 20 s into the slow handler; the unrouted event is a no-op and sends none.
+        assert_eq!(src.feedbacks, 2);
+    }
+
+    /// The router loop must stay spawnable like `for_each_event`.
+    #[allow(dead_code)]
+    async fn run_future_is_send(router: &mut WalRouter, es: &mut EventStream) {
+        fn send<T: Send>(_: &T) {}
+        send(&router.run(es));
     }
 
     #[tokio::test]

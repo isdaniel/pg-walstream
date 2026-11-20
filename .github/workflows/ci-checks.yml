@@ -464,12 +464,14 @@ jobs:
             # `idle_feedback` sets `wal_sender_timeout` through the connection string's
             # `options` and needs each backend's startup message to carry it and each
             # backend's own COPY read to answer the server's ping with the current
-            # acknowledgement.
+            # acknowledgement. `handler_feedback` holds a consume-loop handler past
+            # `wal_sender_timeout` and needs each backend's own writer to keep the
+            # walsender alive with status updates.
             # `reconnect_recovery` reconnects through each backend's own
             # connect, identity check and START_REPLICATION. `binary_serde` round-trips
             # the events each backend's own COPY ingress produced (a reusable copy on
             # libpq, zero-copy slices on native) through every serde format.
-            error_classification|upload_manifest|initial_snapshot|require_existing_slot|unread_stream_feedback|aligned_snapshot|startup_metadata|startup_params|idle_feedback|reconnect_recovery|binary_serde)
+            error_classification|upload_manifest|initial_snapshot|require_existing_slot|unread_stream_feedback|aligned_snapshot|startup_metadata|startup_params|idle_feedback|handler_feedback|reconnect_recovery|binary_serde)
               variants=("" "--no-default-features --features libpq") ;;
             *) variants=("") ;;
           esac

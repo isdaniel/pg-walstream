@@ -526,7 +526,7 @@ pub struct ReplicationStreamConfig {
     pub slot_name: String,
     /// Publication to replicate from.
     ///
-    /// To stream from several publications at once, pass them comma-separated  with each name quoted — `r#"pub_a","pub_b"#` — which produces the `publication_names '"pub_a","pub_b"'` list pgoutput expects. One stream and one slot cover all of them.
+    /// To stream from several publications at once, use [`with_publications`](Self::with_publications). Written by hand, the list is comma-separated with each name quoted — `r#"pub_a","pub_b"#` — which produces the `publication_names '"pub_a","pub_b"'` list pgoutput expects. One stream and one slot cover all of them.
     ///
     /// [`snapshot`](LogicalReplicationStream::snapshot) and [`published_relations`](LogicalReplicationStream::published_relations) read this list as PostgreSQL does, so a single name is taken literally once each `"` is doubled, and a malformed list is a `Config` error.
     pub publication_name: String,
@@ -811,6 +811,32 @@ impl ReplicationStreamConfig {
             publication_name: publication.into(),
             ..Default::default()
         }
+    }
+
+    /// Stream from several publications at once; one stream and one slot cover all of them.
+    ///
+    /// Replaces the publication given to [`builder`](Self::builder). Every name is taken literally: case is kept, and commas, spaces and `"` need no quoting, so `["Sales", "a,b"]` names two publications. That differs from setting [`publication_name`](Self::publication_name) by hand, where a list has to be written already quoted.
+    ///
+    /// An empty list leaves the publication empty. PostgreSQL 15 and 17 reject that with `publication "" does not exist` at the first change, after `start()` has returned `Ok`; PostgreSQL 18 only logs a warning and streams nothing. `snapshot()` fails with a `Config` error.
+    pub fn with_publications<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut list = String::new();
+        for (i, name) in names.into_iter().enumerate() {
+            if i > 0 {
+                list.push_str("\",\"");
+            }
+            for c in name.as_ref().chars() {
+                if c == '"' {
+                    list.push('"');
+                }
+                list.push(c);
+            }
+        }
+        self.publication_name = list;
+        self
     }
 
     /// Set the logical replication protocol version (1-4).
@@ -2867,6 +2893,15 @@ fn parse_consistent_point(result: &crate::connection::PgResult) -> Option<Lsn> {
 pub(crate) trait EventSource {
     async fn recv(&mut self) -> Result<ChangeEvent>;
     fn ack(&self, lsn: XLogRecPtr);
+
+    /// How often a status update must go out while a handler is pending. `None` (the default) leaves feedback to `recv`.
+    fn feedback_interval(&self) -> Option<Duration> {
+        None
+    }
+
+    async fn send_feedback(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 impl EventSource for EventStream {
@@ -2877,6 +2912,49 @@ impl EventSource for EventStream {
     #[inline]
     fn ack(&self, lsn: XLogRecPtr) {
         self.update_applied_lsn(lsn);
+    }
+    fn feedback_interval(&self) -> Option<Duration> {
+        self.state.stream().map(|s| s.config.feedback_interval)
+    }
+    async fn send_feedback(&mut self) -> Result<()> {
+        match self.state.stream_mut() {
+            Some(stream) => stream.send_feedback().await,
+            None => Ok(()),
+        }
+    }
+}
+
+/// Await a handler's future, sending a status update every `feedback_interval` while it stays pending.
+///
+/// A stream sends feedback only from inside `recv`, so a handler that outlasts the server's `wal_sender_timeout` used to get the walsender killed (and the stream recovered by reconnecting and replaying). The updates repeat the positions the handler's predecessors already acked, never the in-flight event's, and a failed one stops them without cutting the handler short: `recv` finds the dead connection afterwards.
+pub(crate) async fn await_with_feedback<S: EventSource, T>(
+    source: &mut S,
+    fut: impl Future<Output = T>,
+) -> T {
+    let mut fut = std::pin::pin!(fut);
+    // Most handlers finish on their first poll, and those never reach the timer.
+    if let std::task::Poll::Ready(out) =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(fut.as_mut().poll(cx))).await
+    {
+        return out;
+    }
+    let every = match source.feedback_interval() {
+        Some(every) if !every.is_zero() => every,
+        _ => return fut.await,
+    };
+    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            out = &mut fut => return out,
+            _ = tick.tick() => {
+                if let Err(e) = source.send_feedback().await {
+                    warn!("Failed to send feedback while a handler was pending: {e}");
+                    return fut.await;
+                }
+            }
+        }
     }
 }
 
@@ -2892,7 +2970,7 @@ where
         match source.recv().await {
             Ok(ev) => {
                 let lsn = ev.lsn.value();
-                handler(ev).await?;
+                await_with_feedback(source, handler(ev)).await?;
                 source.ack(lsn);
             }
             Err(ReplicationError::Cancelled(_)) | Err(ReplicationError::StreamStopped(_)) => {
@@ -8712,6 +8790,39 @@ pub(crate) mod tests {
         assert_eq!(pub_opt.1, "\"my_publication\"");
     }
 
+    #[test]
+    fn with_publications_builds_the_quoted_list_pgoutput_expects() {
+        for (names, list, option) in [
+            (vec!["only"], "only", r#""only""#),
+            (vec!["a", "B"], r#"a","B"#, r#""a","B""#),
+            (vec!["a,b", " pad "], r#"a,b"," pad "#, r#""a,b"," pad ""#),
+            (vec![r#"q"uote"#], r#"q""uote"#, r#""q""uote""#),
+            (vec![], "", r#""""#),
+        ] {
+            let config =
+                ReplicationStreamConfig::builder("slot", "ignored").with_publications(&names);
+            assert_eq!(config.publication_name, list, "{names:?}");
+            let options = create_test_stream(config)
+                .build_replication_options()
+                .unwrap();
+            let (_, value) = options
+                .iter()
+                .find(|(k, _)| k == "publication_names")
+                .unwrap();
+            assert_eq!(value, option, "{names:?}");
+        }
+    }
+
+    #[test]
+    fn with_publications_accepts_owned_and_borrowed_names_and_replaces_the_builder_one() {
+        let owned = ReplicationStreamConfig::builder("s", "first")
+            .with_publications(vec!["x".to_string(), "y".to_string()]);
+        let borrowed = ReplicationStreamConfig::builder("s", "first").with_publications(["x", "y"]);
+        assert_eq!(owned.publication_name, r#"x","y"#);
+        assert_eq!(borrowed.publication_name, owned.publication_name);
+        assert!(!owned.publication_name.contains("first"));
+    }
+
     // ========================================
     // Tests for validate_replication_options() edge cases
     // ========================================
@@ -12014,6 +12125,163 @@ mod for_each_event_tests {
         assert!(res.is_ok(), "StreamStopped must end the loop gracefully");
         assert_eq!(count, 2, "both events before the stop are handled");
         assert_eq!(src.last_ack.load(std::sync::atomic::Ordering::SeqCst), 20);
+    }
+
+    /// A source that records what `send_feedback` saw, to pin when updates go out
+    /// and which position they carry.
+    struct FeedbackSource {
+        events: VecDeque<Result<ChangeEvent>>,
+        interval: Option<Duration>,
+        fail_feedback: bool,
+        last_ack: AtomicU64,
+        /// The acked position at each `send_feedback` call.
+        feedback_saw: Vec<u64>,
+    }
+    impl FeedbackSource {
+        fn new(events: Vec<Result<ChangeEvent>>, interval: Option<Duration>) -> Self {
+            Self {
+                events: events.into(),
+                interval,
+                fail_feedback: false,
+                last_ack: AtomicU64::new(0),
+                feedback_saw: Vec::new(),
+            }
+        }
+    }
+    impl EventSource for FeedbackSource {
+        async fn recv(&mut self) -> Result<ChangeEvent> {
+            self.events
+                .pop_front()
+                .unwrap_or_else(|| Err(ReplicationError::Cancelled("drained".into())))
+        }
+        fn ack(&self, lsn: XLogRecPtr) {
+            self.last_ack.store(lsn, Ordering::SeqCst);
+        }
+        fn feedback_interval(&self) -> Option<Duration> {
+            self.interval
+        }
+        async fn send_feedback(&mut self) -> Result<()> {
+            self.feedback_saw.push(self.last_ack.load(Ordering::SeqCst));
+            if self.fail_feedback {
+                Err(ReplicationError::transient_connection("socket closed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    const TEN_S: Option<Duration> = Some(Duration::from_secs(10));
+
+    async fn slow(d: Duration) -> Result<()> {
+        tokio::time::sleep(d).await;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn feedback_goes_out_each_interval_while_a_handler_is_pending() {
+        let mut src = FeedbackSource::new(vec![Ok(ins(10))], TEN_S);
+        for_each_event_impl(&mut src, |_| slow(Duration::from_secs(35)))
+            .await
+            .unwrap();
+        // Ticks at 10 s, 20 s and 30 s: the first one is a full interval after the handler
+        // started, not a catch-up tick at once.
+        assert_eq!(src.feedback_saw.len(), 3);
+        assert_eq!(src.last_ack.load(Ordering::SeqCst), 10, "acked once done");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn feedback_while_pending_never_reports_the_in_flight_event() {
+        let mut src = FeedbackSource::new(vec![Ok(ins(10)), Ok(ins(20))], TEN_S);
+        let mut n = 0;
+        for_each_event_impl(&mut src, |_| {
+            n += 1;
+            slow(Duration::from_secs(if n == 1 { 1 } else { 25 }))
+        })
+        .await
+        .unwrap();
+        // Event 10 was acked before event 20's handler started; 20 is acked only after it.
+        assert_eq!(src.feedback_saw, vec![10, 10]);
+        assert_eq!(src.last_ack.load(Ordering::SeqCst), 20);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handlers_that_finish_at_once_send_no_feedback() {
+        let mut src = FeedbackSource::new((1..=50).map(|i| Ok(ins(i))).collect(), TEN_S);
+        for_each_event_impl(&mut src, |_| async { Ok(()) })
+            .await
+            .unwrap();
+        assert!(src.feedback_saw.is_empty());
+        assert_eq!(src.last_ack.load(Ordering::SeqCst), 50);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_source_without_an_interval_or_with_a_zero_one_sends_none() {
+        for interval in [None, Some(Duration::ZERO)] {
+            let mut src = FeedbackSource::new(vec![Ok(ins(10))], interval);
+            for_each_event_impl(&mut src, |_| slow(Duration::from_secs(60)))
+                .await
+                .unwrap();
+            assert!(src.feedback_saw.is_empty(), "{interval:?}");
+            assert_eq!(src.last_ack.load(Ordering::SeqCst), 10, "{interval:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_feedback_stops_the_updates_but_not_the_handler() {
+        let mut src = FeedbackSource::new(vec![Ok(ins(10))], TEN_S);
+        src.fail_feedback = true;
+        for_each_event_impl(&mut src, |_| slow(Duration::from_secs(55)))
+            .await
+            .unwrap();
+        assert_eq!(
+            src.feedback_saw.len(),
+            1,
+            "no retry once the connection is gone"
+        );
+        assert_eq!(
+            src.last_ack.load(Ordering::SeqCst),
+            10,
+            "the handler still finished and acked"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_slow_handler_still_stops_the_loop_without_acking() {
+        let mut src = FeedbackSource::new(vec![Ok(ins(10))], TEN_S);
+        let res = for_each_event_impl(&mut src, |_| async {
+            tokio::time::sleep(Duration::from_secs(25)).await;
+            Err(ReplicationError::deserialize("boom"))
+        })
+        .await;
+        assert!(res.is_err());
+        assert_eq!(src.feedback_saw.len(), 2);
+        assert_eq!(src.last_ack.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn the_event_stream_source_reads_the_interval_from_its_config() {
+        let config = ReplicationStreamConfig::builder("s", "p")
+            .with_feedback_interval(Duration::from_millis(1500));
+        let events = tests::create_test_stream(config).into_stream(CancellationToken::new());
+        assert_eq!(
+            EventSource::feedback_interval(&events),
+            Some(Duration::from_millis(1500))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_event_stream_source_surfaces_a_feedback_failure() {
+        let mut events = tests::create_test_stream(ReplicationStreamConfig::builder("s", "p"))
+            .into_stream(CancellationToken::new());
+        // The test connection is not in replication mode, so the status update is refused.
+        assert!(EventSource::send_feedback(&mut events).await.is_err());
+    }
+
+    /// The consume loop must stay spawnable: `tokio::spawn(async move { es.for_each_event(..).await })`.
+    #[allow(dead_code)]
+    fn for_each_event_future_is_send(es: &mut EventStream) {
+        fn send<T: Send>(_: &T) {}
+        send(&es.for_each_event(|_event| async { Ok(()) }));
     }
 }
 
