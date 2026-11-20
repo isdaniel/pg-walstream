@@ -15,6 +15,10 @@ pub struct ConnInfo {
     pub dbname: String,
     pub sslmode: SslMode,
     pub sslrootcert: Option<String>,
+    /// PEM client certificate chain to present when the server asks for one (libpq's `sslcert`). Always set together with `sslkey`: this backend never reads libpq's default `~/.postgresql/postgresql.crt`.
+    pub sslcert: Option<String>,
+    /// PEM private key for `sslcert` (libpq's `sslkey`). Unencrypted only; an encrypted key is refused when the connection is made.
+    pub sslkey: Option<String>,
     /// TLS negotiation mode. `Postgres` (default) uses the standard SSLRequest, round-trip; `Direct` skips it for PostgreSQL 17+ (saves one round-trip).
     pub sslnegotiation: SslNegotiation,
     pub replication: ReplicationMode,
@@ -98,6 +102,8 @@ impl std::fmt::Debug for ConnInfo {
             .field("dbname", &self.dbname)
             .field("sslmode", &self.sslmode)
             .field("sslrootcert", &self.sslrootcert)
+            .field("sslcert", &self.sslcert)
+            .field("sslkey", &self.sslkey)
             .field("sslnegotiation", &self.sslnegotiation)
             .field("replication", &self.replication)
             .field("application_name", &self.application_name)
@@ -244,6 +250,9 @@ impl ConnInfo {
         let mut sslmode_explicit = false;
         let mut replication = ReplicationMode::None;
         let mut sslrootcert: Option<String> = None;
+        let mut sslcert: Option<String> = None;
+        let mut sslkey: Option<String> = None;
+        let mut client_cert_allowed = true;
         let mut sslnegotiation = SslNegotiation::Postgres;
         let mut application_name: Option<String> = None;
         let mut fallback_application_name: Option<String> = None;
@@ -269,6 +278,9 @@ impl ConnInfo {
                         sslmode_explicit = true;
                     }
                     "sslrootcert" => sslrootcert = Some(val.to_string()),
+                    "sslcert" => sslcert = Some(val.to_string()),
+                    "sslkey" => sslkey = Some(val.to_string()),
+                    "sslcertmode" => client_cert_allowed = parse_sslcertmode(val)?,
                     "sslnegotiation" => sslnegotiation = parse_ssl_negotiation(val)?,
                     "replication" => replication = parse_replication_mode(val)?,
                     "connect_timeout" => {
@@ -362,6 +374,11 @@ impl ConnInfo {
 
         let sslmode =
             resolve_sslrootcert_system(sslmode, sslmode_explicit, sslrootcert.as_deref())?;
+        let (sslcert, sslkey) = client_identity(
+            sslcert,
+            sslkey,
+            client_cert_allowed && sslmode != SslMode::Disable,
+        )?;
         let (application_name, options) =
             session_params(application_name, fallback_application_name, options);
 
@@ -373,6 +390,8 @@ impl ConnInfo {
             dbname,
             sslmode,
             sslrootcert,
+            sslcert,
+            sslkey,
             sslnegotiation,
             replication,
             application_name,
@@ -396,6 +415,9 @@ impl ConnInfo {
         let mut sslmode_explicit = false;
         let mut replication = ReplicationMode::None;
         let mut sslrootcert: Option<String> = None;
+        let mut sslcert: Option<String> = None;
+        let mut sslkey: Option<String> = None;
+        let mut client_cert_allowed = true;
         let mut sslnegotiation = SslNegotiation::Postgres;
         let mut application_name: Option<String> = None;
         let mut fallback_application_name: Option<String> = None;
@@ -495,6 +517,9 @@ impl ConnInfo {
                     sslmode_explicit = true;
                 }
                 "sslrootcert" => sslrootcert = Some(value),
+                "sslcert" => sslcert = Some(value),
+                "sslkey" => sslkey = Some(value),
+                "sslcertmode" => client_cert_allowed = parse_sslcertmode(&value)?,
                 "sslnegotiation" => sslnegotiation = parse_ssl_negotiation(&value)?,
                 "replication" => replication = parse_replication_mode(&value)?,
                 "connect_timeout" => {
@@ -533,6 +558,11 @@ impl ConnInfo {
 
         let sslmode =
             resolve_sslrootcert_system(sslmode, sslmode_explicit, sslrootcert.as_deref())?;
+        let (sslcert, sslkey) = client_identity(
+            sslcert,
+            sslkey,
+            client_cert_allowed && sslmode != SslMode::Disable,
+        )?;
         let (application_name, options) =
             session_params(application_name, fallback_application_name, options);
 
@@ -544,6 +574,8 @@ impl ConnInfo {
             dbname,
             sslmode,
             sslrootcert,
+            sslcert,
+            sslkey,
             sslnegotiation,
             replication,
             application_name,
@@ -682,11 +714,12 @@ fn parse_sslmode(s: &str) -> Result<SslMode, ReplicationError> {
 /// union over REL_14_STABLE..master, so a string written for a newer libpq still
 /// parses and a keyword absent from the reader's server is simply inert.
 ///
-/// `sslcert`/`sslkey`/`sslpassword`/`sslcertmode` are here despite being
-/// unhonourable (every rustls builder ends in `with_no_client_auth()`) because
-/// they fail **closed**: the server rejects the authentication loudly. Contrast
-/// `sslcrl`, which fails **open** — a revoked certificate would be silently
-/// accepted — so that one is in [`UNSUPPORTED_OPTIONS`].
+/// `sslpassword` is here despite being unhonourable because it fails **closed**: an
+/// encrypted `sslkey` is refused by name when the connection is made, and an
+/// unencrypted one needs no password. Contrast `sslcrl`, which fails **open** — a
+/// revoked certificate would be silently accepted — so that one is in
+/// [`UNSUPPORTED_OPTIONS`]. `sslcert`, `sslkey` and `sslcertmode` are handled in
+/// the two match arms.
 ///
 /// That fail-open/fail-closed split is a *security* audit, and it is the only
 /// one this list has ever had. It says nothing about liveness, which is how
@@ -717,10 +750,7 @@ const IGNORED_OPTIONS: &[&str] = &[
     "servicefile",
     "ssl_max_protocol_version",
     "ssl_min_protocol_version", // only a TLSv1.3 floor is unhonourable
-    "sslcert",
-    "sslcertmode", // `require` only: no client certificate is ever sent
     "sslcompression",
-    "sslkey",
     "sslkeylogfile",
     "sslpassword",
     "sslsni",
@@ -763,10 +793,10 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
 fn check_unhandled(key: &str, value: &str) -> Result<(), ReplicationError> {
     // Unhonourable only in their strict form. The *value* is what makes these
     // unhonourable — `channel_binding=prefer` is fine — so it belongs in the
-    // message, and none of these four carry a secret.
+    // message, and none of these three carry a secret.
     let strict_form = match key {
-        // libpq validates these three with strcmp, so an exact match is correct.
-        "channel_binding" | "gssencmode" | "sslcertmode" => value == "require",
+        // libpq validates these two with strcmp, so an exact match is correct.
+        "channel_binding" | "gssencmode" => value == "require",
         // rustls is built with the `tls12` feature, so the floor is already
         // TLSv1.2 and every looser value is satisfied. Only a TLSv1.3 floor is
         // something we cannot promise. libpq compares with `pg_strcasecmp`
@@ -802,6 +832,45 @@ fn check_unhandled(key: &str, value: &str) -> Result<(), ReplicationError> {
     Err(ReplicationError::config(format!(
         "invalid connection option \"{key}\""
     )))
+}
+
+/// Parse `sslcertmode`: `Ok(true)` when a client certificate may be sent.
+///
+/// `require` would also demand that the server ask for one, which this backend does not check, so it stays refused rather than weakened.
+fn parse_sslcertmode(value: &str) -> Result<bool, ReplicationError> {
+    match value {
+        "disable" => Ok(false),
+        "allow" => Ok(true),
+        "require" => Err(ReplicationError::config(
+            "connection option \"sslcertmode=require\" is not supported by the native backend; \
+             ignoring it would silently weaken the connection \
+             (use the `libpq` backend, or remove it)"
+                .to_string(),
+        )),
+        other => Err(ReplicationError::config(format!(
+            "invalid sslcertmode value: \"{other}\" (expected disable, allow or require)"
+        ))),
+    }
+}
+
+/// Settle `sslcert`/`sslkey` into both paths or neither, as the TLS layer needs them.
+///
+/// An empty value is unset, as in libpq. `sslcertmode=disable` drops both. A lone `sslcert` is an error because libpq would look for the key at `~/.postgresql/postgresql.key`, a default this backend never reads; a lone `sslkey` has no certificate to go with it and libpq ignores it too.
+fn client_identity(
+    cert: Option<String>,
+    key: Option<String>,
+    allowed: bool,
+) -> Result<(Option<String>, Option<String>), ReplicationError> {
+    let cert = cert.filter(|c| !c.is_empty());
+    let key = key.filter(|k| !k.is_empty());
+    match (allowed, cert, key) {
+        (false, ..) | (_, None, _) => Ok((None, None)),
+        (true, Some(cert), Some(key)) => Ok((Some(cert), Some(key))),
+        (true, Some(_), None) => Err(ReplicationError::config(
+            "sslcert needs sslkey: the native backend does not read libpq's default key file"
+                .to_string(),
+        )),
+    }
 }
 
 /// Parse a `connect_timeout`, mapping a negative value to "no timeout".
@@ -1185,8 +1254,7 @@ mod tests {
             "sslsni=1",
             "sslcompression=0",
             // Unhonourable but fail-CLOSED: the server rejects the auth loudly.
-            "sslcert=/etc/ssl/client.crt",
-            "sslkey=/etc/ssl/client.key",
+            "sslpassword=secret",
             "gsslib=gssapi",
             "krbsrvname=postgres",
             "load_balance_hosts=random",
@@ -1209,6 +1277,116 @@ mod tests {
                 "URI rejected: {kv}"
             );
         }
+    }
+
+    /// `sslcert`/`sslkey` used to be dropped, so the native backend never sent a client
+    /// certificate and the server rejected it; they are carried to the TLS layer now.
+    #[test]
+    fn sslcert_and_sslkey_are_carried_in_both_syntaxes() {
+        for dsn in [
+            "host=h sslcert=/c/client.crt sslkey=/c/client.key",
+            "host=h sslkey='/c/client.key' sslcert='/c/client.crt'",
+            "postgresql://u@h/db?sslcert=/c/client.crt&sslkey=/c/client.key",
+            "postgresql://u@h/db?sslcert=%2Fc%2Fclient.crt&sslkey=%2Fc%2Fclient.key",
+        ] {
+            let ci = ConnInfo::parse(dsn).unwrap();
+            assert_eq!(ci.sslcert.as_deref(), Some("/c/client.crt"), "{dsn}");
+            assert_eq!(ci.sslkey.as_deref(), Some("/c/client.key"), "{dsn}");
+        }
+        let none = ConnInfo::parse("host=h").unwrap();
+        assert!(none.sslcert.is_none() && none.sslkey.is_none());
+    }
+
+    /// libpq would read the key from `~/.postgresql/postgresql.key`; this backend does not,
+    /// so a certificate without a key is refused up front rather than silently not sent.
+    #[test]
+    fn sslcert_without_sslkey_is_refused_but_a_lone_sslkey_is_ignored() {
+        for dsn in [
+            "host=h sslcert=/c/a.crt",
+            "postgresql://u@h/db?sslcert=/c/a.crt",
+        ] {
+            let err = ConnInfo::parse(dsn).unwrap_err().to_string();
+            assert!(err.contains("sslcert needs sslkey"), "{dsn}: {err}");
+        }
+        for dsn in [
+            "host=h sslkey=/c/a.key",
+            "postgresql://u@h/db?sslkey=/c/a.key",
+        ] {
+            let ci = ConnInfo::parse(dsn).unwrap();
+            assert!(ci.sslcert.is_none() && ci.sslkey.is_none(), "{dsn}");
+        }
+    }
+
+    /// With TLS off libpq never reads the certificate, so a lone `sslcert` is no error there,
+    /// and it was none here before the pair was used.
+    #[test]
+    fn sslmode_disable_ignores_the_client_certificate_options() {
+        for dsn in [
+            "host=h sslmode=disable sslcert=/c/a.crt",
+            "host=h sslcert=/c/a.crt sslmode=disable",
+            "postgresql://u@h/db?sslmode=disable&sslcert=/c/a.crt",
+            "host=h sslmode=disable sslcert=/c/a.crt sslkey=/c/a.key",
+        ] {
+            let ci = ConnInfo::parse(dsn).unwrap_or_else(|e| panic!("{dsn}: {e}"));
+            assert!(ci.sslcert.is_none() && ci.sslkey.is_none(), "{dsn}");
+        }
+    }
+
+    #[test]
+    fn empty_sslcert_and_sslkey_count_as_unset() {
+        let ci = ConnInfo::parse("host=h sslcert='' sslkey=''").unwrap();
+        assert!(ci.sslcert.is_none() && ci.sslkey.is_none());
+        let ci = ConnInfo::parse("postgresql://u@h/db?sslcert=&sslkey=").unwrap();
+        assert!(ci.sslcert.is_none() && ci.sslkey.is_none());
+    }
+
+    #[test]
+    fn sslcertmode_disable_drops_the_client_certificate_and_allow_keeps_it() {
+        let pair = "sslcert=/c/a.crt sslkey=/c/a.key";
+        let off = ConnInfo::parse(&format!("host=h {pair} sslcertmode=disable")).unwrap();
+        assert!(off.sslcert.is_none() && off.sslkey.is_none());
+        // Whatever the order, and even for a lone sslcert that would otherwise be refused.
+        let off = ConnInfo::parse(&format!("host=h sslcertmode=disable {pair}")).unwrap();
+        assert!(off.sslcert.is_none());
+        assert!(ConnInfo::parse("host=h sslcert=/c/a.crt sslcertmode=disable").is_ok());
+        for mode in ["allow", "disable"] {
+            let dsn =
+                format!("postgresql://u@h/db?sslcertmode={mode}&sslcert=/c/a.crt&sslkey=/c/a.key");
+            assert_eq!(
+                ConnInfo::parse(&dsn).unwrap().sslcert.is_some(),
+                mode == "allow",
+                "{dsn}"
+            );
+        }
+    }
+
+    #[test]
+    fn sslcertmode_rejects_require_and_unknown_values() {
+        for (value, expect) in [
+            ("require", "not supported"),
+            ("always", "invalid sslcertmode value"),
+            ("", "invalid sslcertmode value"),
+            ("DISABLE", "invalid sslcertmode value"),
+        ] {
+            for dsn in [
+                format!("host=h sslcertmode={value}"),
+                format!("postgresql://u@h/db?sslcertmode={value}"),
+            ] {
+                let err = ConnInfo::parse(&dsn).unwrap_err().to_string();
+                assert!(err.contains(expect), "{dsn}: {err}");
+            }
+        }
+    }
+
+    /// Both paths are shown (they are not secrets) so a misconfigured pair is diagnosable.
+    #[test]
+    fn debug_shows_the_client_certificate_paths() {
+        let ci = ConnInfo::parse("host=h sslcert=/c/a.crt sslkey=/c/a.key").unwrap();
+        let shown = format!("{ci:?}");
+        assert!(
+            shown.contains("/c/a.crt") && shown.contains("/c/a.key"),
+            "{shown}"
+        );
     }
 
     /// `application_name` and `options` were parsed and dropped, so the native

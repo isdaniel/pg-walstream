@@ -1,0 +1,3 @@
+Throwaway fixtures for the client-certificate tests in startup.rs. They protect nothing:
+the keys were generated for these tests, are valid for 100 years, and are not trusted by any server.
+`client_ec_encrypted.key` is `client_ec_sec1.key` under the password `pgws-fixture`.
