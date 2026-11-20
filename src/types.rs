@@ -504,10 +504,15 @@ impl Default for BaseBackupOptions {
 }
 
 /// LSN (Log Sequence Number) representation
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 pub struct Lsn(pub u64);
 
 impl Lsn {
+    /// `0/0`, the "no position" value PostgreSQL calls `InvalidXLogRecPtr`; also what [`Default`] returns.
+    pub const ZERO: Lsn = Lsn(0);
+
     /// Create a new LSN from a u64 value
     ///
     /// # Arguments
@@ -3268,17 +3273,35 @@ mod tests {
 
     #[test]
     fn test_lsn_equality_and_hash() {
-        use std::collections::HashSet;
+        use std::collections::{HashMap, HashSet};
         let a = Lsn::new(100);
         let b = Lsn::new(100);
         let c = Lsn::new(200);
         assert_eq!(a, b);
         assert_ne!(a, c);
 
-        // Lsn doesn't impl Hash, but does impl Copy + Eq
-        let x = a;
-        assert_eq!(x, a);
-        let _ = HashSet::<u64>::new(); // type check only
+        let set: HashSet<Lsn> = [a, b, c, Lsn::ZERO].into_iter().collect();
+        assert_eq!(set.len(), 3, "equal LSNs hash alike, distinct ones do not");
+
+        let mut by_lsn: HashMap<Lsn, &str> = HashMap::new();
+        by_lsn.insert(a, "first");
+        by_lsn.insert(b, "second");
+        assert_eq!(by_lsn.len(), 1);
+        assert_eq!(by_lsn[&Lsn::new(100)], "second");
+    }
+
+    #[test]
+    fn test_lsn_zero_constant_and_default() {
+        assert_eq!(Lsn::ZERO, Lsn::new(0));
+        assert_eq!(Lsn::default(), Lsn::ZERO);
+        assert_eq!(Lsn::ZERO.value(), INVALID_XLOG_REC_PTR);
+        assert_eq!(Lsn::ZERO.to_string(), "0/0");
+        // A struct holding an LSN can now derive `Default` itself.
+        #[derive(Default, PartialEq, Debug)]
+        struct Checkpoint {
+            lsn: Lsn,
+        }
+        assert_eq!(Checkpoint::default().lsn, Lsn::ZERO);
     }
 
     #[test]

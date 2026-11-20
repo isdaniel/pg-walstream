@@ -280,3 +280,88 @@ pub use sql_builder::{
     build_create_subscription_sql, build_detach_slot_sql, build_disable_subscription_sql,
     build_drop_subscription_sql, quote_ident, quote_literal, CreateSubscriptionOptions,
 };
+
+/// Compile-time guard on the auto traits of the public types.
+///
+/// A new field (a boxed callback, an `Rc`, a raw pointer) silently strips `Send`,
+/// `Sync` or `UnwindSafe` from a type, and the loss only surfaces in a downstream
+/// crate that spawns it on a thread or holds it across `catch_unwind`. Nothing here
+/// runs: the test is that it compiles.
+#[cfg(all(test, feature = "std"))]
+mod auto_trait_tests {
+    use core::panic::{RefUnwindSafe, UnwindSafe};
+
+    use crate::{
+        ChangeEvent, ColumnValue, EventType, LogicalReplicationMessage, Lsn, RelationInfo,
+        ReplicationError, ReplicationSlotInfo, ReplicationSlotOptions, RowData, ServerError,
+    };
+
+    fn plain_data<T: Send + Sync + Unpin + UnwindSafe + RefUnwindSafe>() {}
+    fn shareable<T: Send + Sync + Unpin>() {}
+
+    #[allow(dead_code)]
+    fn data_types_are_plain_data() {
+        plain_data::<Lsn>();
+        plain_data::<ChangeEvent>();
+        plain_data::<EventType>();
+        plain_data::<RowData>();
+        plain_data::<ColumnValue>();
+        plain_data::<ServerError>();
+        plain_data::<ReplicationSlotInfo>();
+        plain_data::<ReplicationSlotOptions>();
+        plain_data::<LogicalReplicationMessage>();
+        plain_data::<RelationInfo>();
+        // Not `plain_data`: its `Io(std::io::Error)` variant is neither `UnwindSafe` nor
+        // `RefUnwindSafe` on any toolchain, because `io::Error` boxes a `dyn Error`.
+        shareable::<ReplicationError>();
+    }
+
+    #[cfg(target_has_atomic = "64")]
+    #[allow(dead_code)]
+    fn shared_handles_are_plain_data() {
+        plain_data::<crate::SharedLsnFeedback>();
+    }
+
+    #[cfg(any(feature = "libpq", feature = "rustls-tls"))]
+    #[allow(dead_code)]
+    fn stream_side_types_are_plain_data() {
+        use crate::{
+            ErrorClass, MetricsSnapshot, OriginFilter, ReplicationStreamConfig, RetryConfig,
+            ServerIdentity, StreamMetrics, StreamingMode, TimelineSwitch, TypeInfo,
+        };
+        plain_data::<ReplicationStreamConfig>();
+        plain_data::<StreamingMode>();
+        plain_data::<OriginFilter>();
+        plain_data::<RetryConfig>();
+        plain_data::<ServerIdentity>();
+        plain_data::<TimelineSwitch>();
+        plain_data::<TypeInfo>();
+        plain_data::<StreamMetrics>();
+        plain_data::<MetricsSnapshot>();
+        plain_data::<ErrorClass>();
+    }
+
+    /// Owners of a connection (or boxed handlers) move between tasks but are not shared.
+    #[cfg(any(feature = "libpq", feature = "rustls-tls"))]
+    #[allow(dead_code)]
+    fn connection_owners_move_between_threads() {
+        fn sendable<T: Send + Unpin>() {}
+        sendable::<crate::LogicalReplicationStream>();
+        sendable::<crate::EventStream>();
+        sendable::<crate::WalRouter>();
+        sendable::<crate::SnapshotEvents>();
+    }
+
+    /// The guards above are generic calls that compile or do not; running them once keeps them out of the uncovered-line count.
+    #[test]
+    fn guards_run() {
+        data_types_are_plain_data();
+        #[cfg(target_has_atomic = "64")]
+        shared_handles_are_plain_data();
+        #[cfg(any(feature = "libpq", feature = "rustls-tls"))]
+        {
+            stream_side_types_are_plain_data();
+            connection_owners_move_between_threads();
+        }
+    }
+}
