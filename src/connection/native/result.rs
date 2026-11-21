@@ -26,6 +26,18 @@ pub struct NativePgResult {
     pub(crate) error: Option<ServerError>,
 }
 
+impl crate::connection::commands::QueryResult for NativePgResult {
+    fn is_ok(&self) -> bool {
+        NativePgResult::is_ok(self)
+    }
+    fn error_message(&self) -> Option<String> {
+        NativePgResult::error_message(self)
+    }
+    fn get_value(&self, row: i32, col: i32) -> Option<String> {
+        NativePgResult::get_value(self, row, col)
+    }
+}
+
 impl NativePgResult {
     pub(crate) fn new() -> Self {
         Self {
