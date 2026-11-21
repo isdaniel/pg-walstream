@@ -26,6 +26,18 @@ pub struct NativePgResult {
     pub(crate) error: Option<ServerError>,
 }
 
+impl crate::connection::commands::QueryResult for NativePgResult {
+    fn is_ok(&self) -> bool {
+        NativePgResult::is_ok(self)
+    }
+    fn error_message(&self) -> Option<String> {
+        NativePgResult::error_message(self)
+    }
+    fn get_value(&self, row: i32, col: i32) -> Option<String> {
+        NativePgResult::get_value(self, row, col)
+    }
+}
+
 impl NativePgResult {
     pub(crate) fn new() -> Self {
         Self {
@@ -265,6 +277,30 @@ mod tests {
             r.error_message().as_deref(),
             Some("ERROR: can no longer access replication slot (SQLSTATE 55000)")
         );
+    }
+
+    /// The crate-private `QueryResult` view the shared replication commands read returns what the
+    /// inherent accessors do, on an error result and on a row-bearing one.
+    #[test]
+    fn query_result_forwards_to_the_inherent_accessors() {
+        use crate::connection::commands::QueryResult;
+        let mut r = NativePgResult::new();
+        r.status = NativeResultStatus::FatalError;
+        r.error = Some(ServerError {
+            severity: "ERROR".to_string(),
+            message: "boom".to_string(),
+            ..ServerError::default()
+        });
+        r.rows = vec![vec![Some(b"abc".to_vec()), None]];
+
+        assert!(!QueryResult::is_ok(&r));
+        assert_eq!(QueryResult::error_message(&r), r.error_message());
+        assert!(QueryResult::error_message(&r).unwrap().contains("boom"));
+        assert_eq!(QueryResult::get_value(&r, 0, 0).as_deref(), Some("abc"));
+        assert_eq!(QueryResult::get_value(&r, 0, 1), None);
+
+        r.status = NativeResultStatus::CommandOk;
+        assert!(QueryResult::is_ok(&r));
     }
 
     #[test]

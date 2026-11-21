@@ -67,6 +67,7 @@ src/
 │   ├── events.rs    #   SnapshotEvents: ChangeEvent adapter + EventSource impl
 │   └── aligned.rs   #   AlignedSnapshot: tables added to a running stream (side slot)
 └── connection/      # native/ rustls-tls backend (default) + libpq FFI backend (opt-in)
+    ├── commands.rs          # replication commands both backends share (`replication_commands!`)
     └── native/copy_out.rs   # CopyOut state machine (NOT copy.rs — see below)
 macros/              # #[derive(WalTable)] (opt-in `derive` feature)
 ```
@@ -175,7 +176,7 @@ passes on default, `derive` and `libpq` · coverage ≥ 90% total lines
 models of `SharedLsnFeedback` pass (`loom` job in `ci-checks.yml`; cargo-mutants
 runs weekly, not per PR).
 
-The 90% gate reads only that default-backend unit pass, so `src/connection/libpq.rs` (gated on `libpq` *without* `rustls-tls` in `connection/mod.rs`) is invisible to it. Codecov receives the default and libpq unit passes merged, plus the integration suites run instrumented on PostgreSQL 18, and its patch check covers both backends.
+The 90% gate reads only that default-backend unit pass, so `src/connection/libpq.rs` (gated on `libpq` *without* `rustls-tls` in `connection/mod.rs`) is invisible to it. The shared `commands.rs` is not. Codecov receives the default and libpq unit passes merged, plus the integration suites run instrumented on PostgreSQL 18, and its patch check covers both backends.
 
 A new file under `integration-tests/` needs a matching `[[test]]` stanza in
 `Cargo.toml`; CI enumerates the directory and fails without it.
