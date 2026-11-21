@@ -14,6 +14,8 @@
 //! - `42704` undefined_object — START_REPLICATION on a slot that does not exist.
 //! - `55000` object_not_in_prerequisite_state — logical replication started on
 //!   a physical slot (the same code slot invalidation raises).
+//! - a missing publication, which pgoutput reports as `42704` too, but only once it
+//!   decodes the first change, so it is read mid-stream and must not blame the slot.
 //! - a non-slot error stays retryable rather than being over-classified.
 //!
 //! ## Prerequisites
@@ -30,7 +32,10 @@
 //! cargo test --test error_classification -- --ignored --nocapture --test-threads=1
 //! ```
 
-use pg_walstream::{sqlstate::pg, PgReplicationConnection, ReplicationError};
+use pg_walstream::{
+    sqlstate::pg, CancellationToken, LogicalReplicationStream, PgReplicationConnection,
+    ReplicationError, ReplicationStreamConfig,
+};
 
 fn replication_conn_string() -> String {
     std::env::var("DATABASE_URL").unwrap_or_else(|_| {
@@ -196,4 +201,67 @@ fn ordinary_sql_error_stays_retryable() {
         Some("parserOpenTable"),
         "{server:?}"
     );
+}
+
+/// START_REPLICATION accepts a publication that does not exist: pgoutput looks it
+/// up only when it decodes the first change. The `42704` that follows is read
+/// mid-stream and names the publication, so it must not be reported as a slot
+/// error (an operator would drop a healthy slot). It stays permanent, because a
+/// reconnect re-sends the same name.
+#[tokio::test]
+#[ignore = "requires live PostgreSQL with wal_level=logical"]
+async fn missing_publication_is_permanent_but_does_not_blame_the_slot() {
+    init_tracing();
+    let slot = "it_errcls_missing_pub";
+    let table = "it_errcls_missing_pub_t";
+    let publication = "it_errcls_no_such_publication";
+    drop_slot(slot);
+
+    let mut regular =
+        PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
+    regular
+        .exec(&format!(
+            "DROP TABLE IF EXISTS {table}; CREATE TABLE {table} (id integer)"
+        ))
+        .expect("create table");
+
+    let mut stream = LogicalReplicationStream::new(
+        &replication_conn_string(),
+        ReplicationStreamConfig::builder(slot, publication),
+    )
+    .await
+    .expect("stream");
+    stream
+        .start(None)
+        .await
+        .expect("START_REPLICATION accepts an unknown publication");
+    regular
+        .exec(&format!("INSERT INTO {table} VALUES (1)"))
+        .expect("insert");
+
+    let cancel = CancellationToken::new();
+    let err = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            if let Err(e) = stream.next_event_with_retry(&cancel).await {
+                return e;
+            }
+        }
+    })
+    .await
+    .expect("the missing publication must surface, not hang");
+
+    assert!(
+        matches!(err, ReplicationError::PermanentConnection(..)),
+        "expected PermanentConnection, got {err:?}"
+    );
+    assert!(err.is_permanent(), "a retry re-sends the same name: {err}");
+    assert_eq!(err.sqlstate(), Some(pg::UNDEFINED_OBJECT), "{err:?}");
+    assert!(err.to_string().contains(publication), "{err}");
+
+    drop(stream);
+    for _ in 0..50 {
+        drop_slot(slot);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = regular.exec(&format!("DROP TABLE IF EXISTS {table}"));
 }

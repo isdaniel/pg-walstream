@@ -187,7 +187,7 @@ fn drain_read_buffer(
                 }
                 let fields = super::error::parse_error_fields(&read_buf[HEADER_LEN..total_len]);
                 let msg = format!("server error during replication: {fields}");
-                return Some(ReplicationError::from_server(Some(fields), msg));
+                return Some(ReplicationError::from_server_stream(Some(fields), msg));
             }
             b'c' => {
                 // CopyDone — the server ended the replication stream.

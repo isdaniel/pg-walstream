@@ -394,7 +394,7 @@ GRANT USAGE ON SCHEMA public TO replication_user;
 
 | Option | Description | PG Version |
 |--------|-------------|------------|
-| `temporary` | Temporary slot (not persisted to disk, dropped on disconnect) | 14+ |
+| `temporary` | Temporary slot (not persisted to disk, dropped on disconnect). A reconnect cannot resume it: recovery fails with a permanent `ReplicationSlot` error instead of creating a new slot that would skip the changes in between | 14+ |
 | `two_phase` | Enable two-phase commit for logical slots | 14+ |
 | `reserve_wal` | Reserve WAL immediately for physical slots | 14+ |
 | `snapshot` | Snapshot behavior: `"export"`, `"use"`, or `"nothing"` | 14+ |

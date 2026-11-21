@@ -705,7 +705,7 @@ impl ReplicationStreamConfig {
     /// Set replication slot creation options
     ///
     /// This allows customizing how the replication slot is created, including:
-    /// - `temporary`: Create a temporary slot (dropped when connection ends)
+    /// - `temporary`: Create a temporary slot (dropped when connection ends). A reconnect cannot resume it, so recovery fails with a permanent [`ReplicationError::ReplicationSlot`] rather than creating a new slot that would skip every change committed in between
     /// - `snapshot`: Control snapshot export behavior (`"export"`, `"use"`, `"nothing"`)
     /// - `two_phase`: Enable two-phase commit support for the slot
     /// - `failover`: Enable failover synchronization
@@ -1679,6 +1679,17 @@ impl LogicalReplicationStream {
     }
 
     async fn reconnect(&mut self) -> Result<()> {
+        // A temporary slot dies with its connection, and a replacement would start at the server's current WAL position, silently skipping everything committed in between. Stop before dialing; the error is permanent, so the retry loop does not reconnect into the gap. A stream that never created its slot (`Absent`) has nothing to lose.
+        if self.config.slot_options.temporary && self.slot.is_present() {
+            return Err(ReplicationError::replication_slot(format!(
+                "temporary replication slot \"{}\" was dropped with its connection; a new one \
+                 would start at the server's current WAL position and skip every change \
+                 committed since this stream last saw one. Use a persistent slot to survive a \
+                 reconnect, or start a new stream and re-sync",
+                self.config.slot_name
+            )));
+        }
+
         info!("Attempting to recover replication connection");
         self.recovering = true;
         // The new connection resends everything from the applied position, held frame included.
@@ -1693,11 +1704,6 @@ impl LogicalReplicationStream {
         // A reconnect can land somewhere other than where we left off, and the stored LSN is only meaningful on the original cluster and timeline. A malformed reply fails closed with `PermanentConnection`, never `ReplicationSlot`, which would send an operator to drop a healthy slot.
         let current = ServerIdentity::identify(&mut self.connection).await?;
         self.check_server_identity(&current)?;
-
-        // Temporary slots are dropped when the connection dies.
-        if self.config.slot_options.temporary {
-            self.slot = SlotState::Absent;
-        }
 
         self.prepare_replication_slot().await?;
 
@@ -6407,45 +6413,63 @@ pub(crate) mod tests {
         frame
     }
 
-    /// A permanent error out of the COPY stream (`42704`: the slot is gone) ends the loop
-    /// on the first attempt. Retrying cannot help, and recovery would only reconnect into
-    /// the same failure. A real worker and socket carry the error, so this is the path a
-    /// live server takes. Real time, because a paused clock would jump ahead while the
-    /// worker thread is still reading; a retry would sit out a 1 s and a 2 s backoff.
+    /// A permanent error out of the COPY stream ends the loop on the first attempt.
+    /// Retrying cannot help, and recovery would only reconnect into the same failure.
+    /// A real worker and socket carry the error, so this is the path a live server
+    /// takes. Real time, because a paused clock would jump ahead while the worker
+    /// thread is still reading; a retry would sit out a 1 s and a 2 s backoff.
+    ///
+    /// `55000` is an invalidated slot and stays the slot's fault. `42704` mid-stream
+    /// is a missing publication (a missing slot is refused by `START_REPLICATION`
+    /// itself), so it must not send an operator to drop a healthy slot.
     #[cfg(feature = "rustls-tls")]
     #[tokio::test]
     async fn next_event_with_retry_returns_a_permanent_read_error_without_retrying() {
         use std::io::Write;
-        let (connection, mut server) = PgReplicationConnection::silent_replication_for_testing();
-        let mut stream = stream_that_cannot_read_or_reconnect();
-        stream.connection = connection;
-        server
-            .write_all(&error_response(
-                "42704",
-                "replication slot \"slot\" does not exist",
-            ))
-            .unwrap();
-        let token = CancellationToken::new();
-        let started = std::time::Instant::now();
+        for (code, message, blames_the_slot) in [
+            (
+                "55000",
+                "can no longer get changes from replication slot \"slot\"",
+                true,
+            ),
+            ("42704", "publication \"pub\" does not exist", false),
+        ] {
+            let (connection, mut server) =
+                PgReplicationConnection::silent_replication_for_testing();
+            let mut stream = stream_that_cannot_read_or_reconnect();
+            stream.connection = connection;
+            server.write_all(&error_response(code, message)).unwrap();
+            let token = CancellationToken::new();
+            let started = std::time::Instant::now();
 
-        let err = tokio::time::timeout(
-            Duration::from_secs(20),
-            stream.next_event_with_retry(&token),
-        )
-        .await
-        .expect("the error must reach the loop, not leave it waiting")
-        .unwrap_err();
+            let err = tokio::time::timeout(
+                Duration::from_secs(20),
+                stream.next_event_with_retry(&token),
+            )
+            .await
+            .expect("the error must reach the loop, not leave it waiting")
+            .unwrap_err();
 
-        assert!(
-            matches!(err, ReplicationError::ReplicationSlot(..)),
-            "the server's error comes back as it was classified: {err:?}"
-        );
-        assert!(err.is_permanent());
-        let waited = started.elapsed();
-        assert!(
-            waited < Duration::from_secs(2),
-            "a permanent error must not wait out a backoff, waited {waited:?}"
-        );
+            assert_eq!(
+                matches!(err, ReplicationError::ReplicationSlot(..)),
+                blames_the_slot,
+                "{code}: the server's error comes back as it was classified: {err:?}"
+            );
+            assert!(
+                matches!(
+                    err,
+                    ReplicationError::ReplicationSlot(..)
+                        | ReplicationError::PermanentConnection(..)
+                ),
+                "{code}: {err:?}"
+            );
+            assert!(err.is_permanent());
+            let waited = started.elapsed();
+            assert!(
+                waited < Duration::from_secs(2),
+                "{code}: a permanent error must not wait out a backoff, waited {waited:?}"
+            );
+        }
     }
 
     /// A frame that fails to decode on a connection that is still up is surfaced, not
@@ -8431,48 +8455,70 @@ pub(crate) mod tests {
     // Tests for recover_connection() logic
     // ========================================
 
-    /// When `slot_options.temporary` is true, `recover_connection()` should reset
-    /// `slot_created` to false so the slot can be recreated.
-    #[test]
-    fn test_recover_connection_resets_slot_created_for_temporary() {
-        let config = create_test_config().with_slot_options(ReplicationSlotOptions {
-            temporary: true,
-            ..Default::default()
-        });
-        let mut stream = create_test_stream(config);
+    /// A temporary slot dies with its connection, so reconnecting would create a
+    /// new one at the server's current WAL position and silently skip every
+    /// commit in between. Recovery must refuse before dialing, and the error must
+    /// be permanent so the retry loop does not reconnect into the gap.
+    #[tokio::test]
+    async fn recovery_refuses_to_replace_a_dropped_temporary_slot() {
+        let (port, dialed) = counting_server(true).await;
+        let config = ReplicationStreamConfig::builder("slot", "pub")
+            .with_slot_options(ReplicationSlotOptions {
+                temporary: true,
+                ..Default::default()
+            })
+            .with_retry_config(retries_three_times_quickly());
+        let mut stream = create_test_stream(config.clone());
+        stream.retry_handler =
+            ReplicationConnectionRetry::new(config.retry_config, conninfo_for(port));
         stream.slot = SlotState::Ours {
             consistent_point: None,
             exported_snapshot: None,
         };
 
-        // Simulate the temporary-slot reset logic from recover_connection()
-        if stream.config.slot_options.temporary {
-            stream.slot = SlotState::Absent;
-        }
+        let err = stream.recover_connection().await.unwrap_err();
 
-        assert!(!stream.slot.is_present());
+        assert!(
+            matches!(err, ReplicationError::ReplicationSlot(..)),
+            "{err:?}"
+        );
+        assert!(err.is_permanent());
+        assert!(err
+            .to_string()
+            .contains("temporary replication slot \"slot\""));
+        assert_eq!(dialed.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(stream.slot.is_present(), "the slot record must survive");
     }
 
-    /// When `slot_options.temporary` is false, `recover_connection()` should NOT
-    /// reset `slot_created`.
-    #[test]
-    fn test_recover_connection_preserves_slot_created_for_persistent() {
-        let config = create_test_config().with_slot_options(ReplicationSlotOptions {
-            temporary: false,
-            ..Default::default()
-        });
-        let mut stream = create_test_stream(config);
-        stream.slot = SlotState::Ours {
-            consistent_point: None,
-            exported_snapshot: None,
-        };
+    /// A temporary slot this stream never created has nothing to lose, and a
+    /// persistent slot survives the connection: both still reconnect.
+    #[tokio::test]
+    async fn recovery_still_reconnects_when_no_slot_is_lost() {
+        for (temporary, slot) in [
+            (true, SlotState::Absent),
+            (false, SlotState::PreExisting),
+            (false, SlotState::Absent),
+        ] {
+            let (port, dialed) = counting_server(true).await;
+            let config = ReplicationStreamConfig::builder("slot", "pub")
+                .with_slot_options(ReplicationSlotOptions {
+                    temporary,
+                    ..Default::default()
+                })
+                .with_retry_config(retries_three_times_quickly());
+            let mut stream = create_test_stream(config.clone());
+            stream.retry_handler =
+                ReplicationConnectionRetry::new(config.retry_config, conninfo_for(port));
+            stream.slot = slot;
 
-        // Simulate the temporary-slot reset logic from recover_connection()
-        if stream.config.slot_options.temporary {
-            stream.slot = SlotState::Absent;
+            let err = stream.recover_connection().await.unwrap_err();
+
+            assert!(
+                !matches!(err, ReplicationError::ReplicationSlot(..)),
+                "{err:?}"
+            );
+            assert_eq!(dialed.load(std::sync::atomic::Ordering::SeqCst), 3);
         }
-
-        assert!(stream.slot.is_present());
     }
 
     /// Verify that recover_connection restarts replication from last_received_lsn.

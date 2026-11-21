@@ -170,7 +170,7 @@ impl CopyEnd {
             CopyEnd::Done => ReplicationError::transient_connection(
                 "replication stream ended by server (CopyDone)",
             ),
-            CopyEnd::Failed(server, message) => ReplicationError::from_server(
+            CopyEnd::Failed(server, message) => ReplicationError::from_server_stream(
                 server.clone(),
                 format!("replication stream terminated by server: {message}"),
             ),

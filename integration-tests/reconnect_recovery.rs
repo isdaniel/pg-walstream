@@ -13,8 +13,8 @@
 
 use core::time::Duration;
 use pg_walstream::{
-    EventStream, EventType, LogicalReplicationStream, PgReplicationConnection,
-    ReplicationStreamConfig,
+    EventStream, EventType, LogicalReplicationStream, PgReplicationConnection, ReplicationError,
+    ReplicationSlotOptions, ReplicationStreamConfig,
 };
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -332,6 +332,92 @@ async fn a_stream_resumes_after_its_walsender_is_terminated() {
         fixture.walsender_pid(),
         before,
         "the rows must come from a new walsender"
+    );
+}
+
+/// A temporary slot dies with its walsender. Reconnecting used to create a new one at the
+/// server's current WAL position and carry on, so the row committed in between was never
+/// delivered and nothing said so. The stream must stop with a permanent slot error instead,
+/// and must not leave a replacement slot behind.
+#[tokio::test]
+#[ignore = "requires live PostgreSQL with wal_level=logical"]
+async fn a_temporary_slot_is_not_silently_replaced_after_a_reconnect() {
+    let mut fixture = Fixture::new("it_reconnect_temp_slot");
+    let config = fixture.config().with_slot_options(ReplicationSlotOptions {
+        temporary: true,
+        ..Default::default()
+    });
+    let mut stream = LogicalReplicationStream::new(&replication_conn_string(), config)
+        .await
+        .expect("stream");
+    stream.start(None).await.expect("start");
+
+    fixture.insert(1);
+    assert_eq!(read_until(&mut stream, 1).await, [1]);
+
+    // The slot goes with the walsender, so row 2 is committed while no slot exists.
+    fixture.terminate_walsender();
+    fixture.insert(2);
+
+    let cancel = CancellationToken::new();
+    let outcome = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match stream.next_event_with_retry(&cancel).await {
+                Err(e) => return Err(e),
+                Ok(event) => {
+                    if let EventType::Insert { data, .. } = event.event_type {
+                        return Ok(inserted_id(&data));
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    match outcome {
+        Ok(Err(err)) => {
+            assert!(
+                matches!(err, ReplicationError::ReplicationSlot(..)),
+                "{err:?}"
+            );
+            assert!(
+                err.is_permanent(),
+                "a retry would reconnect into the gap: {err}"
+            );
+        }
+        Ok(Ok(id)) => panic!("row {id} arrived, but row 2 was committed with no slot"),
+        Err(_) => {
+            fixture.insert(3);
+            let seen = read_until(&mut stream, 3).await;
+            panic!(
+                "reconnected silently and skipped row 2: the rows seen afterwards were {seen:?}"
+            );
+        }
+    }
+    // The terminated walsender takes the old slot with it, a moment after the signal. Once it
+    // is gone, give a reconnect a full backoff to create a replacement, then look again.
+    let count_slots = |fixture: &mut Fixture| {
+        fixture
+            .regular
+            .exec(&format!(
+                "SELECT count(*) FROM pg_replication_slots WHERE slot_name = '{}'",
+                fixture.slot
+            ))
+            .expect("query slots")
+            .get_value(0, 0)
+    };
+    let started = Instant::now();
+    while count_slots(&mut fixture).as_deref() != Some("0") {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the old slot never went away"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        count_slots(&mut fixture).as_deref(),
+        Some("0"),
+        "a replacement slot was created"
     );
 }
 

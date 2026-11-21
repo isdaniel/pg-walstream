@@ -257,7 +257,9 @@ impl ReplicationError {
     ///   (`wal_removed`, `rows_removed`, `wal_level_insufficient`, or PG18's
     ///   `idle_timeout`), or `wal_level` is below `logical`. Recovery requires
     ///   dropping the slot and re-syncing; retrying cannot help.
-    /// - `42704` *undefined_object* — the slot does not exist.
+    /// - `42704` *undefined_object* — the slot does not exist. Read mid-stream
+    ///   it means a missing publication instead; see
+    ///   [`from_server_stream`](Self::from_server_stream).
     ///
     /// Terminal for the credentials — [`Authentication`](Self::Authentication):
     /// - `28000` *invalid_authorization_specification*, `28P01` *invalid_password*.
@@ -378,6 +380,20 @@ impl ReplicationError {
                 Some(Box::new(server)),
             ),
             _ => Self::from_server(Some(server), msg),
+        }
+    }
+
+    /// [`from_server`](Self::from_server) for an ErrorResponse read from the replication stream, after `START_REPLICATION` was accepted.
+    ///
+    /// Identical except that `42704` is **not** reported as [`ReplicationSlot`](Self::ReplicationSlot). A missing slot is refused by `START_REPLICATION` itself, before the stream opens, so a `42704` arriving mid-stream is pgoutput's `publication "x" does not exist`, which it raises lazily at the first decoded change (`LoadPublications`). Calling that a slot error sends an operator to recreate a healthy slot. Both variants are permanent, so this changes the diagnosis, not the control flow. `55000` keeps meaning the slot: an invalidated slot is reported in-stream.
+    #[cfg(any(feature = "libpq", feature = "rustls-tls"))]
+    pub(crate) fn from_server_stream<S: Into<String>>(server: Option<ServerError>, msg: S) -> Self {
+        match server.as_ref().and_then(|server| server.code) {
+            Some(code @ sqlstate::pg::UNDEFINED_OBJECT) => ReplicationError::PermanentConnection(
+                format!("[{code}] {}", msg.into()).into_boxed_str(),
+                server.map(Box::new),
+            ),
+            _ => Self::from_server(server, msg),
         }
     }
 
@@ -839,6 +855,46 @@ mod stop_signal_tests {
             );
             assert!(err.is_permanent(), "{code} must be permanent");
         }
+    }
+
+    /// `START_REPLICATION` refuses a missing slot before the stream opens, so a
+    /// `42704` read mid-stream is pgoutput's `publication "x" does not exist`.
+    /// It must not be blamed on the slot (an operator would drop a healthy one),
+    /// but it stays permanent: reconnecting re-sends the same publication name.
+    #[test]
+    fn from_server_stream_does_not_blame_the_slot_for_a_missing_publication() {
+        let err = ReplicationError::from_server_stream(
+            Some(response("42704")),
+            "server error during replication: publication \"pub_x\" does not exist",
+        );
+        assert!(
+            matches!(err, ReplicationError::PermanentConnection(..)),
+            "{err:?}"
+        );
+        assert!(err.is_permanent());
+        assert_eq!(err.server_error(), Some(&response("42704")));
+        assert_eq!(
+            err.to_string(),
+            "Permanent connection error: [42704] server error during replication: \
+             publication \"pub_x\" does not exist"
+        );
+
+        // An invalidated slot is still reported in-stream as the slot's fault, and
+        // every other code classifies exactly as `from_server` does.
+        for code in ["55000", "28P01", "42501", "57P01", "XX999"] {
+            assert_eq!(
+                core::mem::discriminant(&ReplicationError::from_server_stream(
+                    Some(response(code)),
+                    "m"
+                )),
+                core::mem::discriminant(&classify(code, "m")),
+                "{code}"
+            );
+        }
+        assert!(matches!(
+            ReplicationError::from_server_stream(None, "no server response"),
+            ReplicationError::Protocol(..)
+        ));
     }
 
     /// At startup the server has not looked at a slot: `CheckMyDatabase` raises
