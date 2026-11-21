@@ -65,6 +65,7 @@ src/
 ├── retry.rs         # Exponential backoff retry logic
 └── connection/      # PostgreSQL connection backends
     ├── mod.rs
+    ├── commands.rs  # replication commands both backends share (`replication_commands!`, expanded inside each backend's inherent impl)
     ├── libpq.rs     # libpq FFI backend (opt-in)
     └── native/      # Pure-Rust rustls-tls backend (default)
         └── copy_out.rs  # CopyOut state machine (separate from copy.rs)
@@ -167,7 +168,7 @@ read as a CodSpeed regression.
 - `cargo doc --no-deps --all-features` warning-free
 - Loom models of `SharedLsnFeedback` pass (`loom` job in `ci-checks.yml`); cargo-mutants runs weekly, not per PR
 - Integration tests require PostgreSQL 15+ with logical replication enabled
-- The 90% gate reads only the default-backend unit pass, so `src/connection/libpq.rs` is invisible to it. Codecov merges both backends' unit passes with the integration suites run on PostgreSQL 18.
+- The 90% gate reads only the default-backend unit pass, so `src/connection/libpq.rs` is invisible to it (the shared `commands.rs` is not). Codecov merges both backends' unit passes with the integration suites run on PostgreSQL 18.
 - A new `integration-tests/*.rs` file needs a `[[test]]` stanza in `Cargo.toml`
 
 ## Integration Tests

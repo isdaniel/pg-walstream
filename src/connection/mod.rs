@@ -16,6 +16,8 @@
 //! Both backends expose the same public types: `PgReplicationConnection` and
 //! `PgResult`.
 
+mod commands;
+
 // ── libpq backend (opt-in) ───────────────────────────────────────────────────
 
 #[cfg(all(feature = "libpq", not(feature = "rustls-tls")))]
