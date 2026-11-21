@@ -195,6 +195,8 @@ impl RetryConfig {
 pub struct ReplicationConnectionRetry {
     config: RetryConfig,
     connection_string: String,
+    /// Native backend: keep a stream's connection off its creating runtime's reactor (see `ReplicationStreamConfig::with_dedicated_io_thread`).
+    dedicated_io_thread: bool,
 }
 
 impl ReplicationConnectionRetry {
@@ -203,7 +205,14 @@ impl ReplicationConnectionRetry {
         Self {
             config,
             connection_string,
+            dedicated_io_thread: false,
         }
+    }
+
+    #[inline]
+    pub(crate) fn with_dedicated_io_thread(mut self, enabled: bool) -> Self {
+        self.dedicated_io_thread = enabled;
+        self
     }
 
     /// The connection string this retrier dials, reused verbatim by the
@@ -251,7 +260,7 @@ impl ReplicationConnectionRetry {
     /// # }
     /// ```
     pub async fn connect_with_retry(&self) -> Result<PgReplicationConnection> {
-        self.connect_until(None).await
+        self.connect_until(None, false).await
     }
 
     /// [`connect_with_retry`](Self::connect_with_retry) that stops once `budget` has passed, checked only between attempts.
@@ -261,11 +270,18 @@ impl ReplicationConnectionRetry {
         &self,
         budget: Duration,
     ) -> Result<PgReplicationConnection> {
-        self.connect_until((!budget.is_zero()).then_some(budget))
-            .await
+        self.connect_until(
+            (!budget.is_zero()).then_some(budget),
+            !self.dedicated_io_thread,
+        )
+        .await
     }
 
-    async fn connect_until(&self, budget: Option<Duration>) -> Result<PgReplicationConnection> {
+    async fn connect_until(
+        &self,
+        budget: Option<Duration>,
+        nonblocking: bool,
+    ) -> Result<PgReplicationConnection> {
         let start_time = Instant::now();
         let mut backoff = self.config.to_backoff();
 
@@ -289,7 +305,12 @@ impl ReplicationConnectionRetry {
                 )));
             }
 
-            match PgReplicationConnection::connect_async(&self.connection_string).await {
+            let attempt_result = if nonblocking {
+                PgReplicationConnection::connect_async_nonblocking(&self.connection_string).await
+            } else {
+                PgReplicationConnection::connect_async(&self.connection_string).await
+            };
+            match attempt_result {
                 Ok(conn) => {
                     let elapsed = start_time.elapsed();
                     info!(
@@ -886,5 +907,13 @@ mod tests {
         let conninfo = "postgresql://u:p@h:5432/db?replication=database&sslmode=verify-full";
         let retry = ReplicationConnectionRetry::new(RetryConfig::default(), conninfo.to_string());
         assert_eq!(retry.connection_string(), conninfo);
+    }
+
+    /// `ReplicationStreamConfig::with_dedicated_io_thread` reaches the retrier through this, and the plain constructor must leave it off.
+    #[test]
+    fn the_dedicated_io_thread_choice_is_stored() {
+        let retry = ReplicationConnectionRetry::new(RetryConfig::default(), "x".to_string());
+        assert!(!retry.dedicated_io_thread);
+        assert!(retry.with_dedicated_io_thread(true).dedicated_io_thread);
     }
 }

@@ -335,6 +335,99 @@ async fn a_stream_resumes_after_its_walsender_is_terminated() {
     );
 }
 
+/// Live "pg-walstream-native" worker threads in this process. `comm` is cut to 15 bytes, so the
+/// name reads "pg-walstream-na".
+#[cfg(all(target_os = "linux", feature = "rustls-tls"))]
+fn workers() -> usize {
+    std::fs::read_dir("/proc/self/task")
+        .expect("list threads")
+        .filter_map(|task| std::fs::read_to_string(task.ok()?.path().join("comm")).ok())
+        .filter(|comm| comm.starts_with("pg-walstream-na"))
+        .count()
+}
+
+/// On a current-thread runtime (`#[tokio::test]`, `#[tokio::main(flavor = "current_thread")]`) the
+/// native backend used to park a stream's socket on a dedicated thread and hand every batch back
+/// over a channel, about 9 us of kernel time per hand-off. The stream's own connection now runs
+/// inline. Counted against the fixture's blocking connection, which does need its thread.
+///
+/// The count is process-wide, so run the suite with `--test-threads=1` as CI does: a sibling test
+/// whose worker ends between the two counts would fail it.
+#[cfg(all(target_os = "linux", feature = "rustls-tls"))]
+#[tokio::test]
+#[ignore = "requires live PostgreSQL with wal_level=logical"]
+async fn a_stream_on_a_current_thread_runtime_has_no_worker_thread() {
+    let mut fixture = Fixture::new("it_inline_current_thread");
+    let before = workers();
+    let mut stream = LogicalReplicationStream::new(&replication_conn_string(), fixture.config())
+        .await
+        .expect("stream");
+    stream.start(None).await.expect("start");
+    fixture.insert(1);
+    assert_eq!(read_until(&mut stream, 1).await, [1]);
+
+    assert_eq!(
+        workers(),
+        before,
+        "the stream's connection got a worker thread of its own"
+    );
+}
+
+/// `with_dedicated_io_thread(true)` gives the stream's connection back its worker thread, the same
+/// process-wide count as above.
+#[cfg(all(target_os = "linux", feature = "rustls-tls"))]
+#[tokio::test]
+#[ignore = "requires live PostgreSQL with wal_level=logical"]
+async fn a_dedicated_io_thread_stream_has_a_worker_thread() {
+    let mut fixture = Fixture::new("it_dedicated_io_thread");
+    let before = workers();
+    let mut stream = LogicalReplicationStream::new(
+        &replication_conn_string(),
+        fixture.config().with_dedicated_io_thread(true),
+    )
+    .await
+    .expect("stream");
+    stream.start(None).await.expect("start");
+    fixture.insert(1);
+    assert_eq!(read_until(&mut stream, 1).await, [1]);
+
+    assert_eq!(
+        workers(),
+        before + 1,
+        "the stream's connection should run on a worker thread"
+    );
+}
+
+/// A stream created inside an idle current-thread runtime and read from another one makes progress
+/// when it has a dedicated I/O thread. Inline, its socket would sit on the idle runtime's reactor
+/// and never become readable.
+#[cfg(feature = "rustls-tls")]
+#[test]
+#[ignore = "requires live PostgreSQL with wal_level=logical"]
+fn a_dedicated_io_thread_stream_is_read_from_another_runtime() {
+    let runtime = || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+    };
+    let (creator, reader) = (runtime(), runtime());
+    let mut fixture = Fixture::new("it_dedicated_io_runtimes");
+    let mut stream = creator.block_on(async {
+        let mut stream = LogicalReplicationStream::new(
+            &replication_conn_string(),
+            fixture.config().with_dedicated_io_thread(true),
+        )
+        .await
+        .expect("stream");
+        stream.start(None).await.expect("start");
+        stream
+    });
+
+    fixture.insert(1);
+    assert_eq!(reader.block_on(read_until(&mut stream, 1)), [1]);
+}
+
 /// The counters behind `stream.metrics()` follow a real stream: WAL read, the lag between what
 /// was received and what the consumer applied, a status update sent, and one reconnect after the
 /// walsender is terminated.

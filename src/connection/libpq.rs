@@ -749,6 +749,19 @@ impl PgReplicationConnection {
         })
     }
 
+    /// [`connect_async`](Self::connect_async) for a stream's own connection. libpq owns its socket, so there is no driver to choose.
+    pub(crate) async fn connect_async_nonblocking(conninfo: &str) -> Result<Self> {
+        Self::connect_async(conninfo).await
+    }
+
+    /// libpq blocks the calling thread and never a runtime's reactor, so every method may be called.
+    pub(crate) fn can_block(&self) -> bool {
+        true
+    }
+
+    /// Never needed: with [`can_block`](Self::can_block) always true, nothing opens a second connection while this one is held.
+    pub(crate) fn terminate_nowait(&mut self) {}
+
     /// Non-blocking [`connect`](Self::connect), driving `PQconnectPoll` on `AsyncFd` socket readiness. Dropping the future closes the half-open connection.
     ///
     /// `PQconnectPoll` leaves `connect_timeout` and multi-host failover to its caller, so this runs `PQconnectdb`'s attempt loop itself: one attempt per address, each with its own `connect_timeout`, in libpq's order, honouring `load_balance_hosts` and `target_session_attrs=prefer-standby`. Host names resolve through tokio, so no `getaddrinfo` blocks the calling thread, and each resolves when its server's turn comes, as in libpq, so a slow name later in the list does not delay the hosts before it. Two differences remain. After an authentication failure the next address is still tried, because a failed connection exposes no SQLSTATE. A host list that only a conninfo's `service` file supplies is one attempt under one deadline.
