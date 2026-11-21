@@ -67,6 +67,7 @@ src/
 │   ├── events.rs    #   SnapshotEvents: ChangeEvent adapter + EventSource impl
 │   └── aligned.rs   #   AlignedSnapshot: tables added to a running stream (side slot)
 └── connection/      # native/ rustls-tls backend (default) + libpq FFI backend (opt-in)
+    ├── commands.rs          # replication commands both backends share (`replication_commands!`)
     └── native/copy_out.rs   # CopyOut state machine (NOT copy.rs — see below)
 macros/              # #[derive(WalTable)] (opt-in `derive` feature)
 ```

@@ -11,7 +11,7 @@ use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
+use tracing::debug;
 
 use super::conninfo::ConnInfo;
 use super::startup::{self, Transport};
@@ -19,8 +19,7 @@ use super::{copy, copy_out, query, wire};
 use super::{NativePgResult, NativeResultStatus};
 
 use crate::error::{ReplicationError, Result};
-use crate::protocol::build_hot_standby_feedback_message;
-use crate::types::{format_lsn, BaseBackupOptions, ReplicationSlotOptions, SlotType, XLogRecPtr};
+use crate::types::{BaseBackupOptions, XLogRecPtr};
 
 // A `NativeConnection` is a handle. A dedicated worker thread owns the socket on
 // its own current-thread runtime, so all I/O stays on one reactor and the
@@ -1097,34 +1096,9 @@ impl NativeConnection {
         Ok(result)
     }
 
-    /// Send IDENTIFY_SYSTEM command.
-    pub fn identify_system(&mut self) -> Result<NativePgResult> {
-        debug!("Sending IDENTIFY_SYSTEM command");
-        let result = self.exec("IDENTIFY_SYSTEM")?;
-        Self::log_identity(&result);
-        Ok(result)
-    }
-
-    /// Non-blocking [`identify_system`](Self::identify_system).
-    pub async fn identify_system_async(&mut self) -> Result<NativePgResult> {
-        debug!("Sending IDENTIFY_SYSTEM command");
-        let result = self.exec_async("IDENTIFY_SYSTEM").await?;
-        Self::log_identity(&result);
-        Ok(result)
-    }
-
-    fn log_identity(result: &NativePgResult) {
-        if let (Some(systemid), Some(timeline), Some(xlogpos)) = (
-            result.get_value(0, 0),
-            result.get_value(0, 1),
-            result.get_value(0, 2),
-        ) {
-            debug!(
-                "System identification: systemid={}, timeline={}, xlogpos={}",
-                systemid, timeline, xlogpos
-            );
-        }
-    }
+    // identify_system, standby/hot-standby feedback and the slot commands are shared with the
+    // libpq backend; see `connection::commands`.
+    crate::connection::commands::replication_commands!(NativePgResult);
 
     // ── Replication ─────────────────────────────────────────────────────
 
@@ -1262,35 +1236,6 @@ impl NativeConnection {
         }
     }
 
-    /// Send feedback to the server (standby status update).
-    pub async fn send_standby_status_update(
-        &mut self,
-        received_lsn: XLogRecPtr,
-        flushed_lsn: XLogRecPtr,
-        applied_lsn: XLogRecPtr,
-        reply_requested: bool,
-    ) -> Result<()> {
-        self.ensure_replication_mode()?;
-
-        let reply_data = crate::protocol::build_standby_status_update_message(
-            received_lsn,
-            flushed_lsn,
-            applied_lsn,
-            reply_requested,
-        );
-        self.put_copy_data(reply_data).await?;
-
-        info!(
-            "Sent standby status update: received={}, flushed={}, applied={}, reply_requested={}",
-            format_lsn(received_lsn),
-            format_lsn(flushed_lsn),
-            format_lsn(applied_lsn),
-            reply_requested
-        );
-
-        Ok(())
-    }
-
     /// Send a client CopyDone to end the COPY stream cleanly.
     ///
     /// Idempotent: a no-op when not in COPY mode. On the Inline driver we write
@@ -1338,28 +1283,6 @@ impl NativeConnection {
         Ok(())
     }
 
-    /// Send hot standby feedback message to the server.
-    pub async fn send_hot_standby_feedback(
-        &mut self,
-        xmin: u32,
-        xmin_epoch: u32,
-        catalog_xmin: u32,
-        catalog_xmin_epoch: u32,
-    ) -> Result<()> {
-        self.ensure_replication_mode()?;
-
-        let feedback_data =
-            build_hot_standby_feedback_message(xmin, xmin_epoch, catalog_xmin, catalog_xmin_epoch)?;
-
-        self.put_copy_data(feedback_data).await?;
-
-        debug!(
-            "Sent hot standby feedback: xmin={}, catalog_xmin={}",
-            xmin, catalog_xmin
-        );
-        Ok(())
-    }
-
     /// Send one CopyData message: inline on the worker, or over the channel.
     async fn put_copy_data(&mut self, data: Bytes) -> Result<()> {
         match &mut self.driver {
@@ -1404,135 +1327,7 @@ impl NativeConnection {
         self.server_ver
     }
 
-    // ── Replication slot management ─────────────────────────────────────
-
-    /// Create a replication slot with advanced options.
-    pub fn create_replication_slot_with_options(
-        &mut self,
-        slot_name: &str,
-        slot_type: SlotType,
-        output_plugin: Option<&str>,
-        options: &ReplicationSlotOptions,
-    ) -> Result<NativePgResult> {
-        let sql = self.create_slot_sql(slot_name, slot_type, output_plugin, options)?;
-        self.exec(&sql)
-    }
-
-    /// Non-blocking [`create_replication_slot_with_options`](Self::create_replication_slot_with_options).
-    pub async fn create_replication_slot_with_options_async(
-        &mut self,
-        slot_name: &str,
-        slot_type: SlotType,
-        output_plugin: Option<&str>,
-        options: &ReplicationSlotOptions,
-    ) -> Result<NativePgResult> {
-        let sql = self.create_slot_sql(slot_name, slot_type, output_plugin, options)?;
-        self.exec_async(&sql).await
-    }
-
-    fn create_slot_sql(
-        &self,
-        slot_name: &str,
-        slot_type: SlotType,
-        output_plugin: Option<&str>,
-        options: &ReplicationSlotOptions,
-    ) -> Result<String> {
-        let sql = crate::sql_builder::prepare_create_slot(
-            self.server_version(),
-            slot_name,
-            slot_type,
-            output_plugin,
-            options,
-        )?;
-        debug!("Creating replication slot: {}", sql);
-        Ok(sql)
-    }
-
-    /// Alter a replication slot (logical slots only).
-    pub fn alter_replication_slot(
-        &mut self,
-        slot_name: &str,
-        two_phase: Option<bool>,
-        failover: Option<bool>,
-    ) -> Result<NativePgResult> {
-        let sql = crate::sql_builder::prepare_alter_slot(
-            self.server_version(),
-            slot_name,
-            two_phase,
-            failover,
-        )?;
-
-        debug!("Altering replication slot: {}", sql);
-        let result = self.exec(&sql)?;
-        debug!("Replication slot {} altered", slot_name);
-        Ok(result)
-    }
-
-    /// Drop a replication slot.
-    pub fn drop_replication_slot(&mut self, slot_name: &str, wait: bool) -> Result<()> {
-        let sql = Self::drop_slot_sql(slot_name, wait)?;
-        let result = self.exec(&sql)?;
-        Self::slot_dropped(slot_name, &result)
-    }
-
-    /// Non-blocking [`drop_replication_slot`](Self::drop_replication_slot).
-    pub async fn drop_replication_slot_async(&mut self, slot_name: &str, wait: bool) -> Result<()> {
-        let sql = Self::drop_slot_sql(slot_name, wait)?;
-        let result = self.exec_async(&sql).await?;
-        Self::slot_dropped(slot_name, &result)
-    }
-
-    fn drop_slot_sql(slot_name: &str, wait: bool) -> Result<String> {
-        let sql = crate::sql_builder::build_drop_slot_sql(slot_name, wait)?;
-        debug!("Dropping replication slot: {}", sql);
-        Ok(sql)
-    }
-
-    fn slot_dropped(slot_name: &str, result: &NativePgResult) -> Result<()> {
-        if !result.is_ok() {
-            return Err(ReplicationError::replication_slot(format!(
-                "Failed to drop replication slot '{}': {}",
-                slot_name,
-                result
-                    .error_message()
-                    .unwrap_or_else(|| "unknown error".to_string())
-            )));
-        }
-        debug!("Replication slot {} dropped", slot_name);
-        Ok(())
-    }
-
-    /// Read information about a replication slot.
-    pub fn read_replication_slot(
-        &mut self,
-        slot_name: &str,
-    ) -> Result<crate::types::ReplicationSlotInfo> {
-        let sql = crate::sql_builder::prepare_read_slot(self.server_version(), slot_name)?;
-        debug!("Reading replication slot: {}", sql);
-        let result = self.exec(&sql)?;
-        if !result.is_ok() {
-            return Err(ReplicationError::replication_slot(format!(
-                "Failed to read replication slot '{}': {}",
-                slot_name,
-                result
-                    .error_message()
-                    .unwrap_or_else(|| "unknown error".to_string())
-            )));
-        }
-
-        let slot_type = result.get_value(0, 0);
-        let restart_lsn = result
-            .get_value(0, 1)
-            .and_then(|s| crate::types::parse_lsn(&s).ok())
-            .map(crate::types::Lsn::new);
-        let restart_tli = result.get_value(0, 2).and_then(|s| s.parse::<i32>().ok());
-
-        Ok(crate::types::ReplicationSlotInfo {
-            slot_type,
-            restart_lsn,
-            restart_tli,
-        })
-    }
+    // ── Physical replication and backup ─────────────────────────────────
 
     /// Start physical replication.
     pub fn start_physical_replication(

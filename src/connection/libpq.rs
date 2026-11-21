@@ -30,13 +30,13 @@
 //! This ensures that no thread is blocked waiting for network I/O, maximizing
 //! throughput and enabling efficient concurrent processing of multiple replication streams.
 use crate::error::{ReplicationError, Result, ServerError};
-use crate::protocol::build_hot_standby_feedback_message;
-use crate::types::{format_lsn, BaseBackupOptions, ReplicationSlotOptions, SlotType, XLogRecPtr};
+use crate::types::{BaseBackupOptions, XLogRecPtr};
 use bytes::{BufMut, Bytes, BytesMut};
 use pq_sys::*;
 use sqlstate::SqlState;
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
+use std::future::Future;
 use std::os::raw::{c_char, c_void};
 use std::os::unix::io::{BorrowedFd, OwnedFd, RawFd};
 use std::time::Duration;
@@ -1211,34 +1211,9 @@ impl PgReplicationConnection {
         Ok(())
     }
 
-    /// Send IDENTIFY_SYSTEM command
-    pub fn identify_system(&mut self) -> Result<PgResult> {
-        debug!("Sending IDENTIFY_SYSTEM command");
-        let result = self.exec("IDENTIFY_SYSTEM")?;
-        Self::log_identity(&result);
-        Ok(result)
-    }
-
-    /// Non-blocking [`identify_system`](Self::identify_system).
-    pub async fn identify_system_async(&mut self) -> Result<PgResult> {
-        debug!("Sending IDENTIFY_SYSTEM command");
-        let result = self.exec_async("IDENTIFY_SYSTEM").await?;
-        Self::log_identity(&result);
-        Ok(result)
-    }
-
-    fn log_identity(result: &PgResult) {
-        if let (Some(systemid), Some(timeline), Some(xlogpos)) = (
-            result.get_value(0, 0),
-            result.get_value(0, 1),
-            result.get_value(0, 2),
-        ) {
-            debug!(
-                "System identification: systemid={}, timeline={}, xlogpos={}",
-                systemid, timeline, xlogpos
-            );
-        }
-    }
+    // identify_system, standby/hot-standby feedback and the slot commands are shared with the
+    // native backend; see `connection::commands`.
+    crate::connection::commands::replication_commands!(PgResult);
 
     /// Start logical replication
     pub fn start_replication(
@@ -1278,35 +1253,6 @@ impl PgReplicationConnection {
         // Initialize the async socket first; enter `CopyMode::Replication` only AFTER it succeeds, preserving the invariant `copy.is_replication() ⇒ async_fd is Some`. Otherwise a failed socket setup would leave the mode set with no async_fd, and a later `end_copy`/Drop would reach the writable-wait path with `async_fd == None`.
         self.initialize_async_socket()?;
         self.copy = CopyMode::Replication(CopyStream::default());
-        Ok(())
-    }
-
-    /// Send feedback to the server (standby status update)
-    pub async fn send_standby_status_update(
-        &mut self,
-        received_lsn: XLogRecPtr,
-        flushed_lsn: XLogRecPtr,
-        applied_lsn: XLogRecPtr,
-        reply_requested: bool,
-    ) -> Result<()> {
-        self.ensure_replication_mode()?;
-
-        let reply_data = crate::protocol::build_standby_status_update_message(
-            received_lsn,
-            flushed_lsn,
-            applied_lsn,
-            reply_requested,
-        );
-        self.put_copy_data_and_flush(&reply_data).await?;
-
-        info!(
-            "Sent standby status update: received={}, flushed={}, applied={}, reply_requested={}",
-            format_lsn(received_lsn),
-            format_lsn(flushed_lsn),
-            format_lsn(applied_lsn),
-            reply_requested
-        );
-
         Ok(())
     }
 
@@ -1783,7 +1729,16 @@ impl PgReplicationConnection {
     ///
     /// Uses `AsyncFd::writable()` to avoid blocking the executor thread while
     /// waiting for the socket to become writable during `PQflush`.
-    async fn put_copy_data_and_flush(&mut self, data: &[u8]) -> Result<()> {
+    fn put_copy_data(&mut self, data: Bytes) -> impl Future<Output = Result<()>> + '_ {
+        // Queued before the future exists, so `data` is not held across the flush await.
+        let queued = self.queue_copy_data(&data);
+        async move {
+            queued?;
+            self.flush_until_done().await
+        }
+    }
+
+    fn queue_copy_data(&mut self, data: &[u8]) -> Result<()> {
         let result = unsafe {
             PQputCopyData(
                 self.conn,
@@ -1798,14 +1753,12 @@ impl PgReplicationConnection {
                 "Failed to send data via COPY protocol: {error_msg}"
             )));
         }
-
-        self.flush_until_done().await?;
         Ok(())
     }
 
     /// Send a client CopyDone (`PQputCopyEnd`) to end the COPY stream cleanly.
     ///
-    /// Idempotent: a no-op when not in replication mode. The non-blocking flush loop mirrors `put_copy_data_and_flush`. Trailing results are reclaimed by `PQfinish` on drop (matching `close_replication_connection`), so we do not drain `PQgetResult` here.
+    /// Idempotent: a no-op when not in replication mode. The non-blocking flush loop mirrors `put_copy_data`. Trailing results are reclaimed by `PQfinish` on drop (matching `close_replication_connection`), so we do not drain `PQgetResult` here.
     pub(crate) async fn end_copy(&mut self) -> Result<()> {
         if !self.copy.is_replication() {
             return Ok(());
@@ -1818,7 +1771,7 @@ impl PgReplicationConnection {
             match r {
                 1 => break,
                 0 => {
-                    // Would block: fully drain libpq's output buffer (loop PQflush until it returns 0) before retrying PQputCopyEnd — matching the flush loop in `put_copy_data_and_flush`. Flushing only once then retrying PQputCopyEnd wastes an FFI round-trip per partial flush; not flushing at all would spin (the socket stays writable while the buffer is never emptied).
+                    // Would block: fully drain libpq's output buffer (loop PQflush until it returns 0) before retrying PQputCopyEnd — matching the flush loop in `put_copy_data`. Flushing only once then retrying PQputCopyEnd wastes an FFI round-trip per partial flush; not flushing at all would spin (the socket stays writable while the buffer is never emptied).
                     loop {
                         let flush = unsafe { PQflush(self.conn) };
                         match flush {
@@ -1921,165 +1874,6 @@ impl PgReplicationConnection {
         unsafe { PQserverVersion(self.conn) }
     }
 
-    /// Create a replication slot with advanced options
-    ///
-    /// Uses the positional keyword syntax supported across PostgreSQL 14+:
-    ///
-    /// ```text
-    /// CREATE_REPLICATION_SLOT name [TEMPORARY] PHYSICAL [RESERVE_WAL]
-    /// CREATE_REPLICATION_SLOT name [TEMPORARY] LOGICAL plugin
-    ///   [EXPORT_SNAPSHOT | NOEXPORT_SNAPSHOT | USE_SNAPSHOT | TWO_PHASE]
-    ///   [FAILOVER]
-    /// ```
-    ///
-    /// The snapshot option values are mapped to positional keywords:
-    /// - `"export"` → `EXPORT_SNAPSHOT`
-    /// - `"nothing"` → `NOEXPORT_SNAPSHOT`
-    /// - `"use"` → `USE_SNAPSHOT`
-    ///
-    /// **Note:** When both `two_phase` and `snapshot` are set, both options are emitted for LOGICAL slots — PostgreSQL accepts them together.
-    ///
-    /// See: <https://www.postgresql.org/docs/current/protocol-replication.html>
-    pub fn create_replication_slot_with_options(
-        &mut self,
-        slot_name: &str,
-        slot_type: SlotType,
-        output_plugin: Option<&str>,
-        options: &ReplicationSlotOptions,
-    ) -> Result<PgResult> {
-        let sql = self.create_slot_sql(slot_name, slot_type, output_plugin, options)?;
-        self.exec(&sql)
-    }
-
-    /// Non-blocking [`create_replication_slot_with_options`](Self::create_replication_slot_with_options).
-    pub async fn create_replication_slot_with_options_async(
-        &mut self,
-        slot_name: &str,
-        slot_type: SlotType,
-        output_plugin: Option<&str>,
-        options: &ReplicationSlotOptions,
-    ) -> Result<PgResult> {
-        let sql = self.create_slot_sql(slot_name, slot_type, output_plugin, options)?;
-        self.exec_async(&sql).await
-    }
-
-    fn create_slot_sql(
-        &self,
-        slot_name: &str,
-        slot_type: SlotType,
-        output_plugin: Option<&str>,
-        options: &ReplicationSlotOptions,
-    ) -> Result<String> {
-        let sql = crate::sql_builder::prepare_create_slot(
-            self.server_version(),
-            slot_name,
-            slot_type,
-            output_plugin,
-            options,
-        )?;
-        debug!("Creating replication slot: {}", sql);
-        Ok(sql)
-    }
-
-    /// Alter a replication slot (logical slots only)
-    pub fn alter_replication_slot(
-        &mut self,
-        slot_name: &str,
-        two_phase: Option<bool>,
-        failover: Option<bool>,
-    ) -> Result<PgResult> {
-        let alter_slot_sql = crate::sql_builder::prepare_alter_slot(
-            self.server_version(),
-            slot_name,
-            two_phase,
-            failover,
-        )?;
-
-        debug!("Altering replication slot: {}", alter_slot_sql);
-        let result = self.exec(&alter_slot_sql)?;
-        debug!("Replication slot {} altered", slot_name);
-        Ok(result)
-    }
-
-    /// Drop a replication slot
-    ///
-    /// Generates: `DROP_REPLICATION_SLOT "slot_name" [WAIT]`
-    ///
-    /// # Arguments
-    ///
-    /// * `slot_name` - Name of the replication slot to drop
-    /// * `wait` - If true, the command waits until the slot becomes inactive instead of returning an error when the slot is in use
-    pub fn drop_replication_slot(&mut self, slot_name: &str, wait: bool) -> Result<()> {
-        let sql = Self::drop_slot_sql(slot_name, wait)?;
-        let result = self.exec(&sql)?;
-        Self::slot_dropped(slot_name, &result)
-    }
-
-    /// Non-blocking [`drop_replication_slot`](Self::drop_replication_slot).
-    pub async fn drop_replication_slot_async(&mut self, slot_name: &str, wait: bool) -> Result<()> {
-        let sql = Self::drop_slot_sql(slot_name, wait)?;
-        let result = self.exec_async(&sql).await?;
-        Self::slot_dropped(slot_name, &result)
-    }
-
-    fn drop_slot_sql(slot_name: &str, wait: bool) -> Result<String> {
-        let sql = crate::sql_builder::build_drop_slot_sql(slot_name, wait)?;
-        debug!("Dropping replication slot: {}", sql);
-        Ok(sql)
-    }
-
-    fn slot_dropped(slot_name: &str, result: &PgResult) -> Result<()> {
-        if !result.is_ok() {
-            return Err(ReplicationError::replication_slot(format!(
-                "Failed to drop replication slot '{}': {}",
-                slot_name,
-                result
-                    .error_message()
-                    .unwrap_or_else(|| "unknown error".to_string())
-            )));
-        }
-        debug!("Replication slot {} dropped", slot_name);
-        Ok(())
-    }
-
-    /// Read information about a replication slot
-    ///
-    /// Generates: `READ_REPLICATION_SLOT "slot_name"`
-    ///
-    /// Returns slot type, restart LSN, and restart timeline.
-    /// Requires PostgreSQL 15+.
-    pub fn read_replication_slot(
-        &mut self,
-        slot_name: &str,
-    ) -> Result<crate::types::ReplicationSlotInfo> {
-        let sql = crate::sql_builder::prepare_read_slot(self.server_version(), slot_name)?;
-
-        debug!("Reading replication slot: {}", sql);
-        let result = self.exec(&sql)?;
-        if !result.is_ok() {
-            return Err(ReplicationError::replication_slot(format!(
-                "Failed to read replication slot '{}': {}",
-                slot_name,
-                result
-                    .error_message()
-                    .unwrap_or_else(|| "unknown error".to_string())
-            )));
-        }
-
-        let slot_type = result.get_value(0, 0);
-        let restart_lsn = result
-            .get_value(0, 1)
-            .and_then(|s| crate::types::parse_lsn(&s).ok())
-            .map(crate::types::Lsn::new);
-        let restart_tli = result.get_value(0, 2).and_then(|s| s.parse::<i32>().ok());
-
-        Ok(crate::types::ReplicationSlotInfo {
-            slot_type,
-            restart_lsn,
-            restart_tli,
-        })
-    }
-
     /// Start physical replication
     pub fn start_physical_replication(
         &mut self,
@@ -2100,28 +1894,6 @@ impl PgReplicationConnection {
         self.copy = CopyMode::Replication(CopyStream::default());
 
         debug!("Physical replication started successfully");
-        Ok(())
-    }
-
-    /// Send hot standby feedback message to the server
-    pub async fn send_hot_standby_feedback(
-        &mut self,
-        xmin: u32,
-        xmin_epoch: u32,
-        catalog_xmin: u32,
-        catalog_xmin_epoch: u32,
-    ) -> Result<()> {
-        self.ensure_replication_mode()?;
-
-        let feedback_data =
-            build_hot_standby_feedback_message(xmin, xmin_epoch, catalog_xmin, catalog_xmin_epoch)?;
-
-        self.put_copy_data_and_flush(&feedback_data).await?;
-
-        debug!(
-            "Sent hot standby feedback: xmin={}, catalog_xmin={}",
-            xmin, catalog_xmin
-        );
         Ok(())
     }
 
@@ -2361,6 +2133,18 @@ impl PgReplicationConnection {
 /// Safe wrapper for a PostgreSQL result.
 pub struct PgResult {
     result: *mut PGresult,
+}
+
+impl super::commands::QueryResult for PgResult {
+    fn is_ok(&self) -> bool {
+        PgResult::is_ok(self)
+    }
+    fn error_message(&self) -> Option<String> {
+        PgResult::error_message(self)
+    }
+    fn get_value(&self, row: i32, col: i32) -> Option<String> {
+        PgResult::get_value(self, row, col)
+    }
 }
 
 impl PgResult {
@@ -2689,6 +2473,7 @@ mod tests {
     }
 
     use crate::sql_builder::quote_literal;
+    use crate::types::{ReplicationSlotOptions, SlotType};
 
     fn sanitize_sql_string_value(value: &str) -> String {
         let quoted = quote_literal(value).unwrap();
