@@ -639,14 +639,14 @@ where
 
 /// How a `NativeConnection` drives its socket I/O.
 ///
-/// `Inline` runs the connection's `Worker` directly on the caller's runtime, chosen only on a multi-thread runtime, where this is safe and avoids the cross-thread channel/second-reactor cost. `Threaded` keeps the dedicated worker-thread bridge, used on a current-thread runtime (where the inline `run_sync` `block_in_place` would panic) and with no ambient runtime (where a per-call temporary runtime would orphan the socket). The Inline variant owns a `Worker` (large `Transport`) on the I/O hot path; boxing it would add a pointer indirection to every read, so the size gap with the channel-only Threaded variant is an intentional tradeoff (cf. `Transport`).
+/// `Inline` runs the connection's `Worker` directly on the caller's runtime, chosen on a multi-thread runtime, where this is safe and avoids the cross-thread channel/second-reactor cost, and on any runtime for a stream's own connection ([`NativeConnection::connect_async_nonblocking`]), which never calls a blocking method. `Threaded` keeps the dedicated worker-thread bridge, used by `connect` and `connect_async` on a current-thread runtime (where the inline `run_sync` `block_in_place` would panic) and with no ambient runtime (where a per-call temporary runtime would orphan the socket). The Inline variant owns a `Worker` (large `Transport`) on the I/O hot path; boxing it would add a pointer indirection to every read, so the size gap with the channel-only Threaded variant is an intentional tradeoff (cf. `Transport`).
 #[allow(clippy::large_enum_variant)]
 enum Driver {
     /// Worker owned directly; sync methods use `run_sync`, async methods await.
     Inline {
         worker: Worker,
         pending: VecDeque<Bytes>,
-        /// The multi-thread runtime the socket was created on; `run_sync` always drives sync I/O on it so the socket never ends up on a foreign or temporary reactor (see `run_sync`).
+        /// The runtime the socket was created on; `run_sync` always drives sync I/O on it so the socket never ends up on a foreign or temporary reactor (see `run_sync`).
         handle: tokio::runtime::Handle,
     },
     /// Worker lives on its own thread; commands cross `cmd_tx`, batches `batch_rx`.
@@ -741,7 +741,18 @@ impl NativeConnection {
     ///
     /// Picks the driver by the ambient runtime flavor exactly as `connect` does.
     pub async fn connect_async(conninfo: &str) -> Result<Self> {
-        if Self::prefer_inline_driver() {
+        Self::connect_async_with(conninfo, Self::prefer_inline_driver()).await
+    }
+
+    /// [`connect_async`](Self::connect_async) for callers that only ever use the `_async` methods: inline on any runtime flavor.
+    ///
+    /// On a current-thread runtime the inline driver cannot serve the blocking methods (nothing would drive the reactor while the only thread is blocked), so [`can_block`](Self::can_block) reports it and those methods fail instead of hanging.
+    pub(crate) async fn connect_async_nonblocking(conninfo: &str) -> Result<Self> {
+        Self::connect_async_with(conninfo, tokio::runtime::Handle::try_current().is_ok()).await
+    }
+
+    async fn connect_async_with(conninfo: &str, inline: bool) -> Result<Self> {
+        if inline {
             let alive = Arc::new(AtomicBool::new(false));
             let worker = WorkerInit::Connect {
                 conninfo: conninfo.to_string(),
@@ -775,6 +786,8 @@ impl NativeConnection {
     /// ambient runtime each `run_sync` would spin up a *fresh* temporary runtime
     /// whose reactor dies when it returns, orphaning the long-lived socket. Both
     /// cases therefore use the worker thread, which owns one persistent runtime.
+    /// A stream's own connection is the exception: it uses only `_async` methods, so
+    /// [`connect_async_nonblocking`](Self::connect_async_nonblocking) goes inline on any runtime.
     fn prefer_inline_driver() -> bool {
         matches!(
             tokio::runtime::Handle::try_current(),
@@ -912,6 +925,7 @@ impl NativeConnection {
     /// ships `connect_timeout` and no statement deadline.
     fn run_query(&mut self, sql: &str) -> Result<NativePgResult> {
         self.ensure_no_abandoned_command()?;
+        self.ensure_can_block()?;
         match &mut self.driver {
             Driver::Inline { worker, handle, .. } => run_sync(handle, worker.query(sql)),
             Driver::Threaded { cmd_tx, .. } => {
@@ -930,6 +944,7 @@ impl NativeConnection {
     /// Run a CopyIn query: inline on the worker, or over the command channel.
     fn run_query_copy_in(&mut self, sql: &str, payload: &[u8]) -> Result<NativePgResult> {
         self.ensure_no_abandoned_command()?;
+        self.ensure_can_block()?;
         match &mut self.driver {
             Driver::Inline { worker, handle, .. } => {
                 run_sync(handle, worker.query_copy_in(sql, payload))
@@ -980,6 +995,33 @@ impl NativeConnection {
     ) -> Result<NativePgResult> {
         cmd_tx.send(command).map_err(|_| Self::worker_gone())?;
         reply.await.map_err(|_| Self::worker_reply_dropped())?
+    }
+
+    /// False for an inline connection born on a current-thread runtime: its blocking methods would deadlock the thread that must drive its reactor.
+    pub(crate) fn can_block(&self) -> bool {
+        !matches!(&self.driver, Driver::Inline { handle, .. }
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread)
+    }
+
+    /// Write `Terminate` once, without waiting, so the server ends this session and frees its walsender. For a caller that must open another connection before this one drops and cannot block it: an inline connection on a current-thread runtime. The write needs no wakeup unless the socket buffer is full, and then nothing is sent and the walsender is freed only when the connection drops.
+    pub(crate) fn terminate_nowait(&mut self) {
+        let send_copy_done = self.copy.is_replication();
+        if let Driver::Inline { worker, .. } = &mut self.driver {
+            let mut close = std::pin::pin!(worker.close(send_copy_done));
+            let _ = close
+                .as_mut()
+                .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
+            self.alive.store(false, Ordering::Relaxed);
+        }
+    }
+
+    fn ensure_can_block(&self) -> Result<()> {
+        if self.can_block() {
+            return Ok(());
+        }
+        Err(ReplicationError::protocol(
+            "a blocking method was called on a connection that runs inline on a current-thread runtime; use its _async variant".to_string(),
+        ))
     }
 
     fn ensure_no_abandoned_command(&self) -> Result<()> {
@@ -1763,6 +1805,8 @@ impl NativeConnection {
                 // We must NOT block when dropped *inside* a current-thread runtime: `block_in_place` requires a multi-thread runtime and `block_on`
                 // panics ("cannot start a runtime from within a runtime"). There we skip the courtesy close; the socket still closes via TCP FIN when `worker` drops, and PostgreSQL reaps the walsender on disconnect.
                 match tokio::runtime::Handle::try_current() {
+                    _ if handle.runtime_flavor()
+                        == tokio::runtime::RuntimeFlavor::CurrentThread => {}
                     Ok(cur)
                         if cur.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
                     {
@@ -2336,6 +2380,81 @@ mod tests {
         drop(rt);
     }
 
+    /// An inline connection born on `rt`, a current-thread runtime, with its send buffer full: a courtesy `Terminate` would have to wait for write readiness, which only `rt` can deliver, and `rt` is left idle by the caller.
+    fn stalled_inline_connection(
+        rt: &tokio::runtime::Runtime,
+    ) -> (NativeConnection, tokio::net::TcpStream) {
+        rt.block_on(async {
+            let (mut worker, server) = worker_with_loopback().await;
+            let Transport::Plain(tcp) = &mut worker.transport else {
+                unreachable!("the loopback worker is plain")
+            };
+            while tcp.try_write(&[0u8; 65536]).is_ok() {}
+            let conn = NativeConnection {
+                driver: Driver::Inline {
+                    worker,
+                    pending: VecDeque::new(),
+                    handle: tokio::runtime::Handle::current(),
+                },
+                server_ver: 160000,
+                copy: CopyMode::Idle,
+                alive: Arc::new(AtomicBool::new(true)),
+                command_in_flight: false,
+            };
+            (conn, server)
+        })
+    }
+
+    /// Dropped off its own runtime, the courtesy `Terminate` must be skipped, not awaited: `Handle::block_on` on a current-thread handle never drives that runtime's reactor, so a write that has to wait for readiness would hang the dropping thread for good.
+    #[test]
+    fn test_dropping_a_stalled_current_thread_inline_connection_off_its_runtime_does_not_hang() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (conn, _server) = stalled_inline_connection(&rt);
+
+        let (done, finished) = std_mpsc::channel();
+        std::thread::spawn(move || {
+            drop(conn); // no ambient runtime on this thread
+            let _ = done.send(());
+        });
+        assert!(
+            finished
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok(),
+            "the drop waited on a reactor nobody drives"
+        );
+    }
+
+    /// The same inside a multi-thread runtime, where the drop would otherwise `block_in_place` and `block_on` the idle current-thread handle.
+    #[test]
+    fn test_dropping_a_stalled_current_thread_inline_connection_in_a_multi_thread_runtime_does_not_hang(
+    ) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (conn, _server) = stalled_inline_connection(&rt);
+        let mt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (done, finished) = std_mpsc::channel();
+        mt.spawn(async move {
+            drop(conn);
+            let _ = done.send(());
+        });
+        let finished = finished.recv_timeout(std::time::Duration::from_secs(5));
+        mt.shutdown_background();
+        assert!(
+            finished.is_ok(),
+            "the drop waited on a reactor nobody drives"
+        );
+    }
+
     #[test]
     fn test_inline_drop_within_current_thread_runtime_does_not_panic() {
         // Build the inline connection on a multi-thread runtime (handle = mt), then
@@ -2358,6 +2477,74 @@ mod tests {
         ct.block_on(async move {
             drop(conn); // must not panic on a current-thread runtime
         });
+    }
+
+    /// Inline on a current-thread runtime serves only the `_async` methods; a blocking one must fail fast, because blocking the one thread that has to drive the socket's reactor would deadlock.
+    #[tokio::test]
+    async fn test_inline_on_current_thread_rejects_blocking_methods() {
+        let (worker, _server) = worker_with_loopback().await;
+        let mut conn = NativeConnection {
+            driver: Driver::Inline {
+                worker,
+                pending: VecDeque::new(),
+                handle: tokio::runtime::Handle::current(),
+            },
+            server_ver: 170000, // `upload_manifest` checks the version before it reaches the guard
+            copy: CopyMode::Idle,
+            alive: Arc::new(AtomicBool::new(true)),
+            command_in_flight: false,
+        };
+        assert!(!conn.can_block());
+        let err = conn.exec("IDENTIFY_SYSTEM").unwrap_err().to_string();
+        assert!(err.contains("_async"), "{err}");
+        let err = conn.upload_manifest(b"{}").unwrap_err().to_string();
+        assert!(err.contains("_async"), "{err}");
+        drop(conn); // must neither hang nor panic
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_threaded_and_multi_thread_inline_can_block() {
+        assert!(NativeConnection::null_for_testing().can_block());
+        assert!(NativeConnection::null_for_testing_inline().can_block());
+    }
+
+    /// The one-shot `Terminate` is how a connection that cannot block frees its walsender for the fallback connection a discard opens.
+    #[tokio::test]
+    async fn test_terminate_nowait_sends_terminate_on_an_inline_connection() {
+        use tokio::io::AsyncReadExt;
+        let (worker, mut server) = worker_with_loopback().await;
+        let mut conn = NativeConnection {
+            driver: Driver::Inline {
+                worker,
+                pending: VecDeque::new(),
+                handle: tokio::runtime::Handle::current(),
+            },
+            server_ver: 160000,
+            copy: CopyMode::Idle,
+            alive: Arc::new(AtomicBool::new(true)),
+            command_in_flight: false,
+        };
+        conn.terminate_nowait();
+
+        let mut sent = [0u8; 5];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            server.read_exact(&mut sent),
+        )
+        .await
+        .expect("Terminate must arrive")
+        .unwrap();
+        assert_eq!(sent, [b'X', 0, 0, 0, 4]);
+        assert!(!conn.is_alive());
+    }
+
+    /// A threaded connection can block, so nothing needs it released early.
+    #[tokio::test]
+    async fn test_terminate_nowait_leaves_a_threaded_connection_alone() {
+        let mut conn = NativeConnection::null_for_testing();
+        conn.alive.store(true, Ordering::Relaxed);
+        conn.terminate_nowait();
+        assert!(conn.is_alive());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

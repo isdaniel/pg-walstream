@@ -1085,6 +1085,102 @@ async fn a_snapshot_dropped_before_consumption_leaves_no_slot() {
     );
 }
 
+/// On a current-thread runtime the stream's own connection cannot be used to drop the slot, so the
+/// discard opens a second replication connection while the first still holds a walsender. With none
+/// spare it must still drop the slot: the first session is told to end and the second waits for its
+/// walsender, instead of failing and leaving a slot that turns the next `snapshot()` into
+/// `Unavailable`.
+#[cfg(feature = "rustls-tls")]
+#[tokio::test]
+#[ignore = "requires live PostgreSQL with wal_level=logical"]
+async fn a_dropped_snapshot_cleans_up_when_no_walsender_is_spare() {
+    let (slot, table, publication) = ("it_snap_nospare", "snap_nospare", "snap_nospare_pub");
+    let _guard = slot_guard(slot);
+    setup(table, publication, &["a"]);
+
+    let stream = LogicalReplicationStream::new(
+        &replication_conn_string(),
+        snapshot_config(slot, publication),
+    )
+    .await
+    .expect("connect");
+
+    // Take every other walsender, so the stream's own is the last one in use.
+    let mut probe = regular_conn();
+    let limit = probe_count(
+        &probe
+            .exec("SELECT setting::bigint FROM pg_settings WHERE name = 'max_wal_senders'")
+            .expect("limit"),
+    );
+    let in_use = probe_count(
+        &probe
+            .exec("SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'walsender'")
+            .expect("in use"),
+    );
+    let _fillers: Vec<_> = (0..limit - in_use)
+        .map(|_| PgReplicationConnection::connect(&replication_conn_string()).expect("filler"))
+        .collect();
+
+    {
+        let SnapshotOutcome::Available(_snap) = stream.snapshot().await.expect("snapshot") else {
+            panic!("a fresh slot must export a snapshot");
+        };
+    } // dropped without rows()/events()/abandon()
+
+    let slots = probe
+        .exec(&format!(
+            "SELECT count(*) FROM pg_replication_slots WHERE slot_name = '{slot}'"
+        ))
+        .expect("probe");
+    assert_eq!(
+        probe_count(&slots),
+        0,
+        "the discard must get a walsender once the stream's session has ended"
+    );
+}
+
+/// The discard on a current-thread runtime reaches the slot by name on a fresh connection, so it
+/// must check that the slot is still the one this stream created. One another client made under
+/// the same name since (another node of the cluster looks the same) is theirs to keep.
+#[cfg(feature = "rustls-tls")]
+#[tokio::test]
+#[ignore = "requires live PostgreSQL with wal_level=logical"]
+async fn a_dropped_snapshot_leaves_a_slot_another_client_recreated() {
+    let (slot, table, publication) = ("it_snap_swapped", "snap_swapped", "snap_swapped_pub");
+    let _guard = slot_guard(slot);
+    setup(table, publication, &["a"]);
+
+    let stream = LogicalReplicationStream::new(
+        &replication_conn_string(),
+        snapshot_config(slot, publication),
+    )
+    .await
+    .expect("connect");
+
+    let snapshot = stream.snapshot().await.expect("snapshot");
+    let mut other = regular_conn();
+    other
+        .exec(&format!("SELECT pg_drop_replication_slot('{slot}')"))
+        .expect("drop the stream's slot");
+    other
+        .exec(&format!(
+            "SELECT pg_create_logical_replication_slot('{slot}', 'pgoutput')"
+        ))
+        .expect("recreate it under the same name");
+    drop(snapshot);
+
+    let slots = other
+        .exec(&format!(
+            "SELECT count(*) FROM pg_replication_slots WHERE slot_name = '{slot}'"
+        ))
+        .expect("probe");
+    assert_eq!(
+        probe_count(&slots),
+        1,
+        "a slot this stream did not create must survive the discard"
+    );
+}
+
 /// `START_REPLICATION` destroys the exported snapshot server-side, so the name
 /// must not survive `start()`.
 ///

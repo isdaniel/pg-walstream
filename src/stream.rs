@@ -546,6 +546,8 @@ pub struct ReplicationStreamConfig {
     pub existing_slot_required: bool,
     /// Bounded replay: stop after the transaction whose commit `end_lsn` reaches this LSN. `None` (the default) streams unbounded.
     pub stop_at_lsn: Option<Lsn>,
+    /// Native backend: give the connection a thread of its own on a current-thread runtime, so the stream can be read from any runtime (default `false`). See [`with_dedicated_io_thread`](Self::with_dedicated_io_thread).
+    pub dedicated_io_thread: bool,
 }
 
 /// Streaming mode for logical replication (pgoutput)
@@ -654,6 +656,7 @@ impl ReplicationStreamConfig {
             slot_type: SlotType::Logical,
             stop_at_lsn: None,
             existing_slot_required: false,
+            dedicated_io_thread: false,
         }
     }
 
@@ -773,6 +776,25 @@ impl ReplicationStreamConfig {
         self.slot_type = slot_type;
         self
     }
+
+    /// Give the stream's connection a thread of its own on a current-thread runtime, so the stream can be read from any runtime (default `false`).
+    ///
+    /// By default the native backend runs the connection inline on the runtime that creates the stream, which saves about 9 us of kernel time per batch against a thread hand-off. The price is that the stream makes progress only while that runtime is running: one created inside `rt.block_on(..)` and read from another runtime while `rt` is idle never completes. `true` restores the thread, at that cost.
+    ///
+    /// It has no effect on a multi-thread runtime, which always runs the connection inline and is driven by its own workers, or on the libpq backend.
+    ///
+    /// ```
+    /// use pg_walstream::ReplicationStreamConfig;
+    ///
+    /// let config = ReplicationStreamConfig::builder("my_slot", "my_publication")
+    ///     .with_dedicated_io_thread(true);
+    /// assert!(config.dedicated_io_thread);
+    /// ```
+    #[inline]
+    pub fn with_dedicated_io_thread(mut self, enabled: bool) -> Self {
+        self.dedicated_io_thread = enabled;
+        self
+    }
 }
 
 impl Default for ReplicationStreamConfig {
@@ -797,6 +819,7 @@ impl Default for ReplicationStreamConfig {
             slot_type: SlotType::Logical,
             stop_at_lsn: None,
             existing_slot_required: false,
+            dedicated_io_thread: false,
         }
     }
 }
@@ -946,6 +969,14 @@ impl LogicalReplicationStream {
     ///
     /// A new `LogicalReplicationStream` instance with an initialized LSN feedback tracker.
     ///
+    /// # Runtime
+    ///
+    /// On the native backend the connection's socket stays registered with the runtime that
+    /// calls this, so read the stream on that runtime. On a current-thread runtime it must also
+    /// be running: a stream created inside `rt.block_on(..)` and read from another runtime while
+    /// `rt` is idle makes no progress. [`with_dedicated_io_thread`](ReplicationStreamConfig::with_dedicated_io_thread)
+    /// lifts that restriction.
+    ///
     /// # Errors
     ///
     /// Returns an error if:
@@ -989,7 +1020,8 @@ impl LogicalReplicationStream {
         let retry_handler = ReplicationConnectionRetry::new(
             config.retry_config,
             with_connect_timeout(connection_string, config.connection_timeout),
-        );
+        )
+        .with_dedicated_io_thread(config.dedicated_io_thread);
 
         // `connect_timeout` bounds each address, so the budget only stops the retries between attempts.
         let mut connection = retry_handler
@@ -2322,9 +2354,38 @@ impl LogicalReplicationStream {
     /// Blocking, for `Drop` paths. Async error paths use [`discard_replication_slot_async`](Self::discard_replication_slot_async).
     pub(crate) fn discard_replication_slot(&mut self) {
         if self.owns_slot() {
-            let dropped = self
-                .connection
-                .drop_replication_slot(&self.config.slot_name, false);
+            let dropped = if self.connection.can_block() {
+                self.connection
+                    .drop_replication_slot(&self.config.slot_name, false)
+            } else {
+                // This connection cannot block its own runtime: drop the slot from a fresh one on a scratch thread. This session is told to end first so it does not hold the walsender the fresh one needs; the server releases it a moment after `Terminate`, which `retry_while_full` waits out.
+                self.connection.terminate_nowait();
+                let (conninfo, slot, identity, created_at) = (
+                    self.conninfo().to_string(),
+                    self.config.slot_name.clone(),
+                    self.identity,
+                    self.consistent_point(),
+                );
+                on_scratch_thread(self.config.connection_timeout, move || {
+                    let mut fresh = retry_while_full(Duration::from_secs(2), || {
+                        PgReplicationConnection::connect(&conninfo)
+                    })?;
+                    let reached = ServerIdentity::from_identify_system(&fresh.identify_system()?)?;
+                    identity.ensure_same_server(&reached)?;
+                    // The conninfo can lead to another node of the cluster (a standby shares its primary's identity but not its slots), and the name may have been taken since by another client: drop only a slot still at the position this stream created it at.
+                    let found =
+                        fresh.exec(&crate::sql_builder::build_slot_confirmed_flush_sql(&slot)?)?;
+                    match confirmed_flush_lsn_from(&slot, &found)? {
+                        None => return Ok(()),
+                        Some(at) => ensure_slot_is_ours(&slot, at, created_at)?,
+                    }
+                    match fresh.drop_replication_slot(&slot, false) {
+                        // A temporary slot dies with the session that was just told to end.
+                        Err(e) if e.sqlstate() == Some(sqlstate::pg::UNDEFINED_OBJECT) => Ok(()),
+                        dropped => dropped,
+                    }
+                })
+            };
             self.record_discard(dropped);
         }
     }
@@ -2836,6 +2897,64 @@ impl StreamState {
             }));
         }
     }
+}
+
+/// Run `f` on a thread of its own, with no ambient runtime, and wait up to `limit` for its result (`Duration::ZERO` waits as long as it takes).
+///
+/// A thread that cannot start, panics or outlasts `limit` is an `Err`, not a panic or a hang: the caller is a `Drop` path that may already be unwinding and that holds up its runtime's only thread while it waits. A thread that outlasts `limit` is left to finish by itself.
+fn on_scratch_thread<T: Send + 'static>(
+    limit: Duration,
+    f: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    use std::sync::mpsc::{channel, RecvTimeoutError};
+
+    let (done, result) = channel();
+    std::thread::Builder::new()
+        .name("pg-walstream-slot-drop".to_string())
+        .spawn(move || {
+            let _ = done.send(f());
+        })?;
+    let outcome = if limit.is_zero() {
+        result.recv().map_err(|_| RecvTimeoutError::Disconnected)
+    } else {
+        result.recv_timeout(limit)
+    };
+    match outcome {
+        Ok(result) => result,
+        Err(RecvTimeoutError::Timeout) => Err(ReplicationError::timeout(format!(
+            "the scratch thread was still running after {limit:?}"
+        ))),
+        Err(RecvTimeoutError::Disconnected) => {
+            Err(ReplicationError::backend("the scratch thread panicked"))
+        }
+    }
+}
+
+/// Call `attempt` until it stops failing with `too_many_connections`, for at most `window`. A server out of walsenders answers that way until a session it was told to end has finished exiting, and about one connection in forty meets that moment.
+fn retry_while_full<T>(window: Duration, mut attempt: impl FnMut() -> Result<T>) -> Result<T> {
+    let give_up = Instant::now() + window;
+    loop {
+        match attempt() {
+            Err(e)
+                if e.sqlstate() == Some(sqlstate::pg::TOO_MANY_CONNECTIONS)
+                    && Instant::now() < give_up =>
+            {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            result => return result,
+        }
+    }
+}
+
+/// Refuse to drop a slot that is not at the position this stream created it at: it is another client's, or another node's, whatever its name says.
+fn ensure_slot_is_ours(slot: &str, found: Lsn, created_at: Option<Lsn>) -> Result<()> {
+    if created_at == Some(found) {
+        return Ok(());
+    }
+    let created_at = created_at.map_or("an unknown position".to_string(), |lsn| lsn.to_string());
+    Err(ReplicationError::replication_slot(format!(
+        "replication slot {slot} is at {found}, not at {created_at} where this stream created it, so it is not this stream's slot and is left alone"
+    )))
 }
 
 /// Extract the `consistent_point` from a `CREATE_REPLICATION_SLOT` result.
@@ -5521,6 +5640,96 @@ pub(crate) mod tests {
         );
         assert_eq!(stream.exported_snapshot_name(), Some("snap"));
         assert_eq!(stream.consistent_point(), Some(Lsn::new(42)));
+    }
+
+    /// The scratch thread backs a `Drop` path: a panic inside it must come back as an `Err`, because re-raising it there can abort the process.
+    #[test]
+    fn on_scratch_thread_turns_a_panic_into_an_error() {
+        assert_eq!(on_scratch_thread(Duration::ZERO, || Ok(7)).unwrap(), 7);
+
+        let err = on_scratch_thread::<()>(Duration::ZERO, || panic!("boom")).unwrap_err();
+        assert!(matches!(err, ReplicationError::Backend(_)), "{err}");
+    }
+
+    /// The wait holds up the runtime's only thread, so a stalled endpoint must cost `limit` and not forever.
+    #[test]
+    fn on_scratch_thread_gives_up_after_its_limit() {
+        let started = Instant::now();
+        let err = on_scratch_thread(Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_secs(2));
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(matches!(err, ReplicationError::Timeout(_)), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "waited for the thread"
+        );
+    }
+
+    fn too_many_connections() -> ReplicationError {
+        ReplicationError::from_server(
+            Some(crate::error::ServerError {
+                code: Some("53300".parse().expect("a valid SQLSTATE")),
+                ..Default::default()
+            }),
+            "too many connections",
+        )
+    }
+
+    /// A server out of walsenders answers `too_many_connections` until the session it was told to end has exited: wait that out, then connect.
+    #[test]
+    fn retry_while_full_waits_out_too_many_connections() {
+        let mut calls = 0;
+        let connected = retry_while_full(Duration::from_secs(5), || {
+            calls += 1;
+            if calls < 3 {
+                Err(too_many_connections())
+            } else {
+                Ok(calls)
+            }
+        });
+        assert_eq!(connected.unwrap(), 3);
+    }
+
+    /// Any other failure is not the exiting session's doing, so waiting would only delay it.
+    #[test]
+    fn retry_while_full_returns_any_other_error_at_once() {
+        let mut calls = 0;
+        let err = retry_while_full::<()>(Duration::from_secs(5), || {
+            calls += 1;
+            Err(ReplicationError::protocol("nope"))
+        })
+        .unwrap_err();
+        assert_eq!(calls, 1, "{err}");
+    }
+
+    #[test]
+    fn retry_while_full_gives_up_when_the_window_ends() {
+        let mut calls = 0;
+        let err = retry_while_full::<()>(Duration::ZERO, || {
+            calls += 1;
+            Err(too_many_connections())
+        })
+        .unwrap_err();
+        assert_eq!(calls, 1);
+        assert_eq!(err.sqlstate(), Some(sqlstate::pg::TOO_MANY_CONNECTIONS));
+    }
+
+    /// A slot at another position than the one this stream created is not this stream's, whatever it is named.
+    #[test]
+    fn ensure_slot_is_ours_only_accepts_the_position_it_was_created_at() {
+        let created = Some(Lsn::new(0x16B3748));
+        assert!(ensure_slot_is_ours("s", Lsn::new(0x16B3748), created).is_ok());
+
+        let err = ensure_slot_is_ours("s", Lsn::new(0x16B3750), created).unwrap_err();
+        assert!(
+            matches!(err, ReplicationError::ReplicationSlot(..)),
+            "{err}"
+        );
+        assert!(err.to_string().contains("left alone"), "{err}");
+
+        assert!(ensure_slot_is_ours("s", Lsn::new(0x16B3748), None).is_err());
     }
 
     /// The asymmetry the nested `Option` exists for: `START_REPLICATION` destroys
