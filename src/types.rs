@@ -665,7 +665,8 @@ pub enum EventType {
         abort_lsn: Option<Lsn>,
         abort_timestamp: Option<chrono::DateTime<chrono::Utc>>,
     },
-    /// Relation (schema) definition — emitted on schema changes
+    /// Relation (schema) definition — emitted for every pgoutput `Relation`
+    /// message, including one that repeats the cached definition
     Relation {
         relation_id: Oid,
         namespace: Arc<str>,

@@ -1409,12 +1409,15 @@ pub(crate) fn relation_metadata(
 /// `EventStream` and [`PgOutputDecoder`] delegate to it, so every consumer gets
 /// identical results whether or not a connection is held.
 ///
-/// `Ok(None)` covers two distinct cases the caller cannot tell apart:
-/// - a first-seen `Relation` message (cache is populated, no event emitted), and
-/// - a data message for a relation not yet in `state` (dropped, logged at WARN).
+/// `Ok(None)` means a data message for a relation not yet in `state` (dropped,
+/// logged at WARN).
 ///
-/// A `Relation` whose schema differs from the cached one emits a `Relation`
-/// event before the cache is updated. `lsn` stamps every emitted event.
+/// Every `Relation` message updates the cache and emits a `Relation` event,
+/// including one identical to the cached entry. pgoutput resends a relation's
+/// `Relation` only on its first use in a decoding session, in each streamed
+/// transaction and after any invalidation of the relation (a policy change, a
+/// grant, a schema change), so a repeat is the only in-stream sign of that
+/// invalidation. `lsn` stamps every emitted event.
 ///
 /// Kept `pub(crate)`: the public entry point is [`PgOutputDecoder`]. This lives
 /// in the unconditional `protocol` module (not the network-gated `stream`
@@ -1444,63 +1447,33 @@ pub(crate) fn message_to_change_event(
             replica_identity,
             columns,
         } => {
-            // Emit a Relation event the first time a table is seen and whenever
-            // its schema changes; stay silent for the identical repeats pgoutput
-            // sends at the start of every transaction.
-            let emit = if let Some(existing) = state.get_relation(relation_id) {
-                existing.namespace.as_ref() != namespace.as_ref()
-                    || existing.relation_name.as_ref() != relation_name.as_ref()
-                    || existing.replica_identity != replica_identity
-                    || existing.columns.len() != columns.len()
-                    || existing.columns.iter().zip(columns.iter()).any(|(a, b)| {
-                        a.name.as_ref() != b.name.as_ref()
-                            || a.type_id != b.type_id
-                            || a.type_modifier != b.type_modifier
-                            || a.is_key() != b.is_key()
-                    })
-            } else {
-                true
-            };
-
-            if emit {
-                let ri = ReplicaIdentity::from_byte(replica_identity)
-                    .unwrap_or(ReplicaIdentity::Default);
-                let relation_columns = columns
-                    .iter()
-                    .map(|c| RelationColumn {
-                        name: Arc::clone(&c.name),
-                        type_id: c.type_id,
-                        type_modifier: c.type_modifier,
-                        is_key: c.is_key(),
-                    })
-                    .collect();
-                let relation_info = RelationInfo::new(
-                    relation_id,
-                    namespace.clone(),
-                    relation_name.clone(),
-                    replica_identity,
-                    columns,
-                );
-                state.add_relation(relation_info);
-                ChangeEvent::relation(
-                    relation_id,
-                    namespace,
-                    relation_name,
-                    ri,
-                    relation_columns,
-                    Lsn::new(lsn),
-                )
-            } else {
-                let relation_info = RelationInfo::new(
-                    relation_id,
-                    namespace,
-                    relation_name,
-                    replica_identity,
-                    columns,
-                );
-                state.add_relation(relation_info);
-                return Ok(None);
-            }
+            let ri =
+                ReplicaIdentity::from_byte(replica_identity).unwrap_or(ReplicaIdentity::Default);
+            let relation_columns = columns
+                .iter()
+                .map(|c| RelationColumn {
+                    name: Arc::clone(&c.name),
+                    type_id: c.type_id,
+                    type_modifier: c.type_modifier,
+                    is_key: c.is_key(),
+                })
+                .collect();
+            let relation_info = RelationInfo::new(
+                relation_id,
+                namespace.clone(),
+                relation_name.clone(),
+                replica_identity,
+                columns,
+            );
+            state.add_relation(relation_info);
+            ChangeEvent::relation(
+                relation_id,
+                namespace,
+                relation_name,
+                ri,
+                relation_columns,
+                Lsn::new(lsn),
+            )
         }
 
         LogicalReplicationMessage::Insert { relation_id, tuple } => {
@@ -1933,8 +1906,8 @@ impl PgOutputDecoder {
     /// `body` is the message after any transport framing has been stripped (no
     /// `'w'` XLogData header, no CopyData wrapper), the same contract as
     /// [`LogicalReplicationParser::parse_wal_message`]. Returns `Ok(None)` for a
-    /// first-seen `Relation` (cache update only) or a data message referencing an
-    /// unknown relation, and `Ok(Some(event))` otherwise.
+    /// data message referencing an unknown relation, and `Ok(Some(event))`
+    /// otherwise.
     ///
     /// `lsn` stamps the emitted event; pass the WAL start position of this
     /// message (the network path uses `XLogData.wal_start`). When draining a slot

@@ -11720,7 +11720,7 @@ pub(crate) mod tests {
     // ================================================================
 
     #[test]
-    fn test_convert_to_change_event_relation_first_time_emits_then_dedups() {
+    fn test_convert_to_change_event_relation_first_time_and_repeat_both_emit() {
         use crate::protocol::ColumnInfo;
         use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
 
@@ -11746,15 +11746,19 @@ pub(crate) mod tests {
         assert!(first.is_some(), "First-time relation should emit an event");
         assert!(stream.state.get_relation(200).is_some());
 
-        // pgoutput repeats Relation at the start of every transaction; an
-        // unchanged repeat must stay silent.
-        let repeat =
-            crate::protocol::message_to_change_event(&mut stream.state, mk(), 0xB100).unwrap();
-        assert!(repeat.is_none(), "Unchanged repeat should return None");
+        // pgoutput resends an unchanged Relation after any relcache invalidation
+        // (ALTER POLICY, GRANT, ...), the only in-stream sign of it, so the
+        // repeat must surface too.
+        let repeat = crate::protocol::message_to_change_event(&mut stream.state, mk(), 0xB100)
+            .unwrap()
+            .expect("Unchanged repeat should emit a Relation event");
+        assert_eq!(repeat.event_type_str(), "relation");
+        assert_eq!(repeat.lsn.value(), 0xB100);
+        assert!(stream.state.get_relation(200).is_some());
     }
 
     #[test]
-    fn test_convert_to_change_event_relation_same_schema_returns_none() {
+    fn test_convert_to_change_event_relation_same_schema_emits() {
         use crate::protocol::{ColumnInfo, RelationInfo};
         use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
 
@@ -11788,10 +11792,14 @@ pub(crate) mod tests {
 
         let result =
             crate::protocol::message_to_change_event(&mut stream.state, msg, 0xC000).unwrap();
-        assert!(
-            result.is_none(),
-            "Same schema should not emit a Relation event"
-        );
+        let event = result.expect("Same schema should emit a Relation event");
+        assert!(matches!(
+            event.event_type,
+            EventType::Relation {
+                relation_id: 300,
+                ..
+            }
+        ));
     }
 
     #[test]
