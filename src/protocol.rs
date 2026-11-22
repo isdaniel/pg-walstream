@@ -1413,11 +1413,11 @@ pub(crate) fn relation_metadata(
 /// logged at WARN).
 ///
 /// Every `Relation` message updates the cache and emits a `Relation` event,
-/// including one identical to the cached entry. pgoutput resends a relation's
-/// `Relation` only on its first use in a decoding session, in each streamed
-/// transaction and after any invalidation of the relation (a policy change, a
-/// grant, a schema change), so a repeat is the only in-stream sign of that
-/// invalidation. `lsn` stamps every emitted event.
+/// including one identical to the cached entry. pgoutput sends a relation's
+/// `Relation` on first use in a decoding session, in streamed transactions and
+/// on the next published change after a relcache invalidation (e.g. a policy
+/// change or grant). Invalidations alone emit no message and can coalesce.
+/// `lsn` stamps every emitted event.
 ///
 /// Kept `pub(crate)`: the public entry point is [`PgOutputDecoder`]. This lives
 /// in the unconditional `protocol` module (not the network-gated `stream`
