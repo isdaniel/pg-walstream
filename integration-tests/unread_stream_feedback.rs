@@ -5,30 +5,11 @@
 //! Requires PostgreSQL with `wal_level=logical`, `DATABASE_URL` in replication
 //! mode and `DATABASE_URL_REGULAR` for the same database.
 
+mod common;
+
+use common::{regular_conn, replication_conn_string, value};
 use core::time::Duration;
-use pg_walstream::{LogicalReplicationStream, PgReplicationConnection, ReplicationStreamConfig};
-
-fn replication_conn_string() -> String {
-    std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgresql://postgres:postgres@localhost:5432/test_walstream?replication=database"
-            .to_string()
-    })
-}
-
-fn regular_conn() -> PgReplicationConnection {
-    let url = std::env::var("DATABASE_URL_REGULAR").unwrap_or_else(|_| {
-        replication_conn_string()
-            .replace("?replication=database", "")
-            .replace("&replication=database", "")
-    });
-    PgReplicationConnection::connect(&url).expect("regular connection")
-}
-
-fn value(conn: &mut PgReplicationConnection, sql: &str) -> Option<String> {
-    conn.exec(sql)
-        .unwrap_or_else(|e| panic!("{sql}: {e}"))
-        .get_value(0, 0)
-}
+use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig};
 
 /// The walsender records a status update from a stream that has not read a
 /// single message, and the update does not move the slot's confirmed position.

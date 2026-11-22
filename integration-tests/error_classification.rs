@@ -30,37 +30,13 @@
 //! cargo test --test error_classification -- --ignored --nocapture --test-threads=1
 //! ```
 
+mod common;
+
+use common::{
+    drop_slot_best_effort as drop_slot, init_tracing, regular_conn_string, replication_conn_string,
+    SlotGuard,
+};
 use pg_walstream::{sqlstate::pg, PgReplicationConnection, ReplicationError};
-
-fn replication_conn_string() -> String {
-    std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgresql://postgres:postgres@localhost:5432/test_walstream?replication=database"
-            .to_string()
-    })
-}
-
-fn regular_conn_string() -> String {
-    std::env::var("DATABASE_URL_REGULAR").unwrap_or_else(|_| {
-        let repl = replication_conn_string();
-        repl.replace("?replication=database", "")
-            .replace("&replication=database", "")
-    })
-}
-
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .try_init();
-}
-
-fn drop_slot(slot_name: &str) {
-    if let Ok(mut conn) = PgReplicationConnection::connect(&replication_conn_string()) {
-        let _ = conn.exec(&format!(
-            "SELECT pg_drop_replication_slot('{slot_name}') \
-             WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '{slot_name}')"
-        ));
-    }
-}
 
 /// START_REPLICATION on a slot that was never created: the server answers
 /// SQLSTATE 42704, which must surface as a permanent `ReplicationSlot` error.
@@ -111,12 +87,6 @@ fn wrong_slot_type_is_a_permanent_replication_slot_error() {
     let slot = "it_errcls_physical_slot";
     drop_slot(slot);
 
-    struct SlotGuard<'a>(&'a str);
-    impl Drop for SlotGuard<'_> {
-        fn drop(&mut self) {
-            drop_slot(self.0);
-        }
-    }
     let _guard = SlotGuard(slot);
 
     let mut regular =

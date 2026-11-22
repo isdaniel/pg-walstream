@@ -21,36 +21,22 @@ pub(super) fn encode_begin_prepare(
     write_cstring(buf, gid);
 }
 
-pub(super) fn encode_prepare(
+/// PREPARE, COMMIT PREPARED and STREAM PREPARE share one layout and differ only
+/// in the tag; `lsn` is the prepare LSN, or the commit LSN for COMMIT PREPARED.
+#[allow(clippy::too_many_arguments)] // tag plus the message's six fields
+pub(super) fn encode_flagged_two_phase(
     buf: &mut BytesMut,
+    tag: u8,
     flags: u8,
-    prepare_lsn: XLogRecPtr,
+    lsn: XLogRecPtr,
     end_lsn: XLogRecPtr,
     timestamp: TimestampTz,
     xid: Xid,
     gid: &str,
 ) {
-    buf.put_u8(message_types::PREPARE);
+    buf.put_u8(tag);
     buf.put_u8(flags);
-    buf.put_u64(prepare_lsn);
-    buf.put_u64(end_lsn);
-    buf.put_i64(timestamp);
-    buf.put_u32(xid);
-    write_cstring(buf, gid);
-}
-
-pub(super) fn encode_commit_prepared(
-    buf: &mut BytesMut,
-    flags: u8,
-    commit_lsn: XLogRecPtr,
-    end_lsn: XLogRecPtr,
-    timestamp: TimestampTz,
-    xid: Xid,
-    gid: &str,
-) {
-    buf.put_u8(message_types::COMMIT_PREPARED);
-    buf.put_u8(flags);
-    buf.put_u64(commit_lsn);
+    buf.put_u64(lsn);
     buf.put_u64(end_lsn);
     buf.put_i64(timestamp);
     buf.put_u32(xid);
@@ -78,34 +64,10 @@ pub(super) fn encode_rollback_prepared(
     write_cstring(buf, gid);
 }
 
-pub(super) fn encode_stream_prepare(
-    buf: &mut BytesMut,
-    flags: u8,
-    prepare_lsn: XLogRecPtr,
-    end_lsn: XLogRecPtr,
-    timestamp: TimestampTz,
-    xid: Xid,
-    gid: &str,
-) {
-    buf.put_u8(message_types::STREAM_PREPARE);
-    buf.put_u8(flags);
-    buf.put_u64(prepare_lsn);
-    buf.put_u64(end_lsn);
-    buf.put_i64(timestamp);
-    buf.put_u32(xid);
-    write_cstring(buf, gid);
-}
-
 #[cfg(test)]
 mod tests {
+    use crate::pgoutput_encode::encode;
     use crate::protocol::LogicalReplicationMessage as M;
-    use bytes::BytesMut;
-
-    fn encode(msg: &M, version: u8) -> Vec<u8> {
-        let mut buf = BytesMut::new();
-        crate::pgoutput_encode::encode_message(msg, version, &mut buf);
-        buf.to_vec()
-    }
 
     #[test]
     fn encode_begin_prepare_matches_spec_bytes() {

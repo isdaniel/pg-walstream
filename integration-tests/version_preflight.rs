@@ -18,35 +18,18 @@
 //! cargo test --test version_preflight -- --ignored --nocapture --test-threads=1
 //! ```
 
+mod common;
+
+use common::{
+    drop_slot_best_effort as drop_slot, init_tracing, regular_conn_string, replication_conn_string,
+    WaitingSlotGuard,
+};
 use pg_walstream::{
     EventType, LogicalReplicationStream, PgReplicationConnection, ReplicationSlotOptions,
     ReplicationStreamConfig, RetryConfig, SlotType, StreamingMode,
 };
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-
-fn replication_conn_string() -> String {
-    std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgresql://postgres:postgres@localhost:5432/test_walstream?replication=database"
-            .to_string()
-    })
-}
-
-fn regular_conn_string() -> String {
-    std::env::var("DATABASE_URL_REGULAR").unwrap_or_else(|_| {
-        // Strip `replication=database` while keeping a valid query string.
-        let repl = replication_conn_string();
-        repl.replace("?replication=database&", "?")
-            .replace("&replication=database", "")
-            .replace("?replication=database", "")
-    })
-}
-
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .try_init();
-}
 
 fn server_version_num(conn: &mut PgReplicationConnection) -> i64 {
     conn.exec("SHOW server_version_num")
@@ -55,48 +38,6 @@ fn server_version_num(conn: &mut PgReplicationConnection) -> i64 {
         .expect("server_version_num present")
         .parse()
         .expect("server_version_num numeric")
-}
-
-fn drop_slot(slot: &str) {
-    if let Ok(mut conn) = PgReplicationConnection::connect(&replication_conn_string()) {
-        let _ = conn.exec(&format!(
-            "SELECT pg_drop_replication_slot('{slot}') WHERE EXISTS \
-             (SELECT 1 FROM pg_replication_slots WHERE slot_name = '{slot}')"
-        ));
-    }
-}
-
-/// Poll until the slot's `active` flag clears. The walsender exits
-/// asynchronously after the stream is dropped, and dropping a still-active slot
-/// raises 55006 — which `drop_slot` swallows, leaking the slot. Bounded at 5s.
-fn wait_for_slot_inactive(slot: &str) {
-    let Ok(mut conn) = PgReplicationConnection::connect(&replication_conn_string()) else {
-        return;
-    };
-    for _ in 0..50 {
-        let active = conn
-            .exec(&format!(
-                "SELECT active FROM pg_replication_slots WHERE slot_name = '{slot}'"
-            ))
-            .ok()
-            .and_then(|r| r.get_value(0, 0))
-            .is_some_and(|v| v == "t");
-        if !active {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
-/// Drops its slot on `Drop` so a panicking assertion never leaks a slot (an
-/// orphaned slot pins WAL and can exhaust server disk). `Drop` is sync, hence
-/// the blocking wait for the walsender to release the slot.
-struct SlotGuard(&'static str);
-impl Drop for SlotGuard {
-    fn drop(&mut self) {
-        wait_for_slot_inactive(self.0);
-        drop_slot(self.0);
-    }
 }
 
 fn core_cfg(slot: &str) -> ReplicationStreamConfig {
@@ -121,7 +62,7 @@ async fn core_cdc_path_streams_and_decodes_insert() {
     init_tracing();
     let slot = "vp_it_core_slot";
     drop_slot(slot);
-    let _guard = SlotGuard(slot);
+    let _guard = WaitingSlotGuard(slot);
 
     let mut regular =
         PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
@@ -178,7 +119,7 @@ fn gated_slot_ops_pass_preflight_and_execute_on_pg17plus() {
     init_tracing();
     let slot = "vp_it_gated_slot";
     drop_slot(slot);
-    let _guard = SlotGuard(slot);
+    let _guard = WaitingSlotGuard(slot);
 
     let mut regular =
         PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");

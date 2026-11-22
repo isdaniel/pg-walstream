@@ -26,27 +26,10 @@
 //! cargo test --test quote_literal_scs_off -- --ignored --nocapture
 //! ```
 
+mod common;
+
+use common::{init_tracing, regular_conn_string};
 use pg_walstream::{quote_literal, PgReplicationConnection};
-
-fn regular_conn_string() -> String {
-    std::env::var("DATABASE_URL_REGULAR").unwrap_or_else(|_| {
-        std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| {
-                "postgresql://postgres:postgres@localhost:5432/test_walstream".to_string()
-            })
-            // Drop the replication flag: this test needs a *regular* (non-replication) connection so `SET` and a plain `SELECT` work.
-            // Handle it as the first, a later, or the sole query parameter without leaving a dangling `?`/`&`.
-            .replace("?replication=database&", "?")
-            .replace("&replication=database", "")
-            .replace("?replication=database", "")
-    })
-}
-
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .try_init();
-}
 
 /// `SELECT <quote_literal(payload)>` and return the single scalar the server
 /// echoes back.

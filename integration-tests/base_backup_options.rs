@@ -33,29 +33,11 @@
 //! cargo test --test base_backup_options -- --ignored --nocapture
 //! ```
 
+mod common;
+
+use common::{init_tracing, regular_conn_string, replication_conn_string};
 use pg_walstream::{BaseBackupOptions, PgReplicationConnection};
 use tracing::warn;
-
-fn replication_conn_string() -> String {
-    std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgresql://postgres:postgres@localhost:5432/test_walstream?replication=database"
-            .to_string()
-    })
-}
-
-fn regular_conn_string() -> String {
-    std::env::var("DATABASE_URL_REGULAR").unwrap_or_else(|_| {
-        let repl = replication_conn_string();
-        repl.replace("?replication=database", "")
-            .replace("&replication=database", "")
-    })
-}
-
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .try_init();
-}
 
 fn server_version_num(conn: &mut PgReplicationConnection) -> i64 {
     conn.exec("SHOW server_version_num")

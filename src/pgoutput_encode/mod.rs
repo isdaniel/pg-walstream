@@ -15,7 +15,9 @@ mod wire;
 #[cfg(test)]
 mod roundtrip_tests;
 
-use crate::protocol::{LogicalReplicationMessage, StreamingReplicationMessage, TupleData};
+use crate::protocol::{
+    message_types, LogicalReplicationMessage, StreamingReplicationMessage, TupleData,
+};
 use crate::types::Xid;
 use bytes::BytesMut;
 
@@ -148,7 +150,16 @@ fn encode_inner(
             timestamp,
             xid,
             gid,
-        } => two_phase::encode_prepare(buf, *flags, *prepare_lsn, *end_lsn, *timestamp, *xid, gid),
+        } => two_phase::encode_flagged_two_phase(
+            buf,
+            message_types::PREPARE,
+            *flags,
+            *prepare_lsn,
+            *end_lsn,
+            *timestamp,
+            *xid,
+            gid,
+        ),
         M::CommitPrepared {
             flags,
             commit_lsn,
@@ -156,8 +167,9 @@ fn encode_inner(
             timestamp,
             xid,
             gid,
-        } => two_phase::encode_commit_prepared(
+        } => two_phase::encode_flagged_two_phase(
             buf,
+            message_types::COMMIT_PREPARED,
             *flags,
             *commit_lsn,
             *end_lsn,
@@ -190,8 +202,9 @@ fn encode_inner(
             timestamp,
             xid,
             gid,
-        } => two_phase::encode_stream_prepare(
+        } => two_phase::encode_flagged_two_phase(
             buf,
+            message_types::STREAM_PREPARE,
             *flags,
             *prepare_lsn,
             *end_lsn,
@@ -290,4 +303,11 @@ fn capacity_hint(msg: &LogicalReplicationMessage) -> usize {
         | M::RollbackPrepared { gid, .. }
         | M::StreamPrepare { gid, .. } => 48 + gid.len(),
     }
+}
+
+#[cfg(test)]
+fn encode(msg: &LogicalReplicationMessage, version: u8) -> Vec<u8> {
+    let mut buf = BytesMut::new();
+    encode_message(msg, version, &mut buf);
+    buf.to_vec()
 }

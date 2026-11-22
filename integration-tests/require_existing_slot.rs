@@ -2,6 +2,9 @@
 
 //! Requires PostgreSQL with `wal_level=logical` and `DATABASE_URL` in replication mode.
 
+mod common;
+
+use common::replication_conn_string;
 use core::time::Duration;
 use pg_walstream::{
     EventType, LogicalReplicationStream, Lsn, PgReplicationConnection, ReplicationError,
@@ -9,13 +12,6 @@ use pg_walstream::{
 };
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
-
-fn replication_conn_string() -> String {
-    std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgresql://postgres:postgres@localhost:5432/test_walstream?replication=database"
-            .to_string()
-    })
-}
 
 struct Fixture {
     regular: PgReplicationConnection,

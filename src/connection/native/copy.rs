@@ -4,7 +4,7 @@
 //! COPY mode. This module provides the zero-copy, drain-loop optimized read
 //! path for CopyData messages, and the write path for standby status updates.
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use std::collections::VecDeque;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
@@ -51,7 +51,7 @@ const _: () = assert!(MIN_HEADROOM > super::startup::TLS_BUF_SIZE);
 /// - `split_to().freeze().slice(5..)` — zero-copy extraction of CopyData payload.
 /// - Drain loop: one `read_buf()` → parse ALL complete messages → amortize syscall.
 /// - Native `AsyncRead` on `TlsStream` — no `AsyncFd` wrapper around C socket fd.
-pub async fn get_copy_data<R: AsyncRead + Unpin>(
+pub(super) async fn get_copy_data<R: AsyncRead + Unpin>(
     reader: &mut R,
     read_buf: &mut BytesMut,
     pending: &mut VecDeque<Bytes>,
@@ -243,7 +243,7 @@ fn drain_read_buffer(
 /// Send a CopyData message containing the given payload.
 ///
 /// Used for standby status updates and hot standby feedback.
-pub async fn put_copy_data<W: AsyncWrite + Unpin>(
+pub(super) async fn put_copy_data<W: AsyncWrite + Unpin>(
     writer: &mut W,
     data: &[u8],
 ) -> Result<(), ReplicationError> {
@@ -264,8 +264,6 @@ pub async fn put_copy_data<W: AsyncWrite + Unpin>(
 /// Only a well-formed leading terminal is dropped. Anything else is left alone,
 /// so a genuine protocol desync still surfaces instead of being papered over.
 pub(super) fn clear_latched_terminal(read_buf: &mut BytesMut) {
-    use bytes::Buf;
-
     if read_buf.len() < HEADER_LEN || !matches!(read_buf[0], b'c' | b'E') {
         return;
     }
@@ -280,28 +278,28 @@ pub(super) fn clear_latched_terminal(read_buf: &mut BytesMut) {
 }
 
 /// Send a CopyDone message to end the COPY stream.
-pub async fn send_copy_done<W: AsyncWrite + Unpin>(writer: &mut W) -> Result<(), ReplicationError> {
+pub(super) async fn send_copy_done<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+) -> Result<(), ReplicationError> {
     let msg = wire::build_copy_done();
     wire::write_all(writer, &msg).await?;
     wire::flush(writer).await?;
     Ok(())
 }
 
-use bytes::Buf;
-
 #[cfg(test)]
 mod tests {
+    use super::wire::testing::frame;
     use super::*;
     use bytes::BufMut;
 
+    fn buffer(frames: &[Vec<u8>]) -> BytesMut {
+        BytesMut::from(&frames.concat()[..])
+    }
+
     #[test]
     fn test_drain_single_copy_data() {
-        let mut buf = BytesMut::new();
-        let payload = b"hello";
-        let body_len = (4 + payload.len()) as i32;
-        buf.put_u8(b'd');
-        buf.put_i32(body_len);
-        buf.put_slice(payload);
+        let mut buf = buffer(&[frame(b'd', b"hello")]);
 
         let mut pending = VecDeque::new();
         drain_read_buffer(&mut buf, &mut pending);
@@ -313,17 +311,7 @@ mod tests {
 
     #[test]
     fn test_drain_multiple_messages() {
-        let mut buf = BytesMut::new();
-
-        // Message 1: CopyData "abc"
-        buf.put_u8(b'd');
-        buf.put_i32(4 + 3);
-        buf.put_slice(b"abc");
-
-        // Message 2: CopyData "defgh"
-        buf.put_u8(b'd');
-        buf.put_i32(4 + 5);
-        buf.put_slice(b"defgh");
+        let mut buf = buffer(&[frame(b'd', b"abc"), frame(b'd', b"defgh")]);
 
         let mut pending = VecDeque::new();
         drain_read_buffer(&mut buf, &mut pending);
@@ -336,12 +324,8 @@ mod tests {
 
     #[test]
     fn test_drain_partial_message() {
-        let mut buf = BytesMut::new();
-
         // Complete message
-        buf.put_u8(b'd');
-        buf.put_i32(4 + 3);
-        buf.put_slice(b"abc");
+        let mut buf = buffer(&[frame(b'd', b"abc")]);
 
         // Incomplete message (header only, no payload)
         buf.put_u8(b'd');
@@ -359,16 +343,8 @@ mod tests {
 
     #[test]
     fn test_drain_copy_done() {
-        let mut buf = BytesMut::new();
-
-        // CopyData
-        buf.put_u8(b'd');
-        buf.put_i32(4 + 3);
-        buf.put_slice(b"abc");
-
-        // CopyDone
-        buf.put_u8(b'c');
-        buf.put_i32(4);
+        // CopyData, then CopyDone
+        let mut buf = buffer(&[frame(b'd', b"abc"), frame(b'c', b"")]);
 
         let mut pending = VecDeque::new();
         // Pass 1: the queued frame wins; the terminal is left in the buffer.
@@ -408,11 +384,7 @@ mod tests {
     /// every repeat — the classification drives the reconnect decision.
     #[test]
     fn drain_error_response_is_sticky() {
-        let mut buf = BytesMut::new();
-        buf.put_u8(b'E');
-        let payload = b"C57P01\0Mterminating connection\0\0";
-        buf.put_i32(4 + payload.len() as i32);
-        buf.put_slice(payload);
+        let mut buf = buffer(&[frame(b'E', b"C57P01\0Mterminating connection\0\0")]);
 
         let mut pending = VecDeque::new();
         for _ in 0..3 {
@@ -554,13 +526,7 @@ mod tests {
 
     #[test]
     fn test_drain_error_response() {
-        let mut buf = BytesMut::new();
-        // Build a minimal ErrorResponse: 'E' + len + payload
-        let payload = b"SFATAL\0C42P01\0Mrelation not found\0\0";
-        let body_len = (4 + payload.len()) as i32;
-        buf.put_u8(b'E');
-        buf.put_i32(body_len);
-        buf.put_slice(payload);
+        let mut buf = buffer(&[frame(b'E', b"SFATAL\0C42P01\0Mrelation not found\0\0")]);
 
         let mut pending = VecDeque::new();
         let result = drain_read_buffer(&mut buf, &mut pending);
@@ -583,10 +549,7 @@ mod tests {
         let payload = b"SERROR\0VERROR\0C42883\0\
             Mno binary output function available for type aclitem\0\
             Flsyscache.c\0L3076\0RgetTypeBinaryOutputInfo\0\0";
-        let mut buf = BytesMut::new();
-        buf.put_u8(b'E');
-        buf.put_i32(i32::try_from(4 + payload.len()).unwrap());
-        buf.put_slice(payload);
+        let mut buf = buffer(&[frame(b'E', payload)]);
 
         let err =
             drain_read_buffer(&mut buf, &mut VecDeque::new()).expect("ErrorResponse terminates");
@@ -610,13 +573,8 @@ mod tests {
 
     #[test]
     fn test_drain_notice_response() {
-        let mut buf = BytesMut::new();
         // NoticeResponse 'N': should be consumed but NOT queued
-        let payload = b"SNOTICE\0C00000\0Mtest notice\0\0";
-        let body_len = (4 + payload.len()) as i32;
-        buf.put_u8(b'N');
-        buf.put_i32(body_len);
-        buf.put_slice(payload);
+        let mut buf = buffer(&[frame(b'N', b"SNOTICE\0C00000\0Mtest notice\0\0")]);
 
         let mut pending = VecDeque::new();
         drain_read_buffer(&mut buf, &mut pending);
@@ -627,13 +585,8 @@ mod tests {
 
     #[test]
     fn test_drain_unknown_tag() {
-        let mut buf = BytesMut::new();
         // Unknown tag 'X': should be skipped via advance()
-        let payload = b"data";
-        let body_len = (4 + payload.len()) as i32;
-        buf.put_u8(b'X');
-        buf.put_i32(body_len);
-        buf.put_slice(payload);
+        let mut buf = buffer(&[frame(b'X', b"data")]);
 
         let mut pending = VecDeque::new();
         drain_read_buffer(&mut buf, &mut pending);
@@ -644,14 +597,8 @@ mod tests {
 
     #[test]
     fn test_drain_max_batch_limit() {
-        let mut buf = BytesMut::new();
-
         // Insert MAX_DRAIN_BATCH + 10 CopyData messages
-        for _ in 0..(MAX_DRAIN_BATCH + 10) {
-            buf.put_u8(b'd');
-            buf.put_i32(4 + 1); // 1 byte payload
-            buf.put_u8(b'x');
-        }
+        let mut buf = buffer(&vec![frame(b'd', b"x"); MAX_DRAIN_BATCH + 10]);
 
         let mut pending = VecDeque::new();
         drain_read_buffer(&mut buf, &mut pending);
@@ -669,32 +616,16 @@ mod tests {
     /// prove the drain stops at the terminal rather than reading past it.)
     #[test]
     fn test_drain_interleaved_types() {
-        let mut buf = BytesMut::new();
-
-        // CopyData "a"
-        buf.put_u8(b'd');
-        buf.put_i32(4 + 1);
-        buf.put_u8(b'a');
-
-        // NoticeResponse (consumed, not queued)
-        let notice_payload = b"SINFO\0C00000\0Minfo\0\0";
-        buf.put_u8(b'N');
-        buf.put_i32((4 + notice_payload.len()) as i32);
-        buf.put_slice(notice_payload);
-
-        // CopyData "b"
-        buf.put_u8(b'd');
-        buf.put_i32(4 + 1);
-        buf.put_u8(b'b');
-
-        // CopyDone — terminal, stops the drain here
-        buf.put_u8(b'c');
-        buf.put_i32(4);
-
-        // CopyData "c" — must NOT be read past the terminal
-        buf.put_u8(b'd');
-        buf.put_i32(4 + 1);
-        buf.put_u8(b'c');
+        let mut buf = buffer(&[
+            frame(b'd', b"a"),
+            // NoticeResponse (consumed, not queued)
+            frame(b'N', b"SINFO\0C00000\0Minfo\0\0"),
+            frame(b'd', b"b"),
+            // CopyDone — terminal, stops the drain here
+            frame(b'c', b""),
+            // CopyData "c" — must NOT be read past the terminal
+            frame(b'd', b"c"),
+        ]);
 
         let mut pending = VecDeque::new();
         assert!(drain_read_buffer(&mut buf, &mut pending).is_none());
@@ -718,12 +649,10 @@ mod tests {
 
         tokio::spawn(async move {
             // Write a CopyData message
-            let payload = b"test payload";
-            let body_len = (4 + payload.len()) as i32;
-            let mut msg = vec![b'd'];
-            msg.extend_from_slice(&body_len.to_be_bytes());
-            msg.extend_from_slice(payload);
-            server.write_all(&msg).await.unwrap();
+            server
+                .write_all(&frame(b'd', b"test payload"))
+                .await
+                .unwrap();
             server.flush().await.unwrap();
         });
 
@@ -775,12 +704,7 @@ mod tests {
         let token = CancellationToken::new();
         token.cancel();
 
-        let payload = b"buffered";
-        let body_len = (4 + payload.len()) as i32;
-        let mut read_buf = BytesMut::new();
-        read_buf.extend_from_slice(b"d");
-        read_buf.extend_from_slice(&body_len.to_be_bytes());
-        read_buf.extend_from_slice(payload);
+        let mut read_buf = buffer(&[frame(b'd', b"buffered")]);
 
         let mut pending = VecDeque::new();
         let result = get_copy_data(&mut client, &mut read_buf, &mut pending, &token).await;
@@ -810,11 +734,7 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(8192);
         let token = CancellationToken::new();
         tokio::spawn(async move {
-            let fields = b"SERROR\0C28000\0Mnope\0\0";
-            let body_len = (4 + fields.len()) as i32;
-            let mut msg = vec![b'E'];
-            msg.extend_from_slice(&body_len.to_be_bytes());
-            msg.extend_from_slice(fields);
+            let msg = frame(b'E', b"SERROR\0C28000\0Mnope\0\0");
             server.write_all(&msg).await.unwrap();
             server.flush().await.unwrap();
         });
@@ -832,11 +752,7 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(8192);
         let token = CancellationToken::new();
         tokio::spawn(async move {
-            let payload = b"split payload";
-            let body_len = (4 + payload.len()) as i32;
-            let mut msg = vec![b'd'];
-            msg.extend_from_slice(&body_len.to_be_bytes());
-            msg.extend_from_slice(payload);
+            let msg = frame(b'd', b"split payload");
             server.write_all(&msg[..7]).await.unwrap();
             server.flush().await.unwrap();
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;

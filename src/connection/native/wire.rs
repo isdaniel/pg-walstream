@@ -9,7 +9,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::error::ReplicationError;
 
 /// Minimum message size: 1 (tag) + 4 (length) = 5 bytes header.
-pub(crate) const HEADER_LEN: usize = 5;
+pub(super) const HEADER_LEN: usize = 5;
 
 /// Maximum allowed message body length (128 MiB).
 ///
@@ -23,7 +23,7 @@ pub(crate) const HEADER_LEN: usize = 5;
 /// allowed …"), so a `COPY` frame above the cap aborts the snapshot here while the
 /// libpq backend, which applies no ceiling of its own to what `PQgetCopyData`
 /// hands back, streams it.
-pub(crate) const MAX_MESSAGE_LEN: usize = 128 * 1024 * 1024;
+pub(super) const MAX_MESSAGE_LEN: usize = 128 * 1024 * 1024;
 
 /// Read a single complete PostgreSQL backend message from the transport.
 ///
@@ -32,7 +32,7 @@ pub(crate) const MAX_MESSAGE_LEN: usize = 128 * 1024 * 1024;
 ///
 /// This function is cancel-safe: it only advances `buf` when a
 /// complete message is available (`split_to`).
-pub async fn read_message<R: AsyncRead + Unpin>(
+pub(super) async fn read_message<R: AsyncRead + Unpin>(
     reader: &mut R,
     buf: &mut BytesMut,
 ) -> Result<Bytes, ReplicationError> {
@@ -81,7 +81,9 @@ pub async fn read_message<R: AsyncRead + Unpin>(
 }
 
 /// Read a single-byte response (used for SSLRequest response).
-pub async fn read_byte<R: AsyncRead + Unpin>(reader: &mut R) -> Result<u8, ReplicationError> {
+pub(super) async fn read_byte<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<u8, ReplicationError> {
     let mut buf = [0u8; 1];
     reader
         .read_exact(&mut buf)
@@ -91,7 +93,7 @@ pub async fn read_byte<R: AsyncRead + Unpin>(reader: &mut R) -> Result<u8, Repli
 }
 
 /// Write raw bytes to the transport.
-pub async fn write_all<W: AsyncWrite + Unpin>(
+pub(super) async fn write_all<W: AsyncWrite + Unpin>(
     writer: &mut W,
     data: &[u8],
 ) -> Result<(), ReplicationError> {
@@ -103,7 +105,7 @@ pub async fn write_all<W: AsyncWrite + Unpin>(
 }
 
 /// Flush the transport.
-pub async fn flush<W: AsyncWrite + Unpin>(writer: &mut W) -> Result<(), ReplicationError> {
+pub(super) async fn flush<W: AsyncWrite + Unpin>(writer: &mut W) -> Result<(), ReplicationError> {
     writer
         .flush()
         .await
@@ -121,7 +123,7 @@ pub async fn flush<W: AsyncWrite + Unpin>(writer: &mut W) -> Result<(), Replicat
 /// would switch the session to replication mode. libpq cannot express one at all
 /// (C strings, and its URI parser refuses `%00`). The error names the parameter,
 /// never the value.
-pub fn build_startup_message(params: &[(&str, &str)]) -> Result<BytesMut, ReplicationError> {
+pub(super) fn build_startup_message(params: &[(&str, &str)]) -> Result<BytesMut, ReplicationError> {
     if let Some((key, _)) = params
         .iter()
         .find(|(key, value)| key.contains('\0') || value.contains('\0'))
@@ -148,37 +150,44 @@ pub fn build_startup_message(params: &[(&str, &str)]) -> Result<BytesMut, Replic
 }
 
 /// Build an SSLRequest message.
-pub fn build_ssl_request() -> BytesMut {
+pub(super) fn build_ssl_request() -> BytesMut {
     let mut buf = BytesMut::with_capacity(8);
     buf.put_i32(8); // message length
     buf.put_i32(80877103); // SSL request code = 1234 << 16 | 5679
     buf
 }
 
-/// Build a Query message ('Q').
-pub fn build_query_message(sql: &str) -> BytesMut {
-    let body_len = 4 + sql.len() + 1; // 4 (length) + sql + null terminator
+/// `[tag][length][s\0]`: the frame shared by Query, PasswordMessage and CopyFail.
+fn cstr_frame(tag: u8, s: &str) -> BytesMut {
+    let body_len = 4 + s.len() + 1;
     let mut buf = BytesMut::with_capacity(1 + body_len);
-    buf.put_u8(b'Q');
+    buf.put_u8(tag);
     buf.put_i32(body_len as i32);
-    buf.put_slice(sql.as_bytes());
+    buf.put_slice(s.as_bytes());
     buf.put_u8(0);
     buf
+}
+
+/// `[tag][length = 4]`: the frame shared by CopyDone and Terminate.
+fn empty_frame(tag: u8) -> BytesMut {
+    let mut buf = BytesMut::with_capacity(5);
+    buf.put_u8(tag);
+    buf.put_i32(4);
+    buf
+}
+
+/// Build a Query message ('Q').
+pub(super) fn build_query_message(sql: &str) -> BytesMut {
+    cstr_frame(b'Q', sql)
 }
 
 /// Build a PasswordMessage ('p').
-pub fn build_password_message(password: &str) -> BytesMut {
-    let body_len = 4 + password.len() + 1;
-    let mut buf = BytesMut::with_capacity(1 + body_len);
-    buf.put_u8(b'p');
-    buf.put_i32(body_len as i32);
-    buf.put_slice(password.as_bytes());
-    buf.put_u8(0);
-    buf
+pub(super) fn build_password_message(password: &str) -> BytesMut {
+    cstr_frame(b'p', password)
 }
 
 /// Build a CopyData message ('d') wrapping a payload.
-pub fn build_copy_data(payload: &[u8]) -> BytesMut {
+pub(super) fn build_copy_data(payload: &[u8]) -> BytesMut {
     let body_len = 4 + payload.len();
     let mut buf = BytesMut::with_capacity(1 + body_len);
     buf.put_u8(b'd');
@@ -188,11 +197,8 @@ pub fn build_copy_data(payload: &[u8]) -> BytesMut {
 }
 
 /// Build a CopyDone message ('c').
-pub fn build_copy_done() -> BytesMut {
-    let mut buf = BytesMut::with_capacity(5);
-    buf.put_u8(b'c');
-    buf.put_i32(4);
-    buf
+pub(super) fn build_copy_done() -> BytesMut {
+    empty_frame(b'c')
 }
 
 /// Build a CopyFail message ('f') carrying an error message.
@@ -202,21 +208,12 @@ pub fn build_copy_done() -> BytesMut {
 /// reused; abandoning the CopyIn without it leaves both sides waiting.
 /// Only [`super::query::simple_query`] needs it, so it stays module-local.
 pub(super) fn build_copy_fail(message: &str) -> BytesMut {
-    let body_len = 4 + message.len() + 1;
-    let mut buf = BytesMut::with_capacity(1 + body_len);
-    buf.put_u8(b'f');
-    buf.put_i32(body_len as i32);
-    buf.put_slice(message.as_bytes());
-    buf.put_u8(0);
-    buf
+    cstr_frame(b'f', message)
 }
 
 /// Build a Terminate message ('X').
-pub fn build_terminate() -> BytesMut {
-    let mut buf = BytesMut::with_capacity(5);
-    buf.put_u8(b'X');
-    buf.put_i32(4);
-    buf
+pub(super) fn build_terminate() -> BytesMut {
+    empty_frame(b'X')
 }
 
 /// Parse a null-terminated C string from a byte slice.
@@ -224,7 +221,7 @@ pub fn build_terminate() -> BytesMut {
 /// If no null terminator exists, consumes the entire slice.
 ///
 /// Uses `memchr` for SIMD-accelerated null-byte scanning.
-pub fn read_cstring(data: &[u8]) -> (&str, usize) {
+pub(super) fn read_cstring(data: &[u8]) -> (&str, usize) {
     match memchr::memchr(0, data) {
         Some(null_pos) => {
             let s = std::str::from_utf8(&data[..null_pos]).unwrap_or("");
@@ -235,6 +232,42 @@ pub fn read_cstring(data: &[u8]) -> (&str, usize) {
             let s = std::str::from_utf8(data).unwrap_or("");
             (s, data.len())
         }
+    }
+}
+
+/// Fake backend traffic shared by the tests of the sibling modules.
+#[cfg(test)]
+pub(super) mod testing {
+    use super::*;
+
+    /// A backend message: `[tag][len: i32 BE][payload]`.
+    pub(in super::super) fn frame(tag: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
+        out.push(tag);
+        out.extend_from_slice(&((4 + payload.len()) as i32).to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// An ErrorResponse carrying severity, SQLSTATE and message.
+    pub(in super::super) fn build_error_response(
+        severity: &str,
+        code: &str,
+        message: &str,
+    ) -> Vec<u8> {
+        let mut payload = Vec::new();
+        for (field, value) in [(b'S', severity), (b'C', code), (b'M', message)] {
+            payload.push(field);
+            payload.extend_from_slice(value.as_bytes());
+            payload.push(0);
+        }
+        payload.push(0); // terminator
+        frame(b'E', &payload)
+    }
+
+    /// What a fake server does with the client's first message before it replies.
+    pub(in super::super) async fn discard_request<S: AsyncRead + Unpin>(server: &mut S) {
+        let _ = server.read(&mut [0u8; 1024]).await;
     }
 }
 

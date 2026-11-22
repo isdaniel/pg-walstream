@@ -8,9 +8,11 @@
 //! 5. Backend parameter processing until ReadyForQuery
 
 use super::conninfo::{ConnInfo, ReplicationMode, SslMode, SslNegotiation, SSLROOTCERT_SYSTEM};
+use super::error::error_frame;
 use super::wire;
 use crate::error::ReplicationError;
 use bytes::BytesMut;
+use memchr::memmem;
 use rustls::pki_types::pem::PemObject;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
@@ -44,9 +46,9 @@ fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
 /// - `postgres-openssl` and `postgres-native-tls` use 8,192 (one typical record).
 /// - For **replication streaming**, we use 65,536 so one `read()` can pull several maximum-size TLS records at once. The CopyData drain loop (`copy::drain_read_buffer`) then parses more WAL messages per wakeup,  cutting syscalls and — on the worker-thread driver — cross-thread batch handoffs during sustained high-throughput WAL consumption.
 ///
-/// Exposed `pub(crate)` so `copy.rs` can pin its read-headroom invariant
+/// Exposed `pub(super)` so `copy.rs` can pin its read-headroom invariant
 /// (`MIN_HEADROOM > TLS_BUF_SIZE`) to this value at compile time, guaranteeing tokio's `BufReader` always bypasses its buffer on the CopyData hot path.
-pub(crate) const TLS_BUF_SIZE: usize = 65_536;
+pub(super) const TLS_BUF_SIZE: usize = 65_536;
 
 /// The transport layer — either plain TCP or TLS-wrapped TCP.
 ///
@@ -56,7 +58,7 @@ pub(crate) const TLS_BUF_SIZE: usize = 65_536;
 // satisfy large_enum_variant would add a pointer indirection to every read and
 // write, so the size gap is an intentional tradeoff.
 #[allow(clippy::large_enum_variant)]
-pub enum Transport {
+pub(super) enum Transport {
     Plain(TcpStream),
     Tls(BufReader<tokio_rustls::client::TlsStream<TcpStream>>),
 }
@@ -68,7 +70,7 @@ impl Transport {
     /// The hash algorithm depends on the certificate's signature algorithm:
     /// - MD5 or SHA-1 → use SHA-256
     /// - Otherwise → use the signature algorithm's hash (SHA-256, SHA-384, SHA-512)
-    pub fn tls_server_end_point(&self) -> Option<Vec<u8>> {
+    fn tls_server_end_point(&self) -> Option<Vec<u8>> {
         match self {
             Transport::Tls(buf_reader) => {
                 let tls_stream = buf_reader.get_ref();
@@ -107,50 +109,35 @@ fn compute_tls_server_end_point_hash(cert_der: &[u8]) -> Option<Vec<u8>> {
     //   md5WithRSAEncryption:    1.2.840.113549.1.1.4   → 06 09 2a 86 48 86 f7 0d 01 01 04
     //   sha1WithRSAEncryption:   1.2.840.113549.1.1.5   → 06 09 2a 86 48 86 f7 0d 01 01 05
 
-    // RSA signature OID prefix: 2a 86 48 86 f7 0d 01 01
-    let rsa_prefix = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01];
-    // ECDSA signature OID prefix: 2a 86 48 ce 3d 04 03
-    let ecdsa_prefix = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03];
+    // Each prefix is followed by one byte naming the hash. The listed bytes are
+    // the ones that pick something other than SHA-256: RSA's 0x04 (MD5) and 0x05
+    // (SHA-1) fall back to it per RFC 5929, like any unknown byte or OID.
+    type Wider<'a> = [(u8, &'a digest::Algorithm); 2];
+    let oids: [(&[u8], Wider); 2] = [
+        (
+            &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01],
+            [(0x0c, &digest::SHA384), (0x0d, &digest::SHA512)],
+        ),
+        (
+            &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03],
+            [(0x03, &digest::SHA384), (0x04, &digest::SHA512)],
+        ),
+    ];
 
-    let algorithm = if let Some(pos) = find_subsequence(cert_der, rsa_prefix) {
-        let suffix_pos = pos + rsa_prefix.len();
-        if suffix_pos < cert_der.len() {
-            match cert_der[suffix_pos] {
-                0x04 | 0x05 => &digest::SHA256, // MD5 or SHA-1 → use SHA-256 per RFC 5929
-                0x0b => &digest::SHA256,        // sha256WithRSA
-                0x0c => &digest::SHA384,        // sha384WithRSA
-                0x0d => &digest::SHA512,        // sha512WithRSA
-                _ => &digest::SHA256,           // unknown → default to SHA-256
+    let mut algorithm = &digest::SHA256;
+    for (prefix, wider) in oids {
+        if let Some(pos) = memmem::find(cert_der, prefix) {
+            let suffix = cert_der.get(pos + prefix.len());
+            if let Some((_, wide)) = wider.iter().find(|(byte, _)| Some(byte) == suffix) {
+                algorithm = wide;
             }
-        } else {
-            &digest::SHA256
+            // The first OID found decides, even when it names nothing wider.
+            break;
         }
-    } else if let Some(pos) = find_subsequence(cert_der, ecdsa_prefix) {
-        let suffix_pos = pos + ecdsa_prefix.len();
-        if suffix_pos < cert_der.len() {
-            match cert_der[suffix_pos] {
-                0x02 => &digest::SHA256, // ecdsa-with-SHA256
-                0x03 => &digest::SHA384, // ecdsa-with-SHA384
-                0x04 => &digest::SHA512, // ecdsa-with-SHA512
-                _ => &digest::SHA256,    // unknown → default to SHA-256
-            }
-        } else {
-            &digest::SHA256
-        }
-    } else {
-        // Unknown signature algorithm → default to SHA-256
-        &digest::SHA256
-    };
+    }
 
     let hash = digest::digest(algorithm, cert_der);
     Some(hash.as_ref().to_vec())
-}
-
-/// Find the first occurrence of `needle` in `haystack`.
-fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
 }
 
 impl AsyncRead for Transport {
@@ -216,7 +203,9 @@ impl AsyncWrite for Transport {
 /// [`tcp_connect`] keeps its own inner timeout: it fires first for the common
 /// SYN-timeout case and names the address, which is a better diagnostic than the
 /// generic deadline below. The outer budget covers the phases that have none.
-pub async fn connect(info: &ConnInfo) -> Result<(Transport, i32, BytesMut), ReplicationError> {
+pub(super) async fn connect(
+    info: &ConnInfo,
+) -> Result<(Transport, i32, BytesMut), ReplicationError> {
     if info.connect_timeout == 0 {
         return connect_inner(info).await;
     }
@@ -271,24 +260,21 @@ async fn connect_inner(info: &ConnInfo) -> Result<(Transport, i32, BytesMut), Re
 
 /// Open a TCP connection with optional timeout, TCP_NODELAY, and keepalive.
 async fn tcp_connect(addr: &str, info: &ConnInfo) -> Result<TcpStream, ReplicationError> {
+    let connect = TcpStream::connect(addr);
     let tcp = if info.connect_timeout > 0 {
         let timeout = Duration::from_secs(info.connect_timeout);
-        tokio::time::timeout(timeout, TcpStream::connect(addr))
-            .await
-            .map_err(|_| {
-                ReplicationError::transient_connection(format!(
-                    "Connection to {addr} timed out after {}s",
-                    info.connect_timeout
-                ))
-            })?
-            .map_err(|e| {
-                ReplicationError::transient_connection(format!("Failed to connect to {addr}: {e}"))
-            })?
-    } else {
-        TcpStream::connect(addr).await.map_err(|e| {
-            ReplicationError::transient_connection(format!("Failed to connect to {addr}: {e}"))
+        tokio::time::timeout(timeout, connect).await.map_err(|_| {
+            ReplicationError::transient_connection(format!(
+                "Connection to {addr} timed out after {}s",
+                info.connect_timeout
+            ))
         })?
-    };
+    } else {
+        connect.await
+    }
+    .map_err(|e| {
+        ReplicationError::transient_connection(format!("Failed to connect to {addr}: {e}"))
+    })?;
 
     tcp.set_nodelay(true).ok();
 
@@ -431,39 +417,24 @@ async fn negotiate_tls_standard(
     match response {
         b'S' => {
             // Server supports SSL — do the handshake
-            let connector = TlsConnector::from(tls);
-
-            let server_name = rustls::pki_types::ServerName::try_from(info.host.as_str())
-                .map_err(|e| {
-                    ReplicationError::permanent_connection(format!(
-                        "Invalid server name for TLS: {e}"
-                    ))
-                })?
-                .to_owned();
-
-            let tls_stream = connector.connect(server_name, tcp).await.map_err(|e| {
-                ReplicationError::transient_connection(format!("TLS handshake failed: {e}"))
-            })?;
-
-            tracing::debug!("TLS connection established");
-            log_negotiated_suite(&tls_stream);
-            Ok(Transport::Tls(BufReader::with_capacity(
-                TLS_BUF_SIZE,
-                tls_stream,
-            )))
+            tls_handshake(
+                tcp,
+                &info.host,
+                TlsConnector::from(tls),
+                "TLS",
+                "TLS connection established",
+            )
+            .await
         }
         b'N' => {
             // Server does not support SSL
-            match info.sslmode {
-                SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull => {
-                    Err(ReplicationError::permanent_connection(
-                        "Server does not support SSL but sslmode=require".to_string(),
-                    ))
-                }
-                _ => {
-                    tracing::debug!("Server doesn't support SSL, falling back to plain");
-                    Ok(Transport::Plain(tcp))
-                }
+            if info.sslmode.requires_tls() {
+                Err(ReplicationError::permanent_connection(
+                    "Server does not support SSL but sslmode=require".to_string(),
+                ))
+            } else {
+                tracing::debug!("Server doesn't support SSL, falling back to plain");
+                Ok(Transport::Plain(tcp))
             }
         }
         other => Err(ReplicationError::protocol(format!(
@@ -490,19 +461,37 @@ async fn negotiate_tls_direct(
     // TLS PostgreSQL connection from other protocols.
     tls_config.alpn_protocols = vec![b"postgresql".to_vec()];
 
-    let connector = TlsConnector::from(Arc::new(tls_config));
+    tls_handshake(
+        tcp,
+        &info.host,
+        TlsConnector::from(Arc::new(tls_config)),
+        "Direct TLS",
+        "Direct TLS connection established (ALPN postgresql)",
+    )
+    .await
+}
 
-    let server_name = rustls::pki_types::ServerName::try_from(info.host.as_str())
+/// Run the TLS handshake with `host` over `tcp` and wrap the stream for reading.
+///
+/// `what` names the handshake in its error, `established` is the debug line logged once it succeeds.
+async fn tls_handshake(
+    tcp: TcpStream,
+    host: &str,
+    connector: TlsConnector,
+    what: &str,
+    established: &str,
+) -> Result<Transport, ReplicationError> {
+    let server_name = rustls::pki_types::ServerName::try_from(host)
         .map_err(|e| {
             ReplicationError::permanent_connection(format!("Invalid server name for TLS: {e}"))
         })?
         .to_owned();
 
     let tls_stream = connector.connect(server_name, tcp).await.map_err(|e| {
-        ReplicationError::transient_connection(format!("Direct TLS handshake failed: {e}"))
+        ReplicationError::transient_connection(format!("{what} handshake failed: {e}"))
     })?;
 
-    tracing::debug!("Direct TLS connection established (ALPN postgresql)");
+    tracing::debug!("{established}");
     log_negotiated_suite(&tls_stream);
     Ok(Transport::Tls(BufReader::with_capacity(
         TLS_BUF_SIZE,
@@ -526,14 +515,7 @@ fn build_tls_config(info: &ConnInfo) -> Result<rustls::ClientConfig, Replication
         SslMode::VerifyFull => {
             // Full verification: check cert chain + hostname
             let root_store = build_root_store(info.sslrootcert.as_deref())?;
-            let config = rustls::ClientConfig::builder_with_provider(provider)
-                .with_safe_default_protocol_versions()
-                .map_err(|e| {
-                    ReplicationError::permanent_connection(format!(
-                        "Failed to configure TLS protocol versions: {e}"
-                    ))
-                })?
-                .with_root_certificates(root_store);
+            let config = tls_builder(provider)?.with_root_certificates(root_store);
             with_client_identity(config, info)
         }
         SslMode::VerifyCa => {
@@ -541,13 +523,7 @@ fn build_tls_config(info: &ConnInfo) -> Result<rustls::ClientConfig, Replication
             let root_store = build_root_store(info.sslrootcert.as_deref())?;
             let verifier = NoHostnameVerifier::new(root_store, provider.clone());
 
-            let config = rustls::ClientConfig::builder_with_provider(provider)
-                .with_safe_default_protocol_versions()
-                .map_err(|e| {
-                    ReplicationError::permanent_connection(format!(
-                        "Failed to configure TLS protocol versions: {e}"
-                    ))
-                })?
+            let config = tls_builder(provider)?
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(verifier));
             with_client_identity(config, info)
@@ -555,13 +531,7 @@ fn build_tls_config(info: &ConnInfo) -> Result<rustls::ClientConfig, Replication
         SslMode::Require | SslMode::Prefer | SslMode::Allow => {
             // Encrypt but skip certificate verification entirely.
             // This matches libpq's `sslmode=require` behavior.
-            let config = rustls::ClientConfig::builder_with_provider(provider.clone())
-                .with_safe_default_protocol_versions()
-                .map_err(|e| {
-                    ReplicationError::permanent_connection(format!(
-                        "Failed to configure TLS protocol versions: {e}"
-                    ))
-                })?
+            let config = tls_builder(provider.clone())?
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(NoVerification(provider)));
             with_client_identity(config, info)
@@ -570,6 +540,18 @@ fn build_tls_config(info: &ConnInfo) -> Result<rustls::ClientConfig, Replication
             unreachable!("TLS config not needed when sslmode=disable")
         }
     }
+}
+
+fn tls_builder(
+    provider: Arc<rustls::crypto::CryptoProvider>,
+) -> Result<rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier>, ReplicationError> {
+    rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| {
+            ReplicationError::permanent_connection(format!(
+                "Failed to configure TLS protocol versions: {e}"
+            ))
+        })
 }
 
 /// Finish a `ClientConfig`, presenting the `sslcert`/`sslkey` pair if there is one.
@@ -646,7 +628,7 @@ fn load_client_identity(
         [b"BEGIN ENCRYPTED PRIVATE KEY", b"Proc-Type: 4,ENCRYPTED"];
     if ENCRYPTED_MARKERS
         .iter()
-        .any(|marker| find_subsequence(&key_pem, marker).is_some())
+        .any(|marker| memmem::find(&key_pem, marker).is_some())
     {
         return Err(ReplicationError::permanent_connection(format!(
             "sslkey '{key_path}' is encrypted, and the native backend cannot decrypt it \
@@ -927,13 +909,13 @@ async fn startup_and_auth(
                 break;
             }
             b'E' => {
-                let fields = super::error::parse_error_fields(&msg[5..]);
+                let fields = error_frame(&msg);
                 let message = format!("Server error during startup: {fields}");
                 return Err(ReplicationError::from_server_startup(fields, message));
             }
             b'N' => {
                 // NoticeResponse — log and continue
-                let fields = super::error::parse_error_fields(&msg[5..]);
+                let fields = error_frame(&msg);
                 tracing::info!("Server notice: {}", fields);
             }
             _ => {
@@ -988,6 +970,7 @@ fn parse_server_version(version_str: &str) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use super::wire::testing::frame;
     use super::*;
 
     /// `sslrootcert=system` is libpq's reserved word for the platform trust
@@ -1361,6 +1344,16 @@ mod tests {
         }
     }
 
+    /// A listener on a free local port, and a `ConnInfo` that connects to it.
+    async fn listener_and_info(sslmode: SslMode) -> (tokio::net::TcpListener, ConnInfo) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut info = test_conninfo(sslmode, None);
+        info.host = addr.ip().to_string();
+        info.port = addr.port();
+        (listener, info)
+    }
+
     /// The `(key, value)` pairs a server reads out of a StartupMessage.
     fn startup_pairs(msg: &[u8]) -> Vec<(String, String)> {
         let mut rest = &msg[8..]; // length, then protocol version
@@ -1458,8 +1451,7 @@ mod tests {
     async fn connect_sends_the_session_parameters_to_the_server() {
         use tokio::io::AsyncReadExt;
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let (listener, mut info) = listener_and_info(SslMode::Disable).await;
         let server = tokio::spawn(async move {
             let (mut peer, _) = listener.accept().await.unwrap();
             let mut len = [0u8; 4];
@@ -1470,9 +1462,6 @@ mod tests {
             msg // dropping `peer` here ends the handshake
         });
 
-        let mut info = test_conninfo(SslMode::Disable, None);
-        info.host = addr.ip().to_string();
-        info.port = addr.port();
         info.application_name = Some("pgws-wire".to_string());
         info.options = Some("-c TimeZone=Asia/Tokyo".to_string());
 
@@ -1533,8 +1522,7 @@ mod tests {
     /// real-world shape.
     #[tokio::test]
     async fn connect_timeout_bounds_the_handshake_not_just_the_syn() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let (listener, mut info) = listener_and_info(SslMode::Disable).await;
 
         // Accept, hold the socket open, and never answer the StartupMessage.
         let _silent_peer = tokio::spawn(async move {
@@ -1542,9 +1530,6 @@ mod tests {
             std::future::pending::<()>().await;
         });
 
-        let mut info = test_conninfo(SslMode::Disable, None);
-        info.host = addr.ip().to_string();
-        info.port = addr.port();
         info.connect_timeout = 1;
 
         let started = std::time::Instant::now();
@@ -1577,8 +1562,7 @@ mod tests {
     async fn startup_error_response_keeps_the_server_response() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let (listener, mut info) = listener_and_info(SslMode::Disable).await;
         let peer = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let len = usize::try_from(stream.read_u32().await.unwrap()).unwrap();
@@ -1588,16 +1572,12 @@ mod tests {
                 Mdatabase \"test\" is not currently accepting connections\0\
                 RCheckMyDatabase\0\0";
             // AuthenticationOk, then the ErrorResponse.
-            let mut reply = vec![b'R', 0, 0, 0, 8, 0, 0, 0, 0, b'E'];
-            reply.extend_from_slice(&u32::try_from(4 + fields.len()).unwrap().to_be_bytes());
-            reply.extend_from_slice(fields);
+            let mut reply = frame(b'R', &[0; 4]);
+            reply.extend_from_slice(&frame(b'E', fields));
             stream.write_all(&reply).await.unwrap();
             stream
         });
 
-        let mut info = test_conninfo(SslMode::Disable, None);
-        info.host = addr.ip().to_string();
-        info.port = addr.port();
         info.connect_timeout = 5;
         // `Transport` is not `Debug`, so `expect_err` is unavailable here.
         let err = connect(&info)
@@ -1855,42 +1835,71 @@ mod tests {
         );
     }
 
-    // === find_subsequence ===
+    /// The handshake error names which handshake failed, and a host that is not a
+    /// valid TLS server name is refused before any byte is sent.
+    #[tokio::test]
+    async fn tls_handshake_errors_name_the_handshake() {
+        use tokio::io::AsyncWriteExt;
 
-    #[test]
-    fn test_find_subsequence_found() {
-        let haystack = &[0x01, 0x02, 0x03, 0x04, 0x05];
-        assert_eq!(find_subsequence(haystack, &[0x02, 0x03]), Some(1));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut peer, _)) = listener.accept().await {
+                let _ = peer.write_all(b"not a TLS server hello at all").await;
+            }
+        });
+        let connector = || {
+            let config = build_tls_config(&test_conninfo(SslMode::Require, None)).unwrap();
+            TlsConnector::from(Arc::new(config))
+        };
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let Err(err) = tls_handshake(tcp, "localhost", connector(), "Direct TLS", "up").await
+        else {
+            panic!("a peer that does not speak TLS must fail the handshake");
+        };
+        assert!(
+            err.to_string().contains("Direct TLS handshake failed: "),
+            "{err}"
+        );
+        assert!(err.is_transient(), "{err:?}");
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let Err(err) = tls_handshake(tcp, "not a host name", connector(), "TLS", "up").await else {
+            panic!("an invalid server name must be refused");
+        };
+        assert!(
+            err.to_string().contains("Invalid server name for TLS: "),
+            "{err}"
+        );
+        assert!(err.is_permanent(), "{err:?}");
     }
 
-    #[test]
-    fn test_find_subsequence_at_start() {
-        let haystack = &[0x01, 0x02, 0x03];
-        assert_eq!(find_subsequence(haystack, &[0x01, 0x02]), Some(0));
-    }
+    // === memmem::find, which locates the OIDs and PEM markers ===
 
     #[test]
-    fn test_find_subsequence_at_end() {
-        let haystack = &[0x01, 0x02, 0x03];
-        assert_eq!(find_subsequence(haystack, &[0x02, 0x03]), Some(1));
-    }
-
-    #[test]
-    fn test_find_subsequence_not_found() {
-        let haystack = &[0x01, 0x02, 0x03];
-        assert_eq!(find_subsequence(haystack, &[0x04, 0x05]), None);
-    }
-
-    #[test]
-    fn test_find_subsequence_single_byte_needle() {
-        let haystack = &[0x01, 0x02, 0x03];
-        assert_eq!(find_subsequence(haystack, &[0x02]), Some(1));
-    }
-
-    #[test]
-    fn test_find_subsequence_needle_longer_than_haystack() {
-        let haystack = &[0x01];
-        assert_eq!(find_subsequence(haystack, &[0x01, 0x02]), None);
+    fn test_memmem_find() {
+        let cases: [(&[u8], &[u8], Option<usize>); 6] = [
+            // found
+            (&[0x01, 0x02, 0x03, 0x04, 0x05], &[0x02, 0x03], Some(1)),
+            // at start
+            (&[0x01, 0x02, 0x03], &[0x01, 0x02], Some(0)),
+            // at end
+            (&[0x01, 0x02, 0x03], &[0x02, 0x03], Some(1)),
+            // not found
+            (&[0x01, 0x02, 0x03], &[0x04, 0x05], None),
+            // single byte needle
+            (&[0x01, 0x02, 0x03], &[0x02], Some(1)),
+            // needle longer than haystack
+            (&[0x01], &[0x01, 0x02], None),
+        ];
+        for (haystack, needle, want) in cases {
+            assert_eq!(
+                memmem::find(haystack, needle),
+                want,
+                "{haystack:?} {needle:?}"
+            );
+        }
     }
 
     // === compute_tls_server_end_point_hash ===

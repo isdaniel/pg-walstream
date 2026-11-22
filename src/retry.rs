@@ -372,10 +372,9 @@ mod tests {
         RetryConfig {
             max_attempts,
             initial_delay,
-            max_delay: Duration::from_secs(60),
             multiplier: 1.0,
-            max_duration: Duration::from_secs(300),
             jitter: false,
+            ..RetryConfig::default()
         }
     }
 
@@ -416,28 +415,11 @@ mod tests {
         silent.abort();
     }
 
-    /// A server that accepts every connection and hangs up at once, so each attempt fails
-    /// without a timeout of its own. Returns its port and the number of connections seen.
-    async fn server_that_hangs_up() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let attempts = std::sync::Arc::new(AtomicUsize::new(0));
-        let count = std::sync::Arc::clone(&attempts);
-        tokio::spawn(async move {
-            while let Ok((socket, _)) = listener.accept().await {
-                count.fetch_add(1, Ordering::SeqCst);
-                drop(socket);
-            }
-        });
-        (port, attempts)
-    }
-
     /// A zero budget is "no budget", not a budget already spent: it made one attempt and
     /// returned `Timeout("... 0ns")` whatever `max_attempts` said.
     #[tokio::test]
     async fn a_zero_connect_budget_does_not_cut_the_retries_short() {
-        let (port, attempts) = server_that_hangs_up().await;
+        let (port, attempts) = crate::stream::tests::counting_server(true).await;
         let retry = ReplicationConnectionRetry::new(
             fixed_backoff(3, Duration::from_millis(5)),
             format!(
@@ -501,12 +483,9 @@ mod tests {
     async fn invalid_connection_string_returns_on_first_attempt() {
         let retry = ReplicationConnectionRetry::new(
             RetryConfig {
-                max_attempts: 5,
                 initial_delay: Duration::from_secs(5),
-                max_delay: Duration::from_secs(60),
-                multiplier: 2.0,
-                max_duration: Duration::from_secs(300),
                 jitter: false,
+                ..RetryConfig::default()
             },
             "postgresql://u@127.0.0.1/db?replication=database&sslmode=bogus".to_string(),
         );
@@ -547,8 +526,8 @@ mod tests {
                 initial_delay: Duration::from_millis(50),
                 max_delay: Duration::from_secs(1),
                 multiplier: 1.0,
-                max_duration: Duration::from_secs(300),
                 jitter: false,
+                ..RetryConfig::default()
             },
             format!(
                 "postgresql://u@127.0.0.1:{port}/db\
@@ -571,12 +550,9 @@ mod tests {
     #[test]
     fn test_exponential_backoff_basic() {
         let config = RetryConfig {
-            max_attempts: 5,
             initial_delay: Duration::from_millis(100),
-            max_delay: Duration::from_secs(60),
-            multiplier: 2.0,
-            max_duration: Duration::from_secs(300),
             jitter: false,
+            ..RetryConfig::default()
         };
 
         let mut backoff = ExponentialBackoff::new(&config);
@@ -603,9 +579,8 @@ mod tests {
             max_attempts: 10,
             initial_delay: Duration::from_millis(100),
             max_delay: Duration::from_millis(500), // Low max delay for testing
-            multiplier: 2.0,
-            max_duration: Duration::from_secs(300),
             jitter: false,
+            ..RetryConfig::default()
         };
 
         let mut backoff = ExponentialBackoff::new(&config);
@@ -623,12 +598,9 @@ mod tests {
     #[test]
     fn test_exponential_backoff_reset() {
         let config = RetryConfig {
-            max_attempts: 5,
             initial_delay: Duration::from_millis(100),
-            max_delay: Duration::from_secs(60),
-            multiplier: 2.0,
-            max_duration: Duration::from_secs(300),
             jitter: false,
+            ..RetryConfig::default()
         };
 
         let mut backoff = ExponentialBackoff::new(&config);
@@ -650,12 +622,9 @@ mod tests {
     #[test]
     fn test_exponential_backoff_jitter() {
         let config = RetryConfig {
-            max_attempts: 5,
             initial_delay: Duration::from_millis(100),
-            max_delay: Duration::from_secs(60),
-            multiplier: 2.0,
-            max_duration: Duration::from_secs(300),
             jitter: true,
+            ..RetryConfig::default()
         };
 
         let mut backoff = ExponentialBackoff::new(&config);
@@ -678,10 +647,8 @@ mod tests {
         let config = RetryConfig {
             max_attempts: 3,
             initial_delay: Duration::from_millis(100),
-            max_delay: Duration::from_secs(60),
-            multiplier: 2.0,
-            max_duration: Duration::from_secs(300),
             jitter: false,
+            ..RetryConfig::default()
         };
 
         let mut backoff = ExponentialBackoff::new(&config);
@@ -700,12 +667,10 @@ mod tests {
     #[test]
     fn test_multiplier_effect() {
         let config = RetryConfig {
-            max_attempts: 5,
             initial_delay: Duration::from_millis(10),
-            max_delay: Duration::from_secs(60),
             multiplier: 3.0, // 3x multiplier
-            max_duration: Duration::from_secs(300),
             jitter: false,
+            ..RetryConfig::default()
         };
 
         let mut backoff = ExponentialBackoff::new(&config);
@@ -722,17 +687,16 @@ mod tests {
         assert_eq!(config.initial_delay, Duration::from_secs(1));
         assert_eq!(config.max_delay, Duration::from_secs(60));
         assert_eq!(config.multiplier, 2.0);
+        assert_eq!(config.max_duration, Duration::from_secs(300));
+        assert!(config.jitter);
     }
 
     #[test]
     fn test_backoff_current_delay_field() {
         let config = RetryConfig {
-            max_attempts: 5,
             initial_delay: Duration::from_millis(100),
-            max_delay: Duration::from_secs(60),
-            multiplier: 2.0,
-            max_duration: Duration::from_secs(300),
             jitter: false,
+            ..RetryConfig::default()
         };
 
         let mut backoff = ExponentialBackoff::new(&config);
@@ -745,12 +709,9 @@ mod tests {
     #[test]
     fn test_reset_clears_state() {
         let config = RetryConfig {
-            max_attempts: 5,
             initial_delay: Duration::from_millis(100),
-            max_delay: Duration::from_secs(60),
-            multiplier: 2.0,
-            max_duration: Duration::from_secs(300),
             jitter: false,
+            ..RetryConfig::default()
         };
 
         let mut backoff = ExponentialBackoff::new(&config);
@@ -790,10 +751,9 @@ mod tests {
         let config = RetryConfig {
             max_attempts: 50,
             initial_delay: Duration::from_millis(1000),
-            max_delay: Duration::from_secs(60),
             multiplier: 1.0, // Keep delay constant so we can measure jitter range
-            max_duration: Duration::from_secs(300),
             jitter: true,
+            ..RetryConfig::default()
         };
 
         let mut backoff = ExponentialBackoff::new(&config);
@@ -840,10 +800,8 @@ mod tests {
         let config = RetryConfig {
             max_attempts: 20,
             initial_delay: Duration::from_secs(30),
-            max_delay: Duration::from_secs(60),
-            multiplier: 2.0,
-            max_duration: Duration::from_secs(300),
             jitter: true,
+            ..RetryConfig::default()
         };
 
         let mut backoff = ExponentialBackoff::new(&config);
@@ -864,12 +822,10 @@ mod tests {
     #[test]
     fn test_add_jitter_small_delay() {
         let config = RetryConfig {
-            max_attempts: 5,
             initial_delay: Duration::from_millis(1),
-            max_delay: Duration::from_secs(60),
             multiplier: 1.0,
-            max_duration: Duration::from_secs(300),
             jitter: true,
+            ..RetryConfig::default()
         };
 
         let mut backoff = ExponentialBackoff::new(&config);
@@ -883,10 +839,8 @@ mod tests {
         let config = RetryConfig {
             max_attempts: 10,
             initial_delay: Duration::from_secs(50),
-            max_delay: Duration::from_secs(60),
-            multiplier: 2.0,
-            max_duration: Duration::from_secs(300),
             jitter: false,
+            ..RetryConfig::default()
         };
 
         let mut backoff = ExponentialBackoff::new(&config);

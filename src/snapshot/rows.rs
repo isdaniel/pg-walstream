@@ -4,7 +4,7 @@ use super::plan::SnapshotTable;
 use super::table_copy::{poisoned_err, TableCopy};
 use crate::column_value::RowData;
 use crate::connection::PgReplicationConnection;
-use crate::error::{ReplicationError, Result};
+use crate::error::Result;
 use crate::prelude::*;
 use crate::stream::LogicalReplicationStream;
 use crate::types::Lsn;
@@ -139,22 +139,15 @@ impl SnapshotRows {
     ///
     /// The returned stream holds no exported snapshot, so a second [`snapshot`](LogicalReplicationStream::snapshot) on it is [`Unavailable`](crate::SnapshotOutcome::Unavailable).
     pub async fn finish(mut self) -> Result<LogicalReplicationStream> {
-        if self.copy.poisoned() {
-            // Reached via the pull API: `next_row` failed, and the caller is now
-            // trying to salvage the stream. Returning `Err` drops `self`, and
-            // `Drop` discards the slot, so their retry cannot silently come back
-            // with no baseline.
-            return Err(poisoned_err());
-        }
-        if !self.copy.completed() {
-            return Err(ReplicationError::protocol(
-                "snapshot was not fully consumed; finish() would leave a gap between \
-                 the snapshot and the stream. Consume every row, or use abandon() \
-                 instead of finish()."
-                    .to_string(),
-            ));
-        }
-        self.copy.close();
+        // A poisoned handle is reached via the pull API: `next_row` failed, and the
+        // caller is now trying to salvage the stream. Returning `Err` drops `self`,
+        // and `Drop` discards the slot, so their retry cannot silently come back
+        // with no baseline.
+        self.copy.finish(
+            "snapshot was not fully consumed; finish() would leave a gap between \
+             the snapshot and the stream. Consume every row, or use abandon() \
+             instead of finish().",
+        )?;
         Ok(self.take_stream())
     }
 
@@ -245,6 +238,7 @@ impl Drop for SnapshotRows {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ReplicationError;
     use crate::stream::{tests::create_test_stream, ReplicationStreamConfig};
 
     /// `LogicalReplicationStream` has no `Debug`, so `unwrap_err` is unavailable

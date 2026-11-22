@@ -31,6 +31,7 @@
 //! copy. Only an escaped field allocates.
 //!
 
+use crate::column_value::hex_nibble;
 use crate::error::{ReplicationError, Result};
 use crate::prelude::*;
 use crate::protocol::ColumnData;
@@ -83,6 +84,7 @@ impl TextRowDecoder {
     /// Returns `None` when more frames are needed. A `None` return leaves the
     /// frame queue empty; anything left over lives in the carry buffer and is
     /// reported by [`finish`](Self::finish).
+    #[inline]
     pub(crate) fn next_line(&mut self) -> Option<Bytes> {
         loop {
             // Look before mutating so the queue borrow ends before `pop_front`.
@@ -164,6 +166,7 @@ fn strip_trailing_cr(line: Bytes) -> Bytes {
 /// Fields are slices of `line`, so an escape-free row allocates nothing beyond the
 /// returned `SmallVec` (which is inline for the ≤ 16 columns that cover almost
 /// every table).
+#[inline]
 pub(crate) fn decode_line(line: &Bytes, column_count: usize) -> Result<SmallVec<[ColumnData; 16]>> {
     // A zero-column table is legal in PostgreSQL and copies as empty lines.
     if column_count == 0 {
@@ -303,11 +306,11 @@ fn unescape_field(raw: Bytes) -> Bytes {
                 out.put_u8(value);
             }
             b'x' => {
-                // `hex_value` *is* the digit test, so there is no separate classification step that could drift out of sync with it.
-                if let Some(hi) = src.get(pos).copied().and_then(hex_value) {
+                // `hex_nibble` *is* the digit test, so there is no separate classification step that could drift out of sync with it.
+                if let Some(hi) = src.get(pos).copied().and_then(hex_nibble) {
                     pos += 1;
                     let mut value = hi;
-                    if let Some(lo) = src.get(pos).copied().and_then(hex_value) {
+                    if let Some(lo) = src.get(pos).copied().and_then(hex_nibble) {
                         value = value.wrapping_mul(16).wrapping_add(lo);
                         pos += 1;
                     }
@@ -323,21 +326,6 @@ fn unescape_field(raw: Bytes) -> Bytes {
     }
 
     out.freeze()
-}
-
-/// Value of one ASCII hex digit, or `None` if `byte` is not one.
-///
-/// Returning `Option` keeps the range check and the subtraction in the same
-/// `match`: every arm subtracts a bound it has just tested, so no caller can make
-/// this underflow by forgetting to classify the byte first.
-#[inline]
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -437,16 +425,16 @@ mod tests {
 
     #[test]
     fn hex_value_accepts_both_cases_and_rejects_the_rest() {
-        assert_eq!(hex_value(b'0'), Some(0));
-        assert_eq!(hex_value(b'9'), Some(9));
-        assert_eq!(hex_value(b'a'), Some(10));
-        assert_eq!(hex_value(b'F'), Some(15));
+        assert_eq!(hex_nibble(b'0'), Some(0));
+        assert_eq!(hex_nibble(b'9'), Some(9));
+        assert_eq!(hex_nibble(b'a'), Some(10));
+        assert_eq!(hex_nibble(b'F'), Some(15));
         // Not a regression test: the call site already classified the byte, so
         // these were unreachable. They pin the contract for any future caller.
-        assert_eq!(hex_value(b'/'), None);
-        assert_eq!(hex_value(0x00), None);
-        assert_eq!(hex_value(b'g'), None);
-        assert_eq!(hex_value(b'Z'), None);
+        assert_eq!(hex_nibble(b'/'), None);
+        assert_eq!(hex_nibble(0x00), None);
+        assert_eq!(hex_nibble(b'g'), None);
+        assert_eq!(hex_nibble(b'Z'), None);
     }
 
     #[test]

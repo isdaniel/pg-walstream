@@ -29,6 +29,7 @@
 //!
 //! This ensures that no thread is blocked waiting for network I/O, maximizing
 //! throughput and enabling efficient concurrent processing of multiple replication streams.
+use super::commands::server_failure;
 use crate::error::{ReplicationError, Result, ServerError};
 use crate::types::{BaseBackupOptions, XLogRecPtr};
 use bytes::{BufMut, Bytes, BytesMut};
@@ -196,6 +197,25 @@ const COPY_IN_CHUNK: usize = 64 * 1024;
 
 /// libpq's `PG_ENCODING_UTF8` (libpq-fe.h), which pq-sys does not export.
 const PG_ENCODING_UTF8: i32 = 6;
+
+/// `ptr` as an owned string, `None` when it is NULL.
+///
+/// # Safety
+///
+/// `ptr` must be NULL or point to a NUL-terminated string that stays valid for the call.
+unsafe fn cstr_lossy(ptr: *const c_char) -> Option<String> {
+    if ptr.is_null() {
+        None
+    } else {
+        Some(CStr::from_ptr(ptr).to_string_lossy().into_owned())
+    }
+}
+
+/// libpq's error text for `conn`, or `fallback` when it has none.
+fn conn_error(conn: *mut PGconn, fallback: &str) -> String {
+    // SAFETY: libpq returns NULL or a NUL-terminated string owned by the connection, copied out before any further call on it.
+    unsafe { cstr_lossy(PQerrorMessage(conn)) }.unwrap_or_else(|| fallback.to_string())
+}
 
 /// Where one `PQconnectPoll` attempt connects: libpq's `host`, `hostaddr` and `port` for a single server.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -549,28 +569,13 @@ struct HalfOpenConnection {
 impl HalfOpenConnection {
     /// The connection's current error text, or a placeholder when libpq has none.
     fn error_message(&self) -> String {
-        unsafe {
-            let error_ptr = PQerrorMessage(self.conn);
-            if error_ptr.is_null() {
-                "Unknown connection error".to_string()
-            } else {
-                CStr::from_ptr(error_ptr).to_string_lossy().into_owned()
-            }
-        }
+        conn_error(self.conn, "Unknown connection error")
     }
 
     /// The server this attempt is connecting to, worded as libpq prefixes its own connection errors.
     fn server_prefix(&self) -> String {
-        let text = |ptr: *const c_char| {
-            if ptr.is_null() {
-                String::new()
-            } else {
-                // SAFETY: libpq returns a NUL-terminated string owned by the connection, read before any further call on it.
-                unsafe { CStr::from_ptr(ptr) }
-                    .to_string_lossy()
-                    .into_owned()
-            }
-        };
+        // SAFETY: libpq returns a NUL-terminated string owned by the connection, read before any further call on it.
+        let text = |ptr: *const c_char| unsafe { cstr_lossy(ptr) }.unwrap_or_default();
         let (host, hostaddr, port) = unsafe {
             (
                 text(PQhost(self.conn)),
@@ -697,14 +702,7 @@ impl PgReplicationConnection {
 
         let status = unsafe { PQstatus(conn) };
         if status != ConnStatusType::CONNECTION_OK {
-            let error_msg = unsafe {
-                let error_ptr = PQerrorMessage(conn);
-                if error_ptr.is_null() {
-                    "Unknown connection error".to_string()
-                } else {
-                    CStr::from_ptr(error_ptr).to_string_lossy().into_owned()
-                }
-            };
+            let error_msg = conn_error(conn, "Unknown connection error");
             unsafe { PQfinish(conn) };
 
             // Categorize the connection error
@@ -713,14 +711,7 @@ impl PgReplicationConnection {
 
         // Force UTF-8 client_encoding so quote_literal/quote_ident's ASCII-only escaping is multibyte-safe regardless of the server/locale default , parity with the native backend, which sends client_encoding=UTF8 in its startup packet. Under an ASCII-unsafe encoding (SJIS/GBK/BIG5) a raw lead byte could otherwise fuse with an escaping quote and reopen a literal breakout.
         if unsafe { PQsetClientEncoding(conn, c"UTF8".as_ptr()) } != 0 {
-            let error_msg = unsafe {
-                let error_ptr = PQerrorMessage(conn);
-                if error_ptr.is_null() {
-                    "Unknown error".to_string()
-                } else {
-                    CStr::from_ptr(error_ptr).to_string_lossy().into_owned()
-                }
-            };
+            let error_msg = conn_error(conn, "Unknown error");
             unsafe { PQfinish(conn) };
             return Err(ReplicationError::permanent_connection(format!(
                 "Failed to set client_encoding=UTF8: {error_msg}"
@@ -1189,12 +1180,10 @@ impl PgReplicationConnection {
                 | ExecStatusType::PGRES_COPY_BOTH
                 | ExecStatusType::PGRES_COPY_OUT
         ) {
-            let error_msg = pg_result
-                .error_message()
-                .unwrap_or_else(|| "Unknown error".to_string());
-            return Err(ReplicationError::from_server(
+            return Err(server_failure(
                 pg_result.server_error(),
-                format!("Query execution failed: {error_msg}"),
+                pg_result.error_message(),
+                "Query execution failed",
             ));
         }
         Ok(())
@@ -1249,10 +1238,13 @@ impl PgReplicationConnection {
     fn enter_replication(&mut self) -> Result<()> {
         // A fresh COPY stream: drop any terminal state left by a previous one.
         self.dead = false;
+        self.enter_copy(CopyMode::Replication(CopyStream::default()))
+    }
 
-        // Initialize the async socket first; enter `CopyMode::Replication` only AFTER it succeeds, preserving the invariant `copy.is_replication() ⇒ async_fd is Some`. Otherwise a failed socket setup would leave the mode set with no async_fd, and a later `end_copy`/Drop would reach the writable-wait path with `async_fd == None`.
+    /// Enter `mode` once the async socket exists, preserving the invariant `copy.is_replication() ⇒ async_fd is Some`. Otherwise a failed socket setup would leave the mode set with no async_fd, and a later `end_copy`/Drop would reach the writable-wait path with `async_fd == None`.
+    fn enter_copy(&mut self, mode: CopyMode) -> Result<()> {
         self.initialize_async_socket()?;
-        self.copy = CopyMode::Replication(CopyStream::default());
+        self.copy = mode;
         Ok(())
     }
 
@@ -1293,9 +1285,7 @@ impl PgReplicationConnection {
         }
 
         // Idempotent: a multi-table snapshot reaches this once per table.
-        self.initialize_async_socket()?;
-        self.copy = CopyMode::Out(CopyStream::default());
-        Ok(())
+        self.enter_copy(CopyMode::Out(CopyStream::default()))
     }
 
     /// The next `CopyData` payload, or `Ok(None)` once the stream has ended
@@ -1704,25 +1694,7 @@ impl PgReplicationConnection {
 
     /// Get the last error message from the connection
     fn last_error_message(&self) -> String {
-        unsafe {
-            let error_ptr = PQerrorMessage(self.conn);
-            if error_ptr.is_null() {
-                "Unknown error".to_string()
-            } else {
-                CStr::from_ptr(error_ptr).to_string_lossy().into_owned()
-            }
-        }
-    }
-
-    /// Helper: Check if connection is in replication mode
-    #[inline]
-    fn ensure_replication_mode(&self) -> Result<()> {
-        if !self.copy.is_replication() {
-            return Err(ReplicationError::protocol(
-                "Connection is not in replication mode".to_string(),
-            ));
-        }
-        Ok(())
+        conn_error(self.conn, "Unknown error")
     }
 
     /// Helper: Send data via COPY protocol and flush (async, non-blocking)
@@ -1761,7 +1733,7 @@ impl PgReplicationConnection {
 
     /// Send a client CopyDone (`PQputCopyEnd`) to end the COPY stream cleanly.
     ///
-    /// Idempotent: a no-op when not in replication mode. The non-blocking flush loop mirrors `put_copy_data`. Trailing results are reclaimed by `PQfinish` on drop (matching `close_replication_connection`), so we do not drain `PQgetResult` here.
+    /// Idempotent: a no-op when not in replication mode. Flushes through `flush_until_done`, as `put_copy_data` does. Trailing results are reclaimed by `PQfinish` on drop (matching `close_replication_connection`), so we do not drain `PQgetResult` here.
     pub(crate) async fn end_copy(&mut self) -> Result<()> {
         if !self.copy.is_replication() {
             return Ok(());
@@ -1770,35 +1742,10 @@ impl PgReplicationConnection {
         self.copy = CopyMode::Idle;
         // PQputCopyEnd: 1 = queued, 0 = would block (nonblocking mode), -1 = err.
         loop {
-            let r = unsafe { PQputCopyEnd(self.conn, ptr::null()) };
-            match r {
+            match unsafe { PQputCopyEnd(self.conn, ptr::null()) } {
                 1 => break,
-                0 => {
-                    // Would block: fully drain libpq's output buffer (loop PQflush until it returns 0) before retrying PQputCopyEnd — matching the flush loop in `put_copy_data`. Flushing only once then retrying PQputCopyEnd wastes an FFI round-trip per partial flush; not flushing at all would spin (the socket stays writable while the buffer is never emptied).
-                    loop {
-                        let flush = unsafe { PQflush(self.conn) };
-                        match flush {
-                            0 => break,
-                            1 => {
-                                let async_fd = self.async_fd.as_ref().ok_or_else(|| {
-                                    ReplicationError::protocol(
-                                        "AsyncFd not initialized".to_string(),
-                                    )
-                                })?;
-                                let mut guard = async_fd.writable().await.map_err(|e| {
-                                    ReplicationError::protocol(format!("wait writable failed: {e}"))
-                                })?;
-                                guard.clear_ready();
-                            }
-                            _ => {
-                                let msg = self.last_error_message();
-                                return Err(ReplicationError::protocol(format!(
-                                    "PQflush failed: {msg}"
-                                )));
-                            }
-                        }
-                    }
-                }
+                // Would block: fully drain libpq's output buffer before retrying PQputCopyEnd. Flushing only once then retrying wastes an FFI round-trip per partial flush; not flushing at all would spin (the socket stays writable while the buffer is never emptied).
+                0 => self.flush_until_done().await?,
                 _ => {
                     let msg = self.last_error_message();
                     return Err(ReplicationError::protocol(format!(
@@ -1807,27 +1754,8 @@ impl PgReplicationConnection {
                 }
             }
         }
-        // Flush the CopyDone to the socket (same non-blocking loop as feedback).
-        loop {
-            let flush = unsafe { PQflush(self.conn) };
-            match flush {
-                0 => break,
-                1 => {
-                    let async_fd = self.async_fd.as_ref().ok_or_else(|| {
-                        ReplicationError::protocol("AsyncFd not initialized".to_string())
-                    })?;
-                    let mut guard = async_fd.writable().await.map_err(|e| {
-                        ReplicationError::protocol(format!("wait writable failed: {e}"))
-                    })?;
-                    guard.clear_ready();
-                }
-                _ => {
-                    let msg = self.last_error_message();
-                    return Err(ReplicationError::protocol(format!("PQflush failed: {msg}")));
-                }
-            }
-        }
-        Ok(())
+        // Flush the CopyDone to the socket.
+        self.flush_until_done().await
     }
 
     /// Check if the connection is still alive
@@ -1893,8 +1821,7 @@ impl PgReplicationConnection {
         debug!("Starting physical replication: {}", sql);
         let _result = self.exec(&sql)?;
 
-        self.initialize_async_socket()?;
-        self.copy = CopyMode::Replication(CopyStream::default());
+        self.enter_copy(CopyMode::Replication(CopyStream::default()))?;
 
         debug!("Physical replication started successfully");
         Ok(())
@@ -1938,12 +1865,10 @@ impl PgReplicationConnection {
         let pg_result = PgResult::new(res);
         if !matches!(pg_result.status(), ExecStatusType::PGRES_COPY_IN) {
             restore(self.conn);
-            let error_msg = pg_result
-                .error_message()
-                .unwrap_or_else(|| "Unknown error".to_string());
-            return Err(ReplicationError::from_server(
+            return Err(server_failure(
                 pg_result.server_error(),
-                format!("UPLOAD_MANIFEST did not enter CopyIn mode: {error_msg}"),
+                pg_result.error_message(),
+                "UPLOAD_MANIFEST did not enter CopyIn mode",
             ));
         }
         drop(pg_result);
@@ -1984,13 +1909,10 @@ impl PgReplicationConnection {
             }
             let res = PgResult::new(raw);
             if !matches!(res.status(), ExecStatusType::PGRES_COMMAND_OK) && failure.is_none() {
-                failure = Some(ReplicationError::from_server(
+                failure = Some(server_failure(
                     res.server_error(),
-                    format!(
-                        "UPLOAD_MANIFEST failed: {}",
-                        res.error_message()
-                            .unwrap_or_else(|| "Unknown error".to_string())
-                    ),
+                    res.error_message(),
+                    "UPLOAD_MANIFEST failed",
                 ));
             }
         }
@@ -2013,8 +1935,7 @@ impl PgReplicationConnection {
         debug!("Starting base backup: {}", base_backup_sql);
         let result = self.exec(&base_backup_sql)?;
 
-        self.initialize_async_socket()?;
-        self.copy = CopyMode::Replication(CopyStream::default());
+        self.enter_copy(CopyMode::Replication(CopyStream::default()))?;
 
         debug!("Base backup started successfully");
         Ok(result)
@@ -2216,12 +2137,8 @@ impl PgResult {
 
     /// Get error message if any
     pub fn error_message(&self) -> Option<String> {
-        let error_ptr = unsafe { PQresultErrorMessage(self.result) };
-        if error_ptr.is_null() {
-            None
-        } else {
-            unsafe { Some(CStr::from_ptr(error_ptr).to_string_lossy().into_owned()) }
-        }
+        // SAFETY: libpq returns NULL or a NUL-terminated string owned by the result, copied out before it is cleared.
+        unsafe { cstr_lossy(PQresultErrorMessage(self.result)) }
     }
 
     /// The server's `ErrorResponse` behind this result, `None` when the failure
@@ -2230,7 +2147,7 @@ impl PgResult {
     /// Unlike [`error_message`](Self::error_message), its SQLSTATE is stable
     /// across PostgreSQL major versions, so it is what
     /// `ReplicationError::from_server` classifies on. Crate-internal: `exec` maps every non-OK result to `Err`, so callers never hold a failing result.
-    pub(crate) fn server_error(&self) -> Option<ServerError> {
+    fn server_error(&self) -> Option<ServerError> {
         let text = |field: u8| {
             self.error_field(field)
                 .map(|value| value.to_string_lossy().into_owned())

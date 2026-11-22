@@ -487,29 +487,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_transient_connection_error() {
-        let err = ReplicationError::transient_connection("connection lost");
-        assert!(err.is_transient());
-        assert!(!err.is_permanent());
-        assert!(!err.is_cancelled());
-    }
-
-    #[cfg(feature = "std")]
-    #[test]
-    fn test_io_error_is_transient() {
-        let err = ReplicationError::Io(std::io::Error::other("disk hiccup"));
-        assert!(err.is_transient());
-        assert!(!err.is_permanent());
-    }
-
-    #[cfg(feature = "std")]
-    #[test]
-    fn test_io_error_display() {
-        let err = ReplicationError::Io(std::io::Error::other("boom"));
-        assert_eq!(err.to_string(), "IO error: boom");
-    }
-
     #[cfg(feature = "std")]
     #[test]
     fn test_string_conversion_error_display() {
@@ -518,48 +495,113 @@ mod tests {
         assert!(err.to_string().starts_with("String conversion error:"));
     }
 
+    /// Every constructor's `Display` and its three classification predicates.
     #[test]
-    fn test_permanent_connection_error() {
-        let err = ReplicationError::permanent_connection("invalid host");
-        assert!(!err.is_transient());
-        assert!(err.is_permanent());
-    }
-
-    #[test]
-    fn test_authentication_error() {
-        let err = ReplicationError::authentication("invalid password");
-        assert!(err.is_permanent());
-        assert_eq!(err.to_string(), "Authentication failed: invalid password");
-    }
-
-    #[test]
-    fn test_replication_slot_error() {
-        let err = ReplicationError::replication_slot("slot not found");
-        assert!(err.is_permanent());
-    }
-
-    #[test]
-    fn test_timeout_error() {
-        let err = ReplicationError::timeout("operation timed out");
-        assert!(err.is_transient());
-    }
-
-    #[test]
-    fn test_cancelled_error() {
-        let err = ReplicationError::cancelled("user cancelled");
-        assert!(err.is_cancelled());
-        assert!(!err.is_transient());
-        assert!(!err.is_permanent());
-    }
-
-    /// A rejected configuration fails identically on every attempt without ever
-    /// opening a socket, so it is permanent — retrying it just burns the backoff
-    /// budget. (It is still not `is_transient`, which is a narrower predicate.)
-    #[test]
-    fn test_config_error() {
-        let err = ReplicationError::config("invalid config");
-        assert!(!err.is_transient());
-        assert!(err.is_permanent());
+    fn test_constructor_display_and_classification() {
+        // (error, Display, is_transient, is_permanent, is_cancelled)
+        let cases = [
+            (
+                ReplicationError::Protocol("test".into(), None),
+                "Protocol parsing error: test",
+                false,
+                false,
+                false,
+            ),
+            (
+                ReplicationError::Buffer("test".to_string()),
+                "Buffer error: test",
+                false,
+                false,
+                false,
+            ),
+            (
+                ReplicationError::transient_connection("connection lost"),
+                "Transient connection error: connection lost",
+                true,
+                false,
+                false,
+            ),
+            (
+                ReplicationError::permanent_connection("invalid host"),
+                "Permanent connection error: invalid host",
+                false,
+                true,
+                false,
+            ),
+            (
+                ReplicationError::connection("connection lost"),
+                "Replication connection error: connection lost",
+                true,
+                false,
+                false,
+            ),
+            (
+                ReplicationError::authentication("invalid password"),
+                "Authentication failed: invalid password",
+                false,
+                true,
+                false,
+            ),
+            (
+                ReplicationError::replication_slot("slot not found"),
+                "Replication slot error: slot not found",
+                false,
+                true,
+                false,
+            ),
+            (
+                ReplicationError::timeout("operation timed out"),
+                "Operation timed out: operation timed out",
+                true,
+                false,
+                false,
+            ),
+            (
+                ReplicationError::cancelled("user cancelled"),
+                "Operation was cancelled: user cancelled",
+                false,
+                false,
+                true,
+            ),
+            // A rejected configuration fails identically on every attempt without
+            // ever opening a socket, so it is permanent: retrying it just burns the
+            // backoff budget. (It is still not `is_transient`, a narrower predicate.)
+            (
+                ReplicationError::config("missing field"),
+                "Configuration error: missing field",
+                false,
+                true,
+                false,
+            ),
+            (
+                ReplicationError::deserialize("cannot parse 'abc' as u32"),
+                "Deserialization error: cannot parse 'abc' as u32",
+                false,
+                false,
+                false,
+            ),
+            (
+                ReplicationError::backend("reply dropped"),
+                "Backend worker error: reply dropped",
+                true,
+                false,
+                false,
+            ),
+            #[cfg(feature = "std")]
+            (
+                ReplicationError::Io(std::io::Error::other("boom")),
+                "IO error: boom",
+                true,
+                false,
+                false,
+            ),
+        ];
+        for (err, display, transient, permanent, cancelled) in cases {
+            assert_eq!(err.to_string(), display);
+            assert_eq!(err.is_transient(), transient, "{err:?}");
+            assert_eq!(err.is_permanent(), permanent, "{err:?}");
+            assert_eq!(err.is_cancelled(), cancelled, "{err:?}");
+        }
     }
 
     #[test]
@@ -569,36 +611,6 @@ mod tests {
             ReplicationError::ReplicationConnection(_) => {}
             _ => panic!("Expected ReplicationConnection error"),
         }
-    }
-
-    #[test]
-    fn test_connection_alias_display() {
-        let err = ReplicationError::connection("connection lost");
-        assert_eq!(
-            err.to_string(),
-            "Replication connection error: connection lost"
-        );
-    }
-
-    #[test]
-    fn test_replication_slot_display() {
-        let err = ReplicationError::replication_slot("slot not found");
-        assert_eq!(err.to_string(), "Replication slot error: slot not found");
-    }
-
-    #[test]
-    fn test_cancelled_display() {
-        let err = ReplicationError::cancelled("user cancelled");
-        assert_eq!(err.to_string(), "Operation was cancelled: user cancelled");
-    }
-
-    #[test]
-    fn test_config_error_display() {
-        let err = ReplicationError::config("missing field");
-        assert_eq!(err.to_string(), "Configuration error: missing field");
-        assert!(!err.is_transient());
-        assert!(err.is_permanent());
-        assert!(!err.is_cancelled());
     }
 
     #[test]
@@ -620,18 +632,6 @@ mod tests {
             ReplicationError::StringConversion(_) => {}
             _ => panic!("Expected StringConversion error"),
         }
-    }
-
-    #[test]
-    fn test_error_display() {
-        let err = ReplicationError::Protocol("test".into(), None);
-        assert!(format!("{err}").contains("Protocol parsing error"));
-
-        let err = ReplicationError::Buffer("test".to_string());
-        assert!(format!("{err}").contains("Buffer error"));
-
-        let err = ReplicationError::Timeout("test".to_string());
-        assert!(format!("{err}").contains("Operation timed out"));
     }
 
     #[test]
@@ -687,23 +687,6 @@ mod tests {
     }
 
     #[test]
-    fn test_deserialize_error_display() {
-        let err = ReplicationError::deserialize("cannot parse 'abc' as u32");
-        assert_eq!(
-            err.to_string(),
-            "Deserialization error: cannot parse 'abc' as u32"
-        );
-    }
-
-    #[test]
-    fn test_deserialize_error_classification() {
-        let err = ReplicationError::deserialize("test");
-        assert!(!err.is_transient());
-        assert!(!err.is_permanent());
-        assert!(!err.is_cancelled());
-    }
-
-    #[test]
     fn test_deserialize_error_source() {
         use std::error::Error;
         let err = ReplicationError::deserialize("test");
@@ -731,14 +714,6 @@ mod tests {
             err.to_string(),
             "Backend worker error: worker thread is gone"
         );
-    }
-
-    #[test]
-    fn test_backend_error_is_transient() {
-        let err = ReplicationError::backend("reply dropped");
-        assert!(err.is_transient());
-        assert!(!err.is_permanent());
-        assert!(!err.is_cancelled());
     }
 }
 

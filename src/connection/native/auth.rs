@@ -2,6 +2,7 @@
 //!
 //! Supports cleartext, MD5, and SCRAM-SHA-256 authentication.
 
+use super::error::error_frame;
 use super::wire;
 use crate::error::ReplicationError;
 use bytes::BytesMut;
@@ -15,7 +16,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 /// `tls_server_end_point` is the SHA-256 hash of the server's TLS certificate
 /// (DER-encoded), used for SCRAM-SHA-256 channel binding. Pass `None` for
 /// plain-text connections.
-pub async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
+pub(super) async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     buf: &mut BytesMut,
     user: &str,
@@ -53,29 +54,25 @@ pub async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
                                 "Server requested cleartext password over unencrypted connection"
                             );
                         }
-                        let pw = password.ok_or_else(|| {
-                            ReplicationError::authentication(
-                                "Server requires password but none provided".to_string(),
-                            )
-                        })?;
+                        let pw = require_password(password)?;
                         let pw_msg = wire::build_password_message(pw);
                         wire::write_all(stream, &pw_msg).await?;
                         wire::flush(stream).await?;
                     }
                     5 => {
                         // AuthenticationMD5Password
-                        let pw = password.ok_or_else(|| {
-                            ReplicationError::authentication(
-                                "Server requires password but none provided".to_string(),
-                            )
-                        })?;
+                        let pw = require_password(password)?;
                         if msg.len() < 13 {
                             return Err(ReplicationError::protocol(
                                 "MD5 auth message too short (missing salt)".to_string(),
                             ));
                         }
-                        let salt = &msg[9..13];
-                        let hashed = md5_password(user, pw, salt);
+                        let salt: [u8; 4] = msg[9..13].try_into().unwrap();
+                        let hashed = postgres_protocol::authentication::md5_hash(
+                            user.as_bytes(),
+                            pw.as_bytes(),
+                            salt,
+                        );
                         let pw_msg = wire::build_password_message(&hashed);
                         wire::write_all(stream, &pw_msg).await?;
                         wire::flush(stream).await?;
@@ -96,7 +93,7 @@ pub async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
             }
             b'E' => {
                 // ErrorResponse during auth
-                let fields = super::error::parse_error_fields(&msg[5..]);
+                let fields = error_frame(&msg);
                 let message = format!("Authentication failed: {fields}");
                 return Err(ReplicationError::from_server_startup(fields, message));
             }
@@ -111,24 +108,38 @@ pub async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
-/// Compute an MD5 password hash as PostgreSQL expects:
-/// `"md5" + md5(md5(password + user) + salt)`
-fn md5_password(user: &str, password: &str, salt: &[u8]) -> String {
-    // Step 1: md5(password + user)
-    let mut ctx = super::md5::Context::new();
-    ctx.consume(password.as_bytes());
-    ctx.consume(user.as_bytes());
-    let inner_hash = ctx.finalize();
-    let inner = super::md5::hex_digest(&inner_hash);
+fn require_password(password: Option<&str>) -> Result<&str, ReplicationError> {
+    password.ok_or_else(|| {
+        ReplicationError::authentication("Server requires password but none provided".to_string())
+    })
+}
 
-    // Step 2: md5(inner_hex + salt)
-    let mut ctx = super::md5::Context::new();
-    ctx.consume(inner.as_bytes());
-    ctx.consume(salt);
-    let outer_hash = ctx.finalize();
-    let outer = super::md5::hex_digest(&outer_hash);
-
-    format!("md5{outer}")
+/// Check that `msg` is the Authentication message `want` and return its payload.
+///
+/// An ErrorResponse in its place is the server rejecting the SCRAM exchange.
+fn expect_scram_step<'a>(
+    msg: &'a [u8],
+    want: i32,
+    frame: &str,
+    kind: &str,
+) -> Result<&'a [u8], ReplicationError> {
+    if msg[0] == b'E' {
+        let fields = error_frame(msg);
+        return Err(ReplicationError::Authentication(
+            format!("SCRAM authentication failed: {fields}").into_boxed_str(),
+            Some(Box::new(fields)),
+        ));
+    }
+    if msg[0] != b'R' || msg.len() < 9 {
+        return Err(ReplicationError::protocol(format!("Expected {frame}")));
+    }
+    let got = i32::from_be_bytes(msg[5..9].try_into().unwrap());
+    if got != want {
+        return Err(ReplicationError::protocol(format!(
+            "Expected {kind} ({want}), got {got}"
+        )));
+    }
+    Ok(&msg[9..])
 }
 
 /// Handle SCRAM-SHA-256 authentication using `postgres_protocol`.
@@ -155,26 +166,14 @@ async fn handle_scram_sha256<S: AsyncRead + AsyncWrite + Unpin>(
     // Parse the SASL mechanism list from the initial message.
     // After the 4-byte auth type, the payload contains null-terminated mechanism names
     // followed by an extra null terminator.
-    let mechanisms_payload = &initial_msg[9..];
-    let mut has_scram_sha256 = false;
-    let mut has_scram_sha256_plus = false;
-    let mut pos = 0;
-    while pos < mechanisms_payload.len() {
-        if mechanisms_payload[pos] == 0 {
-            break;
-        }
-        let end = mechanisms_payload[pos..]
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(mechanisms_payload.len() - pos);
-        let mechanism = std::str::from_utf8(&mechanisms_payload[pos..pos + end]).unwrap_or("");
-        match mechanism {
-            "SCRAM-SHA-256" => has_scram_sha256 = true,
-            "SCRAM-SHA-256-PLUS" => has_scram_sha256_plus = true,
-            _ => {}
-        }
-        pos += end + 1;
-    }
+    let offers = |name: &str| {
+        initial_msg[9..]
+            .split(|&b| b == 0)
+            .take_while(|mechanism| !mechanism.is_empty())
+            .any(|mechanism| mechanism == name.as_bytes())
+    };
+    let has_scram_sha256 = offers(sasl::SCRAM_SHA_256);
+    let has_scram_sha256_plus = offers(sasl::SCRAM_SHA_256_PLUS);
 
     if !has_scram_sha256 && !has_scram_sha256_plus {
         return Err(ReplicationError::authentication(
@@ -222,27 +221,9 @@ async fn handle_scram_sha256<S: AsyncRead + AsyncWrite + Unpin>(
 
     // Step 2: Receive AuthenticationSASLContinue (type 11)
     let msg2 = wire::read_message(stream, buf).await?;
-    if msg2[0] == b'E' {
-        let fields = super::error::parse_error_fields(&msg2[5..]);
-        return Err(ReplicationError::Authentication(
-            format!("SCRAM authentication failed: {fields}").into_boxed_str(),
-            Some(Box::new(fields)),
-        ));
-    }
-    if msg2[0] != b'R' || msg2.len() < 9 {
-        return Err(ReplicationError::protocol(
-            "Expected AuthenticationSASLContinue".to_string(),
-        ));
-    }
-    let auth_type2 = i32::from_be_bytes(msg2[5..9].try_into().unwrap());
-    if auth_type2 != 11 {
-        return Err(ReplicationError::protocol(format!(
-            "Expected SASL continue (11), got {auth_type2}"
-        )));
-    }
+    let server_first = expect_scram_step(&msg2, 11, "AuthenticationSASLContinue", "SASL continue")?;
 
     // Process server-first message
-    let server_first = &msg2[9..];
     scram.update(server_first).map_err(|e| {
         ReplicationError::authentication(format!("SCRAM server-first processing failed: {e}"))
     })?;
@@ -258,27 +239,9 @@ async fn handle_scram_sha256<S: AsyncRead + AsyncWrite + Unpin>(
 
     // Step 4: Receive AuthenticationSASLFinal (type 12)
     let msg3 = wire::read_message(stream, buf).await?;
-    if msg3[0] == b'E' {
-        let fields = super::error::parse_error_fields(&msg3[5..]);
-        return Err(ReplicationError::Authentication(
-            format!("SCRAM authentication failed: {fields}").into_boxed_str(),
-            Some(Box::new(fields)),
-        ));
-    }
-    if msg3[0] != b'R' || msg3.len() < 9 {
-        return Err(ReplicationError::protocol(
-            "Expected AuthenticationSASLFinal".to_string(),
-        ));
-    }
-    let auth_type3 = i32::from_be_bytes(msg3[5..9].try_into().unwrap());
-    if auth_type3 != 12 {
-        return Err(ReplicationError::protocol(format!(
-            "Expected SASL final (12), got {auth_type3}"
-        )));
-    }
+    let server_final = expect_scram_step(&msg3, 12, "AuthenticationSASLFinal", "SASL final")?;
 
     // Verify server signature
-    let server_final = &msg3[9..];
     scram.finish(server_final).map_err(|e| {
         ReplicationError::authentication(format!("SCRAM server signature verification failed: {e}"))
     })?;
@@ -293,7 +256,7 @@ async fn handle_scram_sha256<S: AsyncRead + AsyncWrite + Unpin>(
             )));
         }
     } else if msg4[0] == b'E' {
-        let fields = super::error::parse_error_fields(&msg4[5..]);
+        let fields = error_frame(&msg4);
         return Err(ReplicationError::Authentication(
             format!("Authentication failed after SCRAM: {fields}").into_boxed_str(),
             Some(Box::new(fields)),
@@ -305,70 +268,38 @@ async fn handle_scram_sha256<S: AsyncRead + AsyncWrite + Unpin>(
 
 #[cfg(test)]
 mod tests {
+    use super::wire::testing::{build_error_response, discard_request, frame};
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    #[test]
-    fn test_md5_password() {
-        // Known test vector: user="md5", password="md5", salt=[0x01, 0x02, 0x03, 0x04]
-        let result = md5_password("md5", "md5", &[0x01, 0x02, 0x03, 0x04]);
-        assert!(result.starts_with("md5"));
-        assert_eq!(result.len(), 35); // "md5" + 32 hex chars
+    /// `"md5" + md5hex(md5hex(password + user) + salt)`, the expected value computed
+    /// outside this crate with `md5sum`.
+    #[tokio::test]
+    async fn test_md5_password_known_answer() {
+        let (mut client, mut server) = tokio::io::duplex(8192);
+
+        let peer = tokio::spawn(async move {
+            server
+                .write_all(&auth_request(5, &[0x01, 0x02, 0x03, 0x04]))
+                .await
+                .unwrap();
+            let (tag, body) = read_frontend(&mut server).await;
+            server.write_all(&auth_request(0, &[])).await.unwrap();
+            (tag, body)
+        });
+
+        let mut buf = BytesMut::new();
+        authenticate(&mut client, &mut buf, "md5_user", Some("password"), None)
+            .await
+            .unwrap();
+        let (tag, body) = peer.await.unwrap();
+        assert_eq!(tag, b'p');
+        assert_eq!(body, b"md580a32c6f038b79de232354a2ee7060eb\0");
     }
 
-    #[test]
-    fn test_md5_password_known() {
-        // PostgreSQL MD5 hash for user=test, password=test, salt=[0,0,0,0]
-        let result = md5_password("test", "test", &[0, 0, 0, 0]);
-        assert!(result.starts_with("md5"));
-    }
-
-    // === Helper: build auth messages ===
-
-    /// Build an AuthenticationOk message: R + len(8) + type(0)
-    fn build_auth_ok() -> Vec<u8> {
-        let mut msg = vec![b'R'];
-        msg.extend_from_slice(&8i32.to_be_bytes());
-        msg.extend_from_slice(&0i32.to_be_bytes());
-        msg
-    }
-
-    /// Build an AuthenticationCleartextPassword message: R + len(8) + type(3)
-    fn build_auth_cleartext() -> Vec<u8> {
-        let mut msg = vec![b'R'];
-        msg.extend_from_slice(&8i32.to_be_bytes());
-        msg.extend_from_slice(&3i32.to_be_bytes());
-        msg
-    }
-
-    /// Build an AuthenticationMD5Password message: R + len(12) + type(5) + salt(4)
-    fn build_auth_md5(salt: &[u8; 4]) -> Vec<u8> {
-        let mut msg = vec![b'R'];
-        msg.extend_from_slice(&12i32.to_be_bytes());
-        msg.extend_from_slice(&5i32.to_be_bytes());
-        msg.extend_from_slice(salt);
-        msg
-    }
-
-    /// Build an ErrorResponse message
-    fn build_error_response(severity: &str, code: &str, message: &str) -> Vec<u8> {
-        let mut payload = Vec::new();
-        payload.push(b'S');
-        payload.extend_from_slice(severity.as_bytes());
-        payload.push(0);
-        payload.push(b'C');
-        payload.extend_from_slice(code.as_bytes());
-        payload.push(0);
-        payload.push(b'M');
-        payload.extend_from_slice(message.as_bytes());
-        payload.push(0);
-        payload.push(0); // terminator
-
-        let mut msg = vec![b'E'];
-        let len = (4 + payload.len()) as i32;
-        msg.extend_from_slice(&len.to_be_bytes());
-        msg.extend_from_slice(&payload);
-        msg
+    /// An Authentication message of `kind` carrying `data`.
+    fn auth_request(kind: i32, data: &[u8]) -> Vec<u8> {
+        frame(b'R', &[&kind.to_be_bytes()[..], data].concat())
     }
 
     // === authenticate mock stream tests ===
@@ -378,7 +309,7 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(8192);
 
         tokio::spawn(async move {
-            server.write_all(&build_auth_ok()).await.unwrap();
+            server.write_all(&auth_request(0, &[])).await.unwrap();
             server.flush().await.unwrap();
         });
 
@@ -393,15 +324,13 @@ mod tests {
 
         tokio::spawn(async move {
             // Send cleartext password challenge
-            server.write_all(&build_auth_cleartext()).await.unwrap();
+            server.write_all(&auth_request(3, &[])).await.unwrap();
             server.flush().await.unwrap();
 
-            // Read and discard the password message from client
-            let mut discard = vec![0u8; 1024];
-            let _ = AsyncReadExt::read(&mut server, &mut discard).await;
+            discard_request(&mut server).await;
 
             // Send AuthenticationOk
-            server.write_all(&build_auth_ok()).await.unwrap();
+            server.write_all(&auth_request(0, &[])).await.unwrap();
             server.flush().await.unwrap();
         });
 
@@ -417,15 +346,13 @@ mod tests {
 
         tokio::spawn(async move {
             // Send MD5 password challenge with salt
-            server.write_all(&build_auth_md5(&salt)).await.unwrap();
+            server.write_all(&auth_request(5, &salt)).await.unwrap();
             server.flush().await.unwrap();
 
-            // Read and discard the password response from client
-            let mut discard = vec![0u8; 1024];
-            let _ = AsyncReadExt::read(&mut server, &mut discard).await;
+            discard_request(&mut server).await;
 
             // Send AuthenticationOk
-            server.write_all(&build_auth_ok()).await.unwrap();
+            server.write_all(&auth_request(0, &[])).await.unwrap();
             server.flush().await.unwrap();
         });
 
@@ -439,7 +366,7 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(8192);
 
         tokio::spawn(async move {
-            server.write_all(&build_auth_cleartext()).await.unwrap();
+            server.write_all(&auth_request(3, &[])).await.unwrap();
             server.flush().await.unwrap();
         });
 
@@ -484,10 +411,7 @@ mod tests {
 
         tokio::spawn(async move {
             // Send an unsupported auth type (99)
-            let mut msg = vec![b'R'];
-            msg.extend_from_slice(&8i32.to_be_bytes());
-            msg.extend_from_slice(&99i32.to_be_bytes());
-            server.write_all(&msg).await.unwrap();
+            server.write_all(&auth_request(99, &[])).await.unwrap();
             server.flush().await.unwrap();
         });
 
@@ -511,13 +435,7 @@ mod tests {
             payload.push(0);
         }
         payload.push(0); // final terminator
-
-        let body_len = 4 + 4 + payload.len(); // length field + auth_type + mechanisms
-        let mut msg = vec![b'R'];
-        msg.extend_from_slice(&(body_len as i32).to_be_bytes());
-        msg.extend_from_slice(&10i32.to_be_bytes()); // AuthenticationSASL = 10
-        msg.extend_from_slice(&payload);
-        msg
+        auth_request(10, &payload) // AuthenticationSASL = 10
     }
 
     #[tokio::test]
@@ -735,15 +653,6 @@ mod tests {
         let mut body = vec![0; len - 4];
         server.read_exact(&mut body).await.unwrap();
         (tag, body)
-    }
-
-    /// An Authentication message of `kind` carrying `data`.
-    fn auth_request(kind: i32, data: &[u8]) -> Vec<u8> {
-        let mut msg = vec![b'R'];
-        msg.extend_from_slice(&i32::try_from(8 + data.len()).unwrap().to_be_bytes());
-        msg.extend_from_slice(&kind.to_be_bytes());
-        msg.extend_from_slice(data);
-        msg
     }
 
     /// Plays a SCRAM-SHA-256 server for `SCRAM_PASSWORD`, then sends `failure`.

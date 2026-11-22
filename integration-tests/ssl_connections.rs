@@ -34,6 +34,9 @@
 //! cargo test --test ssl_connections --no-default-features --features rustls-tls -- --ignored --nocapture
 //! ```
 
+mod common;
+
+use common::{ca_cert_path, replication_conn_string};
 use pg_walstream::{
     CancellationToken, EventType, LogicalReplicationStream, PgReplicationConnection,
     ReplicationSlotOptions, ReplicationStreamConfig, RetryConfig, StreamingMode,
@@ -42,24 +45,11 @@ use std::time::Duration;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-/// Base replication connection string (should NOT contain sslmode).
-fn replication_conn_string() -> String {
-    std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgresql://postgres:postgres@localhost:5432/test_walstream?replication=database"
-            .to_string()
-    })
-}
-
 /// Regular (non-replication) connection string.
 fn regular_conn_string() -> String {
     std::env::var("DATABASE_URL_REGULAR").unwrap_or_else(|_| {
         "postgresql://postgres:postgres@localhost:5432/test_walstream".to_string()
     })
-}
-
-/// Path to the CA certificate that signed the server's certificate.
-fn ca_cert_path() -> String {
-    std::env::var("SSL_CA_CERT_PATH").expect("SSL_CA_CERT_PATH must be set for SSL tests")
 }
 
 /// Path to a CA certificate that did NOT sign the server's certificate.

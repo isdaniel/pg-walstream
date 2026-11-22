@@ -67,10 +67,61 @@ src/
 │   ├── events.rs    #   SnapshotEvents: ChangeEvent adapter + EventSource impl
 │   └── aligned.rs   #   AlignedSnapshot: tables added to a running stream (side slot)
 └── connection/      # native/ rustls-tls backend (default) + libpq FFI backend (opt-in)
-    ├── commands.rs          # replication commands both backends share (`replication_commands!`)
+    ├── commands.rs          # replication commands both backends share (`replication_commands!`), `server_failure`
+    ├── native/error.rs      # ErrorResponse parsing: `error_frame` (whole frame), `parse_error_fields` (payload)
+    ├── native/wire.rs       # frame builders + `#[cfg(test)] testing` (frames shared by native tests)
     └── native/copy_out.rs   # CopyOut state machine (NOT copy.rs — see below)
 macros/              # #[derive(WalTable)] (opt-in `derive` feature)
+integration-tests/   # `#[ignore]` suites; `common/mod.rs` = helpers they share (not a test target)
 ```
+
+## Shared seams
+
+Logic that both backends, or many tests, need lives in one place. Change it there;
+do not add a second copy.
+
+- **Replication commands.** `replication_commands!` (`src/connection/commands.rs`)
+  defines `identify_system`, `create_/alter_/drop_/read_replication_slot`,
+  `send_standby_status_update` and `send_hot_standby_feedback` (plus `_async`
+  forms) once. It is expanded *inside each backend's inherent impl*
+  (`connection/libpq.rs`, `connection/native/connection.rs`), so there is no trait
+  to import and no per-backend copy to keep in sync. A backend must provide `exec`,
+  `exec_async`, `server_version`, `put_copy_data` and a `copy` field with
+  `is_replication()`; the macro supplies `ensure_replication_mode`.
+  `start_replication`, `start_physical_replication`, `base_backup` and
+  `upload_manifest` stay per backend (they differ in how COPY mode is entered).
+- **Server errors.** Build the error for a rejected result with
+  `commands::server_failure(server_error, message, context)`. In the native backend
+  parse an `E`/`N` frame with `error_frame(&msg)` (`native/error.rs`), never
+  `parse_error_fields(&msg[5..])`. The `ReplicationError` variant chosen by
+  `from_server` decides reconnect vs fatal, so a hand-rolled `format!` that
+  bypasses these can silently change recovery behavior.
+- **Connection strings (native).** URI and `key=value` both feed `RawOpts::set`,
+  and `RawOpts::finish` applies the defaults. A new libpq option is one `set` arm
+  plus its default in `finish`, never a branch in one syntax only. Keys not handled
+  go through `check_unhandled`; keep `IGNORED_OPTIONS` / `UNSUPPORTED_OPTIONS`
+  current (see the maintenance contract above them in `conninfo.rs`).
+- **SQL text.** In `sql_builder.rs`: `push_literal` (an optional replication-grammar
+  literal), `version_preflight::require` (a "needs PostgreSQL N+" gate) and
+  `quote_qualified` (`"ns"."name"`). Replication-command literals use
+  `quote_replication_literal` (no `E''`, no backslash escapes), not `quote_literal`.
+- **serde.** `deserializer.rs` generates the policy-independent `Deserializer`
+  methods for both Strict and Lenient with `shared_deserializer_methods!` (the
+  strict impl passes `#[inline]`, the lenient one does not). Add a method there, not
+  in each impl.
+- **Native worker.** `run_worker`'s idle loop starts `StreamCopy` and
+  `CopyOutStream` itself and hands every other `Command` to `handle_stream_cmd`
+  through a catch-all arm. A new `Command` that starts a stream needs its own arm
+  *before* that catch-all; the compiler will not flag the omission.
+- **Test helpers.** Native protocol tests build frames with
+  `wire::testing::{frame, build_error_response, discard_request}`; `stream.rs`
+  tests use `MockSource`, `test_stream()` and `options_config()`. Prefer a new row
+  in an existing table-driven test over a new `#[test]` that repeats the setup.
+- **Integration-test helpers.** Every suite starts with `mod common;`, which is
+  `integration-tests/common/mod.rs`: `replication_conn_string`,
+  `regular_conn_string` / `regular_conn`, `strip_replication_param`, `SlotGuard` /
+  `WaitingSlotGuard` / `UnwindSafeSlotGuard`, `drop_slot_best_effort`,
+  `ca_cert_path`. Use them; do not paste a private copy into a suite.
 
 ## Initial snapshot
 
@@ -178,5 +229,6 @@ runs weekly, not per PR).
 
 The 90% gate reads only that default-backend unit pass, so `src/connection/libpq.rs` (gated on `libpq` *without* `rustls-tls` in `connection/mod.rs`) is invisible to it. The shared `commands.rs` is not. Codecov receives the default and libpq unit passes merged, plus the integration suites run instrumented on PostgreSQL 18, and its patch check covers both backends.
 
-A new file under `integration-tests/` needs a matching `[[test]]` stanza in
-`Cargo.toml`; CI enumerates the directory and fails without it.
+A new top-level `integration-tests/*.rs` file needs a matching `[[test]]` stanza in
+`Cargo.toml`; CI enumerates those files and fails without it. `common/mod.rs` is a
+helper module included with `mod common;`, not a test target, so it needs none.
