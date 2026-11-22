@@ -133,7 +133,7 @@ extern crate self as pg_walstream;
 /// in both `std` and `no_std + alloc` builds. Glob-imported, so unused entries
 /// never warn, and under `std` they shadow the identical prelude items harmlessly.
 #[allow(unused_imports)]
-pub(crate) mod prelude {
+mod prelude {
     pub(crate) use alloc::borrow::{Cow, ToOwned};
     pub(crate) use alloc::boxed::Box;
     pub(crate) use alloc::collections::BTreeMap;
@@ -164,7 +164,7 @@ pub mod protocol;
 /// COPY TEXT decoding for the initial-snapshot helper. Crate-internal: the
 /// snapshot API is the supported surface, not the decoder underneath it.
 #[cfg(any(feature = "libpq", feature = "rustls-tls"))]
-pub(crate) mod copy_text;
+mod copy_text;
 
 // High-level stream management
 #[cfg(any(feature = "libpq", feature = "rustls-tls"))]

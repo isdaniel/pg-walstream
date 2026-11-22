@@ -4,11 +4,11 @@
 use super::plan::{self, SnapshotTable};
 use super::resolve_tables;
 use super::rows::SnapshotRow;
-use super::table_copy::{poisoned_err, TableCopy};
+use super::table_copy::TableCopy;
 use crate::connection::PgReplicationConnection;
 use crate::error::{ReplicationError, Result};
 use crate::prelude::*;
-use crate::sql_builder::quote_ident;
+use crate::sql_builder::quote_qualified;
 use crate::stream::{LogicalReplicationStream, ServerIdentity};
 use crate::types::{Lsn, ReplicationSlotOptions, SlotType};
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -203,17 +203,8 @@ impl AlignedSnapshot {
     /// Errors when the copy failed or was not read to the end, so a partial copy
     /// cannot pass for a complete one.
     pub fn finish(mut self) -> Result<()> {
-        if self.copy.poisoned() {
-            return Err(poisoned_err());
-        }
-        if !self.copy.completed() {
-            return Err(ReplicationError::protocol(
-                "aligned snapshot was not fully consumed; read every row before finish()"
-                    .to_string(),
-            ));
-        }
-        self.copy.close();
-        Ok(())
+        self.copy
+            .finish("aligned snapshot was not fully consumed; read every row before finish()")
     }
 
     #[cfg(test)]
@@ -345,13 +336,7 @@ async fn pin_tables(reader: &mut PgReplicationConnection, tables: &[SnapshotTabl
 fn pin_sql(tables: &[SnapshotTable]) -> Result<(String, String)> {
     let names = tables
         .iter()
-        .map(|t| {
-            Ok(format!(
-                "{}.{}",
-                quote_ident(&t.relation.namespace)?,
-                quote_ident(&t.relation.relation_name)?
-            ))
-        })
+        .map(|t| quote_qualified(&t.relation.namespace, &t.relation.relation_name))
         .collect::<Result<Vec<_>>>()?
         .join(", ");
     let oids = tables
@@ -464,19 +449,18 @@ fn side_slot_name() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{ColumnInfo, RelationInfo};
 
     fn published(names: &[(&str, &str)]) -> Vec<SnapshotTable> {
         names
             .iter()
             .enumerate()
             .map(|(oid, (schema, table))| SnapshotTable {
-                relation: Arc::new(RelationInfo::new(
+                relation: Arc::new(plan::test_relation(
                     u32::try_from(oid).unwrap(),
-                    schema.to_string(),
-                    table.to_string(),
-                    b'd',
-                    vec![ColumnInfo::new(0, "id".to_string(), 23, -1)],
+                    schema,
+                    table,
+                    &["id"],
+                    23,
                 )),
                 copy_sql: format!("COPY {schema}.{table}"),
             })

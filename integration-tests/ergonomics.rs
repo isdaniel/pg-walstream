@@ -17,6 +17,9 @@
 //! cargo test --test ergonomics -- --ignored --nocapture --test-threads=1
 //! ```
 
+mod common;
+
+use common::strip_replication_param;
 use pg_walstream::{
     CancellationToken, ChangeEvent, EventType, LogicalReplicationStream, PgReplicationConnection,
     ReplicationSlotOptions, ReplicationStreamConfig, StreamingMode, WalRouter,
@@ -34,26 +37,8 @@ fn replication_conn_string() -> String {
 }
 
 fn regular_conn_string() -> String {
-    if let Ok(s) = std::env::var("DATABASE_URL_REGULAR") {
-        return s;
-    }
-    let url = replication_conn_string();
-    // Split off the query string, drop the `replication=database` param,
-    // rejoin the rest (preserves things like `sslmode=require`).
-    match url.split_once('?') {
-        None => url,
-        Some((base, query)) => {
-            let kept: Vec<&str> = query
-                .split('&')
-                .filter(|p| *p != "replication=database")
-                .collect();
-            if kept.is_empty() {
-                base.to_string()
-            } else {
-                format!("{base}?{}", kept.join("&"))
-            }
-        }
-    }
+    std::env::var("DATABASE_URL_REGULAR")
+        .unwrap_or_else(|_| strip_replication_param(&replication_conn_string()))
 }
 
 fn drop_slot(slot_name: &str) {

@@ -14,6 +14,9 @@
 //! cargo test --test aligned_snapshot -- --ignored --nocapture --test-threads=1
 //! ```
 
+mod common;
+
+use common::{regular_conn, regular_conn_string, replication_conn_string, UnwindSafeSlotGuard};
 use pg_walstream::{
     AlignedSnapshot, CancellationToken, ChangeEvent, ColumnValue, EventType,
     LogicalReplicationStream, Lsn, PgReplicationConnection, PgResult, ReplicationError,
@@ -25,25 +28,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
-
-fn replication_conn_string() -> String {
-    std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgresql://postgres:postgres@localhost:5432/test_walstream?replication=database"
-            .to_string()
-    })
-}
-
-fn regular_conn_string() -> String {
-    std::env::var("DATABASE_URL_REGULAR").unwrap_or_else(|_| {
-        replication_conn_string()
-            .replace("?replication=database", "")
-            .replace("&replication=database", "")
-    })
-}
-
-fn regular_conn() -> PgReplicationConnection {
-    PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection")
-}
 
 fn exec(conn: &mut PgReplicationConnection, sql: &str) -> PgResult {
     conn.exec(sql).unwrap_or_else(|e| panic!("{sql}: {e}"))
@@ -77,22 +61,9 @@ fn drop_slot(slot: &str) {
     panic!("could not drop replication slot {slot}");
 }
 
-/// Drops its slot however the test leaves; declare it before the stream.
-struct SlotGuard(&'static str);
-
-impl Drop for SlotGuard {
-    fn drop(&mut self) {
-        if std::thread::panicking() {
-            let _ = std::panic::catch_unwind(|| drop_slot(self.0));
-        } else {
-            drop_slot(self.0);
-        }
-    }
-}
-
-fn slot_guard(slot: &'static str) -> SlotGuard {
+fn slot_guard(slot: &'static str) -> UnwindSafeSlotGuard {
     drop_slot(slot);
-    SlotGuard(slot)
+    UnwindSafeSlotGuard::new(slot, drop_slot)
 }
 
 async fn running_stream(slot: &str, publication: &str) -> LogicalReplicationStream {
@@ -147,7 +118,7 @@ fn no_aligned_slot_left() -> bool {
 /// `{prefix}_new` and `{prefix}_old` across a capture of `{prefix}_new`, and a
 /// sentinel row in `{prefix}_old` after the writer stopped.
 struct Race {
-    _guard: SlotGuard,
+    _guard: UnwindSafeSlotGuard,
     admin: PgReplicationConnection,
     stream: LogicalReplicationStream,
     cancel: CancellationToken,
@@ -810,7 +781,7 @@ async fn capture_with_feedback(
 async fn table_added_to_a_running_stream(
     prefix: &'static str,
     slot: &'static str,
-) -> (SlotGuard, PgReplicationConnection, Recording) {
+) -> (UnwindSafeSlotGuard, PgReplicationConnection, Recording) {
     let guard = slot_guard(slot);
     let mut admin = regular_conn();
     for sql in [

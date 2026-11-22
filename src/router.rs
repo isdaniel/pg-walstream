@@ -218,12 +218,32 @@ impl WalRouter {
     }
 }
 
+/// The ids a test handler saw; a handler returns `seen.push(id)`.
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct Seen(Arc<std::sync::Mutex<Vec<i64>>>);
+
+#[cfg(test)]
+impl Seen {
+    fn push(&self, id: i64) -> impl Future<Output = Result<()>> + Send + 'static {
+        let seen = self.0.clone();
+        async move {
+            seen.lock().unwrap().push(id);
+            Ok(())
+        }
+    }
+
+    fn ids(&self) -> Vec<i64> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
 #[cfg(all(test, feature = "derive"))]
 mod on_of_tests {
     use super::*;
     use crate::{ChangeEvent, ColumnValue, Lsn, ReplicaIdentity, RowData, WalTable};
     use serde::Deserialize;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     #[derive(Deserialize, WalTable)]
     #[wal(table = "things")]
@@ -251,35 +271,23 @@ mod on_of_tests {
 
     #[tokio::test]
     async fn on_insert_of_infers_table() {
-        let seen = Arc::new(Mutex::new(Vec::<i64>::new()));
+        let seen = Seen::default();
         let s = seen.clone();
         let mut router = WalRouter::new();
-        router.on_insert_of::<Thing, _>(move |t| {
-            let s = s.clone();
-            async move {
-                s.lock().unwrap().push(t.id);
-                Ok(())
-            }
-        });
+        router.on_insert_of::<Thing, _>(move |t| s.push(t.id));
         assert_eq!(<Thing as WalTable>::TABLE, "things");
         router.dispatch(&ins("7", 1)).await.unwrap();
-        assert_eq!(*seen.lock().unwrap(), vec![7]);
+        assert_eq!(seen.ids(), vec![7]);
     }
 
     #[tokio::test]
     async fn on_update_of_infers_table() {
-        let seen = Arc::new(Mutex::new(Vec::<i64>::new()));
+        let seen = Seen::default();
         let s = seen.clone();
         let mut router = WalRouter::new();
-        router.on_update_of::<Thing, _>(move |_old, new| {
-            let s = s.clone();
-            async move {
-                s.lock().unwrap().push(new.id);
-                Ok(())
-            }
-        });
+        router.on_update_of::<Thing, _>(move |_old, new| s.push(new.id));
         router.dispatch(&upd("9", 2)).await.unwrap();
-        assert_eq!(*seen.lock().unwrap(), vec![9]);
+        assert_eq!(seen.ids(), vec![9]);
     }
 
     fn del(id: &str, lsn: u64) -> ChangeEvent {
@@ -297,29 +305,21 @@ mod on_of_tests {
 
     #[tokio::test]
     async fn on_delete_of_infers_table() {
-        let seen = Arc::new(Mutex::new(Vec::<i64>::new()));
+        let seen = Seen::default();
         let s = seen.clone();
         let mut router = WalRouter::new();
-        router.on_delete_of::<Thing, _>(move |t| {
-            let s = s.clone();
-            async move {
-                s.lock().unwrap().push(t.id);
-                Ok(())
-            }
-        });
+        router.on_delete_of::<Thing, _>(move |t| s.push(t.id));
         router.dispatch(&del("5", 3)).await.unwrap();
-        assert_eq!(*seen.lock().unwrap(), vec![5]);
+        assert_eq!(seen.ids(), vec![5]);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stream::EventSource;
-    use crate::types::XLogRecPtr;
+    use crate::stream::tests::MockSource;
     use crate::{ChangeEvent, ColumnValue, Lsn, ReplicaIdentity, ReplicationError, RowData};
     use serde::Deserialize;
-    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -347,18 +347,12 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_insert_hits_typed_handler() {
-        let seen = Arc::new(Mutex::new(Vec::<i64>::new()));
+        let seen = Seen::default();
         let s = seen.clone();
         let mut router = WalRouter::new();
-        router.on_insert::<Row, _, _>("users", move |r| {
-            let s = s.clone();
-            async move {
-                s.lock().unwrap().push(r.id);
-                Ok(())
-            }
-        });
+        router.on_insert::<Row, _, _>("users", move |r| s.push(r.id));
         router.dispatch(&ins("users", "7", 1)).await.unwrap();
-        assert_eq!(*seen.lock().unwrap(), vec![7]);
+        assert_eq!(seen.ids(), vec![7]);
     }
 
     #[tokio::test]
@@ -389,16 +383,7 @@ mod tests {
                 Ok(())
             }
         });
-        let begin = ChangeEvent {
-            event_type: crate::EventType::Begin {
-                transaction_id: 1,
-                final_lsn: Lsn::new(1),
-                commit_timestamp: chrono::Utc::now(),
-            },
-            lsn: Lsn::new(1),
-            metadata: None,
-            xid: None,
-        };
+        let begin = ChangeEvent::begin(1, Lsn::new(1), chrono::Utc::now(), Lsn::new(1));
         router.dispatch(&begin).await.unwrap();
         assert_eq!(hit.load(Ordering::SeqCst), 1);
     }
@@ -422,39 +407,15 @@ mod tests {
     }
 
     // run() over a MockSource: dispatch + ack + Cancelled exit end-to-end.
-    struct MockSource {
-        events: VecDeque<Result<ChangeEvent>>,
-        last_ack: AtomicU64,
-    }
-    impl EventSource for MockSource {
-        async fn recv(&mut self) -> Result<ChangeEvent> {
-            self.events
-                .pop_front()
-                .unwrap_or_else(|| Err(ReplicationError::Cancelled("drained".into())))
-        }
-        fn ack(&self, lsn: XLogRecPtr) {
-            self.last_ack.store(lsn, Ordering::SeqCst);
-        }
-    }
-
     #[tokio::test]
     async fn run_impl_dispatches_and_acks() {
-        let seen = Arc::new(Mutex::new(Vec::<i64>::new()));
+        let seen = Seen::default();
         let s = seen.clone();
         let mut router = WalRouter::new();
-        router.on_insert::<Row, _, _>("users", move |r| {
-            let s = s.clone();
-            async move {
-                s.lock().unwrap().push(r.id);
-                Ok(())
-            }
-        });
-        let mut src = MockSource {
-            events: vec![Ok(ins("users", "3", 30)), Ok(ins("users", "4", 40))].into(),
-            last_ack: AtomicU64::new(0),
-        };
+        router.on_insert::<Row, _, _>("users", move |r| s.push(r.id));
+        let mut src = MockSource::new(vec![Ok(ins("users", "3", 30)), Ok(ins("users", "4", 40))]);
         router.run_over(&mut src).await.unwrap();
-        assert_eq!(*seen.lock().unwrap(), vec![3, 4]);
+        assert_eq!(seen.ids(), vec![3, 4]);
         assert_eq!(src.last_ack.load(Ordering::SeqCst), 40);
     }
 
@@ -464,16 +425,7 @@ mod tests {
         // the event, and returns Ok for both unmatched DML and non-DML events.
         let mut router = WalRouter::new();
         router.dispatch(&ins("unhandled", "1", 1)).await.unwrap();
-        let begin = ChangeEvent {
-            event_type: crate::EventType::Begin {
-                transaction_id: 1,
-                final_lsn: Lsn::new(1),
-                commit_timestamp: chrono::Utc::now(),
-            },
-            lsn: Lsn::new(1),
-            metadata: None,
-            xid: None,
-        };
+        let begin = ChangeEvent::begin(1, Lsn::new(1), chrono::Utc::now(), Lsn::new(1));
         router.dispatch(&begin).await.unwrap();
     }
 
@@ -516,10 +468,7 @@ mod tests {
     #[tokio::test]
     async fn run_over_propagates_non_cancelled_err() {
         let mut router = WalRouter::new();
-        let mut src = MockSource {
-            events: vec![Err(ReplicationError::deserialize("io"))].into(),
-            last_ack: AtomicU64::new(0),
-        };
+        let mut src = MockSource::new(vec![Err(ReplicationError::deserialize("io"))]);
         assert!(router.run_over(&mut src).await.is_err());
     }
 

@@ -7,35 +7,35 @@ use crate::error::ReplicationError;
 
 /// Parsed connection configuration.
 #[derive(Clone)]
-pub struct ConnInfo {
-    pub host: String,
-    pub port: u16,
-    pub user: String,
-    pub password: Option<String>,
-    pub dbname: String,
-    pub sslmode: SslMode,
-    pub sslrootcert: Option<String>,
+pub(crate) struct ConnInfo {
+    pub(super) host: String,
+    pub(super) port: u16,
+    pub(super) user: String,
+    pub(super) password: Option<String>,
+    pub(super) dbname: String,
+    pub(super) sslmode: SslMode,
+    pub(super) sslrootcert: Option<String>,
     /// PEM client certificate chain to present when the server asks for one (libpq's `sslcert`). Always set together with `sslkey`: this backend never reads libpq's default `~/.postgresql/postgresql.crt`.
-    pub sslcert: Option<String>,
+    pub(super) sslcert: Option<String>,
     /// PEM private key for `sslcert` (libpq's `sslkey`). Unencrypted only; an encrypted key is refused when the connection is made.
-    pub sslkey: Option<String>,
+    pub(super) sslkey: Option<String>,
     /// TLS negotiation mode. `Postgres` (default) uses the standard SSLRequest, round-trip; `Direct` skips it for PostgreSQL 17+ (saves one round-trip).
-    pub sslnegotiation: SslNegotiation,
-    pub replication: ReplicationMode,
+    pub(super) sslnegotiation: SslNegotiation,
+    pub(crate) replication: ReplicationMode,
     /// `application_name` for the startup message: what `pg_stat_activity` and `pg_stat_replication` show, and what `synchronous_standby_names` matches. Already resolved against `fallback_application_name` as libpq does; `None` when neither is set or the result is empty. libpq's `PGAPPNAME` is not read, as with every environment variable but `PGPASSWORD`.
-    pub application_name: Option<String>,
+    pub(super) application_name: Option<String>,
     /// `options` for the startup message, passed to the server verbatim (`-c TimeZone=UTC -c lock_timeout=5s`): GUCs pinned for this session, so decoded text renders as it would on any connection with the same settings. `None` when unset or empty; `PGOPTIONS` is not read. Redacted in `Debug`, like `password`: a custom setting can carry a secret.
-    pub options: Option<String>,
+    pub(super) options: Option<String>,
     /// Connection timeout in seconds (0 = disabled). Maps to libpq's `connect_timeout`.
-    pub connect_timeout: u64,
+    pub(super) connect_timeout: u64,
     /// Whether TCP keepalives are enabled (default: true). Maps to `keepalives`.
-    pub keepalives: bool,
+    pub(super) keepalives: bool,
     /// Seconds of idle time before sending a keepalive probe. Maps to `keepalives_idle`.
-    pub keepalives_idle: u64,
+    pub(super) keepalives_idle: u64,
     /// Seconds between keepalive probes. Maps to `keepalives_interval`.
-    pub keepalives_interval: u64,
+    pub(super) keepalives_interval: u64,
     /// Maximum number of keepalive probes before declaring dead. Maps to `keepalives_count`.
-    pub keepalives_count: u32,
+    pub(super) keepalives_count: u32,
     /// Milliseconds transmitted data may go unacknowledged before the kernel
     /// forcibly closes the connection (0 = disabled). Maps to libpq's
     /// `tcp_user_timeout`; Linux-family only.
@@ -47,11 +47,11 @@ pub struct ConnInfo {
     /// — including the `DROP_REPLICATION_SLOT` that snapshot cleanup runs from
     /// `Drop`. Keepalives do not: they fire only when the connection is idle,
     /// and a round-trip waiting for a reply is not idle.
-    pub tcp_user_timeout: u64,
+    pub(super) tcp_user_timeout: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum SslMode {
+pub(super) enum SslMode {
     Disable,
     Allow,
     Prefer,
@@ -60,8 +60,15 @@ pub enum SslMode {
     VerifyFull,
 }
 
+impl SslMode {
+    /// Whether the connection must be encrypted or fail, rather than fall back to plaintext.
+    pub(super) fn requires_tls(self) -> bool {
+        matches!(self, Self::Require | Self::VerifyCa | Self::VerifyFull)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ReplicationMode {
+pub(crate) enum ReplicationMode {
     Database,
     Physical,
     None,
@@ -74,7 +81,7 @@ pub enum ReplicationMode {
 /// protocol `"postgresql"`. This saves one network round-trip on
 /// every connection establishment.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum SslNegotiation {
+pub(super) enum SslNegotiation {
     /// Standard PostgreSQL TLS negotiation: send SSLRequest, wait for
     /// `'S'`/`'N'` response, then perform TLS handshake. Works with all
     /// PostgreSQL versions.
@@ -126,19 +133,14 @@ impl std::fmt::Debug for ConnInfo {
 }
 
 impl ConnInfo {
-    pub fn parse(conninfo: &str) -> Result<Self, ReplicationError> {
+    pub(crate) fn parse(conninfo: &str) -> Result<Self, ReplicationError> {
         let info = if conninfo.starts_with("postgresql://") || conninfo.starts_with("postgres://") {
             Self::parse_uri(conninfo)?
         } else {
             Self::parse_key_value(conninfo)?
         };
 
-        if info.sslnegotiation == SslNegotiation::Direct
-            && !matches!(
-                info.sslmode,
-                SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull
-            )
-        {
+        if info.sslnegotiation == SslNegotiation::Direct && !info.sslmode.requires_tls() {
             return Err(ReplicationError::config(
                 "sslnegotiation=direct requires sslmode=require, verify-ca or verify-full; \
                  a weaker mode may silently fall back to plaintext"
@@ -171,11 +173,11 @@ impl ConnInfo {
             Some(i) if stripped.as_bytes()[i] == b'@' => (&stripped[..i], &stripped[i + 1..]),
             _ => ("", stripped),
         };
-        let (mut user, mut password) = if creds.is_empty() {
-            ("postgres".to_string(), None)
+        let (user, password) = if creds.is_empty() {
+            (None, None)
         } else if let Some((u, p)) = creds.split_once(':') {
             (
-                url_decode(u),
+                Some(url_decode(u)),
                 if p.is_empty() {
                     None
                 } else {
@@ -183,7 +185,7 @@ impl ConnInfo {
                 },
             )
         } else {
-            (url_decode(creds), None)
+            (Some(url_decode(creds)), None)
         };
 
         // Split rest into authority and the `db?params` tail.
@@ -204,7 +206,7 @@ impl ConnInfo {
 
         // An IPv6 literal is bracketed (`[::1]`, `[::1]:5433`); splitting on the
         // last `:` would otherwise cut inside the address.
-        let (mut host, mut port) = if let Some(rest_after_bracket) = host_port.strip_prefix('[') {
+        let (host, port) = if let Some(rest_after_bracket) = host_port.strip_prefix('[') {
             let (addr, tail) = rest_after_bracket.split_once(']').ok_or_else(|| {
                 ReplicationError::config(format!(
                     "unterminated IPv6 address in connection URI: \"{host_port}\""
@@ -239,30 +241,14 @@ impl ConnInfo {
         // query loop, as libpq does it in `pqConnectOptions2` (`connectOptions2` before PG17) — otherwise
         // `postgresql:///?user=alice` would yield dbname="postgres".
         let (db, params_str) = db_params.split_once('?').unwrap_or((db_params, ""));
-        let mut dbname = if db.is_empty() {
-            String::new()
-        } else {
-            url_decode(db)
+        let mut raw = RawOpts {
+            host: Some(host),
+            port: Some(port),
+            user,
+            password,
+            dbname: Some(url_decode(db)),
+            ..Default::default()
         };
-
-        // Parse query params
-        let mut sslmode = SslMode::Prefer;
-        let mut sslmode_explicit = false;
-        let mut replication = ReplicationMode::None;
-        let mut sslrootcert: Option<String> = None;
-        let mut sslcert: Option<String> = None;
-        let mut sslkey: Option<String> = None;
-        let mut client_cert_allowed = true;
-        let mut sslnegotiation = SslNegotiation::Postgres;
-        let mut application_name: Option<String> = None;
-        let mut fallback_application_name: Option<String> = None;
-        let mut options: Option<String> = None;
-        let mut connect_timeout: u64 = 0;
-        let mut keepalives = true;
-        let mut keepalives_idle: u64 = 120;
-        let mut keepalives_interval: u64 = 10;
-        let mut keepalives_count: u32 = 3;
-        let mut tcp_user_timeout: u64 = 0;
 
         for param in params_str.split('&') {
             if param.is_empty() {
@@ -271,81 +257,15 @@ impl ConnInfo {
             if let Some((key, val)) = param.split_once('=') {
                 // Query values are percent-encoded like the rest of the URI.
                 let val = url_decode(val);
-                let val = val.as_str();
                 match key {
-                    "sslmode" => {
-                        sslmode = parse_sslmode(val)?;
-                        sslmode_explicit = true;
-                    }
-                    "sslrootcert" => sslrootcert = Some(val.to_string()),
-                    "sslcert" => sslcert = Some(val.to_string()),
-                    "sslkey" => sslkey = Some(val.to_string()),
-                    "sslcertmode" => client_cert_allowed = parse_sslcertmode(val)?,
-                    "sslnegotiation" => sslnegotiation = parse_ssl_negotiation(val)?,
-                    "replication" => replication = parse_replication_mode(val)?,
-                    "connect_timeout" => {
-                        connect_timeout = parse_connect_timeout("connect_timeout", val)?;
-                    }
-                    // libpq parses this as an integer (`pqParseIntParam` via
-                    // `useKeepalives`), so `keepalives=abc` is an error there, not
-                    // "on". Every sibling keepalive option is validated; so is this.
-                    "keepalives" => keepalives = parse_num::<i32>("keepalives", val)? != 0,
-                    "keepalives_idle" => {
-                        keepalives_idle = parse_num("keepalives_idle", val)?;
-                    }
-                    "keepalives_interval" => {
-                        keepalives_interval = parse_num("keepalives_interval", val)?;
-                    }
-                    "keepalives_count" => {
-                        keepalives_count = parse_num("keepalives_count", val)?;
-                    }
-                    // Milliseconds, and clamped like `connect_timeout` rather than
-                    // rejected: libpq's `setTCPUserTimeout` takes a negative as 0,
-                    // and a `Config` error here is permanent, so rejecting one
-                    // would hard fail a string psql accepts.
-                    "tcp_user_timeout" => {
-                        tcp_user_timeout = parse_connect_timeout("tcp_user_timeout", val)?;
-                    }
-                    // libpq docs 32.1.1.2: "Values that would normally appear in
-                    // the hierarchical part of the URI can alternatively be given
-                    // as named parameters", e.g.
-                    // `postgresql:///mydb?host=localhost&port=5433`. The query
-                    // overrides the hierarchical part, matching
-                    // `conninfo_uri_parse_options`, which stores host/port/dbname
-                    // before calling `conninfo_uri_parse_params`. Without these
-                    // arms the new error below would reject a legal URI.
-                    "host" | "hostaddr" => host = val.to_string(),
-                    "port" => port = parse_port(val)?,
-                    "user" => user = val.to_string(),
-                    "password" => password = Some(val.to_string()),
-                    "dbname" => dbname = val.to_string(),
-                    "application_name" => application_name = Some(val.to_string()),
-                    "fallback_application_name" => {
-                        fallback_application_name = Some(val.to_string());
-                    }
-                    "options" => options = Some(val.to_string()),
-                    // libpq translates both of these to sslmode; dropping them is
-                    // the same silent downgrade this arm exists to prevent.
-                    // `requiressl` is handled in `conninfo_storeval`; `ssl=true`
-                    // is JDBC compatibility, hardcoded in
+                    // `ssl=true` is JDBC compatibility, hardcoded in
                     // `conninfo_uri_parse_params` and therefore URI-query only.
-                    "requiressl" => {
-                        sslmode = if val.starts_with('1') {
-                            SslMode::Require
-                        } else {
-                            SslMode::Prefer
-                        };
-                        sslmode_explicit = true;
-                    }
-                    "ssl" if val == "true" => {
-                        sslmode = SslMode::Require;
-                        sslmode_explicit = true;
-                    }
-                    k => check_unhandled(k, val)?,
+                    "ssl" if val == "true" => raw.sslmode = Some(SslMode::Require),
+                    _ => raw.set(key, &val)?,
                 }
             } else {
                 // No `=` at all. Dropping it silently is the same downgrade the
-                // unknown-key arm above exists to prevent, through a wider door:
+                // unknown-key check in `RawOpts::set` exists to prevent, through a wider door:
                 // `?sslmodeverify-full` would leave sslmode at its Prefer default.
                 // libpq answers `missing key/value separator "=" in URI query
                 // parameter: "%s"` (`conninfo_uri_parse_params`).
@@ -357,77 +277,19 @@ impl ConnInfo {
 
         // libpq applies this fallback in `pqConnectOptions2` (`connectOptions2` before PG17), i.e. AFTER the query
         // params are parsed — so `postgresql:///?user=alice` gives dbname=alice.
-        if dbname.is_empty() {
-            dbname = user.clone();
-        }
+        raw.dbname = raw.dbname.filter(|dbname| !dbname.is_empty());
 
         // `postgresql:///mydb` has no authority at all. libpq reads an empty host
         // as "use the Unix socket"; this backend is TCP-only, so fall back to the
         // same default the key/value path uses rather than handing
         // `TcpStream::connect(":5432")` an unparsable address.
-        if host.is_empty() {
-            host = "localhost".to_string();
-        }
+        raw.host = raw.host.filter(|host| !host.is_empty());
 
-        // Check PGPASSWORD env var if no password in URI
-        let password = password.or_else(|| std::env::var("PGPASSWORD").ok());
-
-        let sslmode =
-            resolve_sslrootcert_system(sslmode, sslmode_explicit, sslrootcert.as_deref())?;
-        let (sslcert, sslkey) = client_identity(
-            sslcert,
-            sslkey,
-            client_cert_allowed && sslmode != SslMode::Disable,
-        )?;
-        let (application_name, options) =
-            session_params(application_name, fallback_application_name, options);
-
-        Ok(ConnInfo {
-            host,
-            port,
-            user,
-            password,
-            dbname,
-            sslmode,
-            sslrootcert,
-            sslcert,
-            sslkey,
-            sslnegotiation,
-            replication,
-            application_name,
-            options,
-            connect_timeout,
-            keepalives,
-            keepalives_idle,
-            keepalives_interval,
-            keepalives_count,
-            tcp_user_timeout,
-        })
+        raw.finish()
     }
 
     fn parse_key_value(input: &str) -> Result<Self, ReplicationError> {
-        let mut host = "localhost".to_string();
-        let mut port: u16 = 5432;
-        let mut user = "postgres".to_string();
-        let mut password: Option<String> = None;
-        let mut dbname: Option<String> = None;
-        let mut sslmode = SslMode::Prefer;
-        let mut sslmode_explicit = false;
-        let mut replication = ReplicationMode::None;
-        let mut sslrootcert: Option<String> = None;
-        let mut sslcert: Option<String> = None;
-        let mut sslkey: Option<String> = None;
-        let mut client_cert_allowed = true;
-        let mut sslnegotiation = SslNegotiation::Postgres;
-        let mut application_name: Option<String> = None;
-        let mut fallback_application_name: Option<String> = None;
-        let mut options: Option<String> = None;
-        let mut connect_timeout: u64 = 0;
-        let mut keepalives = true;
-        let mut keepalives_idle: u64 = 120;
-        let mut keepalives_interval: u64 = 10;
-        let mut keepalives_count: u32 = 3;
-        let mut tcp_user_timeout: u64 = 0;
+        let mut raw = RawOpts::default();
 
         // Simple key=value parser (handles single-quoted values)
         let mut chars = input.chars().peekable();
@@ -503,89 +365,146 @@ impl ConnInfo {
                 v
             };
 
-            match key {
-                "host" | "hostaddr" => host = value,
-                "port" => port = parse_port(&value)?,
-                "user" => user = value,
-                "password" => password = Some(value),
-                "dbname" | "database" => dbname = Some(value),
-                "application_name" => application_name = Some(value),
-                "fallback_application_name" => fallback_application_name = Some(value),
-                "options" => options = Some(value),
-                "sslmode" => {
-                    sslmode = parse_sslmode(&value)?;
-                    sslmode_explicit = true;
-                }
-                "sslrootcert" => sslrootcert = Some(value),
-                "sslcert" => sslcert = Some(value),
-                "sslkey" => sslkey = Some(value),
-                "sslcertmode" => client_cert_allowed = parse_sslcertmode(&value)?,
-                "sslnegotiation" => sslnegotiation = parse_ssl_negotiation(&value)?,
-                "replication" => replication = parse_replication_mode(&value)?,
-                "connect_timeout" => {
-                    connect_timeout = parse_connect_timeout("connect_timeout", &value)?
-                }
-                "keepalives" => keepalives = parse_num::<i32>("keepalives", &value)? != 0,
-                "keepalives_idle" => keepalives_idle = parse_num("keepalives_idle", &value)?,
-                "keepalives_interval" => {
-                    keepalives_interval = parse_num("keepalives_interval", &value)?
-                }
-                "keepalives_count" => keepalives_count = parse_num("keepalives_count", &value)?,
-                // Milliseconds, and clamped like `connect_timeout` rather than
-                // rejected: libpq's `setTCPUserTimeout` takes a negative as 0, and
-                // a `Config` error here is permanent, so rejecting one would hard
-                // fail a string psql accepts.
-                "tcp_user_timeout" => {
-                    tcp_user_timeout = parse_connect_timeout("tcp_user_timeout", &value)?
-                }
-                // libpq translates this to sslmode in `conninfo_storeval`, so it
-                // works in both syntaxes. Dropping it is a silent downgrade.
-                "requiressl" => {
-                    sslmode = if value.starts_with('1') {
-                        SslMode::Require
-                    } else {
-                        SslMode::Prefer
-                    };
-                    sslmode_explicit = true;
-                }
-                k => check_unhandled(k, &value)?,
-            }
+            raw.set(if key == "database" { "dbname" } else { key }, &value)?;
         }
 
-        let password = password.or_else(|| std::env::var("PGPASSWORD").ok());
+        raw.finish()
+    }
+}
 
-        let dbname = dbname.unwrap_or_else(|| user.clone());
+/// The options of a connection string as given, in either syntax.
+///
+/// `None` is "not given": [`RawOpts::finish`] applies libpq's defaults, and
+/// `sslmode` being `Some` is what separates an explicit `prefer` from the default.
+#[derive(Default)]
+struct RawOpts {
+    host: Option<String>,
+    port: Option<u16>,
+    user: Option<String>,
+    password: Option<String>,
+    dbname: Option<String>,
+    sslmode: Option<SslMode>,
+    sslrootcert: Option<String>,
+    sslcert: Option<String>,
+    sslkey: Option<String>,
+    client_cert_allowed: Option<bool>,
+    sslnegotiation: Option<SslNegotiation>,
+    replication: Option<ReplicationMode>,
+    application_name: Option<String>,
+    fallback_application_name: Option<String>,
+    options: Option<String>,
+    connect_timeout: Option<u64>,
+    keepalives: Option<bool>,
+    keepalives_idle: Option<u64>,
+    keepalives_interval: Option<u64>,
+    keepalives_count: Option<u32>,
+    tcp_user_timeout: Option<u64>,
+}
 
-        let sslmode =
-            resolve_sslrootcert_system(sslmode, sslmode_explicit, sslrootcert.as_deref())?;
-        let (sslcert, sslkey) = client_identity(
-            sslcert,
-            sslkey,
-            client_cert_allowed && sslmode != SslMode::Disable,
+impl RawOpts {
+    /// Store one `key=value`, rejecting a malformed value or an unknown key.
+    fn set(&mut self, key: &str, val: &str) -> Result<(), ReplicationError> {
+        match key {
+            // libpq docs 32.1.1.2: "Values that would normally appear in the
+            // hierarchical part of the URI can alternatively be given as named
+            // parameters", e.g. `postgresql:///mydb?host=localhost&port=5433`. The
+            // query overrides the hierarchical part, matching
+            // `conninfo_uri_parse_options`, which stores host/port/dbname before
+            // calling `conninfo_uri_parse_params`. Without this the unknown-key
+            // error below would reject a legal URI.
+            "host" | "hostaddr" => self.host = Some(val.to_string()),
+            "port" => self.port = Some(parse_port(val)?),
+            "user" => self.user = Some(val.to_string()),
+            "password" => self.password = Some(val.to_string()),
+            "dbname" => self.dbname = Some(val.to_string()),
+            "application_name" => self.application_name = Some(val.to_string()),
+            "fallback_application_name" => {
+                self.fallback_application_name = Some(val.to_string());
+            }
+            "options" => self.options = Some(val.to_string()),
+            "sslmode" => self.sslmode = Some(parse_sslmode(val)?),
+            "sslrootcert" => self.sslrootcert = Some(val.to_string()),
+            "sslcert" => self.sslcert = Some(val.to_string()),
+            "sslkey" => self.sslkey = Some(val.to_string()),
+            "sslcertmode" => self.client_cert_allowed = Some(parse_sslcertmode(val)?),
+            "sslnegotiation" => self.sslnegotiation = Some(parse_ssl_negotiation(val)?),
+            "replication" => self.replication = Some(parse_replication_mode(val)?),
+            "connect_timeout" => {
+                self.connect_timeout = Some(parse_connect_timeout("connect_timeout", val)?);
+            }
+            // libpq parses this as an integer (`pqParseIntParam` via
+            // `useKeepalives`), so `keepalives=abc` is an error there, not
+            // "on". Every sibling keepalive option is validated; so is this.
+            "keepalives" => self.keepalives = Some(parse_num::<i32>("keepalives", val)? != 0),
+            "keepalives_idle" => {
+                self.keepalives_idle = Some(parse_num("keepalives_idle", val)?);
+            }
+            "keepalives_interval" => {
+                self.keepalives_interval = Some(parse_num("keepalives_interval", val)?);
+            }
+            "keepalives_count" => {
+                self.keepalives_count = Some(parse_num("keepalives_count", val)?);
+            }
+            // Milliseconds, and clamped like `connect_timeout` rather than
+            // rejected: libpq's `setTCPUserTimeout` takes a negative as 0,
+            // and a `Config` error here is permanent, so rejecting one
+            // would hard fail a string psql accepts.
+            "tcp_user_timeout" => {
+                self.tcp_user_timeout = Some(parse_connect_timeout("tcp_user_timeout", val)?);
+            }
+            // libpq translates this to sslmode in `conninfo_storeval`, so it
+            // works in both syntaxes. Dropping it is a silent downgrade.
+            "requiressl" => {
+                self.sslmode = Some(if val.starts_with('1') {
+                    SslMode::Require
+                } else {
+                    SslMode::Prefer
+                });
+            }
+            k => check_unhandled(k, val)?,
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<ConnInfo, ReplicationError> {
+        let user = self.user.unwrap_or_else(|| "postgres".to_string());
+        let sslmode = resolve_sslrootcert_system(
+            self.sslmode.unwrap_or(SslMode::Prefer),
+            self.sslmode.is_some(),
+            self.sslrootcert.as_deref(),
         )?;
-        let (application_name, options) =
-            session_params(application_name, fallback_application_name, options);
+        let (sslcert, sslkey) = client_identity(
+            self.sslcert,
+            self.sslkey,
+            self.client_cert_allowed.unwrap_or(true) && sslmode != SslMode::Disable,
+        )?;
+        let (application_name, options) = session_params(
+            self.application_name,
+            self.fallback_application_name,
+            self.options,
+        );
 
         Ok(ConnInfo {
-            host,
-            port,
+            host: self.host.unwrap_or_else(|| "localhost".to_string()),
+            port: self.port.unwrap_or(5432),
+            dbname: self.dbname.unwrap_or_else(|| user.clone()),
             user,
-            password,
-            dbname,
+            // Check PGPASSWORD env var if no password was given
+            password: self.password.or_else(|| std::env::var("PGPASSWORD").ok()),
             sslmode,
-            sslrootcert,
+            sslrootcert: self.sslrootcert,
             sslcert,
             sslkey,
-            sslnegotiation,
-            replication,
+            sslnegotiation: self.sslnegotiation.unwrap_or(SslNegotiation::Postgres),
+            replication: self.replication.unwrap_or(ReplicationMode::None),
             application_name,
             options,
-            connect_timeout,
-            keepalives,
-            keepalives_idle,
-            keepalives_interval,
-            keepalives_count,
-            tcp_user_timeout,
+            connect_timeout: self.connect_timeout.unwrap_or(0),
+            keepalives: self.keepalives.unwrap_or(true),
+            keepalives_idle: self.keepalives_idle.unwrap_or(120),
+            keepalives_interval: self.keepalives_interval.unwrap_or(10),
+            keepalives_count: self.keepalives_count.unwrap_or(3),
+            tcp_user_timeout: self.tcp_user_timeout.unwrap_or(0),
         })
     }
 }
@@ -612,7 +531,7 @@ fn session_params(
 
 /// libpq's reserved `sslrootcert` value meaning "use the SSL implementation's
 /// own trusted CA roots" (PG16+), as opposed to a path to a CA bundle.
-pub(crate) const SSLROOTCERT_SYSTEM: &str = "system";
+pub(super) const SSLROOTCERT_SYSTEM: &str = "system";
 
 /// Apply libpq's `sslrootcert=system` rule to the parsed `sslmode`.
 ///
@@ -781,6 +700,14 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "sslcrldir",
 ];
 
+fn unsupported_option(option: &str) -> ReplicationError {
+    ReplicationError::config(format!(
+        "connection option \"{option}\" is not supported by the native backend; \
+         ignoring it would silently weaken the connection \
+         (use the `libpq` backend, or remove it)"
+    ))
+}
+
 /// Classify a connection option this parser does not implement.
 ///
 /// libpq rejects any keyword outside `PQconninfoOptions[]`: `conninfo_storeval`
@@ -805,11 +732,7 @@ fn check_unhandled(key: &str, value: &str) -> Result<(), ReplicationError> {
         _ => false,
     };
     if strict_form {
-        return Err(ReplicationError::config(format!(
-            "connection option \"{key}={value}\" is not supported by the native backend; \
-             ignoring it would silently weaken the connection \
-             (use the `libpq` backend, or remove it)"
-        )));
+        return Err(unsupported_option(&format!("{key}={value}")));
     }
     // Unhonourable whatever the value is, so the value adds no diagnostic — and
     // echoing it would leak a credential. `UNSUPPORTED_OPTIONS` holds
@@ -819,11 +742,7 @@ fn check_unhandled(key: &str, value: &str) -> Result<(), ReplicationError> {
     // who will log it, and the secret never becomes a `ConnInfo` field, so the
     // hand-written `Debug` redaction below cannot help here. Key only.
     if UNSUPPORTED_OPTIONS.contains(&key) {
-        return Err(ReplicationError::config(format!(
-            "connection option \"{key}\" is not supported by the native backend; \
-             ignoring it would silently weaken the connection \
-             (use the `libpq` backend, or remove it)"
-        )));
+        return Err(unsupported_option(key));
     }
     if IGNORED_OPTIONS.contains(&key) {
         tracing::debug!("ignoring unimplemented connection option \"{key}\"");
@@ -841,12 +760,7 @@ fn parse_sslcertmode(value: &str) -> Result<bool, ReplicationError> {
     match value {
         "disable" => Ok(false),
         "allow" => Ok(true),
-        "require" => Err(ReplicationError::config(
-            "connection option \"sslcertmode=require\" is not supported by the native backend; \
-             ignoring it would silently weaken the connection \
-             (use the `libpq` backend, or remove it)"
-                .to_string(),
-        )),
+        "require" => Err(unsupported_option("sslcertmode=require")),
         other => Err(ReplicationError::config(format!(
             "invalid sslcertmode value: \"{other}\" (expected disable, allow or require)"
         ))),
@@ -1686,6 +1600,23 @@ mod tests {
         let ci = ConnInfo::parse("postgresql://h/?user=alice").unwrap();
         assert_eq!(ci.user, "alice");
         assert_eq!(ci.dbname, "alice");
+    }
+
+    /// What an alias or an empty value means differs between the two syntaxes:
+    /// `database` is a `dbname` alias in key/value only, and an empty `host` or
+    /// `dbname` falls back in a URI but stays empty in key/value.
+    #[test]
+    fn aliases_and_empty_values_differ_between_the_syntaxes() {
+        assert_eq!(
+            ConnInfo::parse("host=h user=u database=d").unwrap().dbname,
+            "d"
+        );
+        assert!(ConnInfo::parse("postgresql://u@h/db?database=d").is_err());
+
+        let ci = ConnInfo::parse("postgresql://u@h/db?dbname=&host=").unwrap();
+        assert_eq!((ci.dbname.as_str(), ci.host.as_str()), ("u", "localhost"));
+        let ci = ConnInfo::parse("host='' user=u dbname=''").unwrap();
+        assert_eq!((ci.dbname.as_str(), ci.host.as_str()), ("", ""));
     }
 
     /// libpq substitutes the default port for an empty port field, so tightening

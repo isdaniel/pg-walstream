@@ -7,10 +7,7 @@
 
 use crate::error::{ReplicationError, Result};
 use crate::prelude::*;
-use crate::types::{
-    format_lsn, BaseBackupOptions, ReplicationSlotOptions, SlotType, XLogRecPtr,
-    INVALID_XLOG_REC_PTR,
-};
+use crate::types::{format_lsn, BaseBackupOptions, ReplicationSlotOptions, SlotType, XLogRecPtr};
 
 /// Identifier (double quotes) vs string literal (single quotes). Selects the quote character, backslash handling, and null-byte error wording for [`quote_internal`].
 #[derive(Clone, Copy)]
@@ -129,6 +126,17 @@ pub fn quote_ident(name: &str) -> Result<String> {
     quote_internal(name, QuoteStyle::Identifier)
 }
 
+/// Quote a `namespace.name` relation reference.
+#[cfg(any(feature = "libpq", feature = "rustls-tls"))]
+#[inline]
+pub(crate) fn quote_qualified(namespace: &str, name: &str) -> Result<String> {
+    Ok(format!(
+        "{}.{}",
+        quote_ident(namespace)?,
+        quote_ident(name)?
+    ))
+}
+
 /// Quote a PostgreSQL string literal by wrapping in single quotes and escaping
 /// internal single quotes (doubling them).
 ///
@@ -188,7 +196,7 @@ pub fn quote_literal(value: &str) -> Result<String> {
 ///
 /// Returns an error if `value` contains a null byte (`\0`).
 #[inline]
-pub(crate) fn quote_replication_literal(value: &str) -> Result<String> {
+fn quote_replication_literal(value: &str) -> Result<String> {
     quote_internal(value, QuoteStyle::ReplicationLiteral)
 }
 
@@ -435,30 +443,21 @@ pub fn build_start_replication_sql(
     options: &[(&str, &str)],
 ) -> Result<String> {
     let quoted_slot = quote_ident(slot_name)?;
-    let lsn_str = if start_lsn == INVALID_XLOG_REC_PTR {
-        "0/0".to_string()
-    } else {
-        format_lsn(start_lsn)
-    };
-
-    if options.is_empty() {
-        return Ok(format!(
-            "START_REPLICATION SLOT {quoted_slot} LOGICAL {lsn_str}"
-        ));
-    }
-
-    let mut options_parts = Vec::with_capacity(options.len());
-    for (k, v) in options {
-        options_parts.push(format!(
-            "{} {}",
-            quote_ident(k)?,
-            quote_replication_literal(v)?
-        ));
-    }
-    let options_str = options_parts.join(", ");
+    let options = options
+        .iter()
+        .map(|(k, v)| {
+            Ok(format!(
+                "{} {}",
+                quote_ident(k)?,
+                quote_replication_literal(v)?
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(format!(
-        "START_REPLICATION SLOT {quoted_slot} LOGICAL {lsn_str} ({options_str})"
+        "START_REPLICATION SLOT {quoted_slot} LOGICAL {}{}",
+        format_lsn(start_lsn),
+        build_sql_options(&options)
     ))
 }
 
@@ -488,12 +487,7 @@ pub fn build_start_physical_replication_sql(
     }
 
     sql.push_str("PHYSICAL ");
-
-    if start_lsn == INVALID_XLOG_REC_PTR {
-        sql.push_str("0/0");
-    } else {
-        sql.push_str(&format_lsn(start_lsn));
-    }
+    sql.push_str(&format_lsn(start_lsn));
 
     if let Some(tli) = timeline_id {
         // PostgreSQL's `opt_timeline` grammar rejects `TIMELINE 0` with a syntax error (`if ($2 <= 0) ereport(ERROR, ... "invalid timeline")`) on every version. `None` is the "no timeline" sentinel, so `Some(0)` is invalid input
@@ -532,31 +526,15 @@ pub fn build_start_physical_replication_sql(
 pub fn build_base_backup_sql(options: &BaseBackupOptions) -> Result<String> {
     let mut opts = Vec::new();
 
-    if let Some(ref label) = options.label {
-        opts.push(format!("LABEL {}", quote_replication_literal(label)?));
-    }
-
-    if let Some(ref target) = options.target {
-        opts.push(format!("TARGET {}", quote_replication_literal(target)?));
-    }
-
-    if let Some(ref target_detail) = options.target_detail {
-        opts.push(format!(
-            "TARGET_DETAIL {}",
-            quote_replication_literal(target_detail)?
-        ));
-    }
+    push_literal(&mut opts, "LABEL", options.label.as_deref())?;
+    push_literal(&mut opts, "TARGET", options.target.as_deref())?;
+    push_literal(&mut opts, "TARGET_DETAIL", options.target_detail.as_deref())?;
 
     if options.progress {
         opts.push("PROGRESS true".to_string());
     }
 
-    if let Some(ref checkpoint) = options.checkpoint {
-        opts.push(format!(
-            "CHECKPOINT {}",
-            quote_replication_literal(checkpoint)?
-        ));
-    }
+    push_literal(&mut opts, "CHECKPOINT", options.checkpoint.as_deref())?;
 
     if options.wal {
         opts.push("WAL true".to_string());
@@ -568,19 +546,12 @@ pub fn build_base_backup_sql(options: &BaseBackupOptions) -> Result<String> {
         opts.push("WAIT false".to_string());
     }
 
-    if let Some(ref compression) = options.compression {
-        opts.push(format!(
-            "COMPRESSION {}",
-            quote_replication_literal(compression)?
-        ));
-    }
-
-    if let Some(ref compression_detail) = options.compression_detail {
-        opts.push(format!(
-            "COMPRESSION_DETAIL {}",
-            quote_replication_literal(compression_detail)?
-        ));
-    }
+    push_literal(&mut opts, "COMPRESSION", options.compression.as_deref())?;
+    push_literal(
+        &mut opts,
+        "COMPRESSION_DETAIL",
+        options.compression_detail.as_deref(),
+    )?;
 
     if let Some(max_rate) = options.max_rate {
         // Deliberately NOT range-checked here. PostgreSQL's own
@@ -612,16 +583,12 @@ pub fn build_base_backup_sql(options: &BaseBackupOptions) -> Result<String> {
         opts.push("VERIFY_CHECKSUMS false".to_string());
     }
 
-    if let Some(ref manifest) = options.manifest {
-        opts.push(format!("MANIFEST {}", quote_replication_literal(manifest)?));
-    }
-
-    if let Some(ref manifest_checksums) = options.manifest_checksums {
-        opts.push(format!(
-            "MANIFEST_CHECKSUMS {}",
-            quote_replication_literal(manifest_checksums)?
-        ));
-    }
+    push_literal(&mut opts, "MANIFEST", options.manifest.as_deref())?;
+    push_literal(
+        &mut opts,
+        "MANIFEST_CHECKSUMS",
+        options.manifest_checksums.as_deref(),
+    )?;
 
     if options.incremental {
         opts.push("INCREMENTAL".to_string());
@@ -630,6 +597,14 @@ pub fn build_base_backup_sql(options: &BaseBackupOptions) -> Result<String> {
     Ok(format!("BASE_BACKUP{}", build_sql_options(&opts)))
 }
 
+fn push_literal(opts: &mut Vec<String>, key: &str, value: Option<&str>) -> Result<()> {
+    if let Some(value) = value {
+        opts.push(format!("{key} {}", quote_replication_literal(value)?));
+    }
+    Ok(())
+}
+
+/// PostgreSQL 15.0 on the `server_version` scale.
 #[cfg(any(feature = "libpq", feature = "rustls-tls"))]
 pub(crate) const PG15: i32 = 150000;
 /// PostgreSQL 17.0 on the `server_version` scale. See [`PG15`].
@@ -649,30 +624,36 @@ mod version_preflight {
         format!("{}.{}", v / 10000, v % 10000)
     }
 
+    /// Fail unless the server is at least `min` (an unknown version, 0, passes). `what` is the subject and verb of the message, since both singular and plural subjects are gated.
+    fn require(server_version: i32, min: i32, what: &str) -> Result<()> {
+        if server_version != 0 && server_version < min {
+            return Err(ReplicationError::config(format!(
+                "{what} PostgreSQL {}+, but the server reports {}",
+                min / 10000,
+                format_server_version(server_version)
+            )));
+        }
+        Ok(())
+    }
+
     /// Preflight `CREATE_REPLICATION_SLOT` options against the server version.
     ///
     /// Returns a clear [`ReplicationError::config`] when the connected server is too old for a requested option, instead of letting the server reject the emitted SQL with a bare `syntax error`. `server_version == 0` (unknown) passes.
     ///
     /// Gates: `TWO_PHASE` requires PostgreSQL 15+, `FAILOVER` requires PostgreSQL 17+.
-    pub(crate) fn check_create_slot_version(
+    fn check_create_slot_version(
         server_version: i32,
         slot_type: SlotType,
         options: &ReplicationSlotOptions,
     ) -> Result<()> {
-        if server_version == 0 || !matches!(slot_type, SlotType::Logical) {
+        if !matches!(slot_type, SlotType::Logical) {
             return Ok(());
         }
-        if options.two_phase && server_version < PG15 {
-            return Err(ReplicationError::config(format!(
-                "TWO_PHASE replication slots require PostgreSQL 15+, but the server reports {}",
-                format_server_version(server_version)
-            )));
+        if options.two_phase {
+            require(server_version, PG15, "TWO_PHASE replication slots require")?;
         }
-        if options.failover && server_version < PG17 {
-            return Err(ReplicationError::config(format!(
-                "FAILOVER replication slots require PostgreSQL 17+, but the server reports {}",
-                format_server_version(server_version)
-            )));
+        if options.failover {
+            require(server_version, PG17, "FAILOVER replication slots require")?;
         }
         Ok(())
     }
@@ -680,25 +661,14 @@ mod version_preflight {
     /// Preflight `ALTER_REPLICATION_SLOT` against the server version.
     ///
     /// Gates: the command itself requires PostgreSQL 17+; altering `TWO_PHASE` additionally requires PostgreSQL 18+ (PostgreSQL 17 rejects `two_phase` with `unrecognized option`). `server_version == 0` (unknown) passes. `FAILOVER` needs no separate gate — it was introduced with the command in PostgreSQL 17, so the command-level check already covers it.
-    pub(crate) fn check_alter_slot_version(
-        server_version: i32,
-        two_phase: Option<bool>,
-    ) -> Result<()> {
-        if server_version == 0 {
-            return Ok(());
-        }
-        if server_version < PG17 {
-            return Err(ReplicationError::config(format!(
-                "ALTER_REPLICATION_SLOT requires PostgreSQL 17+, but the server reports {}",
-                format_server_version(server_version)
-            )));
-        }
-        if two_phase.is_some() && server_version < PG18 {
-            return Err(ReplicationError::config(format!(
-                "altering TWO_PHASE on a replication slot requires PostgreSQL 18+, \
-             but the server reports {}",
-                format_server_version(server_version)
-            )));
+    fn check_alter_slot_version(server_version: i32, two_phase: Option<bool>) -> Result<()> {
+        require(server_version, PG17, "ALTER_REPLICATION_SLOT requires")?;
+        if two_phase.is_some() {
+            require(
+                server_version,
+                PG18,
+                "altering TWO_PHASE on a replication slot requires",
+            )?;
         }
         Ok(())
     }
@@ -706,14 +676,8 @@ mod version_preflight {
     /// Preflight `READ_REPLICATION_SLOT` against the server version.
     ///
     /// Gate: requires PostgreSQL 15+. `server_version == 0` (unknown) passes.
-    pub(crate) fn check_read_slot_version(server_version: i32) -> Result<()> {
-        if server_version != 0 && server_version < PG15 {
-            return Err(ReplicationError::config(format!(
-                "READ_REPLICATION_SLOT requires PostgreSQL 15+, but the server reports {}",
-                format_server_version(server_version)
-            )));
-        }
-        Ok(())
+    fn check_read_slot_version(server_version: i32) -> Result<()> {
+        require(server_version, PG15, "READ_REPLICATION_SLOT requires")
     }
 
     /// Preflight `UPLOAD_MANIFEST` against the server version.
@@ -721,13 +685,7 @@ mod version_preflight {
     /// Gate: the command was added alongside incremental backup in PostgreSQL 17.
     /// `server_version == 0` (unknown) passes.
     pub(crate) fn check_upload_manifest_version(server_version: i32) -> Result<()> {
-        if server_version != 0 && server_version < PG17 {
-            return Err(ReplicationError::config(format!(
-                "UPLOAD_MANIFEST requires PostgreSQL 17+, but the server reports {}",
-                format_server_version(server_version)
-            )));
-        }
-        Ok(())
+        require(server_version, PG17, "UPLOAD_MANIFEST requires")
     }
 
     // The `check_*` preflight and the pure `build_*` grammar are deliberately separate (the parser-only `no_std` build compiles the builders without the feature-gated preflight). These `prepare_*` helpers pair them so the "emit-this-SQL-implies-this-version" rule lives in one place instead of being re-paired by each connection backend. Backend-independent glue is shared, not duplicated across the libpq/rustls adapters.
@@ -767,18 +725,12 @@ mod version_preflight {
     /// command to the PostgreSQL 15+ parenthesized generic-option grammar, which
     /// PostgreSQL 14 cannot parse (a bare `BASE_BACKUP` still works everywhere).
     /// `server_version == 0` (unknown) passes.
-    pub(crate) fn check_base_backup_version(
-        server_version: i32,
-        options: &BaseBackupOptions,
-    ) -> Result<()> {
+    fn check_base_backup_version(server_version: i32, options: &BaseBackupOptions) -> Result<()> {
         if server_version == 0 {
             return Ok(());
         }
-        if options.incremental && server_version < PG17 {
-            return Err(ReplicationError::config(format!(
-                "INCREMENTAL base backup requires PostgreSQL 17+, but the server reports {}",
-                format_server_version(server_version)
-            )));
+        if options.incremental {
+            require(server_version, PG17, "INCREMENTAL base backup requires")?;
         }
         if server_version < PG15 && base_backup_has_options(options) {
             return Err(ReplicationError::config(format!(
@@ -860,8 +812,10 @@ mod version_preflight {
         fn preflight_create_slot_gates_two_phase_pg15() {
             let opts = logical_opts(true, false);
             let err = check_create_slot_version(140023, SlotType::Logical, &opts).unwrap_err();
-            assert!(err.to_string().contains("TWO_PHASE"), "{err}");
-            assert!(err.to_string().contains("15+"), "{err}");
+            assert_eq!(
+                err.to_string(),
+                "Configuration error: TWO_PHASE replication slots require PostgreSQL 15+, but the server reports 14.23"
+            );
             assert!(check_create_slot_version(150000, SlotType::Logical, &opts).is_ok());
             assert!(check_create_slot_version(180000, SlotType::Logical, &opts).is_ok());
         }
@@ -870,8 +824,10 @@ mod version_preflight {
         fn preflight_create_slot_gates_failover_pg17() {
             let opts = logical_opts(false, true);
             let err = check_create_slot_version(160000, SlotType::Logical, &opts).unwrap_err();
-            assert!(err.to_string().contains("FAILOVER"), "{err}");
-            assert!(err.to_string().contains("17+"), "{err}");
+            assert_eq!(
+                err.to_string(),
+                "Configuration error: FAILOVER replication slots require PostgreSQL 17+, but the server reports 16.0"
+            );
             assert!(check_create_slot_version(170000, SlotType::Logical, &opts).is_ok());
         }
 
@@ -899,8 +855,10 @@ mod version_preflight {
         #[test]
         fn preflight_alter_slot_requires_pg17() {
             let err = check_alter_slot_version(160000, None).unwrap_err();
-            assert!(err.to_string().contains("ALTER_REPLICATION_SLOT"), "{err}");
-            assert!(err.to_string().contains("17+"), "{err}");
+            assert_eq!(
+                err.to_string(),
+                "Configuration error: ALTER_REPLICATION_SLOT requires PostgreSQL 17+, but the server reports 16.0"
+            );
             assert!(check_alter_slot_version(170000, None).is_ok());
             assert!(check_alter_slot_version(0, None).is_ok());
         }
@@ -908,8 +866,10 @@ mod version_preflight {
         #[test]
         fn preflight_alter_slot_two_phase_requires_pg18() {
             let err = check_alter_slot_version(170004, Some(true)).unwrap_err();
-            assert!(err.to_string().contains("TWO_PHASE"), "{err}");
-            assert!(err.to_string().contains("18+"), "{err}");
+            assert_eq!(
+                err.to_string(),
+                "Configuration error: altering TWO_PHASE on a replication slot requires PostgreSQL 18+, but the server reports 17.4"
+            );
             assert!(check_alter_slot_version(180000, Some(true)).is_ok());
             // A non-two_phase alter (e.g. failover-only) is fine on PG17.
             assert!(check_alter_slot_version(170000, None).is_ok());
@@ -918,8 +878,10 @@ mod version_preflight {
         #[test]
         fn preflight_read_slot_requires_pg15() {
             let err = check_read_slot_version(140023).unwrap_err();
-            assert!(err.to_string().contains("READ_REPLICATION_SLOT"), "{err}");
-            assert!(err.to_string().contains("15+"), "{err}");
+            assert_eq!(
+                err.to_string(),
+                "Configuration error: READ_REPLICATION_SLOT requires PostgreSQL 15+, but the server reports 14.23"
+            );
             assert!(check_read_slot_version(150000).is_ok());
             assert!(check_read_slot_version(0).is_ok());
         }
@@ -944,7 +906,10 @@ mod version_preflight {
                 ..Default::default()
             };
             let err = check_base_backup_version(160000, &inc).unwrap_err();
-            assert!(err.to_string().contains("INCREMENTAL"), "{err}");
+            assert_eq!(
+                err.to_string(),
+                "Configuration error: INCREMENTAL base backup requires PostgreSQL 17+, but the server reports 16.0"
+            );
             assert!(check_base_backup_version(170000, &inc).is_ok());
             assert!(check_base_backup_version(0, &inc).is_ok());
         }
@@ -952,8 +917,10 @@ mod version_preflight {
         #[test]
         fn preflight_upload_manifest_requires_pg17() {
             let err = check_upload_manifest_version(160000).unwrap_err();
-            assert!(err.to_string().contains("UPLOAD_MANIFEST"), "{err}");
-            assert!(err.to_string().contains("17+"), "{err}");
+            assert_eq!(
+                err.to_string(),
+                "Configuration error: UPLOAD_MANIFEST requires PostgreSQL 17+, but the server reports 16.0"
+            );
             assert!(check_upload_manifest_version(170000).is_ok());
             assert!(check_upload_manifest_version(180000).is_ok());
             // Unknown version passes; the server gets the final say.
@@ -1386,172 +1353,160 @@ mod tests {
             want: std::result::Result<&'static str, &'static str>,
         }
 
+        impl Case {
+            fn logical(
+                name: &'static str,
+                slot: &'static str,
+                opts: ReplicationSlotOptions,
+                want: std::result::Result<&'static str, &'static str>,
+            ) -> Self {
+                Case {
+                    name,
+                    slot,
+                    slot_type: SlotType::Logical,
+                    plugin: Some("pgoutput"),
+                    opts,
+                    want,
+                }
+            }
+        }
+
         let cases = [
-            Case {
-                name: "logical default",
-                slot: "my_slot",
-                slot_type: Logical,
-                plugin: Some("pgoutput"),
-                opts: ReplicationSlotOptions::default(),
-                want: Ok(r#"CREATE_REPLICATION_SLOT "my_slot" LOGICAL "pgoutput";"#),
-            },
-            Case {
-                name: "temporary + export",
-                slot: "tmp_slot",
-                slot_type: Logical,
-                plugin: Some("pgoutput"),
-                opts: ReplicationSlotOptions {
+            Case::logical(
+                "logical default",
+                "my_slot",
+                ReplicationSlotOptions::default(),
+                Ok(r#"CREATE_REPLICATION_SLOT "my_slot" LOGICAL "pgoutput";"#),
+            ),
+            Case::logical(
+                "temporary + export",
+                "tmp_slot",
+                ReplicationSlotOptions {
                     temporary: true,
                     snapshot: Some("export".to_string()),
                     ..Default::default()
                 },
-                want: Ok(
+                Ok(
                     r#"CREATE_REPLICATION_SLOT "tmp_slot" TEMPORARY LOGICAL "pgoutput" EXPORT_SNAPSHOT;"#,
                 ),
-            },
-            Case {
-                name: "noexport snapshot",
-                slot: "slot",
-                slot_type: Logical,
-                plugin: Some("pgoutput"),
-                opts: ReplicationSlotOptions {
+            ),
+            Case::logical(
+                "noexport snapshot",
+                "slot",
+                ReplicationSlotOptions {
                     snapshot: Some("nothing".to_string()),
                     ..Default::default()
                 },
-                want: Ok(r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" NOEXPORT_SNAPSHOT;"#),
-            },
-            Case {
-                name: "use snapshot",
-                slot: "slot",
-                slot_type: Logical,
-                plugin: Some("pgoutput"),
-                opts: ReplicationSlotOptions {
+                Ok(r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" NOEXPORT_SNAPSHOT;"#),
+            ),
+            Case::logical(
+                "use snapshot",
+                "slot",
+                ReplicationSlotOptions {
                     snapshot: Some("use".to_string()),
                     ..Default::default()
                 },
-                want: Ok(r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" USE_SNAPSHOT;"#),
-            },
-            Case {
-                name: "two_phase",
-                slot: "slot",
-                slot_type: Logical,
-                plugin: Some("pgoutput"),
-                opts: ReplicationSlotOptions {
+                Ok(r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" USE_SNAPSHOT;"#),
+            ),
+            Case::logical(
+                "two_phase",
+                "slot",
+                ReplicationSlotOptions {
                     two_phase: true,
                     ..Default::default()
                 },
-                want: Ok(r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" TWO_PHASE;"#),
-            },
-            Case {
-                name: "two_phase + snapshot (both emitted)",
-                slot: "slot",
-                slot_type: Logical,
-                plugin: Some("pgoutput"),
-                opts: ReplicationSlotOptions {
+                Ok(r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" TWO_PHASE;"#),
+            ),
+            Case::logical(
+                "two_phase + snapshot (both emitted)",
+                "slot",
+                ReplicationSlotOptions {
                     two_phase: true,
                     snapshot: Some("export".to_string()),
                     ..Default::default()
                 },
-                want: Ok(
+                Ok(
                     r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" TWO_PHASE EXPORT_SNAPSHOT;"#,
                 ),
-            },
-            Case {
-                name: "temporary + two_phase",
-                slot: "slot",
-                slot_type: Logical,
-                plugin: Some("pgoutput"),
-                opts: ReplicationSlotOptions {
+            ),
+            Case::logical(
+                "temporary + two_phase",
+                "slot",
+                ReplicationSlotOptions {
                     temporary: true,
                     two_phase: true,
                     ..Default::default()
                 },
-                want: Ok(
-                    r#"CREATE_REPLICATION_SLOT "slot" TEMPORARY LOGICAL "pgoutput" TWO_PHASE;"#,
-                ),
-            },
-            Case {
-                name: "failover only",
-                slot: "slot",
-                slot_type: Logical,
-                plugin: Some("pgoutput"),
-                opts: ReplicationSlotOptions {
+                Ok(r#"CREATE_REPLICATION_SLOT "slot" TEMPORARY LOGICAL "pgoutput" TWO_PHASE;"#),
+            ),
+            Case::logical(
+                "failover only",
+                "slot",
+                ReplicationSlotOptions {
                     failover: true,
                     ..Default::default()
                 },
-                want: Ok(r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" (FAILOVER);"#),
-            },
-            Case {
-                name: "failover + export",
-                slot: "slot",
-                slot_type: Logical,
-                plugin: Some("pgoutput"),
-                opts: ReplicationSlotOptions {
+                Ok(r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" (FAILOVER);"#),
+            ),
+            Case::logical(
+                "failover + export",
+                "slot",
+                ReplicationSlotOptions {
                     failover: true,
                     snapshot: Some("export".to_string()),
                     ..Default::default()
                 },
-                want: Ok(
+                Ok(
                     r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" (SNAPSHOT 'export', FAILOVER);"#,
                 ),
-            },
-            Case {
-                name: "failover + nothing",
-                slot: "slot",
-                slot_type: Logical,
-                plugin: Some("pgoutput"),
-                opts: ReplicationSlotOptions {
+            ),
+            Case::logical(
+                "failover + nothing",
+                "slot",
+                ReplicationSlotOptions {
                     failover: true,
                     snapshot: Some("nothing".to_string()),
                     ..Default::default()
                 },
-                want: Ok(
+                Ok(
                     r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" (SNAPSHOT 'nothing', FAILOVER);"#,
                 ),
-            },
-            Case {
-                name: "failover + use",
-                slot: "slot",
-                slot_type: Logical,
-                plugin: Some("pgoutput"),
-                opts: ReplicationSlotOptions {
+            ),
+            Case::logical(
+                "failover + use",
+                "slot",
+                ReplicationSlotOptions {
                     failover: true,
                     snapshot: Some("use".to_string()),
                     ..Default::default()
                 },
-                want: Ok(
+                Ok(
                     r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" (SNAPSHOT 'use', FAILOVER);"#,
                 ),
-            },
-            Case {
-                name: "failover + two_phase",
-                slot: "slot",
-                slot_type: Logical,
-                plugin: Some("pgoutput"),
-                opts: ReplicationSlotOptions {
+            ),
+            Case::logical(
+                "failover + two_phase",
+                "slot",
+                ReplicationSlotOptions {
                     failover: true,
                     two_phase: true,
                     ..Default::default()
                 },
-                want: Ok(
-                    r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" (TWO_PHASE, FAILOVER);"#,
-                ),
-            },
-            Case {
-                name: "failover + two_phase + snapshot",
-                slot: "slot",
-                slot_type: Logical,
-                plugin: Some("pgoutput"),
-                opts: ReplicationSlotOptions {
+                Ok(r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" (TWO_PHASE, FAILOVER);"#),
+            ),
+            Case::logical(
+                "failover + two_phase + snapshot",
+                "slot",
+                ReplicationSlotOptions {
                     failover: true,
                     two_phase: true,
                     snapshot: Some("export".to_string()),
                     ..Default::default()
                 },
-                want: Ok(
+                Ok(
                     r#"CREATE_REPLICATION_SLOT "slot" LOGICAL "pgoutput" (TWO_PHASE, SNAPSHOT 'export', FAILOVER);"#,
                 ),
-            },
+            ),
             Case {
                 name: "physical default",
                 slot: "phys",
@@ -1609,18 +1564,16 @@ mod tests {
                 },
                 want: Err("only supported for logical"),
             },
-            Case {
-                name: "guard: temporary + failover",
-                slot: "slot",
-                slot_type: Logical,
-                plugin: Some("pgoutput"),
-                opts: ReplicationSlotOptions {
+            Case::logical(
+                "guard: temporary + failover",
+                "slot",
+                ReplicationSlotOptions {
                     temporary: true,
                     failover: true,
                     ..Default::default()
                 },
-                want: Err("failover replication slots cannot be temporary"),
-            },
+                Err("failover replication slots cannot be temporary"),
+            ),
             Case {
                 name: "guard: missing plugin",
                 slot: "slot",
@@ -1629,29 +1582,25 @@ mod tests {
                 opts: ReplicationSlotOptions::default(),
                 want: Err("Output plugin required"),
             },
-            Case {
-                name: "guard: invalid snapshot (legacy)",
-                slot: "slot",
-                slot_type: Logical,
-                plugin: Some("pgoutput"),
-                opts: ReplicationSlotOptions {
+            Case::logical(
+                "guard: invalid snapshot (legacy)",
+                "slot",
+                ReplicationSlotOptions {
                     snapshot: Some("bogus".to_string()),
                     ..Default::default()
                 },
-                want: Err("Invalid snapshot option"),
-            },
-            Case {
-                name: "guard: invalid snapshot (failover)",
-                slot: "slot",
-                slot_type: Logical,
-                plugin: Some("pgoutput"),
-                opts: ReplicationSlotOptions {
+                Err("Invalid snapshot option"),
+            ),
+            Case::logical(
+                "guard: invalid snapshot (failover)",
+                "slot",
+                ReplicationSlotOptions {
                     snapshot: Some("bogus".to_string()),
                     failover: true,
                     ..Default::default()
                 },
-                want: Err("Invalid snapshot option"),
-            },
+                Err("Invalid snapshot option"),
+            ),
         ];
 
         for case in cases {
@@ -1878,83 +1827,127 @@ mod tests {
 
     // ── build_base_backup_sql ────────────────────────────────────────────
 
+    /// Each option's exact spelling, alone and in small combinations. The
+    /// narrative tests and the golden test below cover the rest.
     #[test]
-    fn base_backup_default() {
-        let opts = BaseBackupOptions::default();
-        assert_eq!(build_base_backup_sql(&opts).unwrap(), "BASE_BACKUP");
-    }
-
-    #[test]
-    fn base_backup_with_label() {
-        let opts = BaseBackupOptions {
-            label: Some("my_backup".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(
-            build_base_backup_sql(&opts).unwrap(),
-            "BASE_BACKUP (LABEL 'my_backup')"
-        );
-    }
-
-    #[test]
-    fn base_backup_with_target() {
-        let opts = BaseBackupOptions {
-            target: Some("client".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(
-            build_base_backup_sql(&opts).unwrap(),
-            "BASE_BACKUP (TARGET 'client')"
-        );
-    }
-
-    #[test]
-    fn base_backup_with_target_detail() {
-        let opts = BaseBackupOptions {
-            target: Some("server".to_string()),
-            target_detail: Some("/var/backups".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(
-            build_base_backup_sql(&opts).unwrap(),
-            "BASE_BACKUP (TARGET 'server', TARGET_DETAIL '/var/backups')"
-        );
-    }
-
-    #[test]
-    fn base_backup_with_progress() {
-        let opts = BaseBackupOptions {
-            progress: true,
-            ..Default::default()
-        };
-        assert_eq!(
-            build_base_backup_sql(&opts).unwrap(),
-            "BASE_BACKUP (PROGRESS true)"
-        );
-    }
-
-    #[test]
-    fn base_backup_with_checkpoint() {
-        let opts = BaseBackupOptions {
-            checkpoint: Some("fast".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(
-            build_base_backup_sql(&opts).unwrap(),
-            "BASE_BACKUP (CHECKPOINT 'fast')"
-        );
-    }
-
-    #[test]
-    fn base_backup_with_wal() {
-        let opts = BaseBackupOptions {
-            wal: true,
-            ..Default::default()
-        };
-        assert_eq!(
-            build_base_backup_sql(&opts).unwrap(),
-            "BASE_BACKUP (WAL true)"
-        );
+    fn base_backup_sql_cases() {
+        let cases = [
+            (BaseBackupOptions::default(), "BASE_BACKUP"),
+            (
+                BaseBackupOptions {
+                    label: Some("my_backup".to_string()),
+                    ..Default::default()
+                },
+                "BASE_BACKUP (LABEL 'my_backup')",
+            ),
+            (
+                BaseBackupOptions {
+                    target: Some("client".to_string()),
+                    ..Default::default()
+                },
+                "BASE_BACKUP (TARGET 'client')",
+            ),
+            (
+                BaseBackupOptions {
+                    target: Some("server".to_string()),
+                    target_detail: Some("/var/backups".to_string()),
+                    ..Default::default()
+                },
+                "BASE_BACKUP (TARGET 'server', TARGET_DETAIL '/var/backups')",
+            ),
+            (
+                BaseBackupOptions {
+                    progress: true,
+                    ..Default::default()
+                },
+                "BASE_BACKUP (PROGRESS true)",
+            ),
+            (
+                BaseBackupOptions {
+                    checkpoint: Some("fast".to_string()),
+                    ..Default::default()
+                },
+                "BASE_BACKUP (CHECKPOINT 'fast')",
+            ),
+            (
+                BaseBackupOptions {
+                    wal: true,
+                    ..Default::default()
+                },
+                "BASE_BACKUP (WAL true)",
+            ),
+            (
+                BaseBackupOptions {
+                    compression: Some("gzip".to_string()),
+                    ..Default::default()
+                },
+                "BASE_BACKUP (COMPRESSION 'gzip')",
+            ),
+            (
+                BaseBackupOptions {
+                    compression: Some("zstd".to_string()),
+                    compression_detail: Some("level=3".to_string()),
+                    ..Default::default()
+                },
+                "BASE_BACKUP (COMPRESSION 'zstd', COMPRESSION_DETAIL 'level=3')",
+            ),
+            (
+                BaseBackupOptions {
+                    max_rate: Some(1024),
+                    ..Default::default()
+                },
+                "BASE_BACKUP (MAX_RATE 1024)",
+            ),
+            (
+                BaseBackupOptions {
+                    tablespace_map: true,
+                    ..Default::default()
+                },
+                "BASE_BACKUP (TABLESPACE_MAP true)",
+            ),
+            (
+                BaseBackupOptions {
+                    manifest: Some("yes".to_string()),
+                    ..Default::default()
+                },
+                "BASE_BACKUP (MANIFEST 'yes')",
+            ),
+            (
+                BaseBackupOptions {
+                    manifest: Some("yes".to_string()),
+                    manifest_checksums: Some("SHA256".to_string()),
+                    ..Default::default()
+                },
+                "BASE_BACKUP (MANIFEST 'yes', MANIFEST_CHECKSUMS 'SHA256')",
+            ),
+            (
+                BaseBackupOptions {
+                    label: Some("backup".to_string()),
+                    progress: true,
+                    wal: true,
+                    verify_checksums: false,
+                    ..Default::default()
+                },
+                "BASE_BACKUP (LABEL 'backup', PROGRESS true, WAL true, VERIFY_CHECKSUMS false)",
+            ),
+            (
+                BaseBackupOptions {
+                    incremental: true,
+                    ..Default::default()
+                },
+                "BASE_BACKUP (INCREMENTAL)",
+            ),
+            (
+                BaseBackupOptions {
+                    label: Some("evil'; DROP TABLE users; --".to_string()),
+                    ..Default::default()
+                },
+                "BASE_BACKUP (LABEL 'evil''; DROP TABLE users; --')",
+            ),
+        ];
+        for (opts, want) in cases {
+            assert_eq!(build_base_backup_sql(&opts).unwrap(), want, "{opts:?}");
+        }
     }
 
     /// The reported bug: `wait` was inert — `true` emitted `WAIT true` (which
@@ -2023,107 +2016,6 @@ mod tests {
     }
 
     #[test]
-    fn base_backup_with_compression() {
-        let opts = BaseBackupOptions {
-            compression: Some("gzip".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(
-            build_base_backup_sql(&opts).unwrap(),
-            "BASE_BACKUP (COMPRESSION 'gzip')"
-        );
-    }
-
-    #[test]
-    fn base_backup_with_compression_detail() {
-        let opts = BaseBackupOptions {
-            compression: Some("zstd".to_string()),
-            compression_detail: Some("level=3".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(
-            build_base_backup_sql(&opts).unwrap(),
-            "BASE_BACKUP (COMPRESSION 'zstd', COMPRESSION_DETAIL 'level=3')"
-        );
-    }
-
-    #[test]
-    fn base_backup_with_max_rate() {
-        let opts = BaseBackupOptions {
-            max_rate: Some(1024),
-            ..Default::default()
-        };
-        assert_eq!(
-            build_base_backup_sql(&opts).unwrap(),
-            "BASE_BACKUP (MAX_RATE 1024)"
-        );
-    }
-
-    #[test]
-    fn base_backup_with_tablespace_map() {
-        let opts = BaseBackupOptions {
-            tablespace_map: true,
-            ..Default::default()
-        };
-        assert_eq!(
-            build_base_backup_sql(&opts).unwrap(),
-            "BASE_BACKUP (TABLESPACE_MAP true)"
-        );
-    }
-
-    #[test]
-    fn base_backup_with_manifest() {
-        let opts = BaseBackupOptions {
-            manifest: Some("yes".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(
-            build_base_backup_sql(&opts).unwrap(),
-            "BASE_BACKUP (MANIFEST 'yes')"
-        );
-    }
-
-    #[test]
-    fn base_backup_with_manifest_checksums() {
-        let opts = BaseBackupOptions {
-            manifest: Some("yes".to_string()),
-            manifest_checksums: Some("SHA256".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(
-            build_base_backup_sql(&opts).unwrap(),
-            "BASE_BACKUP (MANIFEST 'yes', MANIFEST_CHECKSUMS 'SHA256')"
-        );
-    }
-
-    #[test]
-    fn base_backup_multiple_options() {
-        let opts = BaseBackupOptions {
-            label: Some("backup".to_string()),
-            progress: true,
-            wal: true,
-            verify_checksums: false,
-            ..Default::default()
-        };
-        assert_eq!(
-            build_base_backup_sql(&opts).unwrap(),
-            "BASE_BACKUP (LABEL 'backup', PROGRESS true, WAL true, VERIFY_CHECKSUMS false)"
-        );
-    }
-
-    #[test]
-    fn base_backup_incremental() {
-        let opts = BaseBackupOptions {
-            incremental: true,
-            ..Default::default()
-        };
-        assert_eq!(
-            build_base_backup_sql(&opts).unwrap(),
-            "BASE_BACKUP (INCREMENTAL)"
-        );
-    }
-
-    #[test]
     fn base_backup_all_options_golden() {
         // Locks emission order and every option's exact spelling (guards against a
         // FAILOVER-class option-name regression on the base-backup path).
@@ -2150,18 +2042,6 @@ mod tests {
              PROGRESS true, CHECKPOINT 'fast', WAL true, WAIT false, COMPRESSION 'zstd', \
              COMPRESSION_DETAIL 'level=3', MAX_RATE 2048, TABLESPACE_MAP true, \
              VERIFY_CHECKSUMS false, MANIFEST 'yes', MANIFEST_CHECKSUMS 'SHA256', INCREMENTAL)"
-        );
-    }
-
-    #[test]
-    fn base_backup_label_injection() {
-        let opts = BaseBackupOptions {
-            label: Some("evil'; DROP TABLE users; --".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(
-            build_base_backup_sql(&opts).unwrap(),
-            "BASE_BACKUP (LABEL 'evil''; DROP TABLE users; --')"
         );
     }
 
@@ -2250,15 +2130,21 @@ mod tests {
         );
     }
 
-    #[test]
-    fn create_subscription_create_slot_true() {
-        let opts = CreateSubscriptionOptions {
+    fn subscription() -> CreateSubscriptionOptions<'static> {
+        CreateSubscriptionOptions {
             subscription_name: "sub",
             connection_string: "host=localhost",
             publication: "pub",
             slot_name: "slot",
-            create_slot: true,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn create_subscription_create_slot_true() {
+        let opts = CreateSubscriptionOptions {
+            create_slot: true,
+            ..subscription()
         };
         let sql = build_create_subscription_sql(&opts).unwrap();
         assert!(sql.contains("create_slot = true"));
@@ -2269,12 +2155,8 @@ mod tests {
     #[test]
     fn create_subscription_copy_data_true() {
         let opts = CreateSubscriptionOptions {
-            subscription_name: "sub",
-            connection_string: "host=localhost",
-            publication: "pub",
-            slot_name: "slot",
             copy_data: true,
-            ..Default::default()
+            ..subscription()
         };
         let sql = build_create_subscription_sql(&opts).unwrap();
         assert!(sql.contains("copy_data = true"));
@@ -2283,12 +2165,8 @@ mod tests {
     #[test]
     fn create_subscription_disabled() {
         let opts = CreateSubscriptionOptions {
-            subscription_name: "sub",
-            connection_string: "host=localhost",
-            publication: "pub",
-            slot_name: "slot",
             enabled: false,
-            ..Default::default()
+            ..subscription()
         };
         let sql = build_create_subscription_sql(&opts).unwrap();
         assert!(sql.contains("enabled = false"));
@@ -2297,13 +2175,10 @@ mod tests {
     #[test]
     fn create_subscription_all_true() {
         let opts = CreateSubscriptionOptions {
-            subscription_name: "sub",
-            connection_string: "host=localhost",
-            publication: "pub",
-            slot_name: "slot",
             create_slot: true,
             enabled: true,
             copy_data: true,
+            ..subscription()
         };
         let sql = build_create_subscription_sql(&opts).unwrap();
         assert_eq!(
@@ -2318,13 +2193,10 @@ mod tests {
     #[test]
     fn create_subscription_all_false() {
         let opts = CreateSubscriptionOptions {
-            subscription_name: "sub",
-            connection_string: "host=localhost",
-            publication: "pub",
-            slot_name: "slot",
             create_slot: false,
             enabled: false,
             copy_data: false,
+            ..subscription()
         };
         let sql = build_create_subscription_sql(&opts).unwrap();
         assert_eq!(
@@ -2342,11 +2214,8 @@ mod tests {
         // through a real builder. The doubled space (template space + the escape's
         // leading space) is valid SQL.
         let opts = CreateSubscriptionOptions {
-            subscription_name: "sub",
             connection_string: r"host=db\x",
-            publication: "pub",
-            slot_name: "slot",
-            ..Default::default()
+            ..subscription()
         };
         let sql = build_create_subscription_sql(&opts).unwrap();
         assert!(
@@ -2420,161 +2289,106 @@ mod tests {
     // ── Null byte error propagation through builders ───────────────────
 
     #[test]
-    fn create_slot_rejects_null_in_slot_name() {
-        let opts = ReplicationSlotOptions::default();
-        let err = build_create_slot_sql("slot\0name", SlotType::Logical, Some("pgoutput"), &opts)
-            .unwrap_err();
-        assert!(err.to_string().contains("null bytes"));
-    }
-
-    #[test]
-    fn create_slot_rejects_null_in_plugin() {
-        let opts = ReplicationSlotOptions::default();
-        let err = build_create_slot_sql("slot", SlotType::Logical, Some("pg\0output"), &opts)
-            .unwrap_err();
-        assert!(err.to_string().contains("null bytes"));
-    }
-
-    #[test]
-    fn alter_slot_rejects_null_in_slot_name() {
-        let err = build_alter_slot_sql("slot\0x", Some(true), None).unwrap_err();
-        assert!(err.to_string().contains("null bytes"));
-    }
-
-    #[test]
-    fn drop_slot_rejects_null_in_slot_name() {
-        let err = build_drop_slot_sql("slot\0x", false).unwrap_err();
-        assert!(err.to_string().contains("null bytes"));
-    }
-
-    #[test]
-    fn read_slot_rejects_null_in_slot_name() {
-        let err = build_read_slot_sql("slot\0x").unwrap_err();
-        assert!(err.to_string().contains("null bytes"));
-    }
-
-    #[test]
-    fn start_replication_rejects_null_in_slot_name() {
-        let err = build_start_replication_sql("slot\0x", 0, &[("proto_version", "1")]).unwrap_err();
-        assert!(err.to_string().contains("null bytes"));
-    }
-
-    #[test]
-    fn start_replication_rejects_null_in_option_key() {
-        let err = build_start_replication_sql("slot", 0, &[("key\0x", "value")]).unwrap_err();
-        assert!(err.to_string().contains("null bytes"));
-    }
-
-    #[test]
-    fn start_replication_rejects_null_in_option_value() {
-        let err = build_start_replication_sql("slot", 0, &[("key", "val\0ue")]).unwrap_err();
-        assert!(err.to_string().contains("null bytes"));
-    }
-
-    #[test]
-    fn start_physical_rejects_null_in_slot_name() {
-        let err = build_start_physical_replication_sql(Some("slot\0x"), 0, None).unwrap_err();
-        assert!(err.to_string().contains("null bytes"));
-    }
-
-    #[test]
-    fn base_backup_rejects_null_in_label() {
-        let opts = BaseBackupOptions {
-            label: Some("label\0x".to_string()),
-            ..Default::default()
-        };
-        let err = build_base_backup_sql(&opts).unwrap_err();
-        assert!(err.to_string().contains("null bytes"));
-    }
-
-    #[test]
-    fn base_backup_rejects_null_in_target() {
-        let opts = BaseBackupOptions {
-            target: Some("target\0x".to_string()),
-            ..Default::default()
-        };
-        let err = build_base_backup_sql(&opts).unwrap_err();
-        assert!(err.to_string().contains("null bytes"));
-    }
-
-    #[test]
-    fn base_backup_rejects_null_in_compression() {
-        let opts = BaseBackupOptions {
-            compression: Some("gzip\0x".to_string()),
-            ..Default::default()
-        };
-        let err = build_base_backup_sql(&opts).unwrap_err();
-        assert!(err.to_string().contains("null bytes"));
-    }
-
-    #[test]
-    fn create_subscription_rejects_null_in_name() {
-        let opts = CreateSubscriptionOptions {
-            subscription_name: "sub\0x",
-            connection_string: "host=localhost",
-            publication: "pub",
-            slot_name: "slot",
-            ..Default::default()
-        };
-        let err = build_create_subscription_sql(&opts).unwrap_err();
-        assert!(err.to_string().contains("null bytes"));
-    }
-
-    #[test]
-    fn create_subscription_rejects_null_in_connection() {
-        let opts = CreateSubscriptionOptions {
-            subscription_name: "sub",
-            connection_string: "host=\0localhost",
-            publication: "pub",
-            slot_name: "slot",
-            ..Default::default()
-        };
-        let err = build_create_subscription_sql(&opts).unwrap_err();
-        assert!(err.to_string().contains("null bytes"));
-    }
-
-    #[test]
-    fn create_subscription_rejects_null_in_publication() {
-        let opts = CreateSubscriptionOptions {
-            subscription_name: "sub",
-            connection_string: "host=localhost",
-            publication: "pub\0x",
-            slot_name: "slot",
-            ..Default::default()
-        };
-        let err = build_create_subscription_sql(&opts).unwrap_err();
-        assert!(err.to_string().contains("null bytes"));
-    }
-
-    #[test]
-    fn create_subscription_rejects_null_in_slot_name() {
-        let opts = CreateSubscriptionOptions {
-            subscription_name: "sub",
-            connection_string: "host=localhost",
-            publication: "pub",
-            slot_name: "slot\0x",
-            ..Default::default()
-        };
-        let err = build_create_subscription_sql(&opts).unwrap_err();
-        assert!(err.to_string().contains("null bytes"));
-    }
-
-    #[test]
-    fn disable_subscription_rejects_null() {
-        let err = build_disable_subscription_sql("sub\0x").unwrap_err();
-        assert!(err.to_string().contains("null bytes"));
-    }
-
-    #[test]
-    fn detach_slot_rejects_null() {
-        let err = build_detach_slot_sql("sub\0x").unwrap_err();
-        assert!(err.to_string().contains("null bytes"));
-    }
-
-    #[test]
-    fn drop_subscription_rejects_null() {
-        let err = build_drop_subscription_sql("sub\0x").unwrap_err();
-        assert!(err.to_string().contains("null bytes"));
+    fn builders_reject_null_bytes() {
+        let slot_opts = ReplicationSlotOptions::default();
+        let backup = |opts: BaseBackupOptions| build_base_backup_sql(&opts);
+        let sub = |opts: CreateSubscriptionOptions| build_create_subscription_sql(&opts);
+        let results = [
+            (
+                "create_slot slot_name",
+                build_create_slot_sql(
+                    "slot\0name",
+                    SlotType::Logical,
+                    Some("pgoutput"),
+                    &slot_opts,
+                ),
+            ),
+            (
+                "create_slot plugin",
+                build_create_slot_sql("slot", SlotType::Logical, Some("pg\0output"), &slot_opts),
+            ),
+            (
+                "alter_slot slot_name",
+                build_alter_slot_sql("slot\0x", Some(true), None),
+            ),
+            ("drop_slot slot_name", build_drop_slot_sql("slot\0x", false)),
+            ("read_slot slot_name", build_read_slot_sql("slot\0x")),
+            (
+                "start_replication slot_name",
+                build_start_replication_sql("slot\0x", 0, &[("proto_version", "1")]),
+            ),
+            (
+                "start_replication option key",
+                build_start_replication_sql("slot", 0, &[("key\0x", "value")]),
+            ),
+            (
+                "start_replication option value",
+                build_start_replication_sql("slot", 0, &[("key", "val\0ue")]),
+            ),
+            (
+                "start_physical slot_name",
+                build_start_physical_replication_sql(Some("slot\0x"), 0, None),
+            ),
+            (
+                "base_backup label",
+                backup(BaseBackupOptions {
+                    label: Some("label\0x".to_string()),
+                    ..Default::default()
+                }),
+            ),
+            (
+                "base_backup target",
+                backup(BaseBackupOptions {
+                    target: Some("target\0x".to_string()),
+                    ..Default::default()
+                }),
+            ),
+            (
+                "base_backup compression",
+                backup(BaseBackupOptions {
+                    compression: Some("gzip\0x".to_string()),
+                    ..Default::default()
+                }),
+            ),
+            (
+                "create_subscription name",
+                sub(CreateSubscriptionOptions {
+                    subscription_name: "sub\0x",
+                    ..subscription()
+                }),
+            ),
+            (
+                "create_subscription connection",
+                sub(CreateSubscriptionOptions {
+                    connection_string: "host=\0localhost",
+                    ..subscription()
+                }),
+            ),
+            (
+                "create_subscription publication",
+                sub(CreateSubscriptionOptions {
+                    publication: "pub\0x",
+                    ..subscription()
+                }),
+            ),
+            (
+                "create_subscription slot_name",
+                sub(CreateSubscriptionOptions {
+                    slot_name: "slot\0x",
+                    ..subscription()
+                }),
+            ),
+            (
+                "disable_subscription",
+                build_disable_subscription_sql("sub\0x"),
+            ),
+            ("detach_slot", build_detach_slot_sql("sub\0x")),
+            ("drop_subscription", build_drop_subscription_sql("sub\0x")),
+        ];
+        for (what, result) in results {
+            let err = result.expect_err(what);
+            assert!(err.to_string().contains("null bytes"), "{what}: {err}");
+        }
     }
 
     // ── Compatibility with existing behavior ─────────────────────────────

@@ -17,6 +17,9 @@
 //! cargo test --test initial_snapshot -- --ignored --nocapture --test-threads=1
 //! ```
 
+mod common;
+
+use common::{regular_conn, replication_conn_string, UnwindSafeSlotGuard};
 use pg_walstream::snapshot::SnapshotOutcome;
 use pg_walstream::{
     CancellationToken, ChangeEvent, EventType, LogicalReplicationStream, PgReplicationConnection,
@@ -31,25 +34,6 @@ use std::time::Duration;
 /// backstop; this constant only sharpens the diagnosis where it is applied, by
 /// failing the single test rather than the whole job.
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
-
-fn replication_conn_string() -> String {
-    std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgresql://postgres:postgres@localhost:5432/test_walstream?replication=database"
-            .to_string()
-    })
-}
-
-fn regular_conn_string() -> String {
-    std::env::var("DATABASE_URL_REGULAR").unwrap_or_else(|_| {
-        let repl = replication_conn_string();
-        repl.replace("?replication=database", "")
-            .replace("&replication=database", "")
-    })
-}
-
-fn regular_conn() -> PgReplicationConnection {
-    PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection")
-}
 
 fn server_version() -> i32 {
     regular_conn().server_version()
@@ -111,34 +95,10 @@ fn drop_slot(slot: &str) {
     }
 }
 
-/// Drops its slot when it goes out of scope, however the test leaves.
-///
-/// Without this every test leaked its slot on a failed assertion: the trailing
-/// `drop_slot` is unreachable once a panic unwinds. There are ~42 slot names in
-/// this file against `max_replication_slots = 16`, so a handful of leaks turns
-/// into a run of `53400 all replication slots are in use` failures that bury
-/// whichever assertion actually broke.
-///
-/// Declare it *before* the stream it must outlive, so the stream is dropped —
-/// and the slot therefore inactive — by the time `drop_slot` runs.
-struct SlotGuard(&'static str);
-
-impl Drop for SlotGuard {
-    fn drop(&mut self) {
-        // `drop_slot` panics on some paths; a panic inside Drop during unwind
-        // aborts the process, so swallow it when we are already unwinding.
-        if std::thread::panicking() {
-            let _ = std::panic::catch_unwind(|| drop_slot(self.0));
-        } else {
-            drop_slot(self.0);
-        }
-    }
-}
-
 /// Drop `slot` now, and again when the returned guard goes out of scope.
-fn slot_guard(slot: &'static str) -> SlotGuard {
+fn slot_guard(slot: &'static str) -> UnwindSafeSlotGuard {
     drop_slot(slot);
-    SlotGuard(slot)
+    UnwindSafeSlotGuard::new(slot, drop_slot)
 }
 
 /// Fresh table + publication, seeded with `rows` names.

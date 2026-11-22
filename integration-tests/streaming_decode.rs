@@ -35,6 +35,9 @@
 //!   `streamed_prepare_bytes_reencode_identically` re-encodes the raw bytes of a
 //!   large transaction prepared while streaming and asserts byte identity.
 
+mod common;
+
+use common::{drop_slot_best_effort as drop_slot, regular_conn_string, replication_conn_string};
 use pg_walstream::{
     encode_streaming_message_to_bytes, CancellationToken, ChangeEvent, EventStream, EventType,
     LogicalReplicationMessage, LogicalReplicationParser, LogicalReplicationStream,
@@ -46,21 +49,6 @@ use std::time::Duration;
 /// Rows per forced-streaming transaction. At 200 bytes of payload each this is
 /// ~1 MB of reorder-buffer changes, well past a 64 kB work_mem threshold.
 const ROWS: usize = 5000;
-
-fn replication_conn_string() -> String {
-    std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgresql://postgres:postgres@localhost:5432/test_walstream?replication=database"
-            .to_string()
-    })
-}
-
-fn regular_conn_string() -> String {
-    std::env::var("DATABASE_URL_REGULAR").unwrap_or_else(|_| {
-        replication_conn_string()
-            .replace("?replication=database", "")
-            .replace("&replication=database", "")
-    })
-}
 
 /// `server_version_num` (e.g. 160000 for PG 16). Panics rather than returning a
 /// sentinel: a 0 would fall below every version gate below and turn a broken
@@ -86,15 +74,6 @@ fn setup(conn: &mut PgReplicationConnection) {
     // test burns its whole deadline before blaming logical_decoding_work_mem.
     conn.exec("CREATE PUBLICATION stream_pub FOR TABLE stream_test")
         .expect("create publication stream_pub");
-}
-
-fn drop_slot(slot_name: &str) {
-    if let Ok(mut conn) = PgReplicationConnection::connect(&replication_conn_string()) {
-        let _ = conn.exec(&format!(
-            "SELECT pg_drop_replication_slot('{slot_name}') \
-             WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '{slot_name}')"
-        ));
-    }
 }
 
 fn config(slot_name: &str, proto: u32, mode: StreamingMode) -> ReplicationStreamConfig {

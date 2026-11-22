@@ -17,16 +17,15 @@
 //! itself, so it exercises the strictest mode rather than whatever the
 //! environment happened to default to.
 
+mod common;
+
+use common::ca_cert_path;
 use pg_walstream::snapshot::SnapshotOutcome;
 use pg_walstream::{
     CancellationToken, EventType, LogicalReplicationStream, PgReplicationConnection,
     ReplicationStreamConfig, RetryConfig, StreamingMode,
 };
 use std::time::Duration;
-
-fn ca_cert_path() -> String {
-    std::env::var("SSL_CA_CERT_PATH").expect("SSL_CA_CERT_PATH must be set for SSL tests")
-}
 
 /// Append `sslmode=verify-full` and the CA to a base URL that carries neither.
 ///

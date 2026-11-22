@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 /// Encode a byte slice as lowercase hex string.
-pub(crate) fn hex_encode(bytes: &[u8]) -> String {
+fn hex_encode(bytes: &[u8]) -> String {
     const LUT: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for &byte in bytes {
@@ -39,8 +39,13 @@ pub(crate) fn hex_decode(hex: &str) -> core::result::Result<Vec<u8>, &'static st
     Ok(out)
 }
 
+/// Value of one ASCII hex digit, or `None` if `b` is not one.
+///
+/// Returning `Option` keeps the range check and the subtraction in the same
+/// `match`: every arm subtracts a bound it has just tested, so no caller can make
+/// this underflow by forgetting to classify the byte first.
 #[inline]
-fn hex_nibble(b: u8) -> Option<u8> {
+pub(crate) fn hex_nibble(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
         b'a'..=b'f' => Some(b - b'a' + 10),

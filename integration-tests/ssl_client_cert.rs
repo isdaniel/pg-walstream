@@ -30,6 +30,9 @@
 //! cargo test --test ssl_client_cert --no-default-features --features rustls-tls -- --ignored --nocapture --test-threads=1
 //! ```
 
+mod common;
+
+use common::replication_conn_string;
 use pg_walstream::{
     CancellationToken, EventType, LogicalReplicationStream, PgReplicationConnection,
     ReplicationSlotOptions, ReplicationStreamConfig, RetryConfig, StreamingMode,
@@ -38,13 +41,6 @@ use std::time::Duration;
 
 fn env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("{name} must be set for the mTLS tests"))
-}
-
-fn replication_conn_string() -> String {
-    std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgresql://postgres:postgres@localhost:5432/test_walstream?replication=database"
-            .to_string()
-    })
 }
 
 fn regular_conn_string() -> String {

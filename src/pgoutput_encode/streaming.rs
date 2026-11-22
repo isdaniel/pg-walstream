@@ -53,14 +53,8 @@ pub(super) fn encode_stream_abort(
 
 #[cfg(test)]
 mod tests {
+    use crate::pgoutput_encode::encode;
     use crate::protocol::LogicalReplicationMessage as M;
-    use bytes::BytesMut;
-
-    fn encode(msg: &M, version: u8) -> Vec<u8> {
-        let mut buf = BytesMut::new();
-        crate::pgoutput_encode::encode_message(msg, version, &mut buf);
-        buf.to_vec()
-    }
 
     #[test]
     fn encode_stream_start_matches_spec_bytes() {

@@ -511,7 +511,7 @@ fn catalog_rows_from_result(result: &crate::connection::PgResult) -> Result<Vec<
         };
 
         rows.push(CatalogRow {
-            relation_id: parse_catalog_u32(&get(0)?, "oid")?,
+            relation_id: parse_catalog(&get(0)?, "oid")?,
             namespace: get(1)?,
             relation_name: get(2)?,
             replica_identity: get(3)?.bytes().next().unwrap_or(b'd'),
@@ -520,12 +520,8 @@ fn catalog_rows_from_result(result: &crate::connection::PgResult) -> Result<Vec<
                 Some(name) => Some(crate::protocol::ColumnInfo::new(
                     0, // replica identity membership is not read
                     name,
-                    parse_catalog_u32(&get(6)?, "type oid")?,
-                    get(7)?.parse::<i32>().map_err(|e| {
-                        ReplicationError::protocol(format!(
-                            "catalog query returned a bad typmod: {e}"
-                        ))
-                    })?,
+                    parse_catalog(&get(6)?, "type oid")?,
+                    parse_catalog(&get(7)?, "typmod")?,
                 )),
                 None => None,
             },
@@ -550,8 +546,11 @@ fn catalog_rows_from_result(result: &crate::connection::PgResult) -> Result<Vec<
     Ok(rows)
 }
 
-fn parse_catalog_u32(text: &str, what: &str) -> Result<u32> {
-    text.parse::<u32>().map_err(|e| {
+fn parse_catalog<T: core::str::FromStr>(text: &str, what: &str) -> Result<T>
+where
+    T::Err: core::fmt::Display,
+{
+    text.parse().map_err(|e| {
         ReplicationError::protocol(format!("catalog query returned a bad {what}: {e}"))
     })
 }
@@ -678,7 +677,7 @@ mod tests {
     /// Fabricate a catalog-query result. Native-only: the libpq `PgResult` wraps
     /// a `PGresult` pointer and cannot be built this way.
     #[cfg(feature = "rustls-tls")]
-    fn catalog_result(rows: &[&[Option<&str>]]) -> crate::connection::PgResult {
+    fn catalog_result(rows: &[Vec<Option<&str>>]) -> crate::connection::PgResult {
         let mut result = crate::connection::PgResult::new();
         result.columns = [
             "oid",
@@ -734,9 +733,8 @@ mod tests {
     #[cfg(feature = "rustls-tls")]
     #[test]
     fn catalog_rows_are_read_in_column_order() {
-        let binding = [row("id", None), row("name", None)];
-        let refs: Vec<&[Option<&str>]> = binding.iter().map(|r| r.as_slice()).collect();
-        let rows = catalog_rows_from_result(&catalog_result(&refs)).unwrap();
+        let rows = catalog_rows_from_result(&catalog_result(&[row("id", None), row("name", None)]))
+            .unwrap();
 
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].relation_id, 16384);
@@ -754,9 +752,8 @@ mod tests {
     #[cfg(feature = "rustls-tls")]
     #[test]
     fn catalog_rows_carry_a_row_filter() {
-        let binding = [row("id", Some("(id > 5)"))];
-        let refs: Vec<&[Option<&str>]> = binding.iter().map(|r| r.as_slice()).collect();
-        let rows = catalog_rows_from_result(&catalog_result(&refs)).unwrap();
+        let rows =
+            catalog_rows_from_result(&catalog_result(&[row("id", Some("(id > 5)"))])).unwrap();
         assert_eq!(rows[0].row_filter.as_deref(), Some("(id > 5)"));
     }
 
@@ -766,12 +763,11 @@ mod tests {
     #[cfg(feature = "rustls-tls")]
     #[test]
     fn catalog_rows_carry_the_generated_flag() {
-        let binding = [
+        let rows = catalog_rows_from_result(&catalog_result(&[
             generated_row("id", None, false),
             generated_row("g", None, true),
-        ];
-        let refs: Vec<&[Option<&str>]> = binding.iter().map(|r| r.as_slice()).collect();
-        let rows = catalog_rows_from_result(&catalog_result(&refs)).unwrap();
+        ]))
+        .unwrap();
         assert!(!rows[0].generated);
         assert!(rows[1].generated);
     }
@@ -784,9 +780,7 @@ mod tests {
     #[cfg(feature = "rustls-tls")]
     #[test]
     fn catalog_rows_produce_an_explicit_column_list() {
-        let binding = [row("id", None)];
-        let refs: Vec<&[Option<&str>]> = binding.iter().map(|r| r.as_slice()).collect();
-        let rows = catalog_rows_from_result(&catalog_result(&refs)).unwrap();
+        let rows = catalog_rows_from_result(&catalog_result(&[row("id", None)])).unwrap();
         let tables = plan::tables_from_catalog_rows(&rows).unwrap();
         assert!(
             tables[0].copy_sql.contains(r#"("id")"#),
@@ -797,35 +791,17 @@ mod tests {
 
     #[cfg(feature = "rustls-tls")]
     #[test]
-    fn catalog_rows_reject_a_null_in_a_required_column() {
-        let mut bad = row("id", None);
-        bad[1] = None; // schemaname
-        let binding = [bad];
-        let refs: Vec<&[Option<&str>]> = binding.iter().map(|r| r.as_slice()).collect();
-        let err = catalog_rows_from_result(&catalog_result(&refs)).unwrap_err();
-        assert!(format!("{err}").contains("NULL in column 1"), "{err}");
-    }
-
-    #[cfg(feature = "rustls-tls")]
-    #[test]
-    fn catalog_rows_reject_a_malformed_oid() {
-        let mut bad = row("id", None);
-        bad[0] = Some("not-an-oid");
-        let binding = [bad];
-        let refs: Vec<&[Option<&str>]> = binding.iter().map(|r| r.as_slice()).collect();
-        let err = catalog_rows_from_result(&catalog_result(&refs)).unwrap_err();
-        assert!(format!("{err}").contains("bad oid"), "{err}");
-    }
-
-    #[cfg(feature = "rustls-tls")]
-    #[test]
-    fn catalog_rows_reject_a_malformed_typmod() {
-        let mut bad = row("id", None);
-        bad[7] = Some("x");
-        let binding = [bad];
-        let refs: Vec<&[Option<&str>]> = binding.iter().map(|r| r.as_slice()).collect();
-        let err = catalog_rows_from_result(&catalog_result(&refs)).unwrap_err();
-        assert!(format!("{err}").contains("bad typmod"), "{err}");
+    fn catalog_rows_reject_a_null_or_malformed_column() {
+        for (column, value, message) in [
+            (1, None, "NULL in column 1"), // schemaname
+            (0, Some("not-an-oid"), "bad oid"),
+            (7, Some("x"), "bad typmod"),
+        ] {
+            let mut bad = row("id", None);
+            bad[column] = value;
+            let err = catalog_rows_from_result(&catalog_result(&[bad])).unwrap_err();
+            assert!(format!("{err}").contains(message), "{err}");
+        }
     }
 
     #[cfg(feature = "rustls-tls")]
@@ -837,15 +813,8 @@ mod tests {
     }
 
     fn test_table(name: &str) -> SnapshotTable {
-        use crate::protocol::{ColumnInfo, RelationInfo};
         SnapshotTable {
-            relation: Arc::new(RelationInfo::new(
-                42,
-                "public".to_string(),
-                name.to_string(),
-                b'd',
-                vec![ColumnInfo::new(0, "id".to_string(), 23, -1)],
-            )),
+            relation: Arc::new(plan::test_relation(42, "public", name, &["id"], 23)),
             copy_sql: format!("COPY \"public\".\"{name}\" (\"id\") TO STDOUT"),
         }
     }
@@ -1047,8 +1016,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_catalog_u32_rejects_garbage() {
-        assert!(parse_catalog_u32("not-a-number", "oid").is_err());
-        assert_eq!(parse_catalog_u32("16384", "oid").unwrap(), 16384);
+    fn parse_catalog_rejects_garbage() {
+        assert!(parse_catalog::<u32>("not-a-number", "oid").is_err());
+        assert_eq!(parse_catalog::<u32>("16384", "oid").unwrap(), 16384);
     }
 }

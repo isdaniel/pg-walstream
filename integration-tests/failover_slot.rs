@@ -20,38 +20,14 @@
 //! cargo test --test failover_slot -- --ignored --nocapture
 //! ```
 
+mod common;
+
+use common::{
+    drop_slot_best_effort as drop_slot, init_tracing, regular_conn_string, replication_conn_string,
+    SlotGuard,
+};
 use pg_walstream::{PgReplicationConnection, ReplicationSlotOptions, SlotType};
 use tracing::{error, warn};
-
-/// Replication connection string from the environment, or a local default.
-fn replication_conn_string() -> String {
-    std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgresql://postgres:postgres@localhost:5432/test_walstream?replication=database"
-            .to_string()
-    })
-}
-
-/// Regular (non-replication) connection string from the environment, or derived.
-fn regular_conn_string() -> String {
-    std::env::var("DATABASE_URL_REGULAR").unwrap_or_else(|_| {
-        // Strip `replication=database` while keeping a valid query string even when other parameters follow (the first param must start with `?`).
-        let repl = replication_conn_string();
-        if repl.contains("?replication=database&") {
-            repl.replace("?replication=database&", "?")
-        } else if repl.contains("&replication=database") {
-            repl.replace("&replication=database", "")
-        } else {
-            repl.replace("?replication=database", "")
-        }
-    })
-}
-
-/// Best-effort tracing init so `warn!`/`error!` surface under `--nocapture`.
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .try_init();
-}
 
 /// Read `server_version_num` (e.g. 170004) via the given connection.
 fn server_version_num(conn: &mut PgReplicationConnection) -> i64 {
@@ -65,17 +41,6 @@ fn server_version_num(conn: &mut PgReplicationConnection) -> i64 {
         .expect("server_version_num is numeric")
 }
 
-/// Best-effort slot cleanup.
-fn drop_slot(slot_name: &str) {
-    if let Ok(mut conn) = PgReplicationConnection::connect(&replication_conn_string()) {
-        let _ = conn.exec(&format!(
-            "SELECT pg_drop_replication_slot('{}') WHERE EXISTS \
-             (SELECT 1 FROM pg_replication_slots WHERE slot_name = '{}')",
-            slot_name, slot_name
-        ));
-    }
-}
-
 #[test]
 #[ignore = "requires live PostgreSQL 17+ with wal_level=logical"]
 fn test_failover_slot_created_on_pg17plus() {
@@ -85,12 +50,6 @@ fn test_failover_slot_created_on_pg17plus() {
 
     // Guarantee cleanup even if an assertion below panics: an orphaned
     // replication slot blocks WAL recycling and can exhaust disk on the server.
-    struct SlotGuard<'a>(&'a str);
-    impl Drop for SlotGuard<'_> {
-        fn drop(&mut self) {
-            drop_slot(self.0);
-        }
-    }
     let _guard = SlotGuard(slot);
 
     // Read the server version over a regular connection.

@@ -187,15 +187,10 @@ pub(super) fn encode_logical_message(
 
 #[cfg(test)]
 mod tests {
+    use crate::pgoutput_encode::encode;
     use crate::protocol::{ColumnData, ColumnInfo, LogicalReplicationMessage as M, TupleData};
-    use bytes::{Bytes, BytesMut};
+    use bytes::Bytes;
     use std::sync::Arc;
-
-    fn encode(msg: &M, version: u8) -> Vec<u8> {
-        let mut buf = BytesMut::new();
-        crate::pgoutput_encode::encode_message(msg, version, &mut buf);
-        buf.to_vec()
-    }
 
     #[test]
     fn encode_begin_matches_spec_bytes() {

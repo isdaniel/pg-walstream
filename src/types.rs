@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 // PostgreSQL constants
 /// Seconds from Unix epoch (1970-01-01) to PostgreSQL epoch (2000-01-01)
-pub(crate) const PG_EPOCH_OFFSET_SECS: i64 = 946_684_800;
+const PG_EPOCH_OFFSET_SECS: i64 = 946_684_800;
 /// Invalid/zero LSN pointer
 pub const INVALID_XLOG_REC_PTR: u64 = 0;
 
