@@ -2,7 +2,7 @@
 //! parser robustness on arbitrary bytes, and byte fidelity on spec bytes.
 
 use super::{
-    encode_message, encode_message_to_bytes, encode_streaming_message,
+    encode, encode_message, encode_message_to_bytes, encode_streaming_message,
     encode_streaming_message_to_bytes,
 };
 use crate::protocol::{
@@ -13,12 +13,6 @@ use bytes::{Bytes, BytesMut};
 use proptest::prelude::*;
 use proptest::strategy::{BoxedStrategy, Union};
 use std::sync::Arc;
-
-fn encode(msg: &M, version: u8) -> Vec<u8> {
-    let mut buf = BytesMut::new();
-    encode_message(msg, version, &mut buf);
-    buf.to_vec()
-}
 
 fn arb_cstring() -> impl Strategy<Value = String> {
     any::<String>().prop_map(|s| s.replace('\u{0}', ""))
@@ -249,7 +243,8 @@ fn arb_begin_prepare() -> BoxedStrategy<M> {
         .boxed()
 }
 
-fn arb_prepare() -> BoxedStrategy<M> {
+/// PREPARE, COMMIT PREPARED and STREAM PREPARE carry the same six fields.
+fn arb_flagged_two_phase(build: fn(u8, u64, u64, i64, u32, String) -> M) -> BoxedStrategy<M> {
     (
         any::<u8>(),
         any::<u64>(),
@@ -258,39 +253,36 @@ fn arb_prepare() -> BoxedStrategy<M> {
         any::<u32>(),
         arb_cstring(),
     )
-        .prop_map(
-            |(flags, prepare_lsn, end_lsn, timestamp, xid, gid)| M::Prepare {
-                flags,
-                prepare_lsn,
-                end_lsn,
-                timestamp,
-                xid,
-                gid,
-            },
-        )
+        .prop_map(move |(flags, lsn, end_lsn, timestamp, xid, gid)| {
+            build(flags, lsn, end_lsn, timestamp, xid, gid)
+        })
         .boxed()
 }
 
-fn arb_commit_prepared() -> BoxedStrategy<M> {
-    (
-        any::<u8>(),
-        any::<u64>(),
-        any::<u64>(),
-        any::<i64>(),
-        any::<u32>(),
-        arb_cstring(),
+fn arb_prepare() -> BoxedStrategy<M> {
+    arb_flagged_two_phase(
+        |flags, prepare_lsn, end_lsn, timestamp, xid, gid| M::Prepare {
+            flags,
+            prepare_lsn,
+            end_lsn,
+            timestamp,
+            xid,
+            gid,
+        },
     )
-        .prop_map(
-            |(flags, commit_lsn, end_lsn, timestamp, xid, gid)| M::CommitPrepared {
-                flags,
-                commit_lsn,
-                end_lsn,
-                timestamp,
-                xid,
-                gid,
-            },
-        )
-        .boxed()
+}
+
+fn arb_commit_prepared() -> BoxedStrategy<M> {
+    arb_flagged_two_phase(
+        |flags, commit_lsn, end_lsn, timestamp, xid, gid| M::CommitPrepared {
+            flags,
+            commit_lsn,
+            end_lsn,
+            timestamp,
+            xid,
+            gid,
+        },
+    )
 }
 
 fn arb_rollback_prepared() -> BoxedStrategy<M> {
@@ -328,25 +320,16 @@ fn arb_rollback_prepared() -> BoxedStrategy<M> {
 }
 
 fn arb_stream_prepare() -> BoxedStrategy<M> {
-    (
-        any::<u8>(),
-        any::<u64>(),
-        any::<u64>(),
-        any::<i64>(),
-        any::<u32>(),
-        arb_cstring(),
+    arb_flagged_two_phase(
+        |flags, prepare_lsn, end_lsn, timestamp, xid, gid| M::StreamPrepare {
+            flags,
+            prepare_lsn,
+            end_lsn,
+            timestamp,
+            xid,
+            gid,
+        },
     )
-        .prop_map(
-            |(flags, prepare_lsn, end_lsn, timestamp, xid, gid)| M::StreamPrepare {
-                flags,
-                prepare_lsn,
-                end_lsn,
-                timestamp,
-                xid,
-                gid,
-            },
-        )
-        .boxed()
 }
 
 fn arb_message_for_version(v: u8) -> BoxedStrategy<M> {

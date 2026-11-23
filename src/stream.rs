@@ -641,22 +641,11 @@ impl ReplicationStreamConfig {
             publication_name,
             protocol_version,
             streaming_mode,
-            messages: false,
-            binary: false,
-            two_phase: false,
-            origin: None,
             feedback_interval,
             connection_timeout,
             health_check_interval,
             retry_config,
-            slot_options: ReplicationSlotOptions {
-                snapshot: Some("nothing".to_string()),
-                ..Default::default()
-            },
-            slot_type: SlotType::Logical,
-            stop_at_lsn: None,
-            existing_slot_required: false,
-            dedicated_io_thread: false,
+            ..Default::default()
         }
     }
 
@@ -729,23 +718,15 @@ impl ReplicationStreamConfig {
     /// # Example: Temporary slot with exported snapshot
     ///
     /// ```
-    /// use pg_walstream::{ReplicationStreamConfig, ReplicationSlotOptions, RetryConfig, StreamingMode};
-    /// use std::time::Duration;
+    /// use pg_walstream::{ReplicationStreamConfig, ReplicationSlotOptions, StreamingMode};
     ///
-    /// let config = ReplicationStreamConfig::new(
-    ///     "my_temp_slot".to_string(),
-    ///     "my_publication".to_string(),
-    ///     2,
-    ///     StreamingMode::On,
-    ///     Duration::from_secs(10),
-    ///     Duration::from_secs(30),
-    ///     Duration::from_secs(60),
-    ///     RetryConfig::default(),
-    /// ).with_slot_options(ReplicationSlotOptions {
-    ///     temporary: true,
-    ///     snapshot: Some("export".to_string()),
-    ///     ..Default::default()
-    /// });
+    /// let config = ReplicationStreamConfig::builder("my_temp_slot", "my_publication")
+    ///     .with_streaming_mode(StreamingMode::On)
+    ///     .with_slot_options(ReplicationSlotOptions {
+    ///         temporary: true,
+    ///         snapshot: Some("export".to_string()),
+    ///         ..Default::default()
+    ///     });
     /// ```
     #[inline]
     pub fn with_slot_options(mut self, options: ReplicationSlotOptions) -> Self {
@@ -893,6 +874,73 @@ impl ReplicationStreamConfig {
         self.stop_at_lsn = Some(lsn.into());
         self
     }
+
+    fn build_replication_options(&self) -> Result<Vec<(String, String)>> {
+        self.validate_replication_options()?;
+
+        let proto_version = self.protocol_version.to_string();
+        let publication_names = format!("\"{}\"", self.publication_name);
+        let mut options = vec![
+            ("proto_version".to_string(), proto_version),
+            ("publication_names".to_string(), publication_names),
+        ];
+
+        if !matches!(self.streaming_mode, StreamingMode::Off) {
+            options.push((
+                "streaming".to_string(),
+                self.streaming_mode.as_str().to_string(),
+            ));
+        }
+
+        if self.messages {
+            options.push(("messages".to_string(), "on".to_string()));
+        }
+
+        if self.binary {
+            options.push(("binary".to_string(), "on".to_string()));
+        }
+
+        if self.two_phase {
+            options.push(("two_phase".to_string(), "on".to_string()));
+        }
+
+        if let Some(origin) = self.origin {
+            options.push(("origin".to_string(), origin.as_str().to_string()));
+        }
+
+        Ok(options)
+    }
+
+    fn validate_replication_options(&self) -> Result<()> {
+        match self.protocol_version {
+            1..=4 => {}
+            version => {
+                return Err(ReplicationError::config(format!(
+                    "Unsupported protocol version: {version} (expected 1-4)"
+                )))
+            }
+        }
+
+        if matches!(self.streaming_mode, StreamingMode::On) && self.protocol_version < 2 {
+            return Err(ReplicationError::config(
+                "streaming=on requires protocol version >= 2".to_string(),
+            ));
+        }
+
+        if matches!(self.streaming_mode, StreamingMode::Parallel) && self.protocol_version < 4 {
+            return Err(ReplicationError::config(
+                "streaming=parallel requires protocol version >= 4".to_string(),
+            ));
+        }
+
+        if self.two_phase && self.protocol_version < 3 {
+            return Err(ReplicationError::config(
+                "two_phase requires protocol version >= 3".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 /// Bounded replay: given the configured `stop_at`, return `Some(end_lsn)` when
@@ -989,20 +1037,11 @@ impl LogicalReplicationStream {
     /// # Example
     ///
     /// ```no_run
-    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig, StreamingMode};
-    /// use std::time::Duration;
+    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, StreamingMode};
     ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let config = ReplicationStreamConfig::new(
-    ///     "my_slot".to_string(),
-    ///     "my_publication".to_string(),
-    ///     2,
-    ///     StreamingMode::On,
-    ///     Duration::from_secs(10),
-    ///     Duration::from_secs(30),
-    ///     Duration::from_secs(60),
-    ///     RetryConfig::default(),
-    /// );
+    /// let config = ReplicationStreamConfig::builder("my_slot", "my_publication")
+    ///     .with_streaming_mode(StreamingMode::On);
     ///
     /// let mut stream = LogicalReplicationStream::new(
     ///     "postgresql://postgres:password@localhost:5432/mydb?replication=database",
@@ -1039,22 +1078,29 @@ impl LogicalReplicationStream {
             identity.system_id, identity.timeline
         );
 
-        let parser = LogicalReplicationParser::with_protocol_version(config.protocol_version);
-        let state = ReplicationState::new();
-        let last_health_check = Instant::now();
-
-        // Create shared LSN feedback for consumer
-        let shared_lsn_feedback = SharedLsnFeedback::new_shared();
-
-        Ok(Self {
+        Ok(Self::from_parts(
             connection,
-            parser,
-            state,
+            config,
+            retry_handler,
+            identity,
+        ))
+    }
+
+    fn from_parts(
+        connection: PgReplicationConnection,
+        config: ReplicationStreamConfig,
+        retry_handler: ReplicationConnectionRetry,
+        identity: ServerIdentity,
+    ) -> Self {
+        Self {
+            connection,
+            parser: LogicalReplicationParser::with_protocol_version(config.protocol_version),
+            state: ReplicationState::new(),
             config,
             slot: SlotState::Absent,
             retry_handler,
-            last_health_check,
-            shared_lsn_feedback,
+            last_health_check: Instant::now(),
+            shared_lsn_feedback: SharedLsnFeedback::new_shared(),
             identity,
             feedback_check_counter: 0,
             replay_stop: ReplayStop::Running,
@@ -1062,7 +1108,7 @@ impl LogicalReplicationStream {
             keepalive_wal_end: Lsn::new(0),
             recovering: false,
             counters: Arc::default(),
-        })
+        }
     }
 
     /// The identity of the server this stream is connected to, read by [`new`](Self::new) on the stream's own connection.
@@ -1290,19 +1336,11 @@ impl LogicalReplicationStream {
     /// # Example
     ///
     /// ```no_run
-    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig, StreamingMode};
-    /// use std::time::Duration;
+    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, StreamingMode};
     ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let config = ReplicationStreamConfig::new(
-    ///     "my_slot".to_string(),
-    ///     "my_publication".to_string(),
-    ///     2, StreamingMode::On,
-    ///     Duration::from_secs(10),
-    ///     Duration::from_secs(30),
-    ///     Duration::from_secs(60),
-    ///     RetryConfig::default(),
-    /// );
+    /// let config = ReplicationStreamConfig::builder("my_slot", "my_publication")
+    ///     .with_streaming_mode(StreamingMode::On);
     ///
     /// let mut stream = LogicalReplicationStream::new("connection_string", config).await?;
     ///
@@ -1329,7 +1367,7 @@ impl LogicalReplicationStream {
         // `start(None)` is a no-op and a later ack past X wins.
         self.shared_lsn_feedback.update_applied_lsn(start_lsn);
 
-        let options = self.build_replication_options()?;
+        let options = self.config.build_replication_options()?;
 
         // Start replication
         let options_ref = options
@@ -1463,20 +1501,12 @@ impl LogicalReplicationStream {
     /// # Example
     ///
     /// ```no_run
-    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig, StreamingMode};
+    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, StreamingMode};
     /// use tokio_util::sync::CancellationToken;
-    /// use std::time::Duration;
     ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let config = ReplicationStreamConfig::new(
-    ///     "my_slot".to_string(),
-    ///     "my_publication".to_string(),
-    ///     2, StreamingMode::On,
-    ///     Duration::from_secs(10),
-    ///     Duration::from_secs(30),
-    ///     Duration::from_secs(60),
-    ///     RetryConfig::default(),
-    /// );
+    /// let config = ReplicationStreamConfig::builder("my_slot", "my_publication")
+    ///     .with_streaming_mode(StreamingMode::On);
     ///
     /// let mut stream = LogicalReplicationStream::new("connection_string", config).await?;
     /// stream.start(None).await?;
@@ -1567,20 +1597,12 @@ impl LogicalReplicationStream {
     /// # Example
     ///
     /// ```no_run
-    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig, StreamingMode};
+    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, StreamingMode};
     /// use tokio_util::sync::CancellationToken;
-    /// use std::time::Duration;
     ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let config = ReplicationStreamConfig::new(
-    ///     "my_slot".to_string(),
-    ///     "my_publication".to_string(),
-    ///     2, StreamingMode::On,
-    ///     Duration::from_secs(10),
-    ///     Duration::from_secs(30),
-    ///     Duration::from_secs(60),
-    ///     RetryConfig::default(),
-    /// );
+    /// let config = ReplicationStreamConfig::builder("my_slot", "my_publication")
+    ///     .with_streaming_mode(StreamingMode::On);
     /// let mut stream = LogicalReplicationStream::new("connection_string", config).await?;
     /// stream.start(None).await?;
     /// let cancel = CancellationToken::new();
@@ -1763,7 +1785,7 @@ impl LogicalReplicationStream {
             );
         }
 
-        let options = self.build_replication_options()?;
+        let options = self.config.build_replication_options()?;
         let options_ref = options
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -1826,20 +1848,12 @@ impl LogicalReplicationStream {
     /// # Example
     ///
     /// ```no_run
-    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig, StreamingMode};
+    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, StreamingMode};
     /// use tokio_util::sync::CancellationToken;
-    /// use std::time::Duration;
     ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let config = ReplicationStreamConfig::new(
-    ///     "my_slot".to_string(),
-    ///     "my_publication".to_string(),
-    ///     2, StreamingMode::On,
-    ///     Duration::from_secs(10),
-    ///     Duration::from_secs(30),
-    ///     Duration::from_secs(60),
-    ///     RetryConfig::default(),
-    /// );
+    /// let config = ReplicationStreamConfig::builder("my_slot", "my_publication")
+    ///     .with_streaming_mode(StreamingMode::On);
     ///
     /// let mut stream = LogicalReplicationStream::new("connection_string", config).await?;
     /// stream.start(None).await?;
@@ -2542,20 +2556,12 @@ impl LogicalReplicationStream {
     /// # Example
     ///
     /// ```no_run
-    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig, StreamingMode};
+    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, StreamingMode};
     /// use tokio_util::sync::CancellationToken;
-    /// use std::time::Duration;
     ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let config = ReplicationStreamConfig::new(
-    ///     "my_slot".to_string(),
-    ///     "my_publication".to_string(),
-    ///     2, StreamingMode::On,
-    ///     Duration::from_secs(10),
-    ///     Duration::from_secs(30),
-    ///     Duration::from_secs(60),
-    ///     RetryConfig::default(),
-    /// );
+    /// let config = ReplicationStreamConfig::builder("my_slot", "my_publication")
+    ///     .with_streaming_mode(StreamingMode::On);
     ///
     /// let mut stream = LogicalReplicationStream::new("connection_string", config).await?;
     /// stream.start(None).await?;
@@ -2576,10 +2582,7 @@ impl LogicalReplicationStream {
         let shared_feedback = Arc::clone(&self.shared_lsn_feedback);
         let metrics = self.metrics();
         EventStream {
-            state: StreamState::Ready {
-                stream: Box::new(self),
-                terminated: false,
-            },
+            state: StreamState::ready(Box::new(self), false),
             cancellation_token,
             shared_feedback,
             metrics,
@@ -2605,77 +2608,6 @@ impl LogicalReplicationStream {
             inner: self,
             cancellation_token,
         }
-    }
-
-    fn build_replication_options(&self) -> Result<Vec<(String, String)>> {
-        self.validate_replication_options()?;
-
-        let proto_version = self.config.protocol_version.to_string();
-        let publication_names = format!("\"{}\"", self.config.publication_name);
-        let mut options = vec![
-            ("proto_version".to_string(), proto_version),
-            ("publication_names".to_string(), publication_names),
-        ];
-
-        if !matches!(self.config.streaming_mode, StreamingMode::Off) {
-            options.push((
-                "streaming".to_string(),
-                self.config.streaming_mode.as_str().to_string(),
-            ));
-        }
-
-        if self.config.messages {
-            options.push(("messages".to_string(), "on".to_string()));
-        }
-
-        if self.config.binary {
-            options.push(("binary".to_string(), "on".to_string()));
-        }
-
-        if self.config.two_phase {
-            options.push(("two_phase".to_string(), "on".to_string()));
-        }
-
-        if let Some(origin) = self.config.origin {
-            options.push(("origin".to_string(), origin.as_str().to_string()));
-        }
-
-        Ok(options)
-    }
-
-    fn validate_replication_options(&self) -> Result<()> {
-        match self.config.protocol_version {
-            1..=4 => {}
-            version => {
-                return Err(ReplicationError::config(format!(
-                    "Unsupported protocol version: {version} (expected 1-4)"
-                )))
-            }
-        }
-
-        if matches!(self.config.streaming_mode, StreamingMode::On)
-            && self.config.protocol_version < 2
-        {
-            return Err(ReplicationError::config(
-                "streaming=on requires protocol version >= 2".to_string(),
-            ));
-        }
-
-        if matches!(self.config.streaming_mode, StreamingMode::Parallel)
-            && self.config.protocol_version < 4
-        {
-            return Err(ReplicationError::config(
-                "streaming=parallel requires protocol version >= 4".to_string(),
-            ));
-        }
-
-        if self.config.two_phase && self.config.protocol_version < 3 {
-            return Err(ReplicationError::config(
-                "two_phase requires protocol version >= 3".to_string(),
-            ));
-        }
-
-        Ok(())
     }
 }
 
@@ -2714,20 +2646,12 @@ impl LogicalReplicationStream {
 /// # Using the native API
 ///
 /// ```no_run
-/// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig, StreamingMode};
+/// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, StreamingMode};
 /// use tokio_util::sync::CancellationToken;
-/// use std::time::Duration;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let config = ReplicationStreamConfig::new(
-///     "my_slot".to_string(),
-///     "my_publication".to_string(),
-///     2, StreamingMode::On,
-///     Duration::from_secs(10),
-///     Duration::from_secs(30),
-///     Duration::from_secs(60),
-///     RetryConfig::default(),
-/// );
+/// let config = ReplicationStreamConfig::builder("my_slot", "my_publication")
+///     .with_streaming_mode(StreamingMode::On);
 ///
 /// let mut stream = LogicalReplicationStream::new("connection_string", config).await?;
 /// stream.start(None).await?;
@@ -2802,6 +2726,11 @@ enum StreamState {
 }
 
 impl StreamState {
+    #[inline]
+    fn ready(stream: Box<LogicalReplicationStream>, terminated: bool) -> Self {
+        StreamState::Ready { stream, terminated }
+    }
+
     /// The stream, unless it is currently parked inside a poll future.
     #[inline]
     fn stream(&self) -> Option<&LogicalReplicationStream> {
@@ -3203,10 +3132,7 @@ impl EventStream {
             return None;
         };
         let (stream, result) = fut.as_mut().await;
-        self.state = StreamState::Ready {
-            stream: Box::new(stream),
-            terminated: false,
-        };
+        self.state = StreamState::ready(Box::new(stream), false);
         Some(result)
     }
 
@@ -3243,16 +3169,10 @@ impl EventStream {
         // entirely and tear the COPY down without a CopyDone — while still
         // returning `Ok(())`. Cancelling first is what makes this await prompt:
         // the parked `next_event_with_retry` honours the token.
-        if let StreamState::Polling(fut) = &mut self.state {
-            let (stream, _) = fut.as_mut().await;
-            self.state = StreamState::Ready {
-                stream: Box::new(stream),
-                terminated: false,
-            };
-        }
+        let _ = self.resume_parked_poll().await;
 
         let StreamState::Ready { stream, terminated } = &mut self.state else {
-            // Unreachable: the block above converted Polling to Ready.
+            // Unreachable: resuming the parked poll above left the stream in hand.
             return Ok(());
         };
         let result = stream.stop().await;
@@ -3306,10 +3226,7 @@ impl futures_core::Stream for EventStream {
                     Ok(Some(event)) => Ok(event),
                     // A dropped `next_event_before` parked a read that stopped at its boundary.
                     Ok(None) => {
-                        self.state = StreamState::Ready {
-                            stream,
-                            terminated: false,
-                        };
+                        self.state = StreamState::ready(stream, false);
                         cx.waker().wake_by_ref();
                         return std::task::Poll::Pending;
                     }
@@ -3317,32 +3234,20 @@ impl futures_core::Stream for EventStream {
                 };
                 match result {
                     Ok(event) => {
-                        self.state = StreamState::Ready {
-                            stream,
-                            terminated: false,
-                        };
+                        self.state = StreamState::ready(stream, false);
                         std::task::Poll::Ready(Some(Ok(event)))
                     }
                     Err(ref e) if e.is_cancelled() || e.is_stream_stopped() => {
-                        self.state = StreamState::Ready {
-                            stream,
-                            terminated: true,
-                        };
+                        self.state = StreamState::ready(stream, true);
                         std::task::Poll::Ready(None)
                     }
                     Err(ref e) if e.is_permanent() => {
-                        self.state = StreamState::Ready {
-                            stream,
-                            terminated: true,
-                        };
+                        self.state = StreamState::ready(stream, true);
                         std::task::Poll::Ready(Some(Err(result.unwrap_err())))
                     }
                     Err(e) => {
                         // Transient error — yield it but keep the stream alive
-                        self.state = StreamState::Ready {
-                            stream,
-                            terminated: false,
-                        };
+                        self.state = StreamState::ready(stream, false);
                         std::task::Poll::Ready(Some(Err(e)))
                     }
                 }
@@ -3397,20 +3302,12 @@ impl<'a> EventStreamRef<'a> {
     /// # Example
     ///
     /// ```no_run
-    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, RetryConfig, StreamingMode};
+    /// use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig, StreamingMode};
     /// use tokio_util::sync::CancellationToken;
-    /// use std::time::Duration;
     ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let config = ReplicationStreamConfig::new(
-    ///     "my_slot".to_string(),
-    ///     "my_publication".to_string(),
-    ///     2, StreamingMode::On,
-    ///     Duration::from_secs(10),
-    ///     Duration::from_secs(30),
-    ///     Duration::from_secs(60),
-    ///     RetryConfig::default(),
-    /// );
+    /// let config = ReplicationStreamConfig::builder("my_slot", "my_publication")
+    ///     .with_streaming_mode(StreamingMode::On);
     ///
     /// let mut stream = LogicalReplicationStream::new("connection_string", config).await?;
     /// stream.start(None).await?;
@@ -3484,16 +3381,7 @@ mod reached_stop_lsn_tests {
         chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap()
     }
     fn commit(end: u64) -> ChangeEvent {
-        ChangeEvent {
-            event_type: EventType::Commit {
-                commit_timestamp: ts(),
-                commit_lsn: Lsn::new(end),
-                end_lsn: Lsn::new(end),
-            },
-            lsn: Lsn::new(end),
-            metadata: None,
-            xid: None,
-        }
+        ChangeEvent::commit(ts(), Lsn::new(end), Lsn::new(end), Lsn::new(end))
     }
     fn stream_commit(end: u64) -> ChangeEvent {
         ChangeEvent {
@@ -3509,19 +3397,7 @@ mod reached_stop_lsn_tests {
         }
     }
     fn commit_prepared(end: u64) -> ChangeEvent {
-        ChangeEvent {
-            event_type: EventType::CommitPrepared {
-                flags: 0,
-                transaction_id: 7,
-                commit_lsn: Lsn::new(end),
-                end_lsn: Lsn::new(end),
-                commit_timestamp: ts(),
-                gid: std::sync::Arc::from("g"),
-            },
-            lsn: Lsn::new(end),
-            metadata: None,
-            xid: None,
-        }
+        ChangeEvent::commit_prepared(0, 7, Lsn::new(end), Lsn::new(end), ts(), "g", Lsn::new(end))
     }
     fn insert(lsn: u64) -> ChangeEvent {
         let data = RowData::from_pairs(vec![("id", ColumnValue::text("1"))]);
@@ -3572,8 +3448,11 @@ mod reached_stop_lsn_tests {
 pub(crate) mod tests {
     use super::*;
     use crate::column_value::{ColumnValue, RowData};
-    use crate::protocol::TupleData;
+    use crate::protocol::{ColumnData, ColumnInfo, StreamingReplicationMessage, TupleData};
     use crate::types::{parse_lsn, ReplicaIdentity};
+    use crate::LogicalReplicationMessage;
+    use futures::StreamExt;
+    use futures_core::FusedStream;
 
     #[allow(dead_code)]
     const _: () = {
@@ -3589,16 +3468,8 @@ pub(crate) mod tests {
 
     /// Helper function to create a test configuration
     fn create_test_config() -> ReplicationStreamConfig {
-        ReplicationStreamConfig::new(
-            "test_slot".to_string(),
-            "test_publication".to_string(),
-            2,
-            StreamingMode::On,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        )
+        ReplicationStreamConfig::builder("test_slot", "test_publication")
+            .with_streaming_mode(StreamingMode::On)
     }
 
     #[test]
@@ -3652,7 +3523,7 @@ pub(crate) mod tests {
     #[cfg(feature = "rustls-tls")]
     #[tokio::test]
     async fn automatic_slot_creation_reports_connection_errors() {
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
         let error = stream
             .prepare_replication_slot()
             .await
@@ -3666,16 +3537,9 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_connection_timeout_exceeded() {
-        let config = ReplicationStreamConfig::new(
-            "test_slot".to_string(),
-            "test_publication".to_string(),
-            2,
-            StreamingMode::On,
-            Duration::from_secs(10),
-            Duration::from_millis(1),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        );
+        let config = ReplicationStreamConfig::builder("test_slot", "test_publication")
+            .with_streaming_mode(StreamingMode::On)
+            .with_connection_timeout(Duration::from_millis(1));
 
         let result = timeout_or_error(config.connection_timeout, async {
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -3736,8 +3600,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_feedback_check_counter_initialized_zero() {
-        let config = create_test_config();
-        let stream = create_test_stream(config);
+        let stream = test_stream();
         assert_eq!(stream.feedback_check_counter, 0);
     }
 
@@ -4098,8 +3961,6 @@ pub(crate) mod tests {
 
     #[test]
     fn test_cancellation_token_basic() {
-        use tokio_util::sync::CancellationToken;
-
         let cancel_token = CancellationToken::new();
 
         // Initially not cancelled
@@ -4114,8 +3975,6 @@ pub(crate) mod tests {
 
     #[test]
     fn test_cancellation_token_clone() {
-        use tokio_util::sync::CancellationToken;
-
         let cancel_token = CancellationToken::new();
         let clone = cancel_token.clone();
 
@@ -4206,18 +4065,6 @@ pub(crate) mod tests {
 
         // Test invalid byte
         assert_eq!(ReplicaIdentity::from_byte(b'x'), None);
-    }
-
-    #[test]
-    fn test_retry_config_default() {
-        let config = RetryConfig::default();
-
-        assert_eq!(config.max_attempts, 5);
-        assert_eq!(config.initial_delay, Duration::from_secs(1));
-        assert_eq!(config.max_delay, Duration::from_secs(60));
-        assert_eq!(config.multiplier, 2.0);
-        assert_eq!(config.max_duration, Duration::from_secs(300));
-        assert!(config.jitter);
     }
 
     #[test]
@@ -5347,8 +5194,6 @@ pub(crate) mod tests {
 
     #[test]
     fn test_tuple_to_data_with_binary_column() {
-        use crate::protocol::{ColumnData, ColumnInfo, RelationInfo, TupleData};
-
         let columns = vec![
             ColumnInfo::new(0, "binary_col".to_string(), 17, -1), // bytea
         ];
@@ -5364,8 +5209,6 @@ pub(crate) mod tests {
 
     #[test]
     fn test_tuple_to_data_with_null_column() {
-        use crate::protocol::{ColumnData, ColumnInfo, RelationInfo, TupleData};
-
         let columns = vec![ColumnInfo::new(0, "nullable".to_string(), 25, -1)];
         let relation = RelationInfo::new(1, "public", "t", b'd', columns);
 
@@ -5377,8 +5220,6 @@ pub(crate) mod tests {
 
     #[test]
     fn test_tuple_to_data_skips_unchanged_columns_detailed() {
-        use crate::protocol::{ColumnData, ColumnInfo, RelationInfo, TupleData};
-
         let columns = vec![
             ColumnInfo::new(0, "id".to_string(), 23, -1),
             ColumnInfo::new(0, "unchanged_col".to_string(), 25, -1),
@@ -5398,8 +5239,6 @@ pub(crate) mod tests {
 
     #[test]
     fn test_tuple_to_data_empty_tuple() {
-        use crate::protocol::{ColumnInfo, RelationInfo, TupleData};
-
         let columns: Vec<ColumnInfo> = vec![];
         let relation = RelationInfo::new(1, "public", "t", b'd', columns);
         let tuple = TupleData::new(vec![]);
@@ -5528,27 +5367,62 @@ pub(crate) mod tests {
     /// Helper to create a LogicalReplicationStream for testing without a DB connection.
     /// Only safe for testing methods that don't touch self.connection.
     pub(crate) fn create_test_stream(config: ReplicationStreamConfig) -> LogicalReplicationStream {
-        use crate::lsn::SharedLsnFeedback;
-        LogicalReplicationStream {
-            connection: PgReplicationConnection::null_for_testing(),
-            parser: LogicalReplicationParser::with_protocol_version(config.protocol_version),
-            state: ReplicationState::new(),
-            config: config.clone(),
-            slot: SlotState::Absent,
-            retry_handler: ReplicationConnectionRetry::new(
-                config.retry_config,
-                "postgresql://test@localhost/test?replication=database".to_string(),
-            ),
-            last_health_check: Instant::now(),
-            shared_lsn_feedback: SharedLsnFeedback::new_shared(),
-            identity: identity(7682, 1),
-            feedback_check_counter: 0,
-            replay_stop: ReplayStop::Running,
-            held: None,
-            keepalive_wal_end: Lsn::new(0),
-            recovering: false,
-            counters: Arc::default(),
+        let retry_handler = ReplicationConnectionRetry::new(
+            config.retry_config,
+            "postgresql://test@localhost/test?replication=database".to_string(),
+        );
+        LogicalReplicationStream::from_parts(
+            PgReplicationConnection::null_for_testing(),
+            config,
+            retry_handler,
+            identity(7682, 1),
+        )
+    }
+
+    /// `public.<table>` with a key column `id` and one plain text column per name in `others`.
+    fn relation_info(oid: Oid, table: &str, others: &[&str]) -> RelationInfo {
+        let id = ColumnInfo::new(1, "id".to_string(), 23, -1);
+        let columns = std::iter::once(id)
+            .chain(
+                others
+                    .iter()
+                    .map(|name| ColumnInfo::new(0, name.to_string(), 25, -1)),
+            )
+            .collect();
+        RelationInfo::new(oid, "public", table, b'd', columns)
+    }
+
+    /// Replays `events`, then reports `Cancelled`, and keeps the last LSN it was asked to ack.
+    pub(crate) struct MockSource {
+        events: std::collections::VecDeque<Result<ChangeEvent>>,
+        pub(crate) last_ack: std::sync::atomic::AtomicU64,
+    }
+    impl MockSource {
+        pub(crate) fn new(events: Vec<Result<ChangeEvent>>) -> Self {
+            Self {
+                events: events.into(),
+                last_ack: std::sync::atomic::AtomicU64::new(0),
+            }
         }
+    }
+    impl EventSource for MockSource {
+        async fn recv(&mut self) -> Result<ChangeEvent> {
+            self.events
+                .pop_front()
+                .unwrap_or_else(|| Err(ReplicationError::Cancelled("drained".into())))
+        }
+        fn ack(&self, lsn: XLogRecPtr) {
+            self.last_ack
+                .store(lsn, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn test_stream() -> LogicalReplicationStream {
+        create_test_stream(create_test_config())
+    }
+
+    fn test_event_stream() -> EventStream {
+        test_stream().into_stream(CancellationToken::new())
     }
 
     /// Build an `IDENTIFY_SYSTEM`-shaped result. Native-only: the libpq
@@ -5622,7 +5496,7 @@ pub(crate) mod tests {
     #[cfg(feature = "rustls-tls")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn discard_replication_slot_is_best_effort() {
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
         stream.slot = SlotState::Ours {
             consistent_point: Some(Lsn::new(42)),
             exported_snapshot: Some("snap".to_string()),
@@ -6008,14 +5882,14 @@ pub(crate) mod tests {
     /// Timeline 1 has no history file, so the read answers without a round trip.
     #[tokio::test]
     async fn timeline_one_has_an_empty_history() {
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
         assert_eq!(stream.timeline_history().await.unwrap(), Vec::new());
     }
 
     /// Reconnecting to the same cluster on the same timeline is the normal case.
     #[test]
     fn identity_check_passes_on_an_unchanged_server() {
-        let stream = create_test_stream(create_test_config());
+        let stream = test_stream();
         assert!(stream.check_server_identity(&identity(7682, 1)).is_ok());
     }
 
@@ -6045,7 +5919,7 @@ pub(crate) mod tests {
     /// would stream the post-fork history under LSNs the consumer already used.
     #[test]
     fn identity_check_rejects_a_timeline_switch() {
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
         stream.identity = identity(7682, 1);
 
         let err = stream
@@ -6065,7 +5939,7 @@ pub(crate) mod tests {
     /// production) that happens to have a slot by the same name.
     #[test]
     fn identity_check_rejects_a_different_cluster() {
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
         stream.identity = identity(7682, 1);
 
         let err = stream
@@ -6081,7 +5955,7 @@ pub(crate) mod tests {
     /// actionable diagnosis even when the timeline also differs.
     #[test]
     fn identity_check_reports_the_cluster_when_both_differ() {
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
         stream.identity = identity(7682, 1);
 
         let msg = stream
@@ -6308,7 +6182,9 @@ pub(crate) mod tests {
 
     /// A server that counts the connections it accepts and either holds them without ever
     /// answering or, with `hang_up`, closes them at once. Returns its port and the count.
-    async fn counting_server(hang_up: bool) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+    pub(crate) async fn counting_server(
+        hang_up: bool,
+    ) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -6690,7 +6566,6 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn event_stream_terminates_none_on_stream_stopped() {
-        use futures::StreamExt;
         // poll_next maps StreamStopped to a graceful end-of-stream (None + terminated).
         let cfg = ReplicationStreamConfig::builder("slot", "pub").with_stop_at_lsn(0x300u64);
         let mut stream = create_test_stream(cfg);
@@ -6710,7 +6585,7 @@ pub(crate) mod tests {
     #[test]
     fn read_path_futures_stay_small() {
         const LIMIT: usize = 1024;
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
         let token = CancellationToken::new();
         let boundary = Lsn::new(0x100);
         let plain = std::mem::size_of_val(&stream.next_event(&token));
@@ -6731,232 +6606,173 @@ pub(crate) mod tests {
         }
     }
 
-    #[test]
-    fn test_validate_replication_options_valid_v1() {
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            1,
-            StreamingMode::Off,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        );
-        let stream = create_test_stream(config);
-        assert!(stream.validate_replication_options().is_ok());
+    fn options_config(version: u32, mode: StreamingMode) -> ReplicationStreamConfig {
+        ReplicationStreamConfig::builder("slot", "pub")
+            .with_protocol_version(version)
+            .with_streaming_mode(mode)
     }
 
     #[test]
-    fn test_validate_replication_options_valid_v2_streaming() {
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            2,
-            StreamingMode::On,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        );
-        let stream = create_test_stream(config);
-        assert!(stream.validate_replication_options().is_ok());
+    fn validate_replication_options_accepts_supported_combinations() {
+        let mut accepted: Vec<_> = (1..=4)
+            .map(|version| options_config(version, StreamingMode::Off))
+            .collect();
+        accepted.extend([
+            options_config(2, StreamingMode::On),
+            options_config(3, StreamingMode::Off).with_two_phase(true),
+            options_config(4, StreamingMode::Parallel),
+            options_config(4, StreamingMode::Parallel)
+                .with_messages(true)
+                .with_binary(true)
+                .with_two_phase(true)
+                .with_origin(Some(OriginFilter::None)),
+        ]);
+        for config in accepted {
+            assert!(config.validate_replication_options().is_ok(), "{config:?}");
+        }
     }
 
     #[test]
-    fn test_validate_replication_options_invalid_version() {
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            5,
-            StreamingMode::Off,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        );
-        let stream = create_test_stream(config);
-        let err = stream.validate_replication_options().unwrap_err();
-        assert!(err.to_string().contains("Unsupported protocol version: 5"));
+    fn validate_replication_options_rejects_unsupported_combinations() {
+        for (config, message) in [
+            (
+                options_config(0, StreamingMode::Off),
+                "Unsupported protocol version: 0",
+            ),
+            (
+                options_config(5, StreamingMode::Off),
+                "Unsupported protocol version: 5",
+            ),
+            (
+                options_config(99, StreamingMode::Off),
+                "Unsupported protocol version: 99",
+            ),
+            (
+                options_config(u32::MAX, StreamingMode::Off),
+                "Unsupported protocol version: 4294967295",
+            ),
+            (
+                options_config(1, StreamingMode::On),
+                "streaming=on requires protocol version >= 2",
+            ),
+            (
+                options_config(3, StreamingMode::Parallel),
+                "streaming=parallel requires protocol version >= 4",
+            ),
+            (
+                options_config(2, StreamingMode::Off).with_two_phase(true),
+                "two_phase requires protocol version >= 3",
+            ),
+        ] {
+            let err = config.validate_replication_options().unwrap_err();
+            assert!(err.to_string().contains(message), "{config:?}: {err}");
+            assert!(config.build_replication_options().is_err(), "{config:?}");
+        }
     }
 
     #[test]
-    fn test_validate_streaming_on_requires_v2() {
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            1,
-            StreamingMode::On,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        );
-        let stream = create_test_stream(config);
-        let err = stream.validate_replication_options().unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("streaming=on requires protocol version >= 2"));
-    }
-
-    #[test]
-    fn test_validate_streaming_parallel_requires_v4() {
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            3,
-            StreamingMode::Parallel,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        );
-        let stream = create_test_stream(config);
-        let err = stream.validate_replication_options().unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("streaming=parallel requires protocol version >= 4"));
-    }
-
-    #[test]
-    fn test_validate_two_phase_requires_v3() {
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            2,
-            StreamingMode::Off,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        )
-        .with_two_phase(true);
-        let stream = create_test_stream(config);
-        let err = stream.validate_replication_options().unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("two_phase requires protocol version >= 3"));
-    }
-
-    #[test]
-    fn test_validate_two_phase_v3_ok() {
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            3,
-            StreamingMode::Off,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        )
-        .with_two_phase(true);
-        let stream = create_test_stream(config);
-        assert!(stream.validate_replication_options().is_ok());
-    }
-
-    #[test]
-    fn test_validate_streaming_parallel_v4_ok() {
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            4,
-            StreamingMode::Parallel,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        );
-        let stream = create_test_stream(config);
-        assert!(stream.validate_replication_options().is_ok());
-    }
-
-    #[test]
-    fn test_build_replication_options_basic() {
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            1,
-            StreamingMode::Off,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        );
-        let stream = create_test_stream(config);
-        let options = stream.build_replication_options().unwrap();
-        assert_eq!(options.len(), 2);
-        assert_eq!(options[0].0, "proto_version");
-        assert_eq!(options[0].1, "1");
-        assert_eq!(options[1].0, "publication_names");
-        assert_eq!(options[1].1, "\"pub\"");
-    }
-
-    #[test]
-    fn test_build_replication_options_with_streaming() {
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            2,
-            StreamingMode::On,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        );
-        let stream = create_test_stream(config);
-        let options = stream.build_replication_options().unwrap();
-        assert!(options.iter().any(|(k, v)| k == "streaming" && v == "on"));
-    }
-
-    #[test]
-    fn test_build_replication_options_with_all_flags() {
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            4,
-            StreamingMode::Parallel,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        )
-        .with_messages(true)
-        .with_binary(true)
-        .with_two_phase(true)
-        .with_origin(Some(OriginFilter::None));
-
-        let stream = create_test_stream(config);
-        let options = stream.build_replication_options().unwrap();
-
-        assert!(options
-            .iter()
-            .any(|(k, v)| k == "streaming" && v == "parallel"));
-        assert!(options.iter().any(|(k, v)| k == "messages" && v == "on"));
-        assert!(options.iter().any(|(k, v)| k == "binary" && v == "on"));
-        assert!(options.iter().any(|(k, v)| k == "two_phase" && v == "on"));
-        assert!(options.iter().any(|(k, v)| k == "origin" && v == "none"));
-    }
-
-    #[test]
-    fn test_build_replication_options_invalid_version() {
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            99,
-            StreamingMode::Off,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        );
-        let stream = create_test_stream(config);
-        assert!(stream.build_replication_options().is_err());
+    fn build_replication_options_lists_exactly_what_is_enabled() {
+        let publication = r#""pub""#;
+        for (config, expected) in [
+            (
+                options_config(1, StreamingMode::Off),
+                vec![("proto_version", "1"), ("publication_names", publication)],
+            ),
+            (
+                options_config(2, StreamingMode::Off),
+                vec![("proto_version", "2"), ("publication_names", publication)],
+            ),
+            (
+                options_config(2, StreamingMode::On),
+                vec![
+                    ("proto_version", "2"),
+                    ("publication_names", publication),
+                    ("streaming", "on"),
+                ],
+            ),
+            (
+                options_config(4, StreamingMode::Parallel),
+                vec![
+                    ("proto_version", "4"),
+                    ("publication_names", publication),
+                    ("streaming", "parallel"),
+                ],
+            ),
+            (
+                options_config(1, StreamingMode::Off).with_messages(true),
+                vec![
+                    ("proto_version", "1"),
+                    ("publication_names", publication),
+                    ("messages", "on"),
+                ],
+            ),
+            (
+                options_config(1, StreamingMode::Off).with_binary(true),
+                vec![
+                    ("proto_version", "1"),
+                    ("publication_names", publication),
+                    ("binary", "on"),
+                ],
+            ),
+            (
+                options_config(3, StreamingMode::Off).with_two_phase(true),
+                vec![
+                    ("proto_version", "3"),
+                    ("publication_names", publication),
+                    ("two_phase", "on"),
+                ],
+            ),
+            (
+                options_config(2, StreamingMode::Off).with_origin(Some(OriginFilter::Any)),
+                vec![
+                    ("proto_version", "2"),
+                    ("publication_names", publication),
+                    ("origin", "any"),
+                ],
+            ),
+            (
+                options_config(4, StreamingMode::Off).with_origin(Some(OriginFilter::Any)),
+                vec![
+                    ("proto_version", "4"),
+                    ("publication_names", publication),
+                    ("origin", "any"),
+                ],
+            ),
+            (
+                ReplicationStreamConfig::builder("slot", "my_publication").with_protocol_version(1),
+                vec![
+                    ("proto_version", "1"),
+                    ("publication_names", r#""my_publication""#),
+                ],
+            ),
+            (
+                options_config(4, StreamingMode::Parallel)
+                    .with_messages(true)
+                    .with_binary(true)
+                    .with_two_phase(true)
+                    .with_origin(Some(OriginFilter::None)),
+                vec![
+                    ("proto_version", "4"),
+                    ("publication_names", publication),
+                    ("streaming", "parallel"),
+                    ("messages", "on"),
+                    ("binary", "on"),
+                    ("two_phase", "on"),
+                    ("origin", "none"),
+                ],
+            ),
+        ] {
+            let options = config.build_replication_options().unwrap();
+            let options: Vec<_> = options
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .collect();
+            assert_eq!(options, expected, "{config:?}");
+        }
     }
 
     #[test]
     fn test_get_key_columns_for_relation_k_type() {
-        use crate::protocol::{ColumnInfo, RelationInfo};
         let columns = vec![
             ColumnInfo::new(1, "id".to_string(), 23, -1),    // key
             ColumnInfo::new(0, "name".to_string(), 25, -1),  // not key
@@ -6970,7 +6786,6 @@ pub(crate) mod tests {
 
     #[test]
     fn test_get_key_columns_for_relation_o_type() {
-        use crate::protocol::{ColumnInfo, RelationInfo};
         let columns = vec![
             ColumnInfo::new(1, "id".to_string(), 23, -1),
             ColumnInfo::new(0, "name".to_string(), 25, -1),
@@ -6984,7 +6799,6 @@ pub(crate) mod tests {
 
     #[test]
     fn test_get_key_columns_for_relation_none_with_keys() {
-        use crate::protocol::{ColumnInfo, RelationInfo};
         let columns = vec![
             ColumnInfo::new(1, "id".to_string(), 23, -1),
             ColumnInfo::new(0, "name".to_string(), 25, -1),
@@ -6998,7 +6812,6 @@ pub(crate) mod tests {
 
     #[test]
     fn test_get_key_columns_for_relation_none_no_keys() {
-        use crate::protocol::{ColumnInfo, RelationInfo};
         let columns = vec![
             ColumnInfo::new(0, "data1".to_string(), 25, -1),
             ColumnInfo::new(0, "data2".to_string(), 25, -1),
@@ -7012,7 +6825,6 @@ pub(crate) mod tests {
 
     #[test]
     fn test_get_key_columns_for_relation_unknown_type() {
-        use crate::protocol::{ColumnInfo, RelationInfo};
         let columns = vec![
             ColumnInfo::new(1, "id".to_string(), 23, -1),
             ColumnInfo::new(0, "name".to_string(), 25, -1),
@@ -7025,10 +6837,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_relation_metadata() {
-        use crate::protocol::{ColumnInfo, RelationInfo};
-
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         let relation = RelationInfo::new(
             100,
@@ -7051,16 +6860,13 @@ pub(crate) mod tests {
 
     #[test]
     fn test_relation_metadata_missing() {
-        let stream = create_test_stream(create_test_config());
+        let stream = test_stream();
         assert!(crate::protocol::relation_metadata(&stream.state, 999, None).is_none());
     }
 
     #[test]
     fn test_convert_to_change_event_begin() {
-        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
-
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Begin {
             final_lsn: 0x1000,
@@ -7082,10 +6888,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_convert_to_change_event_commit() {
-        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
-
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Commit {
             flags: 0,
@@ -7113,11 +6916,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_convert_to_change_event_relation() {
-        use crate::protocol::ColumnInfo;
-        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
-
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Relation {
             relation_id: 100,
@@ -7146,23 +6945,10 @@ pub(crate) mod tests {
 
     #[test]
     fn test_convert_to_change_event_insert() {
-        use crate::protocol::{ColumnData, ColumnInfo, RelationInfo, TupleData};
-        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
-
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         // First add a relation
-        let relation = RelationInfo::new(
-            100,
-            "public",
-            "users",
-            b'd',
-            vec![
-                ColumnInfo::new(1, "id".to_string(), 23, -1),
-                ColumnInfo::new(0, "name".to_string(), 25, -1),
-            ],
-        );
+        let relation = relation_info(100, "users", &["name"]);
         stream.state.add_relation(relation);
 
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Insert {
@@ -7195,11 +6981,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_convert_to_change_event_insert_unknown_relation() {
-        use crate::protocol::{ColumnData, TupleData};
-        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
-
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Insert {
             relation_id: 999, // Unknown
@@ -7213,22 +6995,9 @@ pub(crate) mod tests {
 
     #[test]
     fn test_convert_to_change_event_update_with_old() {
-        use crate::protocol::{ColumnData, ColumnInfo, RelationInfo, TupleData};
-        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+        let mut stream = test_stream();
 
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
-
-        let relation = RelationInfo::new(
-            100,
-            "public",
-            "users",
-            b'd',
-            vec![
-                ColumnInfo::new(1, "id".to_string(), 23, -1),
-                ColumnInfo::new(0, "name".to_string(), 25, -1),
-            ],
-        );
+        let relation = relation_info(100, "users", &["name"]);
         stream.state.add_relation(relation);
 
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Update {
@@ -7269,11 +7038,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_convert_to_change_event_update_unknown_relation() {
-        use crate::protocol::{ColumnData, TupleData};
-        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
-
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Update {
             relation_id: 999,
@@ -7289,22 +7054,9 @@ pub(crate) mod tests {
 
     #[test]
     fn test_convert_to_change_event_delete() {
-        use crate::protocol::{ColumnData, ColumnInfo, RelationInfo, TupleData};
-        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+        let mut stream = test_stream();
 
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
-
-        let relation = RelationInfo::new(
-            100,
-            "public",
-            "users",
-            b'd',
-            vec![
-                ColumnInfo::new(1, "id".to_string(), 23, -1),
-                ColumnInfo::new(0, "name".to_string(), 25, -1),
-            ],
-        );
+        let relation = relation_info(100, "users", &["name"]);
         stream.state.add_relation(relation);
 
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Delete {
@@ -7335,11 +7087,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_convert_to_change_event_delete_unknown_relation() {
-        use crate::protocol::{ColumnData, TupleData};
-        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
-
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Delete {
             relation_id: 999,
@@ -7354,19 +7102,9 @@ pub(crate) mod tests {
 
     #[test]
     fn test_convert_to_change_event_truncate() {
-        use crate::protocol::{ColumnInfo, RelationInfo};
-        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+        let mut stream = test_stream();
 
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
-
-        let relation = RelationInfo::new(
-            100,
-            "public",
-            "users",
-            b'd',
-            vec![ColumnInfo::new(1, "id".to_string(), 23, -1)],
-        );
+        let relation = relation_info(100, "users", &[]);
         stream.state.add_relation(relation);
 
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Truncate {
@@ -7389,10 +7127,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_convert_to_change_event_stream_start() {
-        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
-
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::StreamStart {
             xid: 42,
@@ -7416,10 +7151,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_convert_to_change_event_stream_stop() {
-        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
-
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::StreamStop);
 
@@ -7434,10 +7166,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_convert_to_change_event_stream_commit() {
-        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
-
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::StreamCommit {
             xid: 42,
@@ -7460,10 +7189,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_convert_to_change_event_stream_abort() {
-        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
-
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::StreamAbort {
             xid: 42,
@@ -7492,10 +7218,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_convert_to_change_event_unknown_message() {
-        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
-
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Origin {
             origin_lsn: 0x5000,
@@ -7510,36 +7233,11 @@ pub(crate) mod tests {
         assert_eq!(event.event_type_str(), "origin");
     }
 
-    #[test]
-    fn test_current_lsn() {
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
-        assert_eq!(stream.current_lsn(), 0);
-
-        stream.state.update_received_lsn(12345);
-        assert_eq!(stream.current_lsn(), 12345);
-    }
-
-    #[tokio::test]
-    async fn test_stream_stop_method() {
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
-        // stop() performs async I/O (sends final feedback)
-        stream.stop().await.unwrap();
-    }
-
     #[tokio::test]
     async fn test_maybe_send_feedback_no_received_lsn() {
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            1,
-            StreamingMode::Off,
-            Duration::from_millis(1), // Very short interval
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        );
+        let config = ReplicationStreamConfig::builder("slot", "pub")
+            .with_protocol_version(1)
+            .with_feedback_interval(Duration::from_millis(1)); // Very short interval
         let mut stream = create_test_stream(config);
 
         // No received LSN, feedback should be a no-op (won't crash on null conn)
@@ -7550,10 +7248,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_relation_metadata_single_part_name() {
-        use crate::protocol::{ColumnInfo, RelationInfo};
-
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         // Relation with no namespace (empty string) - creates single-part full_name
         let relation = RelationInfo::new(
@@ -7606,7 +7301,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_process_wal_message_too_short() {
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
         let data = vec![b'w'; 10]; // Too short (< 25 bytes)
         let result = stream.process_wal_message(data);
         assert!(result.is_err());
@@ -7615,7 +7310,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_process_wal_message_begin() {
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
         let payload = build_begin_payload(0x2000, 42);
         let data = build_wal_message(0x1000, 0x1500, &payload);
 
@@ -7634,7 +7329,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_process_wal_message_commit() {
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
         let payload = build_commit_payload(0x2000, 0x2100);
         let data = build_wal_message(0x1000, 0x1500, &payload);
 
@@ -7648,7 +7343,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_process_wal_message_no_payload() {
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
         // WAL message with header only (no payload after the 25 header bytes)
         let data = build_wal_message(0x1000, 0x1500, &[]);
         let result = stream.process_wal_message(data).unwrap();
@@ -7657,7 +7352,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_process_wal_message_updates_lsn() {
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
         assert_eq!(stream.state.last_received_lsn, 0);
 
         let payload = build_begin_payload(0x2000, 1);
@@ -7669,7 +7364,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_process_wal_message_zero_end_lsn_no_update() {
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
         stream.state.update_received_lsn(0x3000);
 
         let payload = build_begin_payload(0x2000, 1);
@@ -7691,7 +7386,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_process_keepalive_no_reply() {
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
         let data = build_keepalive_message(0x4000, false);
         let result = stream.process_keepalive_message(&data).await;
         assert!(result.is_ok());
@@ -7701,7 +7396,7 @@ pub(crate) mod tests {
     /// A keepalive asking for a reply is answered even before anything was received.
     #[tokio::test]
     async fn test_process_keepalive_reply_requested_no_received() {
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
         let data = build_keepalive_message(0, true);
         // The null connection fails every send, so an error shows a reply was attempted.
         assert!(stream.process_keepalive_message(&data).await.is_err());
@@ -7709,12 +7404,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_event_stream_accessors() {
-        use tokio_util::sync::CancellationToken;
-
-        let config = create_test_config();
-        let stream = create_test_stream(config);
-        let cancel_token = CancellationToken::new();
-        let event_stream = stream.into_stream(cancel_token);
+        let event_stream = test_event_stream();
 
         assert_eq!(event_stream.current_lsn(), 0);
         assert_eq!(event_stream.get_feedback_lsn(), (0, 0));
@@ -7725,12 +7415,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_event_stream_update_lsn() {
-        use tokio_util::sync::CancellationToken;
-
-        let config = create_test_config();
-        let stream = create_test_stream(config);
-        let cancel_token = CancellationToken::new();
-        let event_stream = stream.into_stream(cancel_token);
+        let event_stream = test_event_stream();
 
         event_stream.update_flushed_lsn(1000);
         event_stream.update_applied_lsn(2000);
@@ -7743,12 +7428,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_event_stream_inner_mut() {
-        use tokio_util::sync::CancellationToken;
-
-        let config = create_test_config();
-        let stream = create_test_stream(config);
-        let cancel_token = CancellationToken::new();
-        let mut event_stream = stream.into_stream(cancel_token);
+        let mut event_stream = test_event_stream();
 
         // inner_mut should allow mutation
         event_stream.inner_mut().state.update_received_lsn(5000);
@@ -7757,10 +7437,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_event_stream_ref_accessors() {
-        use tokio_util::sync::CancellationToken;
-
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
         let cancel_token = CancellationToken::new();
         let event_stream_ref = stream.stream(cancel_token);
 
@@ -7770,10 +7447,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_event_stream_ref_inner_mut() {
-        use tokio_util::sync::CancellationToken;
-
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
         let cancel_token = CancellationToken::new();
         let mut event_stream_ref = stream.stream(cancel_token);
 
@@ -7783,7 +7457,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_process_wal_relation_then_insert() {
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
 
         // Build a Relation payload manually: 'R' + relation_id(4) + namespace\0 + name\0 + replica_id(1) + ncols(2) + columns
         let mut rel_payload = Vec::new();
@@ -7847,7 +7521,7 @@ pub(crate) mod tests {
     /// Before `start()` there is no replication session, so `send_feedback()` reports it instead of claiming success.
     #[tokio::test]
     async fn test_send_feedback_no_received_lsn() {
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
         let err = stream.send_feedback().await.unwrap_err();
         assert!(matches!(err, ReplicationError::Protocol(..)), "{err:?}");
 
@@ -7859,94 +7533,11 @@ pub(crate) mod tests {
         assert_eq!(snapshot.last_feedback_time, 0);
     }
 
-    #[test]
-    fn test_build_options_origin_any() {
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            4,
-            StreamingMode::Off,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        )
-        .with_origin(Some(OriginFilter::Any));
-
-        let stream = create_test_stream(config);
-        let options = stream.build_replication_options().unwrap();
-        assert!(options.iter().any(|(k, v)| k == "origin" && v == "any"));
-    }
-
-    #[test]
-    fn test_build_options_no_streaming_mode_off() {
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            2,
-            StreamingMode::Off,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        );
-
-        let stream = create_test_stream(config);
-        let options = stream.build_replication_options().unwrap();
-        // StreamingMode::Off should NOT produce a "streaming" option
-        assert!(!options.iter().any(|(k, _)| k == "streaming"));
-    }
-
-    #[test]
-    fn test_validate_version_0() {
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            0,
-            StreamingMode::Off,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        );
-        let stream = create_test_stream(config);
-        let err = stream.validate_replication_options().unwrap_err();
-        assert!(err.to_string().contains("Unsupported protocol version: 0"));
-    }
-
-    #[test]
-    fn test_validate_version_4_with_all_features() {
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            4,
-            StreamingMode::Parallel,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        )
-        .with_messages(true)
-        .with_binary(true)
-        .with_two_phase(true)
-        .with_origin(Some(OriginFilter::None));
-
-        let stream = create_test_stream(config);
-        assert!(stream.validate_replication_options().is_ok());
-    }
-
     #[tokio::test]
     async fn test_maybe_send_feedback_with_changed_lsn() {
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            1,
-            StreamingMode::Off,
-            Duration::from_millis(1), // Very short feedback interval
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        );
+        let config = ReplicationStreamConfig::builder("slot", "pub")
+            .with_protocol_version(1)
+            .with_feedback_interval(Duration::from_millis(1)); // Very short feedback interval
         let mut stream = create_test_stream(config);
 
         // Set received LSN (non-zero)
@@ -7966,16 +7557,9 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_maybe_send_feedback_lsn_not_changed() {
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            1,
-            StreamingMode::Off,
-            Duration::from_millis(1),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        );
+        let config = ReplicationStreamConfig::builder("slot", "pub")
+            .with_protocol_version(1)
+            .with_feedback_interval(Duration::from_millis(1));
         let mut stream = create_test_stream(config);
 
         // Set received LSN
@@ -7996,16 +7580,9 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_maybe_send_feedback_zero_shared_lsn() {
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            1,
-            StreamingMode::Off,
-            Duration::from_millis(1),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        );
+        let config = ReplicationStreamConfig::builder("slot", "pub")
+            .with_protocol_version(1)
+            .with_feedback_interval(Duration::from_millis(1));
         let mut stream = create_test_stream(config);
 
         // Non-zero received but zero shared feedback
@@ -8019,8 +7596,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_send_feedback_with_shared_lsn_values() {
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         stream.state.update_received_lsn(10000);
         stream.shared_lsn_feedback.update_flushed_lsn(8000);
@@ -8038,8 +7614,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_send_feedback_applied_greater_than_received() {
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         stream.state.update_received_lsn(5000);
         // Consumer reports higher LSN than received (edge case, capped)
@@ -8053,10 +7628,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_convert_to_change_event_message_with_content() {
-        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
-
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Message {
             flags: 1,
@@ -8088,10 +7660,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_convert_to_change_event_type_message() {
-        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
-
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Type {
             type_id: 100,
@@ -8109,22 +7678,9 @@ pub(crate) mod tests {
 
     #[test]
     fn test_convert_update_no_old_tuple() {
-        use crate::protocol::{ColumnData, ColumnInfo, RelationInfo, TupleData};
-        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+        let mut stream = test_stream();
 
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
-
-        let relation = RelationInfo::new(
-            100,
-            "public",
-            "users",
-            b'd',
-            vec![
-                ColumnInfo::new(1, "id".to_string(), 23, -1),
-                ColumnInfo::new(0, "name".to_string(), 25, -1),
-            ],
-        );
+        let relation = relation_info(100, "users", &["name"]);
         stream.state.add_relation(relation);
 
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Update {
@@ -8154,10 +7710,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_convert_truncate_all_unknown() {
-        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
-
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Truncate {
             relation_ids: vec![999],
@@ -8177,16 +7730,9 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_maybe_send_feedback_flushed_capped() {
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            1,
-            StreamingMode::Off,
-            Duration::from_millis(1),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        );
+        let config = ReplicationStreamConfig::builder("slot", "pub")
+            .with_protocol_version(1)
+            .with_feedback_interval(Duration::from_millis(1));
         let mut stream = create_test_stream(config);
 
         stream.state.update_received_lsn(0x1000);
@@ -8230,43 +7776,27 @@ pub(crate) mod tests {
 
     #[test]
     fn test_exported_snapshot_name_none() {
-        let stream = create_test_stream(create_test_config());
+        let stream = test_stream();
         assert!(stream.exported_snapshot_name().is_none());
     }
 
     #[test]
     fn test_exported_snapshot_name_some() {
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
-        stream.slot = SlotState::Ours {
-            consistent_point: None,
-            exported_snapshot: Some("00000001-00000001-1".to_string()),
-        };
-        assert_eq!(stream.exported_snapshot_name(), Some("00000001-00000001-1"));
-    }
-
-    #[test]
-    fn test_is_temporary_slot_false() {
-        let stream = create_test_stream(create_test_config());
-        assert!(!stream.is_temporary_slot());
-    }
-
-    #[test]
-    fn test_is_temporary_slot_true() {
-        let config = create_test_config().with_slot_options(ReplicationSlotOptions {
-            temporary: true,
-            ..Default::default()
-        });
-        let stream = create_test_stream(config);
-        assert!(stream.is_temporary_slot());
+        for name in ["00000001-00000001-1", "00000003-00000028-1"] {
+            let mut stream = test_stream();
+            stream.slot = SlotState::Ours {
+                consistent_point: None,
+                exported_snapshot: Some(name.to_string()),
+            };
+            assert_eq!(stream.exported_snapshot_name(), Some(name));
+        }
     }
 
     // ---- Coverage: send_feedback with zero shared LSN (else branches) ----
 
     #[tokio::test]
     async fn test_send_feedback_zero_shared_lsn() {
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
         stream.state.update_received_lsn(5000);
         // shared_lsn_feedback flushed and applied are 0 by default
         // This exercises the else branches (flushed_lsn = 0, applied_lsn = 0)
@@ -8306,7 +7836,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_process_keepalive_reply_with_valid_lsn() {
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
         // Set a non-zero received LSN so send_feedback doesn't short-circuit
         stream.state.update_received_lsn(0x2000);
         let data = build_keepalive_message(0x3000, true);
@@ -8321,10 +7851,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_convert_to_change_event_stream_abort_no_optionals() {
-        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
-
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::StreamAbort {
             xid: 99,
@@ -8355,22 +7882,9 @@ pub(crate) mod tests {
 
     #[test]
     fn test_convert_to_change_event_update_key_type_k() {
-        use crate::protocol::{ColumnData, ColumnInfo, RelationInfo, TupleData};
-        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
+        let mut stream = test_stream();
 
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
-
-        let relation = RelationInfo::new(
-            100,
-            "public",
-            "users",
-            b'd',
-            vec![
-                ColumnInfo::new(1, "id".to_string(), 23, -1),
-                ColumnInfo::new(0, "name".to_string(), 25, -1),
-            ],
-        );
+        let relation = relation_info(100, "users", &["name"]);
         stream.state.add_relation(relation);
 
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Update {
@@ -8400,10 +7914,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_event_stream_exported_snapshot() {
-        use tokio_util::sync::CancellationToken;
-
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
         stream.slot = SlotState::Ours {
             consistent_point: None,
             exported_snapshot: Some("snap-123".to_string()),
@@ -8419,8 +7930,6 @@ pub(crate) mod tests {
 
     #[test]
     fn test_event_stream_is_temporary() {
-        use tokio_util::sync::CancellationToken;
-
         let config = create_test_config().with_slot_options(ReplicationSlotOptions {
             temporary: true,
             ..Default::default()
@@ -8435,23 +7944,17 @@ pub(crate) mod tests {
     /// timeout produces a `Timeout` error (the retry loop takes too long).
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_new_with_unreachable_host_timeout() {
-        let config = ReplicationStreamConfig::new(
-            "test_slot".to_string(),
-            "test_pub".to_string(),
-            2,
-            StreamingMode::On,
-            Duration::from_secs(10),
-            Duration::from_millis(1), // extremely short timeout
-            Duration::from_secs(60),
-            RetryConfig {
+        let config = ReplicationStreamConfig::builder("test_slot", "test_pub")
+            .with_streaming_mode(StreamingMode::On)
+            .with_connection_timeout(Duration::from_millis(1)) // extremely short timeout
+            .with_retry_config(RetryConfig {
                 max_attempts: 1,
                 initial_delay: Duration::from_millis(1),
                 max_delay: Duration::from_millis(10),
                 multiplier: 1.0,
                 max_duration: Duration::from_millis(10),
                 jitter: false,
-            },
-        );
+            });
 
         let result = LogicalReplicationStream::new(
             "postgresql://nobody:nothing@192.0.2.1:5432/nonexistent?replication=database&connect_timeout=1",
@@ -8467,23 +7970,17 @@ pub(crate) mod tests {
     /// returns an error (non-timeout path).
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_new_with_invalid_connection_string_no_timeout() {
-        let config = ReplicationStreamConfig::new(
-            "test_slot".to_string(),
-            "test_pub".to_string(),
-            2,
-            StreamingMode::On,
-            Duration::from_secs(10),
-            Duration::from_secs(60), // generous timeout
-            Duration::from_secs(60),
-            RetryConfig {
+        let config = ReplicationStreamConfig::builder("test_slot", "test_pub")
+            .with_streaming_mode(StreamingMode::On)
+            .with_connection_timeout(Duration::from_secs(60)) // generous timeout
+            .with_retry_config(RetryConfig {
                 max_attempts: 1,
                 initial_delay: Duration::from_millis(1),
                 max_delay: Duration::from_millis(10),
                 multiplier: 1.0,
                 max_duration: Duration::from_secs(30),
                 jitter: false,
-            },
-        );
+            });
 
         let result = LogicalReplicationStream::new(
             "host=invalid_host_that_does_not_exist port=99999 dbname=nope replication=database connect_timeout=1",
@@ -8509,16 +8006,9 @@ pub(crate) mod tests {
             max_duration: Duration::from_secs(120),
             jitter: false,
         };
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            2,
-            StreamingMode::On,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            retry_config,
-        );
+        let config = ReplicationStreamConfig::builder("slot", "pub")
+            .with_streaming_mode(StreamingMode::On)
+            .with_retry_config(retry_config);
 
         let stream = create_test_stream(config.clone());
         // Verify that the config fields are stored correctly
@@ -8534,8 +8024,7 @@ pub(crate) mod tests {
     /// Verify that `new()` initializes all fields correctly via `create_test_stream`.
     #[test]
     fn test_new_initializes_all_fields() {
-        let config = create_test_config();
-        let stream = create_test_stream(config);
+        let stream = test_stream();
 
         // slot_created must be false initially
         assert!(!stream.slot.is_present());
@@ -8553,16 +8042,8 @@ pub(crate) mod tests {
     #[test]
     fn test_new_parser_protocol_version() {
         for version in 1..=4 {
-            let config = ReplicationStreamConfig::new(
-                "slot".to_string(),
-                "pub".to_string(),
-                version,
-                StreamingMode::Off,
-                Duration::from_secs(10),
-                Duration::from_secs(30),
-                Duration::from_secs(60),
-                RetryConfig::default(),
-            );
+            let config =
+                ReplicationStreamConfig::builder("slot", "pub").with_protocol_version(version);
 
             let stream = create_test_stream(config);
             assert_eq!(stream.config.protocol_version, version);
@@ -8573,8 +8054,7 @@ pub(crate) mod tests {
     /// short circuit and return `Ok(())` immediately without touching the connection.
     #[tokio::test]
     async fn test_ensure_replication_slot_already_created() {
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
         stream.slot = SlotState::Ours {
             consistent_point: None,
             exported_snapshot: None,
@@ -8591,8 +8071,7 @@ pub(crate) mod tests {
     /// is idempotent and always returns Ok.
     #[tokio::test]
     async fn test_ensure_replication_slot_idempotent() {
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
         stream.slot = SlotState::Ours {
             consistent_point: None,
             exported_snapshot: None,
@@ -8614,26 +8093,6 @@ pub(crate) mod tests {
         // Physical slot → output_plugin = None
         let physical_config = create_test_config().with_slot_type(SlotType::Physical);
         assert!(matches!(physical_config.slot_type, SlotType::Physical));
-    }
-
-    /// Verify that exported_snapshot_name is None before slot creation.
-    #[test]
-    fn test_exported_snapshot_name_none_before_creation() {
-        let config = create_test_config();
-        let stream = create_test_stream(config);
-        assert!(stream.exported_snapshot_name().is_none());
-    }
-
-    /// Verify that we can set and retrieve exported_snapshot_name.
-    #[test]
-    fn test_exported_snapshot_name_set_and_get() {
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
-        stream.slot = SlotState::Ours {
-            consistent_point: None,
-            exported_snapshot: Some("00000003-00000028-1".to_string()),
-        };
-        assert_eq!(stream.exported_snapshot_name(), Some("00000003-00000028-1"));
     }
 
     // ========================================
@@ -8687,8 +8146,7 @@ pub(crate) mod tests {
     /// Verify that recover_connection restarts replication from last_received_lsn.
     #[test]
     fn test_recover_connection_uses_last_received_lsn() {
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
         stream.state.update_received_lsn(0xABCD_1234);
 
         // The recovery logic reads last_received_lsn for restart position
@@ -8771,342 +8229,13 @@ pub(crate) mod tests {
     }
 
     // ========================================
-    // Tests for build_replication_options() edge cases
-    // ========================================
-
-    /// Test build_replication_options with only origin set, no streaming.
-    #[test]
-    fn test_build_replication_options_origin_only() {
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            2,
-            StreamingMode::Off,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        )
-        .with_origin(Some(OriginFilter::Any));
-
-        let stream = create_test_stream(config);
-        let options = stream.build_replication_options().unwrap();
-
-        // Should have proto_version, publication_names, and origin
-        assert_eq!(options.len(), 3);
-        assert!(options.iter().any(|(k, v)| k == "origin" && v == "any"));
-        // Should NOT have streaming
-        assert!(!options.iter().any(|(k, _)| k == "streaming"));
-    }
-
-    /// Test that StreamingMode::Off does NOT add a streaming option.
-    #[test]
-    fn test_build_replication_options_no_streaming_off() {
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            1,
-            StreamingMode::Off,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        );
-        let stream = create_test_stream(config);
-        let options = stream.build_replication_options().unwrap();
-        assert!(!options.iter().any(|(k, _)| k == "streaming"));
-    }
-
-    /// Test build_replication_options with messages enabled but nothing else.
-    #[test]
-    fn test_build_replication_options_messages_only() {
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            1,
-            StreamingMode::Off,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        )
-        .with_messages(true);
-
-        let stream = create_test_stream(config);
-        let options = stream.build_replication_options().unwrap();
-        assert!(options.iter().any(|(k, v)| k == "messages" && v == "on"));
-        assert!(!options.iter().any(|(k, _)| k == "binary"));
-        assert!(!options.iter().any(|(k, _)| k == "two_phase"));
-    }
-
-    /// Test build_replication_options with binary enabled.
-    #[test]
-    fn test_build_replication_options_binary_only() {
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            1,
-            StreamingMode::Off,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        )
-        .with_binary(true);
-
-        let stream = create_test_stream(config);
-        let options = stream.build_replication_options().unwrap();
-        assert!(options.iter().any(|(k, v)| k == "binary" && v == "on"));
-    }
-
-    /// Test build_replication_options with two_phase enabled at v3.
-    #[test]
-    fn test_build_replication_options_two_phase() {
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            3,
-            StreamingMode::Off,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        )
-        .with_two_phase(true);
-
-        let stream = create_test_stream(config);
-        let options = stream.build_replication_options().unwrap();
-        assert!(options.iter().any(|(k, v)| k == "two_phase" && v == "on"));
-    }
-
-    /// Test build_replication_options with parallel streaming at v4.
-    #[test]
-    fn test_build_replication_options_parallel_v4() {
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            4,
-            StreamingMode::Parallel,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        );
-        let stream = create_test_stream(config);
-        let options = stream.build_replication_options().unwrap();
-        assert!(options
-            .iter()
-            .any(|(k, v)| k == "streaming" && v == "parallel"));
-    }
-
-    /// Test that quoted publication name is formatted correctly.
-    #[test]
-    fn test_build_replication_options_publication_name_quoting() {
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "my_publication".to_string(),
-            1,
-            StreamingMode::Off,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        );
-        let stream = create_test_stream(config);
-        let options = stream.build_replication_options().unwrap();
-        let pub_opt = options
-            .iter()
-            .find(|(k, _)| k == "publication_names")
-            .expect("publication_names option must exist");
-        assert_eq!(pub_opt.1, "\"my_publication\"");
-    }
-
-    // ========================================
-    // Tests for validate_replication_options() edge cases
-    // ========================================
-
-    /// Protocol version 0 should be rejected.
-    #[test]
-    fn test_validate_replication_options_version_zero() {
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            0,
-            StreamingMode::Off,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        );
-        let stream = create_test_stream(config);
-        let err = stream.validate_replication_options().unwrap_err();
-        assert!(err.to_string().contains("Unsupported protocol version: 0"));
-    }
-
-    /// All valid protocol versions (1-4) should pass validation with StreamingMode::Off.
-    #[test]
-    fn test_validate_replication_options_all_valid_versions() {
-        for v in 1..=4 {
-            let config = ReplicationStreamConfig::new(
-                "slot".to_string(),
-                "pub".to_string(),
-                v,
-                StreamingMode::Off,
-                Duration::from_secs(10),
-                Duration::from_secs(30),
-                Duration::from_secs(60),
-                RetryConfig::default(),
-            );
-            let stream = create_test_stream(config);
-            assert!(
-                stream.validate_replication_options().is_ok(),
-                "Version {v} should be valid"
-            );
-        }
-    }
-
-    /// Very large protocol version should be rejected.
-    #[test]
-    fn test_validate_replication_options_large_version() {
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            u32::MAX,
-            StreamingMode::Off,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        );
-        let stream = create_test_stream(config);
-        assert!(stream.validate_replication_options().is_err());
-    }
-
-    /// two_phase at v3 should pass, at v2 should fail.
-    #[test]
-    fn test_validate_two_phase_boundary() {
-        // v2 with two_phase → error
-        let config_v2 = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            2,
-            StreamingMode::Off,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        )
-        .with_two_phase(true);
-        let stream_v2 = create_test_stream(config_v2);
-        assert!(stream_v2.validate_replication_options().is_err());
-
-        // v3 with two_phase → ok
-        let config_v3 = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            3,
-            StreamingMode::Off,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        )
-        .with_two_phase(true);
-        let stream_v3 = create_test_stream(config_v3);
-        assert!(stream_v3.validate_replication_options().is_ok());
-    }
-
-    /// streaming=parallel at v3 should fail, at v4 should pass.
-    #[test]
-    fn test_validate_parallel_boundary() {
-        let config_v3 = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            3,
-            StreamingMode::Parallel,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        );
-        let stream_v3 = create_test_stream(config_v3);
-        assert!(stream_v3.validate_replication_options().is_err());
-
-        let config_v4 = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            4,
-            StreamingMode::Parallel,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        );
-        let stream_v4 = create_test_stream(config_v4);
-        assert!(stream_v4.validate_replication_options().is_ok());
-    }
-
-    /// streaming=on at v1 should fail, at v2 should pass.
-    #[test]
-    fn test_validate_streaming_on_boundary() {
-        let config_v1 = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            1,
-            StreamingMode::On,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        );
-        let stream_v1 = create_test_stream(config_v1);
-        assert!(stream_v1.validate_replication_options().is_err());
-
-        let config_v2 = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            2,
-            StreamingMode::On,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        );
-        let stream_v2 = create_test_stream(config_v2);
-        assert!(stream_v2.validate_replication_options().is_ok());
-    }
-
-    /// Validate that all options together at v4 passes.
-    #[test]
-    fn test_validate_all_options_v4() {
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            4,
-            StreamingMode::Parallel,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        )
-        .with_messages(true)
-        .with_binary(true)
-        .with_two_phase(true)
-        .with_origin(Some(OriginFilter::None));
-
-        let stream = create_test_stream(config);
-        assert!(stream.validate_replication_options().is_ok());
-    }
-
-    // ========================================
     // Tests for initialize() path coverage
     // ========================================
 
     /// `initialize()` creates the slot, which a null connection cannot do.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_initialize_fails_on_slot_creation_with_null_conn() {
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         let result = stream.initialize().await;
         assert!(result.is_err());
@@ -9116,8 +8245,7 @@ pub(crate) mod tests {
     /// the ensure_replication_slot() short circuit still works.
     #[tokio::test]
     async fn test_ensure_replication_slot_after_manual_flag() {
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         // Manually mark slot as created
         stream.slot = SlotState::Ours {
@@ -9136,16 +8264,8 @@ pub(crate) mod tests {
     /// Health check should be skipped when the interval hasn't elapsed yet.
     #[tokio::test]
     async fn test_check_connection_health_skipped_when_too_soon() {
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            2,
-            StreamingMode::Off,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(3600), // 1 hour health check interval
-            RetryConfig::default(),
-        );
+        let config = ReplicationStreamConfig::builder("slot", "pub")
+            .with_health_check_interval(Duration::from_secs(3600)); // 1 hour health check interval
         let mut stream = create_test_stream(config);
 
         // Since last_health_check was just set, this should skip the check
@@ -9159,23 +8279,17 @@ pub(crate) mod tests {
     /// which will fail since there's no real DB.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_check_connection_health_detects_dead_connection() {
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            2,
-            StreamingMode::Off,
-            Duration::from_secs(10),
-            Duration::from_millis(1), // very short timeout
-            Duration::from_millis(0), // immediate health check
-            RetryConfig {
+        let config = ReplicationStreamConfig::builder("slot", "pub")
+            .with_connection_timeout(Duration::from_millis(1)) // very short timeout
+            .with_health_check_interval(Duration::from_millis(0)) // immediate health check
+            .with_retry_config(RetryConfig {
                 max_attempts: 1,
                 initial_delay: Duration::from_millis(1),
                 max_delay: Duration::from_millis(1),
                 multiplier: 1.0,
                 max_duration: Duration::from_millis(10),
                 jitter: false,
-            },
-        );
+            });
         let mut stream = create_test_stream(config);
         // Force health check interval to have elapsed
         stream.last_health_check = Instant::now() - Duration::from_secs(3600);
@@ -9272,8 +8386,7 @@ pub(crate) mod tests {
     /// Verify that shared_lsn_feedback can be updated and read back from the stream.
     #[test]
     fn test_stream_shared_lsn_feedback_update_and_read() {
-        let config = create_test_config();
-        let stream = create_test_stream(config);
+        let stream = test_stream();
 
         stream.shared_lsn_feedback.update_flushed_lsn(5000);
         stream.shared_lsn_feedback.update_applied_lsn(4000);
@@ -9286,8 +8399,7 @@ pub(crate) mod tests {
     /// Verify that shared_lsn_feedback does not allow backward movement.
     #[test]
     fn test_stream_shared_lsn_feedback_monotonic() {
-        let config = create_test_config();
-        let stream = create_test_stream(config);
+        let stream = test_stream();
 
         stream.shared_lsn_feedback.update_applied_lsn(1000);
         stream.shared_lsn_feedback.update_applied_lsn(500); // should be ignored
@@ -9301,16 +8413,14 @@ pub(crate) mod tests {
     /// current_lsn returns 0 for a fresh stream.
     #[test]
     fn test_current_lsn_fresh_stream() {
-        let config = create_test_config();
-        let stream = create_test_stream(config);
+        let stream = test_stream();
         assert_eq!(stream.current_lsn(), 0);
     }
 
     /// current_lsn reflects state.last_received_lsn.
     #[test]
     fn test_current_lsn_after_state_update() {
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
         stream.state.update_received_lsn(0x1234_5678);
         assert_eq!(stream.current_lsn(), 0x1234_5678);
     }
@@ -9318,8 +8428,7 @@ pub(crate) mod tests {
     /// is_temporary_slot returns the slot_options.temporary value.
     #[test]
     fn test_is_temporary_slot_default_false() {
-        let config = create_test_config();
-        let stream = create_test_stream(config);
+        let stream = test_stream();
         assert!(!stream.is_temporary_slot());
     }
 
@@ -9340,8 +8449,7 @@ pub(crate) mod tests {
     /// EventStream::current_lsn delegates to inner stream.
     #[test]
     fn test_event_stream_current_lsn() {
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
         stream.state.update_received_lsn(42);
 
         let cancel_token = CancellationToken::new();
@@ -9352,11 +8460,7 @@ pub(crate) mod tests {
     /// EventStream inner/inner_mut provide access to the underlying stream.
     #[test]
     fn test_event_stream_inner_access() {
-        let config = create_test_config();
-        let stream = create_test_stream(config);
-
-        let cancel_token = CancellationToken::new();
-        let mut event_stream = stream.into_stream(cancel_token);
+        let mut event_stream = test_event_stream();
 
         // inner() provides immutable access
         assert_eq!(event_stream.inner().config.slot_name, "test_slot");
@@ -9369,8 +8473,7 @@ pub(crate) mod tests {
     /// EventStreamRef works similarly to EventStream.
     #[test]
     fn test_event_stream_ref_basic() {
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
         stream.state.update_received_lsn(100);
 
         let cancel_token = CancellationToken::new();
@@ -9383,8 +8486,7 @@ pub(crate) mod tests {
     /// EventStreamRef inner_mut access.
     #[test]
     fn test_event_stream_ref_inner_mut_update() {
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         let cancel_token = CancellationToken::new();
         let mut event_stream_ref = stream.stream(cancel_token);
@@ -9395,23 +8497,16 @@ pub(crate) mod tests {
     /// RetryConfig with max_attempts = 0 should still fail (no retries).
     #[tokio::test]
     async fn test_new_with_zero_retry_attempts() {
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            2,
-            StreamingMode::On,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig {
+        let config = ReplicationStreamConfig::builder("slot", "pub")
+            .with_streaming_mode(StreamingMode::On)
+            .with_retry_config(RetryConfig {
                 max_attempts: 0,
                 initial_delay: Duration::from_millis(1),
                 max_delay: Duration::from_millis(10),
                 multiplier: 1.0,
                 max_duration: Duration::from_secs(5),
                 jitter: false,
-            },
-        );
+            });
 
         let result = LogicalReplicationStream::new(
             "postgresql://nobody:nothing@127.0.0.1:1/nonexistent?replication=database&connect_timeout=1",
@@ -9426,23 +8521,16 @@ pub(crate) mod tests {
     /// RetryConfig with very short max_duration should trigger duration exceeded.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_new_with_short_max_duration() {
-        let config = ReplicationStreamConfig::new(
-            "slot".to_string(),
-            "pub".to_string(),
-            2,
-            StreamingMode::On,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig {
+        let config = ReplicationStreamConfig::builder("slot", "pub")
+            .with_streaming_mode(StreamingMode::On)
+            .with_retry_config(RetryConfig {
                 max_attempts: 100,
                 initial_delay: Duration::from_millis(1),
                 max_delay: Duration::from_millis(10),
                 multiplier: 1.0,
                 max_duration: Duration::from_millis(1), // extremely short
                 jitter: false,
-            },
-        );
+            });
 
         let result = LogicalReplicationStream::new(
             "postgresql://nobody:nothing@127.0.0.1:1/nonexistent?replication=database&connect_timeout=1",
@@ -9456,16 +8544,14 @@ pub(crate) mod tests {
     /// Verify that state.relations is empty by default.
     #[test]
     fn test_stream_state_relations_empty() {
-        let config = create_test_config();
-        let stream = create_test_stream(config);
+        let stream = test_stream();
         assert!(stream.state.relations.is_empty());
     }
 
     /// Verify that last_health_check is recent after creation.
     #[test]
     fn test_stream_last_health_check_recent() {
-        let config = create_test_config();
-        let stream = create_test_stream(config);
+        let stream = test_stream();
         // Should have been set within the last second
         assert!(stream.last_health_check.elapsed() < Duration::from_secs(1));
     }
@@ -9496,8 +8582,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_stop_returns_ok_with_default_state() {
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         let result = stream.stop().await;
         assert!(result.is_ok());
@@ -9505,8 +8590,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_stop_preserves_current_lsn() {
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         // Simulate having received some WAL data
         stream.state.update_received_lsn(0x16B374D848);
@@ -9520,8 +8604,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_stop_with_shared_lsn_feedback_set() {
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         // Simulate consumer having updated feedback LSNs
         stream.shared_lsn_feedback.update_flushed_lsn(5000);
@@ -9539,8 +8622,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_stop_can_be_called_multiple_times() {
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
         stream.state.update_received_lsn(1000);
 
         // Calling stop() multiple times should always succeed
@@ -9551,8 +8633,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_stop_with_high_lsn_value() {
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         // Use a large LSN value near u64 max
         let high_lsn: u64 = 0xFFFF_FFFF_FFFF_FFFE;
@@ -9580,20 +8661,14 @@ pub(crate) mod tests {
 
     #[test]
     fn test_event_stream_is_terminated_initially_false() {
-        let config = create_test_config();
-        let stream = create_test_stream(config);
-        let cancel_token = CancellationToken::new();
-        let event_stream = stream.into_stream(cancel_token);
+        let event_stream = test_event_stream();
 
         assert!(!event_stream.is_terminated());
     }
 
     #[tokio::test]
     async fn test_event_stream_shutdown_sets_terminated() {
-        let config = create_test_config();
-        let stream = create_test_stream(config);
-        let cancel_token = CancellationToken::new();
-        let mut event_stream = stream.into_stream(cancel_token);
+        let mut event_stream = test_event_stream();
 
         assert!(!event_stream.is_terminated());
 
@@ -9604,8 +8679,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_event_stream_shutdown_cancels_token() {
-        let config = create_test_config();
-        let stream = create_test_stream(config);
+        let stream = test_stream();
         let cancel_token = CancellationToken::new();
         let cancel_clone = cancel_token.clone();
         let mut event_stream = stream.into_stream(cancel_token);
@@ -9619,10 +8693,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_event_stream_shutdown_idempotent() {
-        let config = create_test_config();
-        let stream = create_test_stream(config);
-        let cancel_token = CancellationToken::new();
-        let mut event_stream = stream.into_stream(cancel_token);
+        let mut event_stream = test_event_stream();
 
         // Calling shutdown multiple times should be safe
         assert!(event_stream.shutdown().await.is_ok());
@@ -9632,10 +8703,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_event_stream_shared_feedback_always_available() {
-        let config = create_test_config();
-        let stream = create_test_stream(config);
-        let cancel_token = CancellationToken::new();
-        let event_stream = stream.into_stream(cancel_token);
+        let event_stream = test_event_stream();
 
         // LSN feedback methods should work regardless of stream state
         event_stream.update_flushed_lsn(1000);
@@ -9648,10 +8716,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_event_stream_inner_returns_ref() {
-        let config = create_test_config();
-        let stream = create_test_stream(config);
-        let cancel_token = CancellationToken::new();
-        let event_stream = stream.into_stream(cancel_token);
+        let event_stream = test_event_stream();
 
         // inner() should return a reference when no poll is in flight
         let inner = event_stream.inner();
@@ -9660,10 +8725,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_event_stream_inner_mut_returns_ref() {
-        let config = create_test_config();
-        let stream = create_test_stream(config);
-        let cancel_token = CancellationToken::new();
-        let mut event_stream = stream.into_stream(cancel_token);
+        let mut event_stream = test_event_stream();
 
         // inner_mut() should allow mutation when no poll is in flight
         event_stream.inner_mut().state.update_received_lsn(9000);
@@ -9673,10 +8735,7 @@ pub(crate) mod tests {
     #[test]
     fn test_event_stream_next_event_name() {
         // Verify that next_event() is the method name (not conflicting with StreamExt::next)
-        let config = create_test_config();
-        let stream = create_test_stream(config);
-        let cancel_token = CancellationToken::new();
-        let mut event_stream = stream.into_stream(cancel_token);
+        let mut event_stream = test_event_stream();
 
         // This should compile - next_event is our native method
         let _future = event_stream.next_event();
@@ -9685,12 +8744,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_event_stream_fused_stream_after_shutdown() {
-        use futures_core::FusedStream;
-
-        let config = create_test_config();
-        let stream = create_test_stream(config);
-        let cancel_token = CancellationToken::new();
-        let mut event_stream = stream.into_stream(cancel_token);
+        let mut event_stream = test_event_stream();
 
         assert!(!FusedStream::is_terminated(&event_stream));
 
@@ -9705,9 +8759,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_process_wal_message_with_bytes_input() {
-        use bytes::Bytes;
-
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
         let payload = build_begin_payload(0x2000, 42);
         let data = build_wal_message(0x1000, 0x1500, &payload);
         let bytes_data = Bytes::from(data);
@@ -9726,8 +8778,6 @@ pub(crate) mod tests {
 
     #[test]
     fn raw_xlogdata_struct_fields() {
-        use bytes::Bytes;
-
         let raw = RawXLogData {
             wal_start: Lsn::new(0x1000),
             wal_end: Lsn::new(0x2000),
@@ -9742,9 +8792,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_process_wal_message_bytes_commit() {
-        use bytes::Bytes;
-
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
         let payload = build_commit_payload(0x2000, 0x2100);
         let data = Bytes::from(build_wal_message(0x1000, 0x1500, &payload));
 
@@ -9758,9 +8806,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_process_wal_message_bytes_too_short() {
-        use bytes::Bytes;
-
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
         let data = Bytes::from(vec![b'w'; 10]);
         let result = stream.process_wal_message(data);
         assert!(result.is_err());
@@ -9769,9 +8815,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_process_wal_message_bytes_no_payload() {
-        use bytes::Bytes;
-
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
         let data = Bytes::from(build_wal_message(0x1000, 0x1500, &[]));
         let result = stream.process_wal_message(data).unwrap();
         assert!(result.is_none());
@@ -9779,9 +8823,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_process_wal_message_bytes_updates_lsn() {
-        use bytes::Bytes;
-
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
         assert_eq!(stream.state.last_received_lsn, 0);
 
         let payload = build_begin_payload(0x2000, 1);
@@ -9792,9 +8834,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_process_wal_message_bytes_zero_end_lsn() {
-        use bytes::Bytes;
-
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
         stream.state.update_received_lsn(0x3000);
 
         let payload = build_begin_payload(0x2000, 1);
@@ -9805,9 +8845,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_process_wal_message_bytes_relation_then_insert() {
-        use bytes::Bytes;
-
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
 
         // Build Relation payload
         let mut rel_payload = Vec::new();
@@ -9850,7 +8888,7 @@ pub(crate) mod tests {
 
     #[test]
     fn decode_raw_frame_returns_payload_and_positions() {
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
         // Build a 'w' frame with an explicit non-zero send_time to prove the
         // header offsets are read correctly.
         let mut frame = vec![b'w'];
@@ -9868,7 +8906,7 @@ pub(crate) mod tests {
 
     #[test]
     fn decode_raw_frame_data_is_zero_copy_slice() {
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
         let orig = bytes::Bytes::from(build_wal_message(1, 2, b"abcdef"));
         let raw = stream.decode_raw_frame(orig.clone()).unwrap();
         // slice(25..) must point into the same allocation (no memcpy).
@@ -9877,7 +8915,7 @@ pub(crate) mod tests {
 
     #[test]
     fn decode_raw_frame_header_only_has_empty_payload() {
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
         // Empty payload → frame is exactly 25 bytes (header only). Decodes to a
         // RawXLogData carrying the header positions and an empty `data` slice.
         let frame = bytes::Bytes::from(build_wal_message(0x10, 0x20, &[]));
@@ -9890,7 +8928,7 @@ pub(crate) mod tests {
 
     #[test]
     fn decode_raw_frame_too_short_errors() {
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
         let data = bytes::Bytes::from(vec![b'w'; 10]);
         let err = stream.decode_raw_frame(data).unwrap_err();
         assert!(err.to_string().contains("too short"));
@@ -9898,7 +8936,7 @@ pub(crate) mod tests {
 
     #[test]
     fn decode_raw_frame_advances_received_lsn() {
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
         assert_eq!(stream.state.last_received_lsn, 0);
         let frame = bytes::Bytes::from(build_wal_message(0x1000, 0xABCD, b"x"));
         stream.decode_raw_frame(frame).unwrap();
@@ -9940,9 +8978,6 @@ pub(crate) mod tests {
         stream
     }
 
-    use crate::protocol::{ColumnData, ColumnInfo, StreamingReplicationMessage};
-    use crate::LogicalReplicationMessage;
-
     fn wal(payload: &[u8]) -> bytes::Bytes {
         bytes::Bytes::from(build_wal_message(0x10, 0x20, payload))
     }
@@ -9962,19 +8997,6 @@ pub(crate) mod tests {
 
     fn begin(final_lsn: u64) -> bytes::Bytes {
         wal(&build_begin_payload(final_lsn, 1))
-    }
-
-    fn protocol_v4_config() -> ReplicationStreamConfig {
-        ReplicationStreamConfig::new(
-            "test_slot".to_string(),
-            "test_publication".to_string(),
-            4,
-            StreamingMode::On,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            RetryConfig::default(),
-        )
     }
 
     /// `B`, `C`, `c` and `K` laid out field by field from the pgoutput message formats, with distinct commit and end positions.
@@ -10031,8 +9053,10 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn frame_commit_lsn_agrees_with_the_parsed_event() {
         for (frame, commit) in golden_commit_frames() {
-            let mut stream =
-                create_test_stream_with_frames(protocol_v4_config(), vec![frame.clone()]);
+            let mut stream = create_test_stream_with_frames(
+                create_test_config().with_protocol_version(4),
+                vec![frame.clone()],
+            );
             let event = stream.next_event(&CancellationToken::new()).await.unwrap();
             assert_eq!(event.event_type.commit_lsn(), Some(commit), "{event:?}");
             assert_eq!(frame_commit_lsn(&frame), event.event_type.commit_lsn());
@@ -10043,8 +9067,10 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn payload_commit_time_agrees_with_the_parsed_timestamp() {
         for (frame, _) in golden_commit_frames() {
-            let mut stream =
-                create_test_stream_with_frames(protocol_v4_config(), vec![frame.clone()]);
+            let mut stream = create_test_stream_with_frames(
+                create_test_config().with_protocol_version(4),
+                vec![frame.clone()],
+            );
             let event = stream.next_event(&CancellationToken::new()).await.unwrap();
             let parsed = match event.event_type {
                 EventType::Commit {
@@ -10347,7 +9373,8 @@ pub(crate) mod tests {
                 timestamp: 0,
             }),
         ];
-        let mut stream = create_test_stream_with_frames(protocol_v4_config(), frames);
+        let mut stream =
+            create_test_stream_with_frames(create_test_config().with_protocol_version(4), frames);
 
         let delivered = drain_before(&mut stream, 0x200).await;
         assert!(
@@ -10398,7 +9425,8 @@ pub(crate) mod tests {
                 gid: "g".to_string(),
             }),
         ];
-        let mut stream = create_test_stream_with_frames(protocol_v4_config(), frames);
+        let mut stream =
+            create_test_stream_with_frames(create_test_config().with_protocol_version(4), frames);
 
         let delivered = drain_before(&mut stream, 0x200).await;
         assert!(
@@ -10466,8 +9494,7 @@ pub(crate) mod tests {
     /// An event an abandoned poll read past the boundary is kept, not delivered early.
     #[tokio::test]
     async fn event_stream_keeps_a_parked_commit_past_the_boundary() {
-        let mut events =
-            create_test_stream(create_test_config()).into_stream(CancellationToken::new());
+        let mut events = test_event_stream();
         events.state.park_with_result(Ok(begin_event(0x300)));
         assert!(events
             .next_event_before(Lsn::new(0x200))
@@ -10496,8 +9523,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn event_stream_holds_a_parked_commit_exactly_at_the_boundary() {
         let boundary = Lsn::new(0x200);
-        let mut events =
-            create_test_stream(create_test_config()).into_stream(CancellationToken::new());
+        let mut events = test_event_stream();
 
         events.state.park_with_result(Ok(begin_event(0x1ff)));
         let below = events.next_event_before(boundary).await.unwrap();
@@ -10521,8 +9547,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_parked_read_that_stopped_at_its_boundary_is_not_an_event() {
         let boundary = Lsn::new(0x200);
-        let mut events =
-            create_test_stream(create_test_config()).into_stream(CancellationToken::new());
+        let mut events = test_event_stream();
 
         events.state.park_resolved(Ok(None));
         assert!(events.next_event_before(boundary).await.unwrap().is_none());
@@ -10545,8 +9570,7 @@ pub(crate) mod tests {
     /// stream is back in hand for the one after.
     #[tokio::test]
     async fn event_stream_surfaces_the_error_of_a_parked_poll() {
-        let mut events =
-            create_test_stream(create_test_config()).into_stream(CancellationToken::new());
+        let mut events = test_event_stream();
         events
             .state
             .park_with_result(Err(ReplicationError::protocol("parked failure")));
@@ -10563,8 +9587,7 @@ pub(crate) mod tests {
     /// `current_lsn()` and `inner()` panic while a poll holds the stream; the metrics handle must not.
     #[tokio::test]
     async fn event_stream_metrics_are_readable_while_a_poll_is_parked() {
-        let mut events =
-            create_test_stream(create_test_config()).into_stream(CancellationToken::new());
+        let mut events = test_event_stream();
         let before = events.metrics();
         events
             .state
@@ -10734,8 +9757,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_into_stream_creates_valid_event_stream() {
-        let config = create_test_config();
-        let stream = create_test_stream(config);
+        let stream = test_stream();
         let cancel_token = CancellationToken::new();
         let event_stream = stream.into_stream(cancel_token.clone());
 
@@ -10753,8 +9775,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_into_stream_shared_feedback_is_cloned() {
-        let config = create_test_config();
-        let stream = create_test_stream(config);
+        let stream = test_stream();
         let original_feedback = Arc::clone(&stream.shared_lsn_feedback);
         let cancel_token = CancellationToken::new();
         let event_stream = stream.into_stream(cancel_token);
@@ -10773,7 +9794,7 @@ pub(crate) mod tests {
     async fn metrics_follow_the_frames_the_stream_reads() {
         use crate::metrics::MetricsSnapshot;
 
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
         let handle = stream.metrics();
         assert_eq!(handle.snapshot(), MetricsSnapshot::default());
 
@@ -10813,7 +9834,7 @@ pub(crate) mod tests {
     /// is zero does not move the received position back.
     #[test]
     fn metrics_ignore_bad_frames_and_never_move_received_backwards() {
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
         let handle = stream.metrics();
 
         assert!(stream
@@ -10848,7 +9869,7 @@ pub(crate) mod tests {
     /// do grow what no status update has confirmed.
     #[tokio::test]
     async fn idle_keepalives_do_not_grow_lag_bytes() {
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
         let handle = stream.metrics();
         stream
             .process_keepalive_message(&build_keepalive_message(26_000_000, false))
@@ -10872,7 +9893,7 @@ pub(crate) mod tests {
     /// reach the snapshot; `Begin` and the rest do not count as commits.
     #[tokio::test]
     async fn metrics_carry_server_times_and_count_commits() {
-        let mut stream = create_test_stream(protocol_v4_config());
+        let mut stream = create_test_stream(create_test_config().with_protocol_version(4));
         let handle = stream.metrics();
 
         let mut frame = build_wal_message(1, 0x2000, b"x");
@@ -10897,10 +9918,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_into_stream_inner_accessible() {
-        let config = create_test_config();
-        let stream = create_test_stream(config);
-        let cancel_token = CancellationToken::new();
-        let event_stream = stream.into_stream(cancel_token);
+        let event_stream = test_event_stream();
 
         // inner() should return the stream
         let inner = event_stream.inner();
@@ -10909,10 +9927,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_into_stream_inner_mut_accessible() {
-        let config = create_test_config();
-        let stream = create_test_stream(config);
-        let cancel_token = CancellationToken::new();
-        let mut event_stream = stream.into_stream(cancel_token);
+        let mut event_stream = test_event_stream();
 
         // Mutate via inner_mut
         event_stream.inner_mut().state.update_received_lsn(9999);
@@ -10925,12 +9940,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_event_stream_poll_next_terminated_returns_none() {
-        use futures::StreamExt;
-
-        let config = create_test_config();
-        let stream = create_test_stream(config);
-        let cancel_token = CancellationToken::new();
-        let mut event_stream = stream.into_stream(cancel_token);
+        let mut event_stream = test_event_stream();
 
         // Manually set terminated
         event_stream.state.mark_terminated();
@@ -10942,12 +9952,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_event_stream_poll_next_after_shutdown_returns_none() {
-        use futures::StreamExt;
-
-        let config = create_test_config();
-        let stream = create_test_stream(config);
-        let cancel_token = CancellationToken::new();
-        let mut event_stream = stream.into_stream(cancel_token);
+        let mut event_stream = test_event_stream();
 
         event_stream.shutdown().await.ok();
         assert!(event_stream.is_terminated());
@@ -10959,10 +9964,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_event_stream_poll_next_cancel_terminates() {
-        use futures::StreamExt;
-
-        let config = create_test_config();
-        let stream = create_test_stream(config);
+        let stream = test_stream();
         let cancel_token = CancellationToken::new();
         let cancel_clone = cancel_token.clone();
         let mut event_stream = stream.into_stream(cancel_token);
@@ -10978,11 +9980,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_event_stream_poll_next_fused_after_cancel() {
-        use futures::StreamExt;
-        use futures_core::FusedStream;
-
-        let config = create_test_config();
-        let stream = create_test_stream(config);
+        let stream = test_stream();
         let cancel_token = CancellationToken::new();
         cancel_token.cancel(); // Pre-cancel
         let mut event_stream = stream.into_stream(cancel_token);
@@ -11000,10 +9998,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_event_stream_poll_next_restores_inner_after_cancel() {
-        use futures::StreamExt;
-
-        let config = create_test_config();
-        let stream = create_test_stream(config);
+        let stream = test_stream();
         let cancel_token = CancellationToken::new();
         cancel_token.cancel();
         let mut event_stream = stream.into_stream(cancel_token);
@@ -11023,10 +10018,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_event_stream_shutdown_clears_inflight() {
-        let config = create_test_config();
-        let stream = create_test_stream(config);
-        let cancel_token = CancellationToken::new();
-        let mut event_stream = stream.into_stream(cancel_token);
+        let mut event_stream = test_event_stream();
 
         event_stream.shutdown().await.ok();
 
@@ -11044,10 +10036,7 @@ pub(crate) mod tests {
     /// to check is that a parked stream gets reclaimed, not abandoned.
     #[tokio::test]
     async fn test_event_stream_shutdown_reclaims_a_parked_stream() {
-        let config = create_test_config();
-        let stream = create_test_stream(config);
-        let cancel_token = CancellationToken::new();
-        let mut event_stream = stream.into_stream(cancel_token);
+        let mut event_stream = test_event_stream();
         event_stream
             .state
             .park_with_result(Err(ReplicationError::protocol("parked")));
@@ -11068,10 +10057,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_event_stream_next_event_returns_future() {
-        let config = create_test_config();
-        let stream = create_test_stream(config);
-        let cancel_token = CancellationToken::new();
-        let mut event_stream = stream.into_stream(cancel_token);
+        let mut event_stream = test_event_stream();
 
         // Verify that next_event returns a future (compile-time check)
         let _fut = event_stream.next_event();
@@ -11084,7 +10070,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_process_wal_message_accepts_vec() {
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
         let payload = build_begin_payload(0x2000, 10);
         let data: Vec<u8> = build_wal_message(0x1000, 0x1500, &payload);
 
@@ -11095,9 +10081,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_process_wal_message_accepts_bytes() {
-        use bytes::Bytes;
-
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
         let payload = build_begin_payload(0x2000, 10);
         let data = Bytes::from(build_wal_message(0x1000, 0x1500, &payload));
 
@@ -11108,9 +10092,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_process_wal_message_uses_zero_copy_reader() {
-        use bytes::Bytes;
-
-        let mut stream = create_test_stream(create_test_config());
+        let mut stream = test_stream();
 
         // Build a relation + insert to test zero-copy Bytes slicing through the pipeline
         let mut rel_payload = Vec::new();
@@ -11175,10 +10157,7 @@ pub(crate) mod tests {
     /// so that poll_next exercises the result-handling branches without
     /// needing a real PostgreSQL connection.
     fn create_event_stream_with_inflight(result: Result<ChangeEvent>) -> EventStream {
-        let config = create_test_config();
-        let stream = create_test_stream(config);
-        let cancel_token = CancellationToken::new();
-        let mut event_stream = stream.into_stream(cancel_token);
+        let mut event_stream = test_event_stream();
         event_stream.state.park_with_result(result);
         event_stream
     }
@@ -11189,16 +10168,7 @@ pub(crate) mod tests {
     /// `.expect()` against a state ordinary use can reach, and panicked.
     #[tokio::test]
     async fn next_event_resumes_an_abandoned_poll_instead_of_panicking() {
-        let event = ChangeEvent {
-            event_type: EventType::Begin {
-                final_lsn: crate::types::Lsn::new(0x1000),
-                commit_timestamp: chrono::Utc::now(),
-                transaction_id: 7,
-            },
-            lsn: crate::types::Lsn::new(0x1000),
-            metadata: None,
-            xid: None,
-        };
+        let event = ChangeEvent::begin(7, Lsn::new(0x1000), chrono::Utc::now(), Lsn::new(0x1000));
         let mut es = create_event_stream_with_inflight(Ok(event));
 
         let got = es
@@ -11252,18 +10222,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_poll_next_ok_event_branch() {
-        use futures::StreamExt;
-
-        let event = ChangeEvent {
-            event_type: EventType::Begin {
-                final_lsn: crate::types::Lsn::new(0x1000),
-                commit_timestamp: chrono::Utc::now(),
-                transaction_id: 42,
-            },
-            lsn: crate::types::Lsn::new(0x1000),
-            metadata: None,
-            xid: None,
-        };
+        let event = ChangeEvent::begin(42, Lsn::new(0x1000), chrono::Utc::now(), Lsn::new(0x1000));
 
         let mut event_stream = create_event_stream_with_inflight(Ok(event));
 
@@ -11287,8 +10246,6 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_poll_next_permanent_error_branch() {
-        use futures::StreamExt;
-
         let err = ReplicationError::permanent_connection("fatal error");
         let mut event_stream = create_event_stream_with_inflight(Err(err));
 
@@ -11313,8 +10270,6 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_poll_next_transient_error_branch() {
-        use futures::StreamExt;
-
         // Protocol error is neither permanent, nor cancelled, nor transient (by enum match) —
         // it falls through to the catch-all Err(e) arm
         let err = ReplicationError::protocol("not in replication mode");
@@ -11337,8 +10292,6 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_poll_next_cancelled_error_branch() {
-        use futures::StreamExt;
-
         let err = ReplicationError::Cancelled("user cancelled".to_string());
         let mut event_stream = create_event_stream_with_inflight(Err(err));
 
@@ -11352,8 +10305,6 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_poll_next_authentication_error_is_permanent() {
-        use futures::StreamExt;
-
         let err = ReplicationError::authentication("bad credentials");
         let mut event_stream = create_event_stream_with_inflight(Err(err));
 
@@ -11368,8 +10319,6 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_poll_next_slot_error_is_permanent() {
-        use futures::StreamExt;
-
         let err = ReplicationError::replication_slot("slot does not exist");
         let mut event_stream = create_event_stream_with_inflight(Err(err));
 
@@ -11381,8 +10330,6 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_poll_next_buffer_error_is_transient_fallthrough() {
-        use futures::StreamExt;
-
         let err = ReplicationError::Buffer("buffer overflow".to_string());
         let mut event_stream = create_event_stream_with_inflight(Err(err));
 
@@ -11397,12 +10344,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_poll_next_multiple_transient_errors_keep_stream_alive() {
-        use futures::StreamExt;
-
-        let config = create_test_config();
-        let stream = create_test_stream(config);
-        let cancel_token = CancellationToken::new();
-        let mut event_stream = stream.into_stream(cancel_token);
+        let mut event_stream = test_event_stream();
 
         // Inject first transient error
         event_stream
@@ -11437,24 +10379,15 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_poll_next_success_then_cancel() {
-        use futures::StreamExt;
-
-        let config = create_test_config();
-        let stream = create_test_stream(config);
-        let cancel_token = CancellationToken::new();
-        let mut event_stream = stream.into_stream(cancel_token);
+        let mut event_stream = test_event_stream();
 
         // Inject a successful event
-        let event = ChangeEvent {
-            event_type: EventType::Commit {
-                commit_lsn: crate::types::Lsn::new(0x2000),
-                end_lsn: crate::types::Lsn::new(0x2100),
-                commit_timestamp: chrono::Utc::now(),
-            },
-            lsn: crate::types::Lsn::new(0x2000),
-            metadata: None,
-            xid: None,
-        };
+        let event = ChangeEvent::commit(
+            chrono::Utc::now(),
+            Lsn::new(0x2000),
+            Lsn::new(0x2000),
+            Lsn::new(0x2100),
+        );
         event_stream.state.park_with_result(Ok(event));
 
         let result1 = event_stream.next().await;
@@ -11480,10 +10413,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_convert_to_change_event_begin_prepare() {
-        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
-
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::BeginPrepare {
             prepare_lsn: 0x5000,
@@ -11518,10 +10448,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_convert_to_change_event_prepare() {
-        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
-
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Prepare {
             flags: 0,
@@ -11559,10 +10486,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_convert_to_change_event_commit_prepared() {
-        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
-
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::CommitPrepared {
             flags: 0,
@@ -11600,10 +10524,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_convert_to_change_event_rollback_prepared() {
-        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
-
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::RollbackPrepared {
             flags: 0,
@@ -11642,10 +10563,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_convert_to_change_event_stream_prepare() {
-        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
-
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::StreamPrepare {
             flags: 0,
@@ -11687,10 +10605,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_convert_to_change_event_origin_fields() {
-        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
-
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Origin {
             origin_lsn: 0xA000,
@@ -11721,11 +10636,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_convert_to_change_event_relation_first_time_and_repeat_both_emit() {
-        use crate::protocol::ColumnInfo;
-        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
-
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         let mk = || {
             StreamingReplicationMessage::new(LogicalReplicationMessage::Relation {
@@ -11757,23 +10668,10 @@ pub(crate) mod tests {
 
     #[test]
     fn test_convert_to_change_event_relation_same_schema_emits() {
-        use crate::protocol::{ColumnInfo, RelationInfo};
-        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
-
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         // Pre-populate cache
-        let relation = RelationInfo::new(
-            300,
-            "public",
-            "items",
-            b'd',
-            vec![
-                ColumnInfo::new(1, "id".to_string(), 23, -1),
-                ColumnInfo::new(0, "name".to_string(), 25, -1),
-            ],
-        );
+        let relation = relation_info(300, "items", &["name"]);
         stream.state.add_relation(relation);
 
         // Send identical relation message — no schema change
@@ -11802,23 +10700,10 @@ pub(crate) mod tests {
 
     #[test]
     fn test_convert_to_change_event_relation_carries_new_column() {
-        use crate::protocol::{ColumnInfo, RelationInfo};
-        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
-
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         // Pre-populate cache with 2 columns
-        let relation = RelationInfo::new(
-            400,
-            "public",
-            "accounts",
-            b'd',
-            vec![
-                ColumnInfo::new(1, "id".to_string(), 23, -1),
-                ColumnInfo::new(0, "email".to_string(), 25, -1),
-            ],
-        );
+        let relation = relation_info(400, "accounts", &["email"]);
         stream.state.add_relation(relation);
 
         // Send relation message with an extra column
@@ -11863,23 +10748,10 @@ pub(crate) mod tests {
 
     #[test]
     fn test_convert_to_change_event_relation_carries_type_change() {
-        use crate::protocol::{ColumnInfo, RelationInfo};
-        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
-
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         // Pre-populate with type_id=25 (text)
-        let relation = RelationInfo::new(
-            500,
-            "public",
-            "products",
-            b'd',
-            vec![
-                ColumnInfo::new(1, "id".to_string(), 23, -1),
-                ColumnInfo::new(0, "price".to_string(), 25, -1),
-            ],
-        );
+        let relation = relation_info(500, "products", &["price"]);
         stream.state.add_relation(relation);
 
         // Send relation with price changed to type_id=1700 (numeric)
@@ -11906,20 +10778,10 @@ pub(crate) mod tests {
 
     #[test]
     fn test_convert_to_change_event_relation_carries_replica_identity() {
-        use crate::protocol::{ColumnInfo, RelationInfo};
-        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
-
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         // Pre-populate with replica_identity = 'd' (Default)
-        let relation = RelationInfo::new(
-            600,
-            "public",
-            "logs",
-            b'd',
-            vec![ColumnInfo::new(1, "id".to_string(), 23, -1)],
-        );
+        let relation = relation_info(600, "logs", &[]);
         stream.state.add_relation(relation);
 
         // Send relation with replica_identity changed to 'f' (Full)
@@ -11950,23 +10812,10 @@ pub(crate) mod tests {
 
     #[test]
     fn test_convert_to_change_event_relation_carries_column_rename() {
-        use crate::protocol::{ColumnInfo, RelationInfo};
-        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
-
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         // Pre-populate
-        let relation = RelationInfo::new(
-            700,
-            "public",
-            "events",
-            b'd',
-            vec![
-                ColumnInfo::new(1, "id".to_string(), 23, -1),
-                ColumnInfo::new(0, "name".to_string(), 25, -1),
-            ],
-        );
+        let relation = relation_info(700, "events", &["name"]);
         stream.state.add_relation(relation);
 
         // Column renamed: "name" -> "title"
@@ -11997,20 +10846,10 @@ pub(crate) mod tests {
 
     #[test]
     fn test_convert_to_change_event_relation_carries_namespace() {
-        use crate::protocol::{ColumnInfo, RelationInfo};
-        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
-
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         // Pre-populate in "public" schema
-        let relation = RelationInfo::new(
-            800,
-            "public",
-            "data",
-            b'd',
-            vec![ColumnInfo::new(1, "id".to_string(), 23, -1)],
-        );
+        let relation = relation_info(800, "data", &[]);
         stream.state.add_relation(relation);
 
         // Same relation_id but moved to "archive" schema
@@ -12038,23 +10877,10 @@ pub(crate) mod tests {
 
     #[test]
     fn test_convert_to_change_event_relation_carries_key_flag() {
-        use crate::protocol::{ColumnInfo, RelationInfo};
-        use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
-
-        let config = create_test_config();
-        let mut stream = create_test_stream(config);
+        let mut stream = test_stream();
 
         // Pre-populate: "email" is NOT a key column (flags=0)
-        let relation = RelationInfo::new(
-            900,
-            "public",
-            "users",
-            b'd',
-            vec![
-                ColumnInfo::new(1, "id".to_string(), 23, -1),
-                ColumnInfo::new(0, "email".to_string(), 25, -1),
-            ],
-        );
+        let relation = relation_info(900, "users", &["email"]);
         stream.state.add_relation(relation);
 
         // Now "email" becomes a key column (flags=1)
@@ -12132,33 +10958,10 @@ mod ergonomics_config_tests {
 
 #[cfg(test)]
 mod for_each_event_tests {
+    use super::tests::MockSource;
     use super::*;
     use crate::{ChangeEvent, ColumnValue, Lsn, RowData};
-    use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    struct MockSource {
-        events: VecDeque<Result<ChangeEvent>>,
-        last_ack: AtomicU64,
-    }
-    impl MockSource {
-        fn new(events: Vec<Result<ChangeEvent>>) -> Self {
-            Self {
-                events: events.into(),
-                last_ack: AtomicU64::new(0),
-            }
-        }
-    }
-    impl EventSource for MockSource {
-        async fn recv(&mut self) -> Result<ChangeEvent> {
-            self.events
-                .pop_front()
-                .unwrap_or_else(|| Err(ReplicationError::Cancelled("drained".into())))
-        }
-        fn ack(&self, lsn: XLogRecPtr) {
-            self.last_ack.store(lsn, Ordering::SeqCst);
-        }
-    }
+    use std::sync::atomic::Ordering;
 
     fn ins(lsn: u64) -> ChangeEvent {
         let data = RowData::from_pairs(vec![("id", ColumnValue::text("1"))]);

@@ -25,30 +25,14 @@
 //! cargo test --test slot_matrix -- --ignored --nocapture
 //! ```
 
+mod common;
+
+use common::{
+    drop_slot_best_effort as drop_slot, init_tracing, regular_conn_string, replication_conn_string,
+    SlotGuard,
+};
 use pg_walstream::{PgReplicationConnection, ReplicationSlotOptions, SlotType};
 use tracing::warn;
-
-fn replication_conn_string() -> String {
-    std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgresql://postgres:postgres@localhost:5432/test_walstream?replication=database"
-            .to_string()
-    })
-}
-
-fn regular_conn_string() -> String {
-    std::env::var("DATABASE_URL_REGULAR").unwrap_or_else(|_| {
-        let repl = replication_conn_string();
-        repl.replace("?replication=database", "")
-            .replace("&replication=database", "")
-    })
-}
-
-/// Best-effort tracing init so `warn!` surfaces under `--nocapture`.
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .try_init();
-}
 
 fn server_version_num(conn: &mut PgReplicationConnection) -> i64 {
     conn.exec("SHOW server_version_num")
@@ -57,16 +41,6 @@ fn server_version_num(conn: &mut PgReplicationConnection) -> i64 {
         .expect("server_version_num value present")
         .parse()
         .expect("server_version_num is numeric")
-}
-
-fn drop_slot(slot_name: &str) {
-    if let Ok(mut conn) = PgReplicationConnection::connect(&replication_conn_string()) {
-        let _ = conn.exec(&format!(
-            "SELECT pg_drop_replication_slot('{}') WHERE EXISTS \
-             (SELECT 1 FROM pg_replication_slots WHERE slot_name = '{}')",
-            slot_name, slot_name
-        ));
-    }
 }
 
 struct Case {
@@ -333,15 +307,6 @@ fn test_create_slot_option_matrix() {
     }
 
     println!("SKIPPED {skipped}/{total} slot-matrix cases on server_version_num {version}");
-}
-
-/// Drops its slot on `Drop`, so a panicking assertion never leaks a slot (an
-/// orphaned slot pins WAL and can exhaust server disk).
-struct SlotGuard(String);
-impl Drop for SlotGuard {
-    fn drop(&mut self) {
-        drop_slot(&self.0);
-    }
 }
 
 /// `READ_REPLICATION_SLOT` round-trip (PG15+, physical slots only).

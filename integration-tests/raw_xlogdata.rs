@@ -6,68 +6,18 @@
 //!   export DATABASE_URL="postgresql://user:pass@host:5432/db?replication=database"
 //!   cargo test --test raw_xlogdata -- --ignored --nocapture --test-threads=1
 
+mod common;
+
+use common::{
+    drop_slot_best_effort as drop_slot, regular_conn_string, replication_conn_string,
+    WaitingSlotGuard,
+};
 use pg_walstream::{
     LogicalReplicationMessage, LogicalReplicationParser, LogicalReplicationStream, Lsn,
     PgReplicationConnection, ReplicationError, ReplicationStreamConfig, RetryConfig, StreamingMode,
 };
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-
-fn replication_conn_string() -> String {
-    std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgresql://postgres:postgres@localhost:5432/test_walstream?replication=database"
-            .to_string()
-    })
-}
-
-fn regular_conn_string() -> String {
-    std::env::var("DATABASE_URL_REGULAR").unwrap_or_else(|_| {
-        let repl = replication_conn_string();
-        repl.replace("?replication=database", "")
-            .replace("&replication=database", "")
-    })
-}
-
-fn drop_slot(slot_name: &str) {
-    if let Ok(mut conn) = PgReplicationConnection::connect(&replication_conn_string()) {
-        let _ = conn.exec(&format!(
-            "SELECT pg_drop_replication_slot('{slot_name}') \
-             WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '{slot_name}')"
-        ));
-    }
-}
-
-/// Poll until the slot's `active` flag clears. The walsender exits
-/// asynchronously after the stream is dropped, and dropping a still-active slot
-/// raises 55006 — which `drop_slot` swallows, leaking the slot. Bounded at 5s.
-fn wait_for_slot_inactive(slot_name: &str) {
-    let Ok(mut conn) = PgReplicationConnection::connect(&replication_conn_string()) else {
-        return;
-    };
-    for _ in 0..50 {
-        let active = conn
-            .exec(&format!(
-                "SELECT active FROM pg_replication_slots WHERE slot_name = '{slot_name}'"
-            ))
-            .ok()
-            .and_then(|r| r.get_value(0, 0))
-            .is_some_and(|v| v == "t");
-        if !active {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
-/// Drops its slot on `Drop` so a panicking assertion never leaks it (an orphaned
-/// persistent slot pins WAL). `Drop` is sync, hence the blocking wait.
-struct SlotGuard(&'static str);
-impl Drop for SlotGuard {
-    fn drop(&mut self) {
-        wait_for_slot_inactive(self.0);
-        drop_slot(self.0);
-    }
-}
 
 fn cfg(slot: &str) -> ReplicationStreamConfig {
     // Persistent (non-temporary) slot, non-streaming commits for simple assertions.
@@ -106,7 +56,7 @@ async fn raw_xlogdata_roundtrips_through_parser_and_stops() {
         .expect("create slot");
     // Declared before the stream, so the stream drops first and the slot is
     // already inactive when the guard tries to drop it.
-    let _slot_guard = SlotGuard(slot);
+    let _slot_guard = WaitingSlotGuard(slot);
 
     // --- Three transactions BEFORE the target ---
     for i in 1..=3 {

@@ -24,6 +24,9 @@
 //! cargo test --test idle_feedback --no-default-features --features libpq -- --ignored --nocapture --test-threads=1
 //! ```
 
+mod common;
+
+use common::{regular_conn_string, replication_conn_string, value};
 use core::time::Duration;
 use pg_walstream::{
     format_lsn, CancellationToken, EventType, LogicalReplicationStream, PgReplicationConnection,
@@ -31,31 +34,10 @@ use pg_walstream::{
 };
 use std::time::Instant;
 
-fn replication_conn_string() -> String {
-    std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgresql://postgres:postgres@localhost:5432/test_walstream?replication=database"
-            .to_string()
-    })
-}
-
-fn regular_conn_string() -> String {
-    std::env::var("DATABASE_URL_REGULAR").unwrap_or_else(|_| {
-        replication_conn_string()
-            .replace("?replication=database", "")
-            .replace("&replication=database", "")
-    })
-}
-
 /// `url` with `extra` appended as further query parameters.
 fn with_params(url: &str, extra: &str) -> String {
     let sep = if url.contains('?') { '&' } else { '?' };
     format!("{url}{sep}{extra}")
-}
-
-fn value(conn: &mut PgReplicationConnection, sql: &str) -> Option<String> {
-    conn.exec(sql)
-        .unwrap_or_else(|e| panic!("{sql}: {e}"))
-        .get_value(0, 0)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

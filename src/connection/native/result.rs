@@ -20,10 +20,10 @@ pub enum NativeResultStatus {
 /// Pure-Rust result set from a PostgreSQL simple-query response.
 #[derive(Debug)]
 pub struct NativePgResult {
-    pub(crate) status: NativeResultStatus,
+    pub(super) status: NativeResultStatus,
     pub(crate) columns: Vec<String>,
     pub(crate) rows: Vec<Vec<Option<Vec<u8>>>>,
-    pub(crate) error: Option<ServerError>,
+    pub(super) error: Option<ServerError>,
 }
 
 impl crate::connection::commands::QueryResult for NativePgResult {
@@ -103,14 +103,14 @@ impl NativePgResult {
     ///
     /// Mirrors the libpq backend's `PgResult::server_error`, so both backends
     /// can feed `ReplicationError::from_server`. Crate-internal: `exec` maps every non-OK result to `Err`, so callers never hold a failing result.
-    pub(crate) fn server_error(&self) -> Option<ServerError> {
+    pub(super) fn server_error(&self) -> Option<ServerError> {
         self.error.clone()
     }
 
     // ── Internal parsing helpers ─────────────────────────────────────────
 
     /// Parse a RowDescription ('T') message payload (after the 5-byte header).
-    pub(crate) fn parse_row_description(&mut self, payload: &[u8]) {
+    pub(super) fn parse_row_description(&mut self, payload: &[u8]) {
         if payload.len() < 2 {
             return;
         }
@@ -136,7 +136,7 @@ impl NativePgResult {
     }
 
     /// Parse a DataRow ('D') message payload (after the 5-byte header).
-    pub(crate) fn parse_data_row(&mut self, payload: &[u8]) {
+    pub(super) fn parse_data_row(&mut self, payload: &[u8]) {
         if payload.len() < 2 {
             return;
         }

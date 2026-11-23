@@ -11,6 +11,9 @@
 //! Requires PostgreSQL with `wal_level=logical`, `DATABASE_URL` in replication mode and,
 //! optionally, `DATABASE_URL_REGULAR` for the same database.
 
+mod common;
+
+use common::replication_conn_string;
 use core::time::Duration;
 use pg_walstream::{
     EventStream, EventType, LogicalReplicationStream, PgReplicationConnection,
@@ -23,13 +26,6 @@ use tokio_util::sync::CancellationToken;
 
 /// Generous: a reconnect sits out a 1 s backoff, and a loaded CI runner is slower still.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
-
-fn replication_conn_string() -> String {
-    std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgresql://postgres:postgres@localhost:5432/test_walstream?replication=database"
-            .to_string()
-    })
-}
 
 struct Fixture {
     regular: PgReplicationConnection,

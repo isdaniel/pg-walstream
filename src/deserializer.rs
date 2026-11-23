@@ -505,6 +505,148 @@ impl<'a, P: ErrorPolicy> ColumnValueDeserializer<'a, P> {
     }
 }
 
+/// The `Deserializer` methods whose behaviour does not depend on the policy.
+/// The attributes passed in are applied to every method (the strict impl
+/// inlines them, the lenient one does not).
+macro_rules! shared_deserializer_methods {
+    ($(#[$attr:meta])*) => {
+        $(#[$attr])*
+        fn deserialize_bool<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+            visitor.visit_bool(self.boolean()?)
+        }
+
+        $(#[$attr])*
+        fn deserialize_i8<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+            visitor.visit_i8(self.signed::<i8>("i8")?)
+        }
+
+        $(#[$attr])*
+        fn deserialize_i16<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+            visitor.visit_i16(self.signed::<i16>("i16")?)
+        }
+
+        $(#[$attr])*
+        fn deserialize_i32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+            visitor.visit_i32(self.signed::<i32>("i32")?)
+        }
+
+        $(#[$attr])*
+        fn deserialize_i64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+            visitor.visit_i64(self.signed::<i64>("i64")?)
+        }
+
+        $(#[$attr])*
+        fn deserialize_u8<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+            visitor.visit_u8(self.unsigned::<u8>("u8")?)
+        }
+
+        $(#[$attr])*
+        fn deserialize_u16<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+            visitor.visit_u16(self.unsigned::<u16>("u16")?)
+        }
+
+        $(#[$attr])*
+        fn deserialize_u32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+            visitor.visit_u32(self.unsigned::<u32>("u32")?)
+        }
+
+        $(#[$attr])*
+        fn deserialize_u64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+            visitor.visit_u64(self.unsigned::<u64>("u64")?)
+        }
+
+        $(#[$attr])*
+        fn deserialize_f32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+            visitor.visit_f32(self.float::<f32>("f32")?)
+        }
+
+        $(#[$attr])*
+        fn deserialize_f64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+            visitor.visit_f64(self.float::<f64>("f64")?)
+        }
+
+        $(#[$attr])*
+        fn deserialize_char<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+            visitor.visit_char(self.character()?)
+        }
+
+        $(#[$attr])*
+        fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+            match self.value {
+                ColumnValue::Null => visitor.visit_none(),
+                _ => visitor.visit_some(self),
+            }
+        }
+
+        $(#[$attr])*
+        fn deserialize_unit_struct<V: Visitor<'de>>(
+            self,
+            _name: &'static str,
+            visitor: V,
+        ) -> Result<V::Value, Self::Error> {
+            self.deserialize_unit(visitor)
+        }
+
+        $(#[$attr])*
+        fn deserialize_newtype_struct<V: Visitor<'de>>(
+            self,
+            _name: &'static str,
+            visitor: V,
+        ) -> Result<V::Value, Self::Error> {
+            visitor.visit_newtype_struct(self)
+        }
+
+        $(#[$attr])*
+        fn deserialize_seq<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value, Self::Error> {
+            Err(ReplicationError::deserialize(MSG_SEQ))
+        }
+
+        $(#[$attr])*
+        fn deserialize_tuple<V: Visitor<'de>>(
+            self,
+            _len: usize,
+            _visitor: V,
+        ) -> Result<V::Value, Self::Error> {
+            Err(ReplicationError::deserialize(MSG_TUPLE))
+        }
+
+        $(#[$attr])*
+        fn deserialize_tuple_struct<V: Visitor<'de>>(
+            self,
+            _name: &'static str,
+            _len: usize,
+            _visitor: V,
+        ) -> Result<V::Value, Self::Error> {
+            Err(ReplicationError::deserialize(MSG_TUPLE_STRUCT))
+        }
+
+        $(#[$attr])*
+        fn deserialize_map<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value, Self::Error> {
+            Err(ReplicationError::deserialize(MSG_MAP))
+        }
+
+        $(#[$attr])*
+        fn deserialize_struct<V: Visitor<'de>>(
+            self,
+            _name: &'static str,
+            _fields: &'static [&'static str],
+            _visitor: V,
+        ) -> Result<V::Value, Self::Error> {
+            Err(ReplicationError::deserialize(MSG_STRUCT))
+        }
+
+        $(#[$attr])*
+        fn deserialize_identifier<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+            self.deserialize_str(visitor)
+        }
+
+        $(#[$attr])*
+        fn deserialize_ignored_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+            visitor.visit_unit()
+        }
+    };
+}
+
 impl<'de> de::Deserializer<'de> for ColumnValueDeserializer<'de, Strict> {
     type Error = ReplicationError;
 
@@ -518,66 +660,6 @@ impl<'de> de::Deserializer<'de> for ColumnValueDeserializer<'de, Strict> {
             },
             ColumnValue::Binary(b) => visitor.visit_borrowed_bytes(b),
         }
-    }
-
-    #[inline]
-    fn deserialize_bool<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_bool(self.boolean()?)
-    }
-
-    #[inline]
-    fn deserialize_i8<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_i8(self.signed::<i8>("i8")?)
-    }
-
-    #[inline]
-    fn deserialize_i16<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_i16(self.signed::<i16>("i16")?)
-    }
-
-    #[inline]
-    fn deserialize_i32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_i32(self.signed::<i32>("i32")?)
-    }
-
-    #[inline]
-    fn deserialize_i64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_i64(self.signed::<i64>("i64")?)
-    }
-
-    #[inline]
-    fn deserialize_u8<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_u8(self.unsigned::<u8>("u8")?)
-    }
-
-    #[inline]
-    fn deserialize_u16<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_u16(self.unsigned::<u16>("u16")?)
-    }
-
-    #[inline]
-    fn deserialize_u32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_u32(self.unsigned::<u32>("u32")?)
-    }
-
-    #[inline]
-    fn deserialize_u64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_u64(self.unsigned::<u64>("u64")?)
-    }
-
-    #[inline]
-    fn deserialize_f32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_f32(self.float::<f32>("f32")?)
-    }
-
-    #[inline]
-    fn deserialize_f64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_f64(self.float::<f64>("f64")?)
-    }
-
-    #[inline]
-    fn deserialize_char<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_char(self.character()?)
     }
 
     #[inline]
@@ -611,76 +693,11 @@ impl<'de> de::Deserializer<'de> for ColumnValueDeserializer<'de, Strict> {
     }
 
     #[inline]
-    fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        match self.value {
-            ColumnValue::Null => visitor.visit_none(),
-            _ => visitor.visit_some(self),
-        }
-    }
-
-    #[inline]
     fn deserialize_unit<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self.value {
             ColumnValue::Null => visitor.visit_unit(),
             _ => Err(ReplicationError::deserialize("expected NULL for unit type")),
         }
-    }
-
-    #[inline]
-    fn deserialize_unit_struct<V: Visitor<'de>>(
-        self,
-        _name: &'static str,
-        visitor: V,
-    ) -> Result<V::Value, Self::Error> {
-        self.deserialize_unit(visitor)
-    }
-
-    #[inline]
-    fn deserialize_newtype_struct<V: Visitor<'de>>(
-        self,
-        _name: &'static str,
-        visitor: V,
-    ) -> Result<V::Value, Self::Error> {
-        visitor.visit_newtype_struct(self)
-    }
-
-    #[inline]
-    fn deserialize_seq<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value, Self::Error> {
-        Err(ReplicationError::deserialize(MSG_SEQ))
-    }
-
-    #[inline]
-    fn deserialize_tuple<V: Visitor<'de>>(
-        self,
-        _len: usize,
-        _visitor: V,
-    ) -> Result<V::Value, Self::Error> {
-        Err(ReplicationError::deserialize(MSG_TUPLE))
-    }
-
-    #[inline]
-    fn deserialize_tuple_struct<V: Visitor<'de>>(
-        self,
-        _name: &'static str,
-        _len: usize,
-        _visitor: V,
-    ) -> Result<V::Value, Self::Error> {
-        Err(ReplicationError::deserialize(MSG_TUPLE_STRUCT))
-    }
-
-    #[inline]
-    fn deserialize_map<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value, Self::Error> {
-        Err(ReplicationError::deserialize(MSG_MAP))
-    }
-
-    #[inline]
-    fn deserialize_struct<V: Visitor<'de>>(
-        self,
-        _name: &'static str,
-        _fields: &'static [&'static str],
-        _visitor: V,
-    ) -> Result<V::Value, Self::Error> {
-        Err(ReplicationError::deserialize(MSG_STRUCT))
     }
 
     #[inline]
@@ -696,15 +713,7 @@ impl<'de> de::Deserializer<'de> for ColumnValueDeserializer<'de, Strict> {
         ))
     }
 
-    #[inline]
-    fn deserialize_identifier<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        self.deserialize_str(visitor)
-    }
-
-    #[inline]
-    fn deserialize_ignored_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_unit()
-    }
+    shared_deserializer_methods!(#[inline]);
 }
 
 // ---------------------------------------------------------------------------
@@ -758,7 +767,7 @@ impl<T> TryDeserializeResult<T> {
 }
 
 /// Shared lenient context passed down through the deserializer chain.
-pub(crate) struct LenientCtx {
+struct LenientCtx {
     errors: core::cell::RefCell<Vec<FieldError>>,
 }
 
@@ -781,13 +790,13 @@ impl LenientCtx {
     }
 }
 
-pub(crate) struct LenientRowDataDeserializer<'a> {
+struct LenientRowDataDeserializer<'a> {
     row: &'a RowData,
     ctx: &'a LenientCtx,
 }
 
 impl<'a> LenientRowDataDeserializer<'a> {
-    pub(crate) fn new(row: &'a RowData, ctx: &'a LenientCtx) -> Self {
+    fn new(row: &'a RowData, ctx: &'a LenientCtx) -> Self {
         Self { row, ctx }
     }
 }
@@ -889,45 +898,6 @@ impl<'de, 'a> de::Deserializer<'de> for ColumnValueDeserializer<'a, Lenient<'a>>
         }
     }
 
-    fn deserialize_bool<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_bool(self.boolean()?)
-    }
-
-    fn deserialize_i8<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_i8(self.signed::<i8>("i8")?)
-    }
-    fn deserialize_i16<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_i16(self.signed::<i16>("i16")?)
-    }
-    fn deserialize_i32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_i32(self.signed::<i32>("i32")?)
-    }
-    fn deserialize_i64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_i64(self.signed::<i64>("i64")?)
-    }
-    fn deserialize_u8<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_u8(self.unsigned::<u8>("u8")?)
-    }
-    fn deserialize_u16<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_u16(self.unsigned::<u16>("u16")?)
-    }
-    fn deserialize_u32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_u32(self.unsigned::<u32>("u32")?)
-    }
-    fn deserialize_u64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_u64(self.unsigned::<u64>("u64")?)
-    }
-    fn deserialize_f32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_f32(self.float::<f32>("f32")?)
-    }
-    fn deserialize_f64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_f64(self.float::<f64>("f64")?)
-    }
-
-    fn deserialize_char<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_char(self.character()?)
-    }
-
     fn deserialize_str<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         visitor.visit_str(self.text("str")?.unwrap_or(""))
     }
@@ -958,69 +928,12 @@ impl<'de, 'a> de::Deserializer<'de> for ColumnValueDeserializer<'a, Lenient<'a>>
         }
     }
 
-    fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        match self.value {
-            ColumnValue::Null => visitor.visit_none(),
-            _ => visitor.visit_some(self),
-        }
-    }
-
     fn deserialize_unit<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         if !matches!(self.value, ColumnValue::Null) {
             self.policy
                 .fail::<()>(|| "expected NULL for unit type".to_string(), || ())?;
         }
         visitor.visit_unit()
-    }
-
-    fn deserialize_unit_struct<V: Visitor<'de>>(
-        self,
-        _name: &'static str,
-        visitor: V,
-    ) -> Result<V::Value, Self::Error> {
-        self.deserialize_unit(visitor)
-    }
-
-    fn deserialize_newtype_struct<V: Visitor<'de>>(
-        self,
-        _name: &'static str,
-        visitor: V,
-    ) -> Result<V::Value, Self::Error> {
-        visitor.visit_newtype_struct(self)
-    }
-
-    fn deserialize_seq<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value, Self::Error> {
-        Err(ReplicationError::deserialize(MSG_SEQ))
-    }
-
-    fn deserialize_tuple<V: Visitor<'de>>(
-        self,
-        _len: usize,
-        _visitor: V,
-    ) -> Result<V::Value, Self::Error> {
-        Err(ReplicationError::deserialize(MSG_TUPLE))
-    }
-
-    fn deserialize_tuple_struct<V: Visitor<'de>>(
-        self,
-        _name: &'static str,
-        _len: usize,
-        _visitor: V,
-    ) -> Result<V::Value, Self::Error> {
-        Err(ReplicationError::deserialize(MSG_TUPLE_STRUCT))
-    }
-
-    fn deserialize_map<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value, Self::Error> {
-        Err(ReplicationError::deserialize(MSG_MAP))
-    }
-
-    fn deserialize_struct<V: Visitor<'de>>(
-        self,
-        _name: &'static str,
-        _fields: &'static [&'static str],
-        _visitor: V,
-    ) -> Result<V::Value, Self::Error> {
-        Err(ReplicationError::deserialize(MSG_STRUCT))
     }
 
     fn deserialize_enum<V: Visitor<'de>>(
@@ -1052,13 +965,7 @@ impl<'de, 'a> de::Deserializer<'de> for ColumnValueDeserializer<'a, Lenient<'a>>
         ))
     }
 
-    fn deserialize_identifier<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        self.deserialize_str(visitor)
-    }
-
-    fn deserialize_ignored_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_unit()
-    }
+    shared_deserializer_methods!();
 }
 
 pub(crate) fn try_deserialize_row<T: serde::de::DeserializeOwned>(
@@ -1077,11 +984,65 @@ pub(crate) fn try_deserialize_row<T: serde::de::DeserializeOwned>(
 mod tests {
     #![allow(dead_code)]
 
+    use super::TryDeserializeResult;
     use crate::column_value::{ColumnValue, RowData};
     use crate::types::{ChangeEvent, Lsn, ReplicaIdentity};
     use bytes::Bytes;
+    use serde::de::DeserializeOwned;
     use serde::Deserialize;
+    use std::fmt::Debug;
     use std::sync::Arc;
+
+    // -- Single-column helpers -------------------------------------------------
+
+    /// One-column target, so a test needs no struct of its own.
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct One<T> {
+        v: T,
+    }
+
+    /// `serde_bytes` target; `One<Vec<u8>>` would take the sequence path instead.
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct Blob(#[serde(with = "serde_bytes")] Vec<u8>);
+
+    fn one_row(val: ColumnValue) -> RowData {
+        RowData::from_pairs(vec![("v", val)])
+    }
+
+    fn one<T: DeserializeOwned>(val: ColumnValue) -> crate::error::Result<T> {
+        one_row(val).deserialize_into::<One<T>>().map(|o| o.v)
+    }
+
+    fn try_one<T: DeserializeOwned>(
+        val: ColumnValue,
+    ) -> crate::error::Result<TryDeserializeResult<T>> {
+        one_row(val)
+            .try_deserialize_into::<One<T>>()
+            .map(|r| TryDeserializeResult {
+                value: r.value.v,
+                errors: r.errors,
+            })
+    }
+
+    fn lenient<T: DeserializeOwned>(val: ColumnValue) -> TryDeserializeResult<T> {
+        try_one(val).unwrap()
+    }
+
+    fn lenient_de<'a>(
+        value: &'a ColumnValue,
+        ctx: &'a super::LenientCtx,
+        field: &'a str,
+    ) -> super::ColumnValueDeserializer<'a, super::Lenient<'a>> {
+        super::ColumnValueDeserializer {
+            value,
+            policy: super::Lenient { ctx, field },
+        }
+    }
+
+    fn assert_err_contains<T: Debug>(result: crate::error::Result<T>, needle: &str) {
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains(needle), "got: {msg}");
+    }
 
     // -- Basic struct deserialization -----------------------------------------
 
@@ -1178,15 +1139,7 @@ mod tests {
 
     #[test]
     fn test_boolean_invalid() {
-        let row = RowData::from_pairs(vec![("a", ColumnValue::text("maybe"))]);
-        #[derive(Debug, Deserialize)]
-        struct B {
-            a: bool,
-        }
-        let result: crate::error::Result<B> = row.deserialize_into();
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("maybe"), "got: {msg}");
+        assert_err_contains(one::<bool>(ColumnValue::text("maybe")), "maybe");
     }
 
     // -- PostgreSQL full boolean input vocabulary --------------------------------
@@ -1253,39 +1206,20 @@ mod tests {
 
     #[test]
     fn test_null_into_non_option() {
-        let row = RowData::from_pairs(vec![("id", ColumnValue::Null)]);
-        #[derive(Debug, Deserialize)]
-        struct S {
-            id: u32,
-        }
-        let result: crate::error::Result<S> = row.deserialize_into();
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("NULL"), "got: {msg}");
+        assert_err_contains(one::<u32>(ColumnValue::Null), "NULL");
     }
 
     #[test]
     fn test_type_mismatch() {
-        let row = RowData::from_pairs(vec![("id", ColumnValue::text("not_a_number"))]);
-        #[derive(Debug, Deserialize)]
-        struct S {
-            id: u32,
-        }
-        let result: crate::error::Result<S> = row.deserialize_into();
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("not_a_number"), "got: {msg}");
+        assert_err_contains(
+            one::<u32>(ColumnValue::text("not_a_number")),
+            "not_a_number",
+        );
     }
 
     #[test]
     fn test_overflow() {
-        let row = RowData::from_pairs(vec![("val", ColumnValue::text("99999"))]);
-        #[derive(Debug, Deserialize)]
-        struct S {
-            val: i8,
-        }
-        let result: crate::error::Result<S> = row.deserialize_into();
-        assert!(result.is_err());
+        assert!(one::<i8>(ColumnValue::text("99999")).is_err());
     }
 
     // -- Extra columns ignored -----------------------------------------------
@@ -1408,24 +1342,13 @@ mod tests {
 
     #[test]
     fn test_char_field() {
-        #[derive(Deserialize, PartialEq, Debug)]
-        struct S {
-            c: char,
-        }
-        let row = RowData::from_pairs(vec![("c", ColumnValue::text("A"))]);
-        let v: S = row.deserialize_into().unwrap();
-        assert_eq!(v.c, 'A');
+        let v = one::<char>(ColumnValue::text("A")).unwrap();
+        assert_eq!(v, 'A');
     }
 
     #[test]
     fn test_char_too_long() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            c: char,
-        }
-        let row = RowData::from_pairs(vec![("c", ColumnValue::text("AB"))]);
-        let result: crate::error::Result<S> = row.deserialize_into();
-        assert!(result.is_err());
+        assert!(one::<char>(ColumnValue::text("AB")).is_err());
     }
 
     // -- Enum deserialization (simple unit variants) -------------------------
@@ -1465,9 +1388,7 @@ mod tests {
             ),
         ]);
         let result: crate::error::Result<UserModel> = row.deserialize_into();
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("binary"), "got: {msg}");
+        assert_err_contains(result, "binary");
     }
 
     // -- ChangeEvent convenience methods -------------------------------------
@@ -1489,9 +1410,7 @@ mod tests {
         let ts = chrono::Utc::now();
         let event = ChangeEvent::begin(1, Lsn::new(100), ts, Lsn::new(100));
         let result: crate::error::Result<UserModel> = event.deserialize_insert();
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("begin"), "got: {msg}");
+        assert_err_contains(result, "begin");
     }
 
     #[test]
@@ -1684,43 +1603,22 @@ mod tests {
 
     #[test]
     fn test_bytes_from_binary_column() {
-        #[derive(Debug, Deserialize, PartialEq)]
-        struct S {
-            #[serde(with = "serde_bytes")]
-            data: Vec<u8>,
-        }
-        let row = RowData::from_pairs(vec![(
-            "data",
-            ColumnValue::binary_bytes(Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef])),
-        )]);
-        let v: S = row.deserialize_into().unwrap();
-        assert_eq!(v.data, vec![0xde, 0xad, 0xbe, 0xef]);
+        let v = one::<Blob>(ColumnValue::binary_bytes(Bytes::from_static(&[
+            0xde, 0xad, 0xbe, 0xef,
+        ])))
+        .unwrap();
+        assert_eq!(v.0, vec![0xde, 0xad, 0xbe, 0xef]);
     }
 
     #[test]
     fn test_bytes_from_text_column() {
-        #[derive(Debug, Deserialize, PartialEq)]
-        struct S {
-            #[serde(with = "serde_bytes")]
-            data: Vec<u8>,
-        }
-        let row = RowData::from_pairs(vec![("data", ColumnValue::text("hello"))]);
-        let v: S = row.deserialize_into().unwrap();
-        assert_eq!(v.data, b"hello");
+        let v = one::<Blob>(ColumnValue::text("hello")).unwrap();
+        assert_eq!(v.0, b"hello");
     }
 
     #[test]
     fn test_bytes_null_errors() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            #[serde(with = "serde_bytes")]
-            data: Vec<u8>,
-        }
-        let row = RowData::from_pairs(vec![("data", ColumnValue::Null)]);
-        let result: crate::error::Result<S> = row.deserialize_into();
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("NULL"), "got: {msg}");
+        assert_err_contains(one::<Blob>(ColumnValue::Null), "NULL");
     }
 
     // -- deserialize_any paths -----------------------------------------------
@@ -1769,30 +1667,14 @@ mod tests {
 
     #[test]
     fn test_unit_from_non_null_errors() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            val: (),
-        }
-        let row = RowData::from_pairs(vec![("val", ColumnValue::text("something"))]);
-        let result: crate::error::Result<S> = row.deserialize_into();
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("NULL"), "got: {msg}");
+        assert_err_contains(one::<()>(ColumnValue::text("something")), "NULL");
     }
 
     // -- Unsupported type errors (seq, tuple, tuple_struct, map, struct on column) --
 
     #[test]
     fn test_seq_not_supported() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            vals: Vec<u32>,
-        }
-        let row = RowData::from_pairs(vec![("vals", ColumnValue::text("[1,2,3]"))]);
-        let result: crate::error::Result<S> = row.deserialize_into();
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("sequence"), "got: {msg}");
+        assert_err_contains(one::<Vec<u32>>(ColumnValue::text("[1,2,3]")), "sequence");
     }
 
     #[test]
@@ -1801,115 +1683,58 @@ mod tests {
         struct Inner {
             x: u32,
         }
-        #[derive(Debug, Deserialize)]
-        struct Outer {
-            inner: Inner,
-        }
-        let row = RowData::from_pairs(vec![("inner", ColumnValue::text("{\"x\":1}"))]);
-        let result: crate::error::Result<Outer> = row.deserialize_into();
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("nested struct"), "got: {msg}");
+        assert_err_contains(
+            one::<Inner>(ColumnValue::text("{\"x\":1}")),
+            "nested struct",
+        );
     }
 
     // -- text_or_err error paths (NULL for bool, Binary for numeric) ----------
 
     #[test]
     fn test_null_bool_errors() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            flag: bool,
-        }
-        let row = RowData::from_pairs(vec![("flag", ColumnValue::Null)]);
-        let result: crate::error::Result<S> = row.deserialize_into();
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("NULL"), "got: {msg}");
+        assert_err_contains(one::<bool>(ColumnValue::Null), "NULL");
     }
 
     #[test]
     fn test_binary_numeric_errors() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            val: i32,
-        }
-        let row = RowData::from_pairs(vec![(
-            "val",
-            ColumnValue::binary_bytes(Bytes::from_static(&[0x01, 0x02])),
-        )]);
-        let result: crate::error::Result<S> = row.deserialize_into();
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("binary"), "got: {msg}");
+        assert_err_contains(
+            one::<i32>(ColumnValue::binary_bytes(Bytes::from_static(&[0x01, 0x02]))),
+            "binary",
+        );
     }
 
     #[test]
     fn test_binary_bool_errors() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            flag: bool,
-        }
-        let row = RowData::from_pairs(vec![(
-            "flag",
-            ColumnValue::binary_bytes(Bytes::from_static(&[0x01])),
-        )]);
-        let result: crate::error::Result<S> = row.deserialize_into();
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("binary"), "got: {msg}");
+        assert_err_contains(
+            one::<bool>(ColumnValue::binary_bytes(Bytes::from_static(&[0x01]))),
+            "binary",
+        );
     }
 
     #[test]
     fn test_binary_string_errors() {
-        let row = RowData::from_pairs(vec![(
-            "username",
-            ColumnValue::binary_bytes(Bytes::from_static(b"data")),
-        )]);
-        #[derive(Debug, Deserialize)]
-        struct S {
-            username: String,
-        }
-        let result: crate::error::Result<S> = row.deserialize_into();
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("binary"), "got: {msg}");
+        assert_err_contains(
+            one::<String>(ColumnValue::binary_bytes(Bytes::from_static(b"data"))),
+            "binary",
+        );
     }
 
     #[test]
     fn test_null_string_errors() {
-        let row = RowData::from_pairs(vec![("name", ColumnValue::Null)]);
-        #[derive(Debug, Deserialize)]
-        struct S {
-            name: String,
-        }
-        let result: crate::error::Result<S> = row.deserialize_into();
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("NULL"), "got: {msg}");
+        assert_err_contains(one::<String>(ColumnValue::Null), "NULL");
     }
 
     // -- Char edge cases -----------------------------------------------------
 
     #[test]
     fn test_char_empty_string_errors() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            c: char,
-        }
-        let row = RowData::from_pairs(vec![("c", ColumnValue::text(""))]);
-        let result: crate::error::Result<S> = row.deserialize_into();
-        assert!(result.is_err());
+        assert!(one::<char>(ColumnValue::text("")).is_err());
     }
 
     #[test]
     fn test_char_null_errors() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            c: char,
-        }
-        let row = RowData::from_pairs(vec![("c", ColumnValue::Null)]);
-        let result: crate::error::Result<S> = row.deserialize_into();
-        assert!(result.is_err());
+        assert!(one::<char>(ColumnValue::Null).is_err());
     }
 
     // -- Enum edge cases ----------------------------------------------------
@@ -1944,9 +1769,7 @@ mod tests {
         ]);
         let event = ChangeEvent::insert("public", "users", 1, row, Lsn::new(100));
         let result: crate::error::Result<UserModel> = event.deserialize_delete();
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("insert"), "got: {msg}");
+        assert_err_contains(result, "insert");
     }
 
     #[test]
@@ -1954,44 +1777,27 @@ mod tests {
         let event =
             ChangeEvent::truncate(vec![Arc::from("public.users")], false, false, Lsn::new(100));
         let result: crate::error::Result<UserModel> = event.deserialize_data();
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("truncate"), "got: {msg}");
+        assert_err_contains(result, "truncate");
     }
 
     // -- Option<bool> and Option<i32> (Option wrapping non-string types) -----
 
     #[test]
     fn test_option_bool_some() {
-        #[derive(Debug, Deserialize, PartialEq)]
-        struct S {
-            flag: Option<bool>,
-        }
-        let row = RowData::from_pairs(vec![("flag", ColumnValue::text("t"))]);
-        let v: S = row.deserialize_into().unwrap();
-        assert_eq!(v.flag, Some(true));
+        let v = one::<Option<bool>>(ColumnValue::text("t")).unwrap();
+        assert_eq!(v, Some(true));
     }
 
     #[test]
     fn test_option_bool_none() {
-        #[derive(Debug, Deserialize, PartialEq)]
-        struct S {
-            flag: Option<bool>,
-        }
-        let row = RowData::from_pairs(vec![("flag", ColumnValue::Null)]);
-        let v: S = row.deserialize_into().unwrap();
-        assert_eq!(v.flag, None);
+        let v = one::<Option<bool>>(ColumnValue::Null).unwrap();
+        assert_eq!(v, None);
     }
 
     #[test]
     fn test_option_i32() {
-        #[derive(Debug, Deserialize, PartialEq)]
-        struct S {
-            val: Option<i32>,
-        }
-        let row = RowData::from_pairs(vec![("val", ColumnValue::text("-42"))]);
-        let v: S = row.deserialize_into().unwrap();
-        assert_eq!(v.val, Some(-42));
+        let v = one::<Option<i32>>(ColumnValue::text("-42")).unwrap();
+        assert_eq!(v, Some(-42));
     }
 
     // -- Multiple rows deserialization (same struct, different data) ----------
@@ -2023,13 +1829,8 @@ mod tests {
 
     #[test]
     fn test_negative_float() {
-        #[derive(Debug, Deserialize, PartialEq)]
-        struct S {
-            val: f64,
-        }
-        let row = RowData::from_pairs(vec![("val", ColumnValue::text("-0.001"))]);
-        let v: S = row.deserialize_into().unwrap();
-        assert!((v.val - (-0.001)).abs() < f64::EPSILON);
+        let v = one::<f64>(ColumnValue::text("-0.001")).unwrap();
+        assert!((v - (-0.001)).abs() < f64::EPSILON);
     }
 
     // -- RowData::as_columns test -------------------------------------------
@@ -2084,73 +1885,36 @@ mod tests {
 
     #[test]
     fn test_byte_buf_from_binary() {
-        #[derive(Debug, Deserialize, PartialEq)]
-        struct S {
-            #[serde(with = "serde_bytes")]
-            data: Vec<u8>,
-        }
-        let row = RowData::from_pairs(vec![(
-            "data",
-            ColumnValue::binary_bytes(Bytes::from_static(&[1, 2, 3])),
-        )]);
-        let v: S = row.deserialize_into().unwrap();
-        assert_eq!(v.data, vec![1, 2, 3]);
+        let v = one::<Blob>(ColumnValue::binary_bytes(Bytes::from_static(&[1, 2, 3]))).unwrap();
+        assert_eq!(v.0, vec![1, 2, 3]);
     }
 
     #[test]
     fn test_byte_buf_null_errors() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            #[serde(with = "serde_bytes")]
-            data: Vec<u8>,
-        }
-        let row = RowData::from_pairs(vec![("data", ColumnValue::Null)]);
-        let result: crate::error::Result<S> = row.deserialize_into();
-        assert!(result.is_err());
+        assert!(one::<Blob>(ColumnValue::Null).is_err());
     }
 
     // -- unsupported types at column level ------------------------------------
 
     #[test]
     fn test_tuple_not_supported() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            pair: (u32, u32),
-        }
-        let row = RowData::from_pairs(vec![("pair", ColumnValue::text("1,2"))]);
-        let result: crate::error::Result<S> = row.deserialize_into();
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("tuple"), "got: {msg}");
+        assert_err_contains(one::<(u32, u32)>(ColumnValue::text("1,2")), "tuple");
     }
 
     #[test]
     fn test_tuple_struct_not_supported() {
         #[derive(Debug, Deserialize)]
         struct Pair(u32, u32);
-        #[derive(Debug, Deserialize)]
-        struct S {
-            p: Pair,
-        }
-        let row = RowData::from_pairs(vec![("p", ColumnValue::text("1,2"))]);
-        let result: crate::error::Result<S> = row.deserialize_into();
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("tuple struct"), "got: {msg}");
+        assert_err_contains(one::<Pair>(ColumnValue::text("1,2")), "tuple struct");
     }
 
     #[test]
     fn test_nested_map_not_supported() {
         use std::collections::HashMap;
-        #[derive(Debug, Deserialize)]
-        struct S {
-            m: HashMap<String, String>,
-        }
-        let row = RowData::from_pairs(vec![("m", ColumnValue::text("{}"))]);
-        let result: crate::error::Result<S> = row.deserialize_into();
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("nested map"), "got: {msg}");
+        assert_err_contains(
+            one::<HashMap<String, String>>(ColumnValue::text("{}")),
+            "nested map",
+        );
     }
 
     // -- unit_struct from Null -------------------------------------------------
@@ -2159,13 +1923,8 @@ mod tests {
     fn test_unit_struct_from_null() {
         #[derive(Debug, Deserialize, PartialEq)]
         struct Marker;
-        #[derive(Debug, Deserialize, PartialEq)]
-        struct S {
-            m: Marker,
-        }
-        let row = RowData::from_pairs(vec![("m", ColumnValue::Null)]);
-        let v: S = row.deserialize_into().unwrap();
-        assert_eq!(v.m, Marker);
+        let v = one::<Marker>(ColumnValue::Null).unwrap();
+        assert_eq!(v, Marker);
     }
 
     // -- identifier / str paths via flatten ------------------------------------
@@ -2196,13 +1955,7 @@ mod tests {
 
     #[test]
     fn test_boolean_invalid_single_char() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            a: bool,
-        }
-        let row = RowData::from_pairs(vec![("a", ColumnValue::text("x"))]);
-        let result: crate::error::Result<S> = row.deserialize_into();
-        assert!(result.is_err());
+        assert!(one::<bool>(ColumnValue::text("x")).is_err());
     }
 
     // -- i64/u64 boundary ------------------------------------------------------
@@ -2249,25 +2002,15 @@ mod tests {
             ),
         ]);
         let result: crate::error::Result<UserModel> = row.deserialize_into();
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("invalid UTF-8"), "got: {msg}");
+        assert_err_contains(result, "invalid UTF-8");
     }
 
     #[test]
     fn test_invalid_utf8_text_as_numeric_errors() {
-        let row = RowData::from_pairs(vec![(
-            "val",
-            ColumnValue::Text(Bytes::from_static(&[0xff, 0xfe])),
-        )]);
-        #[derive(Debug, Deserialize)]
-        struct S {
-            val: u32,
-        }
-        let result: crate::error::Result<S> = row.deserialize_into();
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("invalid UTF-8"), "got: {msg}");
+        assert_err_contains(
+            one::<u32>(ColumnValue::Text(Bytes::from_static(&[0xff, 0xfe]))),
+            "invalid UTF-8",
+        );
     }
 
     // -- deserialize_any: Binary and invalid-UTF8 Text fallbacks -------------
@@ -2301,14 +2044,8 @@ mod tests {
 
     #[test]
     fn test_byte_buf_from_text() {
-        #[derive(Debug, Deserialize, PartialEq)]
-        struct S {
-            #[serde(with = "serde_bytes")]
-            data: Vec<u8>,
-        }
-        let row = RowData::from_pairs(vec![("data", ColumnValue::text("hello"))]);
-        let v: S = row.deserialize_into().unwrap();
-        assert_eq!(v.data, b"hello");
+        let v = one::<Blob>(ColumnValue::text("hello")).unwrap();
+        assert_eq!(v.0, b"hello");
     }
 
     // -- Non-unit enum variants: hit UnitVariantAccess error paths ------------
@@ -2319,15 +2056,7 @@ mod tests {
         enum E {
             V(u32),
         }
-        #[derive(Debug, Deserialize)]
-        struct S {
-            e: E,
-        }
-        let row = RowData::from_pairs(vec![("e", ColumnValue::text("V"))]);
-        let result: crate::error::Result<S> = row.deserialize_into();
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("newtype"), "got: {msg}");
+        assert_err_contains(one::<E>(ColumnValue::text("V")), "newtype");
     }
 
     #[test]
@@ -2336,15 +2065,7 @@ mod tests {
         enum E {
             V(u32, u32),
         }
-        #[derive(Debug, Deserialize)]
-        struct S {
-            e: E,
-        }
-        let row = RowData::from_pairs(vec![("e", ColumnValue::text("V"))]);
-        let result: crate::error::Result<S> = row.deserialize_into();
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("tuple"), "got: {msg}");
+        assert_err_contains(one::<E>(ColumnValue::text("V")), "tuple");
     }
 
     #[test]
@@ -2353,41 +2074,23 @@ mod tests {
         enum E {
             V { x: u32 },
         }
-        #[derive(Debug, Deserialize)]
-        struct S {
-            e: E,
-        }
-        let row = RowData::from_pairs(vec![("e", ColumnValue::text("V"))]);
-        let result: crate::error::Result<S> = row.deserialize_into();
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("struct"), "got: {msg}");
+        assert_err_contains(one::<E>(ColumnValue::text("V")), "struct");
     }
 
     // -- Multi-byte char -------------------------------------------------------
 
     #[test]
     fn test_char_multibyte_unicode() {
-        #[derive(Debug, Deserialize, PartialEq)]
-        struct S {
-            c: char,
-        }
-        let row = RowData::from_pairs(vec![("c", ColumnValue::text("é"))]);
-        let v: S = row.deserialize_into().unwrap();
-        assert_eq!(v.c, 'é');
+        let v = one::<char>(ColumnValue::text("é")).unwrap();
+        assert_eq!(v, 'é');
     }
 
     // -- Option wrapping numeric none path ------------------------------------
 
     #[test]
     fn test_option_u64_none() {
-        #[derive(Debug, Deserialize, PartialEq)]
-        struct S {
-            val: Option<u64>,
-        }
-        let row = RowData::from_pairs(vec![("val", ColumnValue::Null)]);
-        let v: S = row.deserialize_into().unwrap();
-        assert_eq!(v.val, None);
+        let v = one::<Option<u64>>(ColumnValue::Null).unwrap();
+        assert_eq!(v, None);
     }
 
     // -- deserialize_str via &str target --------------------------------------
@@ -2396,13 +2099,8 @@ mod tests {
     fn test_str_field() {
         // String already covered; this exercises deserialize_str path explicitly
         // via a type that calls deserialize_str during Visitor expectation.
-        #[derive(Debug, Deserialize, PartialEq)]
-        struct S {
-            name: String,
-        }
-        let row = RowData::from_pairs(vec![("name", ColumnValue::text("alice"))]);
-        let v: S = row.deserialize_into().unwrap();
-        assert_eq!(v.name, "alice");
+        let v = one::<String>(ColumnValue::text("alice")).unwrap();
+        assert_eq!(v, "alice");
     }
 
     // -- try_deserialize_into (lenient mode) ---------------------------------
@@ -2481,15 +2179,10 @@ mod tests {
 
     #[test]
     fn test_try_bool_invalid_uses_false_and_reports() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            flag: bool,
-        }
-        let row = RowData::from_pairs(vec![("flag", ColumnValue::text("maybe"))]);
-        let r = row.try_deserialize_into::<S>().unwrap();
-        assert!(!r.value.flag);
+        let r = lenient::<bool>(ColumnValue::text("maybe"));
+        assert!(!r.value);
         assert_eq!(r.errors.len(), 1);
-        assert_eq!(r.errors[0].field, "flag");
+        assert_eq!(r.errors[0].field, "v");
     }
 
     #[test]
@@ -2529,76 +2222,40 @@ mod tests {
 
     #[test]
     fn test_try_binary_for_numeric_reports() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            val: i32,
-        }
-        let row = RowData::from_pairs(vec![(
-            "val",
-            ColumnValue::binary_bytes(Bytes::from_static(&[1, 2])),
-        )]);
-        let r = row.try_deserialize_into::<S>().unwrap();
-        assert_eq!(r.value.val, 0);
+        let r = lenient::<i32>(ColumnValue::binary_bytes(Bytes::from_static(&[1, 2])));
+        assert_eq!(r.value, 0);
         assert_eq!(r.errors.len(), 1);
         assert!(r.errors[0].message.contains("binary"));
     }
 
     #[test]
     fn test_try_char_invalid_uses_null_char() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            c: char,
-        }
-        let row = RowData::from_pairs(vec![("c", ColumnValue::text("AB"))]);
-        let r = row.try_deserialize_into::<S>().unwrap();
-        assert_eq!(r.value.c, '\0');
+        let r = lenient::<char>(ColumnValue::text("AB"));
+        assert_eq!(r.value, '\0');
         assert_eq!(r.errors.len(), 1);
-        assert_eq!(r.errors[0].field, "c");
+        assert_eq!(r.errors[0].field, "v");
     }
 
     #[test]
     fn test_try_invalid_utf8_for_string_uses_empty() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            name: String,
-        }
-        let row = RowData::from_pairs(vec![(
-            "name",
-            ColumnValue::Text(Bytes::from_static(&[0xff, 0xfe])),
-        )]);
-        let r = row.try_deserialize_into::<S>().unwrap();
-        assert_eq!(r.value.name, "");
+        let r = lenient::<String>(ColumnValue::Text(Bytes::from_static(&[0xff, 0xfe])));
+        assert_eq!(r.value, "");
         assert_eq!(r.errors.len(), 1);
         assert!(r.errors[0].message.contains("invalid UTF-8"));
     }
 
     #[test]
     fn test_try_bytes_null_uses_empty() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            #[serde(with = "serde_bytes")]
-            data: Vec<u8>,
-        }
-        let row = RowData::from_pairs(vec![("data", ColumnValue::Null)]);
-        let r = row.try_deserialize_into::<S>().unwrap();
-        assert_eq!(r.value.data, Vec::<u8>::new());
+        let r = lenient::<Blob>(ColumnValue::Null);
+        assert_eq!(r.value.0, Vec::<u8>::new());
         assert_eq!(r.errors.len(), 1);
         assert!(r.errors[0].message.contains("NULL"));
     }
 
     #[test]
     fn test_try_bytes_from_binary_ok() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            #[serde(with = "serde_bytes")]
-            data: Vec<u8>,
-        }
-        let row = RowData::from_pairs(vec![(
-            "data",
-            ColumnValue::binary_bytes(Bytes::from_static(&[1, 2, 3])),
-        )]);
-        let r = row.try_deserialize_into::<S>().unwrap();
-        assert_eq!(r.value.data, vec![1, 2, 3]);
+        let r = lenient::<Blob>(ColumnValue::binary_bytes(Bytes::from_static(&[1, 2, 3])));
+        assert_eq!(r.value.0, vec![1, 2, 3]);
     }
 
     #[test]
@@ -2614,27 +2271,17 @@ mod tests {
 
     #[test]
     fn test_try_into_result_err() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            id: u32,
-        }
-        let row = RowData::from_pairs(vec![("id", ColumnValue::text("nope"))]);
-        let r = row.try_deserialize_into::<S>().unwrap();
+        let r = lenient::<u32>(ColumnValue::text("nope"));
         let errs = r.into_result().err().unwrap();
         assert_eq!(errs.len(), 1);
-        assert_eq!(errs[0].field, "id");
+        assert_eq!(errs[0].field, "v");
     }
 
     #[test]
     fn test_try_unit_on_non_null_reports_but_succeeds() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            marker: (),
-        }
-        let row = RowData::from_pairs(vec![("marker", ColumnValue::text("x"))]);
-        let r = row.try_deserialize_into::<S>().unwrap();
+        let r = lenient::<()>(ColumnValue::text("x"));
         assert_eq!(r.errors.len(), 1);
-        assert_eq!(r.errors[0].field, "marker");
+        assert_eq!(r.errors[0].field, "v");
     }
 
     #[test]
@@ -2674,13 +2321,7 @@ mod tests {
         struct Inner {
             x: u32,
         }
-        #[derive(Debug, Deserialize)]
-        struct Outer {
-            inner: Inner,
-        }
-        let row = RowData::from_pairs(vec![("inner", ColumnValue::text("{}"))]);
-        let r = row.try_deserialize_into::<Outer>();
-        assert!(r.is_err());
+        assert!(try_one::<Inner>(ColumnValue::text("{}")).is_err());
     }
 
     // -- Additional coverage tests --------------------------------------------
@@ -2697,12 +2338,7 @@ mod tests {
 
     #[test]
     fn test_try_is_clean_false_when_errors_recorded() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            v: u32,
-        }
-        let row = RowData::from_pairs(vec![("v", ColumnValue::text("nope"))]);
-        let r = row.try_deserialize_into::<S>().unwrap();
+        let r = lenient::<u32>(ColumnValue::text("nope"));
         assert!(!r.is_clean());
     }
 
@@ -2720,26 +2356,15 @@ mod tests {
     fn test_try_lenient_newtype_struct() {
         #[derive(Debug, Deserialize)]
         struct Wrap(u32);
-        #[derive(Debug, Deserialize)]
-        struct S {
-            v: Wrap,
-        }
-        let row = RowData::from_pairs(vec![("v", ColumnValue::text("42"))]);
-        let r = row.try_deserialize_into::<S>().unwrap();
-        assert_eq!(r.value.v.0, 42);
+        let r = lenient::<Wrap>(ColumnValue::text("42"));
+        assert_eq!(r.value.0, 42);
         assert!(r.is_clean());
     }
 
     #[test]
     fn test_try_lenient_bytes_from_text_arm() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            #[serde(with = "serde_bytes")]
-            data: Vec<u8>,
-        }
-        let row = RowData::from_pairs(vec![("data", ColumnValue::text("abc"))]);
-        let r = row.try_deserialize_into::<S>().unwrap();
-        assert_eq!(r.value.data, b"abc");
+        let r = lenient::<Blob>(ColumnValue::text("abc"));
+        assert_eq!(r.value.0, b"abc");
         assert!(r.is_clean());
     }
 
@@ -2747,62 +2372,34 @@ mod tests {
     fn test_try_lenient_tuple_struct_errors() {
         #[derive(Debug, Deserialize)]
         struct TS(u32, u32);
-        #[derive(Debug, Deserialize)]
-        struct S {
-            t: TS,
-        }
-        let row = RowData::from_pairs(vec![("t", ColumnValue::text("1,2"))]);
-        let r = row.try_deserialize_into::<S>();
-        assert!(r.is_err());
+        assert!(try_one::<TS>(ColumnValue::text("1,2")).is_err());
     }
 
     #[test]
     fn test_try_lenient_seq_errors() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            xs: Vec<u32>,
-        }
-        let row = RowData::from_pairs(vec![("xs", ColumnValue::text("1"))]);
-        let r = row.try_deserialize_into::<S>();
-        assert!(r.is_err());
+        assert!(try_one::<Vec<u32>>(ColumnValue::text("1")).is_err());
     }
 
     #[test]
     fn test_try_lenient_nested_map_errors() {
         use std::collections::HashMap;
-        #[derive(Debug, Deserialize)]
-        struct S {
-            m: HashMap<String, String>,
-        }
-        let row = RowData::from_pairs(vec![("m", ColumnValue::text("{}"))]);
-        let r = row.try_deserialize_into::<S>();
-        assert!(r.is_err());
+        assert!(try_one::<HashMap<String, String>>(ColumnValue::text("{}")).is_err());
     }
 
     #[test]
     fn test_try_lenient_option_non_null_parses_inner() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            id: Option<u32>,
-        }
-        let row = RowData::from_pairs(vec![("id", ColumnValue::text("7"))]);
-        let r = row.try_deserialize_into::<S>().unwrap();
-        assert_eq!(r.value.id, Some(7));
+        let r = lenient::<Option<u32>>(ColumnValue::text("7"));
+        assert_eq!(r.value, Some(7));
         assert!(r.is_clean());
     }
 
     #[test]
     fn test_try_lenient_option_non_null_inner_fails_defaults() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            id: Option<u32>,
-        }
-        let row = RowData::from_pairs(vec![("id", ColumnValue::text("bad"))]);
-        let r = row.try_deserialize_into::<S>().unwrap();
+        let r = lenient::<Option<u32>>(ColumnValue::text("bad"));
         // Inner parse fails → u32 default (0) wrapped in Some
-        assert_eq!(r.value.id, Some(0));
+        assert_eq!(r.value, Some(0));
         assert_eq!(r.errors.len(), 1);
-        assert_eq!(r.errors[0].field, "id");
+        assert_eq!(r.errors[0].field, "v");
     }
 
     #[test]
@@ -2825,12 +2422,7 @@ mod tests {
     fn test_strict_unit_struct_ok_on_null() {
         #[derive(Debug, Deserialize, PartialEq)]
         struct Marker;
-        #[derive(Debug, Deserialize)]
-        struct S {
-            m: Marker,
-        }
-        let row = RowData::from_pairs(vec![("m", ColumnValue::Null)]);
-        let v: S = row.deserialize_into().unwrap();
+        let v = one::<Marker>(ColumnValue::Null).unwrap();
         let _ = v;
     }
 
@@ -2838,13 +2430,8 @@ mod tests {
     fn test_strict_newtype_struct() {
         #[derive(Debug, Deserialize)]
         struct Wrap(u32);
-        #[derive(Debug, Deserialize)]
-        struct S {
-            v: Wrap,
-        }
-        let row = RowData::from_pairs(vec![("v", ColumnValue::text("9"))]);
-        let v: S = row.deserialize_into().unwrap();
-        assert_eq!(v.v.0, 9);
+        let v = one::<Wrap>(ColumnValue::text("9")).unwrap();
+        assert_eq!(v.0, 9);
     }
 
     #[test]
@@ -2865,14 +2452,8 @@ mod tests {
 
     #[test]
     fn test_strict_bytes_from_text_arm() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            #[serde(with = "serde_bytes")]
-            data: Vec<u8>,
-        }
-        let row = RowData::from_pairs(vec![("data", ColumnValue::text("xyz"))]);
-        let v: S = row.deserialize_into().unwrap();
-        assert_eq!(v.data, b"xyz");
+        let v = one::<Blob>(ColumnValue::text("xyz")).unwrap();
+        assert_eq!(v.0, b"xyz");
     }
 
     #[test]
@@ -2882,13 +2463,7 @@ mod tests {
         enum E {
             A(u32),
         }
-        #[derive(Debug, Deserialize)]
-        struct S {
-            e: E,
-        }
-        let row = RowData::from_pairs(vec![("e", ColumnValue::text("A"))]);
-        let r: crate::error::Result<S> = row.deserialize_into();
-        assert!(r.is_err());
+        assert!(one::<E>(ColumnValue::text("A")).is_err());
     }
 
     #[test]
@@ -3028,9 +2603,7 @@ mod tests {
         let ts = chrono::Utc::now();
         let event = ChangeEvent::commit(ts, Lsn::new(100), Lsn::new(200), Lsn::new(200));
         let result: crate::error::Result<UserModel> = event.deserialize_data();
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("commit"), "got: {msg}");
+        assert_err_contains(result, "commit");
     }
 
     #[test]
@@ -3045,9 +2618,7 @@ mod tests {
             xid: None,
         };
         let result: crate::error::Result<UserModel> = event.deserialize_data();
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("stream_start"), "got: {msg}");
+        assert_err_contains(result, "stream_start");
     }
 
     #[test]
@@ -3129,16 +2700,8 @@ mod tests {
 
     #[test]
     fn test_try_binary_bool_uses_false_and_reports() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            flag: bool,
-        }
-        let row = RowData::from_pairs(vec![(
-            "flag",
-            ColumnValue::binary_bytes(Bytes::from_static(&[1])),
-        )]);
-        let r = row.try_deserialize_into::<S>().unwrap();
-        assert!(!r.value.flag);
+        let r = lenient::<bool>(ColumnValue::binary_bytes(Bytes::from_static(&[1])));
+        assert!(!r.value);
         assert_eq!(r.errors.len(), 1);
         assert!(r.errors[0].message.contains("binary"));
     }
@@ -3147,13 +2710,8 @@ mod tests {
 
     #[test]
     fn test_try_null_bool_uses_false_and_reports() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            flag: bool,
-        }
-        let row = RowData::from_pairs(vec![("flag", ColumnValue::Null)]);
-        let r = row.try_deserialize_into::<S>().unwrap();
-        assert!(!r.value.flag);
+        let r = lenient::<bool>(ColumnValue::Null);
+        assert!(!r.value);
         assert_eq!(r.errors.len(), 1);
         assert!(r.errors[0].message.contains("NULL"));
     }
@@ -3162,16 +2720,8 @@ mod tests {
 
     #[test]
     fn test_try_binary_char_uses_null_char() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            c: char,
-        }
-        let row = RowData::from_pairs(vec![(
-            "c",
-            ColumnValue::binary_bytes(Bytes::from_static(b"A")),
-        )]);
-        let r = row.try_deserialize_into::<S>().unwrap();
-        assert_eq!(r.value.c, '\0');
+        let r = lenient::<char>(ColumnValue::binary_bytes(Bytes::from_static(b"A")));
+        assert_eq!(r.value, '\0');
         assert_eq!(r.errors.len(), 1);
     }
 
@@ -3179,13 +2729,8 @@ mod tests {
 
     #[test]
     fn test_try_null_char_uses_null_char() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            c: char,
-        }
-        let row = RowData::from_pairs(vec![("c", ColumnValue::Null)]);
-        let r = row.try_deserialize_into::<S>().unwrap();
-        assert_eq!(r.value.c, '\0');
+        let r = lenient::<char>(ColumnValue::Null);
+        assert_eq!(r.value, '\0');
         assert_eq!(r.errors.len(), 1);
     }
 
@@ -3193,25 +2738,15 @@ mod tests {
 
     #[test]
     fn test_try_signed_overflow_defaults_to_zero() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            v: i8,
-        }
-        let row = RowData::from_pairs(vec![("v", ColumnValue::text("99999"))]);
-        let r = row.try_deserialize_into::<S>().unwrap();
-        assert_eq!(r.value.v, 0);
+        let r = lenient::<i8>(ColumnValue::text("99999"));
+        assert_eq!(r.value, 0);
         assert_eq!(r.errors.len(), 1);
     }
 
     #[test]
     fn test_try_unsigned_overflow_defaults_to_zero() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            v: u8,
-        }
-        let row = RowData::from_pairs(vec![("v", ColumnValue::text("999"))]);
-        let r = row.try_deserialize_into::<S>().unwrap();
-        assert_eq!(r.value.v, 0);
+        let r = lenient::<u8>(ColumnValue::text("999"));
+        assert_eq!(r.value, 0);
         assert_eq!(r.errors.len(), 1);
     }
 
@@ -3238,16 +2773,8 @@ mod tests {
 
     #[test]
     fn test_try_binary_string_uses_empty() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            name: String,
-        }
-        let row = RowData::from_pairs(vec![(
-            "name",
-            ColumnValue::binary_bytes(Bytes::from_static(b"data")),
-        )]);
-        let r = row.try_deserialize_into::<S>().unwrap();
-        assert_eq!(r.value.name, "");
+        let r = lenient::<String>(ColumnValue::binary_bytes(Bytes::from_static(b"data")));
+        assert_eq!(r.value, "");
         assert_eq!(r.errors.len(), 1);
         assert!(r.errors[0].message.contains("binary"));
     }
@@ -3258,28 +2785,17 @@ mod tests {
     fn test_try_unit_struct_on_non_null_reports() {
         #[derive(Debug, Deserialize)]
         struct Marker;
-        #[derive(Debug, Deserialize)]
-        struct S {
-            m: Marker,
-        }
-        let row = RowData::from_pairs(vec![("m", ColumnValue::text("x"))]);
-        let r = row.try_deserialize_into::<S>().unwrap();
+        let r = lenient::<Marker>(ColumnValue::text("x"));
         assert_eq!(r.errors.len(), 1);
-        assert_eq!(r.errors[0].field, "m");
+        assert_eq!(r.errors[0].field, "v");
     }
 
     // -- Lenient mode: byte_buf null uses empty --------------------------------
 
     #[test]
     fn test_try_byte_buf_null_uses_empty() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            #[serde(with = "serde_bytes")]
-            data: Vec<u8>,
-        }
-        let row = RowData::from_pairs(vec![("data", ColumnValue::Null)]);
-        let r = row.try_deserialize_into::<S>().unwrap();
-        assert!(r.value.data.is_empty());
+        let r = lenient::<Blob>(ColumnValue::Null);
+        assert!(r.value.0.is_empty());
         assert_eq!(r.errors.len(), 1);
     }
 
@@ -3473,17 +2989,8 @@ mod tests {
 
     #[test]
     fn test_try_binary_bytes_ok_no_error() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            #[serde(with = "serde_bytes")]
-            data: Vec<u8>,
-        }
-        let row = RowData::from_pairs(vec![(
-            "data",
-            ColumnValue::binary_bytes(Bytes::from_static(&[0xCA, 0xFE])),
-        )]);
-        let r = row.try_deserialize_into::<S>().unwrap();
-        assert_eq!(r.value.data, vec![0xCA, 0xFE]);
+        let r = lenient::<Blob>(ColumnValue::binary_bytes(Bytes::from_static(&[0xCA, 0xFE])));
+        assert_eq!(r.value.0, vec![0xCA, 0xFE]);
         assert!(r.is_clean());
     }
 
@@ -3491,14 +2998,8 @@ mod tests {
 
     #[test]
     fn test_try_text_bytes_ok_no_error() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            #[serde(with = "serde_bytes")]
-            data: Vec<u8>,
-        }
-        let row = RowData::from_pairs(vec![("data", ColumnValue::text("hello"))]);
-        let r = row.try_deserialize_into::<S>().unwrap();
-        assert_eq!(r.value.data, b"hello");
+        let r = lenient::<Blob>(ColumnValue::text("hello"));
+        assert_eq!(r.value.0, b"hello");
         assert!(r.is_clean());
     }
 
@@ -3506,44 +3007,21 @@ mod tests {
 
     #[test]
     fn test_strict_float_parse_error() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            v: f64,
-        }
-        let row = RowData::from_pairs(vec![("v", ColumnValue::text("not_float"))]);
-        let result: crate::error::Result<S> = row.deserialize_into();
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("not_float"), "got: {msg}");
+        assert_err_contains(one::<f64>(ColumnValue::text("not_float")), "not_float");
     }
 
     // -- Strict mode: binary for char errors -----------------------------------
 
     #[test]
     fn test_strict_binary_char_errors() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            c: char,
-        }
-        let row = RowData::from_pairs(vec![(
-            "c",
-            ColumnValue::binary_bytes(Bytes::from_static(b"A")),
-        )]);
-        let result: crate::error::Result<S> = row.deserialize_into();
-        assert!(result.is_err());
+        assert!(one::<char>(ColumnValue::binary_bytes(Bytes::from_static(b"A"))).is_err());
     }
 
     // -- Strict mode: null for char errors -------------------------------------
 
     #[test]
     fn test_strict_null_char_errors() {
-        #[derive(Debug, Deserialize)]
-        struct S {
-            c: char,
-        }
-        let row = RowData::from_pairs(vec![("c", ColumnValue::Null)]);
-        let result: crate::error::Result<S> = row.deserialize_into();
-        assert!(result.is_err());
+        assert!(one::<char>(ColumnValue::Null).is_err());
     }
 
     // -- RowData encode/decode round trip --------------------------------------
@@ -3663,16 +3141,7 @@ mod tests {
         enum E {
             A,
         }
-        #[derive(Debug, Deserialize)]
-        struct S {
-            e: E,
-        }
-        let row = RowData::from_pairs(vec![(
-            "e",
-            ColumnValue::binary_bytes(Bytes::from_static(b"A")),
-        )]);
-        let r = row.try_deserialize_into::<S>();
-        assert!(r.is_err());
+        assert!(try_one::<E>(ColumnValue::binary_bytes(Bytes::from_static(b"A"))).is_err());
     }
 
     // -- serde(deny_unknown_fields) works correctly ----------------------------
@@ -3953,24 +3422,12 @@ mod tests {
 
         // deserialize_any: Text(valid) → visit_str
         let cv = ColumnValue::text("hello");
-        let d = super::ColumnValueDeserializer {
-            value: &cv,
-            policy: super::Lenient {
-                ctx: &ctx,
-                field: "f",
-            },
-        };
+        let d = lenient_de(&cv, &ctx, "f");
         assert_eq!(d.deserialize_any(Rec).unwrap(), Got::Str("hello".into()));
 
         // deserialize_any: Text(invalid UTF-8) → visit_bytes
         let cv = ColumnValue::text_bytes(Bytes::from_static(&[0xff, 0xfe]));
-        let d = super::ColumnValueDeserializer {
-            value: &cv,
-            policy: super::Lenient {
-                ctx: &ctx,
-                field: "f",
-            },
-        };
+        let d = lenient_de(&cv, &ctx, "f");
         assert_eq!(
             d.deserialize_any(Rec).unwrap(),
             Got::Bytes(vec![0xff, 0xfe])
@@ -3978,35 +3435,17 @@ mod tests {
 
         // deserialize_any: Binary → visit_bytes
         let cv = ColumnValue::binary_bytes(Bytes::from_static(&[1, 2, 3]));
-        let d = super::ColumnValueDeserializer {
-            value: &cv,
-            policy: super::Lenient {
-                ctx: &ctx,
-                field: "f",
-            },
-        };
+        let d = lenient_de(&cv, &ctx, "f");
         assert_eq!(d.deserialize_any(Rec).unwrap(), Got::Bytes(vec![1, 2, 3]));
 
         // deserialize_any: Null → visit_none
         let cv = ColumnValue::Null;
-        let d = super::ColumnValueDeserializer {
-            value: &cv,
-            policy: super::Lenient {
-                ctx: &ctx,
-                field: "f",
-            },
-        };
+        let d = lenient_de(&cv, &ctx, "f");
         assert_eq!(d.deserialize_any(Rec).unwrap(), Got::None);
 
         // deserialize_bytes: Text → visit_bytes
         let cv = ColumnValue::text("abc");
-        let d = super::ColumnValueDeserializer {
-            value: &cv,
-            policy: super::Lenient {
-                ctx: &ctx,
-                field: "f",
-            },
-        };
+        let d = lenient_de(&cv, &ctx, "f");
         assert_eq!(
             d.deserialize_bytes(Rec).unwrap(),
             Got::Bytes(b"abc".to_vec())
@@ -4014,21 +3453,9 @@ mod tests {
 
         // deserialize_str + deserialize_identifier: Text → visit_str
         let cv = ColumnValue::text("id");
-        let d = super::ColumnValueDeserializer {
-            value: &cv,
-            policy: super::Lenient {
-                ctx: &ctx,
-                field: "f",
-            },
-        };
+        let d = lenient_de(&cv, &ctx, "f");
         assert_eq!(d.deserialize_str(Rec).unwrap(), Got::Str("id".into()));
-        let d = super::ColumnValueDeserializer {
-            value: &cv,
-            policy: super::Lenient {
-                ctx: &ctx,
-                field: "f",
-            },
-        };
+        let d = lenient_de(&cv, &ctx, "f");
         assert_eq!(
             d.deserialize_identifier(Rec).unwrap(),
             Got::Str("id".into())
@@ -4036,13 +3463,7 @@ mod tests {
 
         // deserialize_bytes: NULL → records an error and visits empty bytes
         let cv = ColumnValue::Null;
-        let d = super::ColumnValueDeserializer {
-            value: &cv,
-            policy: super::Lenient {
-                ctx: &ctx,
-                field: "nb",
-            },
-        };
+        let d = lenient_de(&cv, &ctx, "nb");
         assert_eq!(d.deserialize_bytes(Rec).unwrap(), Got::Bytes(vec![]));
         assert!(ctx.into_errors().iter().any(|e| e.message.contains("NULL")));
     }
@@ -4100,12 +3521,7 @@ mod tests {
     #[test]
     fn test_try_lenient_tuple_errors() {
         // A tuple-typed field hits the lenient deserialize_tuple structural reject.
-        #[derive(Debug, Deserialize)]
-        struct S {
-            t: (u32, u32),
-        }
-        let row = RowData::from_pairs(vec![("t", ColumnValue::text("1"))]);
-        assert!(row.try_deserialize_into::<S>().is_err());
+        assert!(try_one::<(u32, u32)>(ColumnValue::text("1")).is_err());
     }
 
     #[test]

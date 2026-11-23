@@ -1,12 +1,18 @@
 //! PostgreSQL ErrorResponse parsing.
 
+use super::wire::HEADER_LEN;
 use crate::error::ServerError;
+
+/// Parse a whole ErrorResponse ('E') or NoticeResponse ('N') frame, tag and length included.
+pub(super) fn error_frame(msg: &[u8]) -> ServerError {
+    parse_error_fields(&msg[HEADER_LEN..])
+}
 
 /// Parse the payload of an ErrorResponse ('E') or NoticeResponse ('N') message.
 ///
 /// Wire format: sequence of `[Byte1(field_type) String(value)\0]` terminated by `\0`.
 /// A `C` field that is not a valid SQLSTATE leaves [`ServerError::code`] `None`.
-pub fn parse_error_fields(payload: &[u8]) -> ServerError {
+pub(super) fn parse_error_fields(payload: &[u8]) -> ServerError {
     let mut fields = ServerError::default();
 
     let mut pos = 0;
@@ -47,6 +53,7 @@ pub fn parse_error_fields(payload: &[u8]) -> ServerError {
 
 #[cfg(test)]
 mod tests {
+    use super::super::wire::testing::build_error_response;
     use super::*;
 
     #[test]
@@ -241,23 +248,9 @@ mod tests {
 
     #[test]
     fn test_parse_error_fields_from_framed_message() {
-        // A full ErrorResponse frame: tag 'E' + i32 length + field payload.
-        // Verifies fields parse out of the framed form (payload starts at msg[5..]).
-        let mut payload = Vec::new();
-        payload.push(b'S');
-        payload.extend_from_slice(b"FATAL\0");
-        payload.push(b'C');
-        payload.extend_from_slice(b"57P01\0");
-        payload.push(b'M');
-        payload.extend_from_slice(b"terminating connection\0");
-        payload.push(0); // terminator
+        let msg = build_error_response("FATAL", "57P01", "terminating connection");
 
-        let mut msg = vec![b'E'];
-        let len = (4 + payload.len()) as i32;
-        msg.extend_from_slice(&len.to_be_bytes());
-        msg.extend_from_slice(&payload);
-
-        let fields = parse_error_fields(&msg[5..]);
+        let fields = error_frame(&msg);
         assert_eq!(fields.severity, "FATAL");
         assert_eq!(fields.code, Some(sqlstate::pg::ADMIN_SHUTDOWN));
         assert!(fields.message.contains("terminating"));

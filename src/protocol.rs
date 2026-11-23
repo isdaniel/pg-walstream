@@ -1348,29 +1348,16 @@ pub(crate) fn key_columns_for_relation(
     relation: &RelationInfo,
     key_type: Option<char>,
 ) -> Vec<Arc<str>> {
-    // Get key columns based on the relation's replica identity and key_type from protocol
     match key_type {
-        Some('K') => {
-            // Key tuple - replica-identity/primary-key columns.
-            relation.key_column_names().collect()
-        }
-        Some('O') => {
-            // Old tuple - means REPLICA IDENTITY FULL, use all columns
-            relation
-                .columns
-                .iter()
-                .map(|col| Arc::clone(&col.name))
-                .collect()
-        }
-        None => {
-            // No old tuple data - means REPLICA IDENTITY NOTHING or DEFAULT
-            // without changes to key columns. Fall back to key columns.
-            relation.key_column_names().collect()
-        }
-        _ => {
-            // Unknown key type, fall back to key columns.
-            relation.key_column_names().collect()
-        }
+        // Old tuple: REPLICA IDENTITY FULL, so every column is part of the key.
+        Some('O') => relation
+            .columns
+            .iter()
+            .map(|col| Arc::clone(&col.name))
+            .collect(),
+        // 'K' key tuple, no old tuple (REPLICA IDENTITY NOTHING/DEFAULT without a
+        // key change), or an unknown type: fall back to the key columns.
+        _ => relation.key_column_names().collect(),
     }
 }
 
@@ -1380,7 +1367,7 @@ pub(crate) struct RelationMetadata<'a> {
     pub(crate) table: Arc<str>,
     pub(crate) replica_identity: ReplicaIdentity,
     pub(crate) key_columns: Vec<Arc<str>>,
-    pub(crate) relation: &'a RelationInfo,
+    relation: &'a RelationInfo,
 }
 
 /// Look up [`RelationMetadata`] for `relation_id` in `state`, or `None` if the
@@ -3413,10 +3400,7 @@ mod tests {
         let mut parser = LogicalReplicationParser::with_protocol_version(2);
 
         // First, start a streaming context
-        let mut stream_start = vec![message_types::STREAM_START];
-        stream_start.extend_from_slice(&write_u32_be(42)); // xid
-        stream_start.push(0x01); // first_segment
-        let _ = parser.parse_wal_message(&stream_start).unwrap();
+        let _ = parser.parse_wal_message(&stream_start(42)).unwrap();
 
         // Now parse an INSERT in streaming context (v2+ requires xid prefix)
         let mut data = vec![message_types::INSERT];
@@ -3448,10 +3432,7 @@ mod tests {
     fn test_reset_clears_streaming_context() {
         let mut parser = LogicalReplicationParser::with_protocol_version(2);
 
-        let mut stream_start = vec![message_types::STREAM_START];
-        stream_start.extend_from_slice(&write_u32_be(42)); // xid
-        stream_start.push(0x01); // first_segment
-        let _ = parser.parse_wal_message(&stream_start).unwrap();
+        let _ = parser.parse_wal_message(&stream_start(42)).unwrap();
 
         parser.reset();
 
@@ -3614,10 +3595,7 @@ mod tests {
         let mut parser = LogicalReplicationParser::with_protocol_version(2);
 
         // Start streaming
-        let mut stream_start = vec![message_types::STREAM_START];
-        stream_start.extend_from_slice(&write_u32_be(42));
-        stream_start.push(0x01);
-        let _ = parser.parse_wal_message(&stream_start).unwrap();
+        let _ = parser.parse_wal_message(&stream_start(42)).unwrap();
 
         // UPDATE in streaming context
         let mut data = vec![message_types::UPDATE];
@@ -3649,10 +3627,7 @@ mod tests {
         let mut parser = LogicalReplicationParser::with_protocol_version(2);
 
         // Start streaming
-        let mut stream_start = vec![message_types::STREAM_START];
-        stream_start.extend_from_slice(&write_u32_be(42));
-        stream_start.push(0x01);
-        let _ = parser.parse_wal_message(&stream_start).unwrap();
+        let _ = parser.parse_wal_message(&stream_start(42)).unwrap();
 
         // DELETE in streaming context
         let mut data = vec![message_types::DELETE];
@@ -3684,10 +3659,7 @@ mod tests {
         let mut parser = LogicalReplicationParser::with_protocol_version(2);
 
         // Start streaming
-        let mut stream_start = vec![message_types::STREAM_START];
-        stream_start.extend_from_slice(&write_u32_be(42));
-        stream_start.push(0x01);
-        let _ = parser.parse_wal_message(&stream_start).unwrap();
+        let _ = parser.parse_wal_message(&stream_start(42)).unwrap();
 
         // TRUNCATE in streaming context
         let mut data = vec![message_types::TRUNCATE];
@@ -3711,10 +3683,7 @@ mod tests {
         let mut parser = LogicalReplicationParser::with_protocol_version(2);
 
         // Start streaming
-        let mut stream_start = vec![message_types::STREAM_START];
-        stream_start.extend_from_slice(&write_u32_be(42));
-        stream_start.push(0x01);
-        let _ = parser.parse_wal_message(&stream_start).unwrap();
+        let _ = parser.parse_wal_message(&stream_start(42)).unwrap();
 
         // RELATION in streaming context
         let mut data = vec![message_types::RELATION];
@@ -3744,10 +3713,7 @@ mod tests {
         let mut parser = LogicalReplicationParser::with_protocol_version(2);
 
         // Start streaming
-        let mut stream_start = vec![message_types::STREAM_START];
-        stream_start.extend_from_slice(&write_u32_be(42));
-        stream_start.push(0x01);
-        let _ = parser.parse_wal_message(&stream_start).unwrap();
+        let _ = parser.parse_wal_message(&stream_start(42)).unwrap();
 
         // TYPE in streaming context
         let mut data = vec![message_types::TYPE];
@@ -3765,10 +3731,7 @@ mod tests {
         let mut parser = LogicalReplicationParser::with_protocol_version(2);
 
         // Start streaming
-        let mut stream_start = vec![message_types::STREAM_START];
-        stream_start.extend_from_slice(&write_u32_be(42));
-        stream_start.push(0x01);
-        let _ = parser.parse_wal_message(&stream_start).unwrap();
+        let _ = parser.parse_wal_message(&stream_start(42)).unwrap();
 
         // MESSAGE in streaming context
         let mut data = vec![message_types::MESSAGE];
@@ -3788,10 +3751,7 @@ mod tests {
         let mut parser = LogicalReplicationParser::with_protocol_version(2);
 
         // Start streaming
-        let mut stream_start = vec![message_types::STREAM_START];
-        stream_start.extend_from_slice(&write_u32_be(42));
-        stream_start.push(0x01);
-        let _start_result = parser.parse_wal_message(&stream_start).unwrap();
+        let _ = parser.parse_wal_message(&stream_start(42)).unwrap();
 
         // We're now in streaming context
         assert!(parser.is_streaming());

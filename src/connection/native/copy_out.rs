@@ -34,6 +34,7 @@
 use bytes::{Bytes, BytesMut};
 use tokio::io::AsyncRead;
 
+use super::error::error_frame;
 use super::wire;
 use crate::error::ReplicationError;
 use crate::prelude::*;
@@ -77,7 +78,7 @@ pub(super) async fn next_copy_out<S: AsyncRead + Unpin>(
             }
 
             Some(b'E') => {
-                let fields = super::error::parse_error_fields(&msg[wire::HEADER_LEN..]);
+                let fields = error_frame(&msg);
                 let message = format!("server error during COPY OUT: {fields}");
                 let err = ReplicationError::from_server(Some(fields), message);
                 let _ = super::query::drain_to_ready(stream, buf).await;
@@ -85,10 +86,7 @@ pub(super) async fn next_copy_out<S: AsyncRead + Unpin>(
             }
 
             Some(b'N') => {
-                tracing::info!(
-                    "Server notice during COPY OUT: {}",
-                    super::error::parse_error_fields(&msg[wire::HEADER_LEN..])
-                );
+                tracing::info!("Server notice during COPY OUT: {}", error_frame(&msg));
             }
 
             // ParameterStatus and NotificationResponse are the only messages
@@ -140,13 +138,10 @@ async fn drain_epilogue<S: AsyncRead + Unpin>(
             Some(b'Z') => break,
             Some(b'C') => {}
             Some(b'N') => {
-                tracing::info!(
-                    "Server notice after COPY OUT: {}",
-                    super::error::parse_error_fields(&msg[wire::HEADER_LEN..])
-                );
+                tracing::info!("Server notice after COPY OUT: {}", error_frame(&msg));
             }
             Some(b'E') => {
-                let fields = super::error::parse_error_fields(&msg[wire::HEADER_LEN..]);
+                let fields = error_frame(&msg);
                 deferred.get_or_insert_with(|| {
                     let message = format!("COPY OUT failed after CopyDone: {fields}");
                     ReplicationError::from_server(Some(fields), message)
@@ -174,17 +169,9 @@ async fn drain_epilogue<S: AsyncRead + Unpin>(
 
 #[cfg(test)]
 mod tests {
+    use super::wire::testing::frame;
     use super::*;
     use tokio::io::AsyncWriteExt;
-
-    /// Build a framed backend message: `[tag][len: i32 BE][payload]`.
-    fn frame(tag: u8, payload: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(wire::HEADER_LEN + payload.len());
-        out.push(tag);
-        out.extend_from_slice(&((4 + payload.len()) as i32).to_be_bytes());
-        out.extend_from_slice(payload);
-        out
-    }
 
     fn copy_data(payload: &[u8]) -> Vec<u8> {
         frame(b'd', payload)

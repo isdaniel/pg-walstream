@@ -19,26 +19,14 @@
 //! Same as `snapshot_export.rs` — requires a live PostgreSQL instance
 //! with `wal_level = logical`.
 
+mod common;
+
+use common::{drop_slot_best_effort as drop_slot, regular_conn_string, replication_conn_string};
 use pg_walstream::{
     CancellationToken, EventType, LogicalReplicationStream, PgReplicationConnection,
     ReplicationStreamConfig, RetryConfig, StreamingMode,
 };
 use std::time::{Duration, Instant};
-
-fn replication_conn_string() -> String {
-    std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgresql://postgres:postgres@localhost:5432/test_walstream?replication=database"
-            .to_string()
-    })
-}
-
-fn regular_conn_string() -> String {
-    std::env::var("DATABASE_URL_REGULAR").unwrap_or_else(|_| {
-        let repl = replication_conn_string();
-        repl.replace("?replication=database", "")
-            .replace("&replication=database", "")
-    })
-}
 
 fn setup_rate_schema(conn: &mut PgReplicationConnection) {
     let _ = conn.exec(
@@ -50,15 +38,6 @@ fn setup_rate_schema(conn: &mut PgReplicationConnection) {
     // fails on its event assertions instead of on the setup that actually broke.
     conn.exec("CREATE PUBLICATION rate_pub FOR TABLE rate_test")
         .expect("CREATE PUBLICATION rate_pub");
-}
-
-fn drop_slot(slot_name: &str) {
-    if let Ok(mut conn) = PgReplicationConnection::connect(&replication_conn_string()) {
-        let _ = conn.exec(&format!(
-            "SELECT pg_drop_replication_slot('{slot_name}') \
-             WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '{slot_name}')"
-        ));
-    }
 }
 
 /// Persistent slot, deliberately. These tests consume through

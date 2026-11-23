@@ -38,6 +38,9 @@
 //! cargo test --test binary_serde -- --ignored --nocapture --test-threads=1
 //! ```
 
+mod common;
+
+use common::{drop_slot_best_effort as drop_slot, regular_conn_string, replication_conn_string};
 use pg_walstream::{
     CancellationToken, ChangeEvent, ColumnValue, EventType, LogicalReplicationStream,
     PgReplicationConnection, ReplicationSlotOptions, ReplicationStreamConfig, StreamingMode,
@@ -52,30 +55,6 @@ const STREAMED_ROWS: usize = 2000;
 
 /// bincode 2 trusts every length prefix unless given a limit.
 const MAX_EVENT_BYTES: usize = 16 * 1024 * 1024;
-
-fn replication_conn_string() -> String {
-    std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgresql://postgres:postgres@localhost:5432/test_walstream?replication=database"
-            .to_string()
-    })
-}
-
-fn regular_conn_string() -> String {
-    std::env::var("DATABASE_URL_REGULAR").unwrap_or_else(|_| {
-        replication_conn_string()
-            .replace("?replication=database", "")
-            .replace("&replication=database", "")
-    })
-}
-
-fn drop_slot(slot_name: &str) {
-    if let Ok(mut conn) = PgReplicationConnection::connect(&replication_conn_string()) {
-        let _ = conn.exec(&format!(
-            "SELECT pg_drop_replication_slot('{slot_name}') \
-             WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '{slot_name}')"
-        ));
-    }
-}
 
 fn setup(conn: &mut PgReplicationConnection) {
     let _ = conn.exec("DROP PUBLICATION IF EXISTS binser_pub");

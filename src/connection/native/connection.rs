@@ -18,6 +18,7 @@ use super::startup::{self, Transport};
 use super::{copy, copy_out, query, wire};
 use super::{NativePgResult, NativeResultStatus};
 
+use crate::connection::commands::server_failure;
 use crate::error::{ReplicationError, Result};
 use crate::types::{BaseBackupOptions, XLogRecPtr};
 
@@ -395,7 +396,9 @@ impl Worker {
         }
     }
 
-    /// Service a command that arrived mid-stream.
+    /// Service a command on a worker that is idle or already streaming. A second
+    /// `StreamCopy`/`CopyOutStream` is rejected rather than nested; the idle loop in
+    /// [`run_worker`] starts those itself and never passes them here.
     async fn handle_stream_cmd(&mut self, cmd: Option<Command>) -> StreamCmd {
         match cmd {
             Some(Command::PutCopyData { data, reply }) => {
@@ -563,25 +566,12 @@ fn run_worker(
 
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
-                Command::Query { sql, reply } => {
-                    reply.answer(worker.query(&sql)).await;
-                }
-                Command::QueryCopyIn {
-                    sql,
-                    payload,
-                    reply,
-                } => {
-                    reply.answer(worker.query_copy_in(&sql, &payload)).await;
-                }
                 Command::StreamCopy { token, batch_tx } => {
                     // Runs its own loop, servicing interleaved commands, until
                     // streaming ends. Returns true only if it handled a Close.
                     if worker.stream_copy(token, batch_tx, &mut cmd_rx).await {
                         break;
                     }
-                }
-                Command::PutCopyData { data, reply } => {
-                    let _ = reply.send(worker.put_copy_data(&data).await);
                 }
                 Command::CopyOutStream { chunk_tx } => {
                     // Same contract as `StreamCopy` above: runs its own loop,
@@ -590,13 +580,10 @@ fn run_worker(
                         break;
                     }
                 }
-                Command::Close {
-                    send_copy_done,
-                    reply,
-                } => {
-                    worker.close(send_copy_done).await;
-                    let _ = reply.send(());
-                    break;
+                cmd => {
+                    if matches!(worker.handle_stream_cmd(Some(cmd)).await, StreamCmd::Close) {
+                        break;
+                    }
                 }
             }
         }
@@ -1085,12 +1072,10 @@ impl NativeConnection {
     fn checked(sql: &str, result: NativePgResult) -> Result<NativePgResult> {
         debug!("query : {} pg_result.status() : {:?}", sql, result.status());
         if !result.is_ok() {
-            let error_msg = result
-                .error_message()
-                .unwrap_or_else(|| "Unknown error".to_string());
-            return Err(ReplicationError::from_server(
+            return Err(server_failure(
                 result.server_error(),
-                format!("Query execution failed: {error_msg}"),
+                result.error_message(),
+                "Query execution failed",
             ));
         }
         Ok(result)
@@ -1130,12 +1115,10 @@ impl NativeConnection {
 
     fn enter_logical_replication(&mut self, result: &NativePgResult) -> Result<()> {
         if result.status() != &NativeResultStatus::CopyBoth {
-            let error_msg = result
-                .error_message()
-                .unwrap_or_else(|| "Unknown error".to_string());
-            return Err(ReplicationError::from_server(
+            return Err(server_failure(
                 result.server_error(),
-                format!("START_REPLICATION did not enter COPY mode: {error_msg}"),
+                result.error_message(),
+                "START_REPLICATION did not enter COPY mode",
             ));
         }
 
@@ -1347,12 +1330,10 @@ impl NativeConnection {
         match result.status() {
             NativeResultStatus::CopyBoth | NativeResultStatus::CopyOut => {}
             _ => {
-                let error_msg = result
-                    .error_message()
-                    .unwrap_or_else(|| "Unknown error".to_string());
-                return Err(ReplicationError::from_server(
+                return Err(server_failure(
                     result.server_error(),
-                    format!("START_REPLICATION did not enter COPY mode: {error_msg}"),
+                    result.error_message(),
+                    "START_REPLICATION did not enter COPY mode",
                 ));
             }
         }
@@ -1373,12 +1354,10 @@ impl NativeConnection {
         debug!("Uploading backup manifest ({} bytes)", manifest.len());
         let result = self.run_query_copy_in("UPLOAD_MANIFEST", manifest)?;
         if !result.is_ok() {
-            let error_msg = result
-                .error_message()
-                .unwrap_or_else(|| "Unknown error".to_string());
-            return Err(ReplicationError::from_server(
+            return Err(server_failure(
                 result.server_error(),
-                format!("UPLOAD_MANIFEST failed: {error_msg}"),
+                result.error_message(),
+                "UPLOAD_MANIFEST failed",
             ));
         }
         debug!("Backup manifest uploaded");
@@ -1560,15 +1539,6 @@ impl NativeConnection {
 
     // ── Helpers ──────────────────────────────────────────────────────────
 
-    #[inline]
-    fn ensure_replication_mode(&self) -> Result<()> {
-        if !self.copy.is_replication() {
-            return Err(ReplicationError::protocol(
-                "Connection is not in replication mode".to_string(),
-            ));
-        }
-        Ok(())
-    }
     /// Gracefully close the replication connection.
     ///
     /// Sends a `Close` command so the worker does a best-effort shutdown

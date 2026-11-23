@@ -8,7 +8,7 @@
 use crate::error::{ReplicationError, Result};
 use crate::prelude::*;
 use crate::protocol::{ColumnInfo, RelationInfo};
-use crate::sql_builder::{quote_ident, quote_literal, PG15, PG17, PG18};
+use crate::sql_builder::{quote_ident, quote_literal, quote_qualified, PG15, PG17, PG18};
 
 /// A table to be copied, with the metadata needed to decode its rows.
 #[derive(Debug, Clone)]
@@ -53,6 +53,27 @@ impl SnapshotTable {
             self.relation.namespace, self.relation.relation_name
         )
     }
+}
+
+/// A relation with oid `id` whose columns all have type `type_id`, for the tests of this module and its siblings.
+#[cfg(test)]
+pub(super) fn test_relation(
+    id: u32,
+    ns: &str,
+    table: &str,
+    columns: &[&str],
+    type_id: u32,
+) -> RelationInfo {
+    RelationInfo::new(
+        id,
+        ns.to_string(),
+        table.to_string(),
+        b'd',
+        columns
+            .iter()
+            .map(|c| ColumnInfo::new(0, c.to_string(), type_id, -1))
+            .collect(),
+    )
 }
 
 /// A published table and one transmitted column, if any.
@@ -268,11 +289,7 @@ fn build_copy_sql(
     partitioned: bool,
     has_generated: bool,
 ) -> Result<String> {
-    let table = format!(
-        "{}.{}",
-        quote_ident(&relation.namespace)?,
-        quote_ident(&relation.relation_name)?
-    );
+    let table = quote_qualified(&relation.namespace, &relation.relation_name)?;
 
     let columns = relation
         .columns
@@ -448,15 +465,7 @@ mod tests {
     }
 
     fn relation(ns: &str, table: &str, cols: &[&str]) -> RelationInfo {
-        RelationInfo::new(
-            42,
-            ns.to_string(),
-            table.to_string(),
-            b'd',
-            cols.iter()
-                .map(|c| ColumnInfo::new(0, c.to_string(), 25, -1))
-                .collect(),
-        )
+        test_relation(42, ns, table, cols, 25)
     }
 
     // ---- build_catalog_sql -------------------------------------------------

@@ -10,6 +10,7 @@
 use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+use super::error::error_frame;
 use super::result::{NativePgResult, NativeResultStatus};
 use super::wire;
 use crate::error::ReplicationError;
@@ -124,13 +125,13 @@ pub(super) async fn simple_query<S: AsyncRead + AsyncWrite + Unpin>(
             b'E' => {
                 // ErrorResponse
                 result.status = NativeResultStatus::FatalError;
-                result.error = Some(super::error::parse_error_fields(&msg[5..]));
+                result.error = Some(error_frame(&msg));
                 // After an error, the server sends ReadyForQuery
                 // We need to consume it
             }
             b'N' => {
                 // NoticeResponse — log and continue
-                let fields = super::error::parse_error_fields(&msg[5..]);
+                let fields = error_frame(&msg);
                 tracing::info!("Server notice: {}", fields);
             }
             _ => {
@@ -179,14 +180,14 @@ pub(super) async fn simple_query_copy_in<S: AsyncRead + AsyncWrite + Unpin>(
             b'G' => break, // CopyInResponse — the server is ready for data
             b'E' => {
                 result.status = NativeResultStatus::FatalError;
-                result.error = Some(super::error::parse_error_fields(&msg[5..]));
+                result.error = Some(error_frame(&msg));
                 // The command never entered CopyIn; drain to ReadyForQuery so
                 // the connection stays usable.
                 drain_to_ready(stream, buf).await?;
                 return Ok(result);
             }
             b'N' => {
-                let fields = super::error::parse_error_fields(&msg[5..]);
+                let fields = error_frame(&msg);
                 tracing::info!("Server notice: {fields}");
             }
             b'Z' => {
@@ -232,10 +233,10 @@ pub(super) async fn simple_query_copy_in<S: AsyncRead + AsyncWrite + Unpin>(
             b'Z' => break,
             b'E' => {
                 result.status = NativeResultStatus::FatalError;
-                result.error = Some(super::error::parse_error_fields(&msg[5..]));
+                result.error = Some(error_frame(&msg));
             }
             b'N' => {
-                let fields = super::error::parse_error_fields(&msg[5..]);
+                let fields = error_frame(&msg);
                 tracing::info!("Server notice: {fields}");
             }
             other => {
@@ -288,6 +289,7 @@ pub(super) async fn drain_to_ready<S: AsyncRead + Unpin>(
 
 #[cfg(test)]
 mod tests {
+    use super::wire::testing::{build_error_response, discard_request, frame};
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -300,58 +302,17 @@ mod tests {
 
     /// Helper: build a CommandComplete message ('C' + len + tag\0)
     fn build_command_complete(tag: &str) -> Vec<u8> {
-        let mut payload = tag.as_bytes().to_vec();
-        payload.push(0);
-        let len = (4 + payload.len()) as i32;
-        let mut msg = vec![b'C'];
-        msg.extend_from_slice(&len.to_be_bytes());
-        msg.extend_from_slice(&payload);
-        msg
+        frame(b'C', &[tag.as_bytes(), b"\0"].concat())
     }
 
     /// Helper: build a ReadyForQuery message ('Z' + len(5) + status)
     fn build_ready_for_query(status: u8) -> Vec<u8> {
-        vec![b'Z', 0, 0, 0, 5, status]
+        frame(b'Z', &[status])
     }
 
-    /// Helper: build a CopyBothResponse message ('W' + len)
-    fn build_copy_both_response() -> Vec<u8> {
-        // Minimal: W + len(7) + format(1 byte) + ncols(2 bytes)
-        let mut msg = vec![b'W'];
-        msg.extend_from_slice(&7i32.to_be_bytes());
-        msg.push(0); // overall format (text)
-        msg.extend_from_slice(&0i16.to_be_bytes()); // 0 columns
-        msg
-    }
-
-    /// Helper: build a CopyOutResponse message ('H' + len)
-    fn build_copy_out_response() -> Vec<u8> {
-        let mut msg = vec![b'H'];
-        msg.extend_from_slice(&7i32.to_be_bytes());
-        msg.push(0); // format
-        msg.extend_from_slice(&0i16.to_be_bytes()); // 0 columns
-        msg
-    }
-
-    /// Helper: build an ErrorResponse message
-    fn build_error_response(severity: &str, code: &str, message: &str) -> Vec<u8> {
-        let mut payload = Vec::new();
-        payload.push(b'S');
-        payload.extend_from_slice(severity.as_bytes());
-        payload.push(0);
-        payload.push(b'C');
-        payload.extend_from_slice(code.as_bytes());
-        payload.push(0);
-        payload.push(b'M');
-        payload.extend_from_slice(message.as_bytes());
-        payload.push(0);
-        payload.push(0); // terminator
-
-        let len = (4 + payload.len()) as i32;
-        let mut msg = vec![b'E'];
-        msg.extend_from_slice(&len.to_be_bytes());
-        msg.extend_from_slice(&payload);
-        msg
+    /// Helper: build a CopyBoth/CopyOut/CopyInResponse (`tag` W/H/G): text format, 0 columns
+    fn build_copy_response(tag: u8) -> Vec<u8> {
+        frame(tag, &[0, 0, 0])
     }
 
     /// Helper: build a RowDescription message ('T' + len + nfields + field_descriptors)
@@ -370,11 +331,7 @@ mod tests {
             payload.extend_from_slice(&0i16.to_be_bytes()); // format code (text)
         }
 
-        let len = (4 + payload.len()) as i32;
-        let mut msg = vec![b'T'];
-        msg.extend_from_slice(&len.to_be_bytes());
-        msg.extend_from_slice(&payload);
-        msg
+        frame(b'T', &payload)
     }
 
     /// Helper: build a DataRow message ('D' + len + ncols + column values)
@@ -388,20 +345,7 @@ mod tests {
             payload.extend_from_slice(bytes);
         }
 
-        let len = (4 + payload.len()) as i32;
-        let mut msg = vec![b'D'];
-        msg.extend_from_slice(&len.to_be_bytes());
-        msg.extend_from_slice(&payload);
-        msg
-    }
-
-    /// Helper: build a CopyInResponse message ('G' + len + format + ncols)
-    fn build_copy_in_response() -> Vec<u8> {
-        let mut msg = vec![b'G'];
-        msg.extend_from_slice(&7i32.to_be_bytes());
-        msg.push(0); // overall format (text)
-        msg.extend_from_slice(&0i16.to_be_bytes()); // 0 columns
-        msg
+        frame(b'D', &payload)
     }
 
     /// PostgreSQL answers a FATAL by closing, not by sending ReadyForQuery.
@@ -414,8 +358,7 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(65536);
 
         tokio::spawn(async move {
-            let mut discard = vec![0u8; 1024];
-            let _ = server.read(&mut discard).await;
+            discard_request(&mut server).await;
             server
                 .write_all(&build_error_response(
                     "FATAL",
@@ -453,9 +396,8 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(65536);
 
         tokio::spawn(async move {
-            let mut discard = vec![0u8; 1024];
-            let _ = server.read(&mut discard).await;
-            server.write_all(&build_copy_in_response()).await.unwrap();
+            discard_request(&mut server).await;
+            server.write_all(&build_copy_response(b'G')).await.unwrap();
             server.flush().await.unwrap();
             // Consume CopyData + CopyDone, then reject and hang up.
             let _ = drain_client(&mut server, 5 + 3 + 5).await;
@@ -515,10 +457,9 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(65536);
 
         let handle = tokio::spawn(async move {
-            let mut discard = vec![0u8; 1024];
-            let _ = server.read(&mut discard).await;
+            discard_request(&mut server).await;
             // Answer a plain Query with CopyInResponse.
-            server.write_all(&build_copy_in_response()).await.unwrap();
+            server.write_all(&build_copy_response(b'G')).await.unwrap();
             server.flush().await.unwrap();
 
             // Expect the client's CopyFail ('f'), not silence.
@@ -567,9 +508,8 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             // Query message, then open the CopyIn.
-            let mut discard = vec![0u8; 1024];
-            let _ = server.read(&mut discard).await;
-            server.write_all(&build_copy_in_response()).await.unwrap();
+            discard_request(&mut server).await;
+            server.write_all(&build_copy_response(b'G')).await.unwrap();
             server.flush().await.unwrap();
 
             // 'd' + len(4+7) + "payload", then 'c' + len(4).
@@ -612,9 +552,8 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(4 * 1024 * 1024);
 
         let handle = tokio::spawn(async move {
-            let mut discard = vec![0u8; 1024];
-            let _ = server.read(&mut discard).await;
-            server.write_all(&build_copy_in_response()).await.unwrap();
+            discard_request(&mut server).await;
+            server.write_all(&build_copy_response(b'G')).await.unwrap();
             server.flush().await.unwrap();
 
             let sent = drain_client(&mut server, expect_bytes).await;
@@ -660,8 +599,7 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(8192);
 
         tokio::spawn(async move {
-            let mut discard = vec![0u8; 1024];
-            let _ = server.read(&mut discard).await;
+            discard_request(&mut server).await;
             server
                 .write_all(&build_error_response(
                     "ERROR",
@@ -696,9 +634,8 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(8192);
 
         tokio::spawn(async move {
-            let mut discard = vec![0u8; 1024];
-            let _ = server.read(&mut discard).await;
-            server.write_all(&build_copy_in_response()).await.unwrap();
+            discard_request(&mut server).await;
+            server.write_all(&build_copy_response(b'G')).await.unwrap();
             server.flush().await.unwrap();
 
             let _ = drain_client(&mut server, 5 + 3 + 5).await;
@@ -737,12 +674,11 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(8192);
 
         tokio::spawn(async move {
-            let mut discard = vec![0u8; 1024];
-            let _ = server.read(&mut discard).await;
+            discard_request(&mut server).await;
             let mut notice = build_error_response("NOTICE", "00000", "heads up");
             notice[0] = b'N';
             server.write_all(&notice).await.unwrap();
-            server.write_all(&build_copy_in_response()).await.unwrap();
+            server.write_all(&build_copy_response(b'G')).await.unwrap();
             server.flush().await.unwrap();
 
             let _ = drain_client(&mut server, 5 + 1 + 5).await;
@@ -773,8 +709,7 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(8192);
 
         tokio::spawn(async move {
-            let mut discard = vec![0u8; 1024];
-            let _ = server.read(&mut discard).await;
+            discard_request(&mut server).await;
             server
                 .write_all(&build_ready_for_query(b'I'))
                 .await
@@ -795,8 +730,7 @@ mod tests {
 
         tokio::spawn(async move {
             // Read and discard the Query message
-            let mut discard = vec![0u8; 1024];
-            let _ = server.read(&mut discard).await;
+            discard_request(&mut server).await;
 
             // Send CommandComplete + ReadyForQuery
             server
@@ -822,8 +756,7 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(8192);
 
         tokio::spawn(async move {
-            let mut discard = vec![0u8; 1024];
-            let _ = server.read(&mut discard).await;
+            discard_request(&mut server).await;
 
             // RowDescription with 2 columns
             server
@@ -867,8 +800,7 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(8192);
 
         tokio::spawn(async move {
-            let mut discard = vec![0u8; 1024];
-            let _ = server.read(&mut discard).await;
+            discard_request(&mut server).await;
 
             // ErrorResponse + ReadyForQuery
             server
@@ -897,10 +829,9 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(8192);
 
         tokio::spawn(async move {
-            let mut discard = vec![0u8; 1024];
-            let _ = server.read(&mut discard).await;
+            discard_request(&mut server).await;
 
-            server.write_all(&build_copy_both_response()).await.unwrap();
+            server.write_all(&build_copy_response(b'W')).await.unwrap();
             server.flush().await.unwrap();
         });
 
@@ -920,10 +851,9 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(8192);
 
         tokio::spawn(async move {
-            let mut discard = vec![0u8; 1024];
-            let _ = server.read(&mut discard).await;
+            discard_request(&mut server).await;
 
-            server.write_all(&build_copy_out_response()).await.unwrap();
+            server.write_all(&build_copy_response(b'H')).await.unwrap();
             server.flush().await.unwrap();
         });
 

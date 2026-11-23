@@ -3,13 +3,13 @@
 //! The libpq and native backends expose the same command methods, and each one is the same
 //! "build the SQL, run it, check the result" sequence over a few backend primitives.
 //! `replication_commands!` holds that sequence once and expands to the public inherent
-//! methods inside each backend's `impl` block. They stay inherent (not a trait) so callers of
-//! `PgReplicationConnection` need no extra `use`.
+//! methods, and the replication-mode guard they call, inside each backend's `impl` block. They
+//! stay inherent (not a trait) so callers of `PgReplicationConnection` need no extra `use`.
 //!
 //! Commands whose only difference is how the backend enters COPY mode (`start_replication`,
 //! `start_physical_replication`, `base_backup`, `upload_manifest`) stay in the backends.
 
-use crate::error::{ReplicationError, Result};
+use crate::error::{ReplicationError, Result, ServerError};
 use crate::types::{parse_lsn, Lsn, ReplicationSlotInfo, ReplicationSlotOptions, SlotType};
 use tracing::debug;
 
@@ -18,6 +18,16 @@ pub(super) trait QueryResult {
     fn is_ok(&self) -> bool;
     fn error_message(&self) -> Option<String>;
     fn get_value(&self, row: i32, col: i32) -> Option<String>;
+}
+
+/// The error for a result the server rejected: `context`, then the server's message.
+pub(super) fn server_failure(
+    server: Option<ServerError>,
+    message: Option<String>,
+    context: &str,
+) -> ReplicationError {
+    let message = message.unwrap_or_else(|| "Unknown error".to_string());
+    ReplicationError::from_server(server, format!("{context}: {message}"))
 }
 
 pub(super) fn log_identity(result: &impl QueryResult) {
@@ -99,12 +109,23 @@ pub(super) fn slot_info(slot_name: &str, result: &impl QueryResult) -> Result<Re
 /// Expands to the public replication commands shared by both backends, returning `$result`.
 ///
 /// `$result` must implement [`QueryResult`], and the expansion must sit in an inherent `impl`
-/// inside `crate::connection`. That `impl` must provide `exec`, `exec_async`, `server_version`
-/// and `ensure_replication_mode`, plus `put_copy_data(&mut self, Bytes)`, which sends one
-/// CopyData message and flushes it. `put_copy_data` returns a future (an `async fn` or
+/// inside `crate::connection`. That `impl` must provide `exec`, `exec_async` and
+/// `server_version`, a `copy` field whose `is_replication()` says whether the connection is
+/// streaming, plus `put_copy_data(&mut self, Bytes)`, which sends one CopyData message and
+/// flushes it. `put_copy_data` returns a future (an `async fn` or
 /// `-> impl Future`); the commands await it right away.
 macro_rules! replication_commands {
     ($result:ty) => {
+        #[inline]
+        fn ensure_replication_mode(&self) -> $crate::error::Result<()> {
+            if !self.copy.is_replication() {
+                return Err($crate::error::ReplicationError::protocol(
+                    "Connection is not in replication mode".to_string(),
+                ));
+            }
+            Ok(())
+        }
+
         /// Send IDENTIFY_SYSTEM command
         pub fn identify_system(&mut self) -> $crate::error::Result<$result> {
             tracing::debug!("Sending IDENTIFY_SYSTEM command");
@@ -342,11 +363,21 @@ mod tests {
         }
     }
 
+    struct FakeCopy {
+        replication: bool,
+    }
+
+    impl FakeCopy {
+        fn is_replication(&self) -> bool {
+            self.replication
+        }
+    }
+
     /// A backend stand-in that records what the shared commands ask of it, so the macro
     /// itself is exercised without a socket.
     struct FakeConn {
         version: i32,
-        replication: bool,
+        copy: FakeCopy,
         reply: Fake,
         exec_fails: bool,
         sql: Vec<String>,
@@ -357,7 +388,7 @@ mod tests {
         fn new(version: i32) -> Self {
             Self {
                 version,
-                replication: true,
+                copy: FakeCopy { replication: true },
                 reply: rows([None; 3]),
                 exec_fails: false,
                 sql: Vec::new(),
@@ -379,15 +410,6 @@ mod tests {
 
         fn server_version(&self) -> i32 {
             self.version
-        }
-
-        fn ensure_replication_mode(&self) -> Result<()> {
-            if !self.replication {
-                return Err(ReplicationError::protocol(
-                    "Connection is not in replication mode".to_string(),
-                ));
-            }
-            Ok(())
         }
 
         async fn put_copy_data(&mut self, data: Bytes) -> Result<()> {
@@ -521,6 +543,14 @@ mod tests {
     }
 
     #[test]
+    fn server_failure_puts_the_context_before_the_server_message() {
+        let err = server_failure(None, Some("boom".to_string()), "ctx");
+        assert!(err.to_string().ends_with("ctx: boom"), "{err}");
+        let err = server_failure(None, None, "ctx");
+        assert!(err.to_string().ends_with("ctx: Unknown error"), "{err}");
+    }
+
+    #[test]
     fn drop_slot_sql_quotes_the_name_and_honours_wait() {
         assert_eq!(
             drop_slot_sql("s", true).unwrap(),
@@ -603,7 +633,7 @@ mod tests {
     #[test]
     fn standby_status_update_outside_replication_mode_sends_nothing() {
         let mut conn = FakeConn::new(170000);
-        conn.replication = false;
+        conn.copy.replication = false;
 
         let err = futures::executor::block_on(conn.send_standby_status_update(1, 2, 3, false))
             .unwrap_err();
@@ -632,7 +662,7 @@ mod tests {
     #[test]
     fn hot_standby_feedback_outside_replication_mode_sends_nothing() {
         let mut conn = FakeConn::new(170000);
-        conn.replication = false;
+        conn.copy.replication = false;
 
         let err =
             futures::executor::block_on(conn.send_hot_standby_feedback(1, 2, 3, 4)).unwrap_err();

@@ -23,29 +23,14 @@
 //! cargo test --test snapshot_export -- --ignored
 //! ```
 
+mod common;
+
+use common::{drop_slot_best_effort as drop_slot, regular_conn_string, replication_conn_string};
 use pg_walstream::{
     CancellationToken, LogicalReplicationStream, PgReplicationConnection, ReplicationSlotOptions,
     ReplicationStreamConfig, RetryConfig, StreamingMode,
 };
 use std::time::Duration;
-
-/// Return the replication connection string from environment, or skip.
-fn replication_conn_string() -> String {
-    std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgresql://postgres:postgres@localhost:5432/test_walstream?replication=database"
-            .to_string()
-    })
-}
-
-/// Return the regular (non-replication) connection string from environment, or derive it.
-fn regular_conn_string() -> String {
-    std::env::var("DATABASE_URL_REGULAR").unwrap_or_else(|_| {
-        // Strip `replication=database` from the replication connection string
-        let repl = replication_conn_string();
-        repl.replace("?replication=database", "")
-            .replace("&replication=database", "")
-    })
-}
 
 /// Create a helper config with a unique slot name to avoid collisions between tests.
 fn test_config(slot_name: &str) -> ReplicationStreamConfig {
@@ -87,16 +72,6 @@ fn setup_schema(regular_conn: &mut PgReplicationConnection) {
     regular_conn
         .exec("CREATE PUBLICATION test_pub FOR TABLE snapshot_test")
         .expect("CREATE PUBLICATION test_pub");
-}
-
-/// Helper: clean up a replication slot (best-effort).
-fn drop_slot(slot_name: &str) {
-    if let Ok(mut conn) = PgReplicationConnection::connect(&replication_conn_string()) {
-        let _ = conn.exec(&format!(
-            "SELECT pg_drop_replication_slot('{}') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '{}')",
-            slot_name, slot_name
-        ));
-    }
 }
 
 #[tokio::test]

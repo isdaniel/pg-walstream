@@ -1,5 +1,7 @@
 //! The table copy loop shared by [`SnapshotRows`](super::SnapshotRows) and [`AlignedSnapshot`](super::AlignedSnapshot).
 
+#[cfg(test)]
+use super::plan::test_relation;
 use super::plan::SnapshotTable;
 use super::rows::SnapshotRow;
 use crate::connection::PgReplicationConnection;
@@ -70,15 +72,8 @@ enum RowSource {
 #[cfg(test)]
 fn synthetic_row(index: usize, lsn: Lsn) -> SnapshotRow {
     use crate::column_value::{ColumnValue, RowData};
-    use crate::protocol::{ColumnInfo, RelationInfo};
 
-    let relation = Arc::new(RelationInfo::new(
-        42,
-        "public".to_string(),
-        "users".to_string(),
-        b'd',
-        vec![ColumnInfo::new(0, "id".to_string(), 23, -1)],
-    ));
+    let relation = Arc::new(test_relation(42, "public", "users", &["id"], 23));
     let mut data = RowData::new();
     data.push(Arc::from("id"), ColumnValue::text(&(index + 1).to_string()));
     SnapshotRow {
@@ -136,11 +131,6 @@ impl TableCopy {
             completed: false,
             poisoned: false,
         }
-    }
-
-    #[inline]
-    pub(super) fn completed(&self) -> bool {
-        self.completed
     }
 
     #[inline]
@@ -232,6 +222,20 @@ impl TableCopy {
         }
     }
 
+    /// Close the reader after a fully consumed copy, or fail without closing it.
+    ///
+    /// `unconsumed` is the error message for a copy that was neither poisoned nor read to the end.
+    pub(super) fn finish(&mut self, unconsumed: &str) -> Result<()> {
+        if self.poisoned {
+            return Err(poisoned_err());
+        }
+        if !self.completed {
+            return Err(ReplicationError::protocol(unconsumed.to_string()));
+        }
+        self.close();
+        Ok(())
+    }
+
     /// Abort any in-flight `COPY` so dropping the reader rolls back its snapshot transaction.
     pub(super) fn close(&mut self) {
         match &mut self.source {
@@ -256,20 +260,10 @@ pub(super) fn poisoned_err() -> ReplicationError {
 mod tests {
     use super::*;
     use crate::column_value::ColumnValue;
-    use crate::protocol::{ColumnInfo, RelationInfo};
 
     fn table(columns: &[&str]) -> SnapshotTable {
         SnapshotTable {
-            relation: Arc::new(RelationInfo::new(
-                42,
-                "public".to_string(),
-                "users".to_string(),
-                b'd',
-                columns
-                    .iter()
-                    .map(|c| ColumnInfo::new(0, c.to_string(), 25, -1))
-                    .collect(),
-            )),
+            relation: Arc::new(test_relation(42, "public", "users", columns, 25)),
             copy_sql: String::new(),
         }
     }
