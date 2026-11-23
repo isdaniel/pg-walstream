@@ -1549,7 +1549,7 @@ impl LogicalReplicationStream {
                     }
                     return Ok(Some(event));
                 }
-                // Control message with no ChangeEvent (e.g. Relation) → next frame.
+                // Data message for a relation not yet seen → next frame.
                 Ok(None) => {}
                 Err(e) => return Err(self.noted(e)),
             }
@@ -11716,7 +11716,7 @@ pub(crate) mod tests {
     }
 
     // ================================================================
-    // Relation schema-change detection tests
+    // Relation event tests
     // ================================================================
 
     #[test]
@@ -11746,9 +11746,7 @@ pub(crate) mod tests {
         assert!(first.is_some(), "First-time relation should emit an event");
         assert!(stream.state.get_relation(200).is_some());
 
-        // pgoutput resends an unchanged Relation after any relcache invalidation
-        // (ALTER POLICY, GRANT, ...), the only in-stream sign of it, so the
-        // repeat must surface too.
+        // pgoutput resends an unchanged Relation after a relcache invalidation (ALTER POLICY, GRANT, ANALYZE, ...).
         let repeat = crate::protocol::message_to_change_event(&mut stream.state, mk(), 0xB100)
             .unwrap()
             .expect("Unchanged repeat should emit a Relation event");
@@ -11803,7 +11801,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_convert_to_change_event_relation_schema_change_new_column() {
+    fn test_convert_to_change_event_relation_carries_new_column() {
         use crate::protocol::{ColumnInfo, RelationInfo};
         use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
 
@@ -11823,7 +11821,7 @@ pub(crate) mod tests {
         );
         stream.state.add_relation(relation);
 
-        // Send relation message with an extra column — schema change!
+        // Send relation message with an extra column
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Relation {
             relation_id: 400,
             namespace: Arc::from("public"),
@@ -11864,7 +11862,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_convert_to_change_event_relation_schema_change_type_change() {
+    fn test_convert_to_change_event_relation_carries_type_change() {
         use crate::protocol::{ColumnInfo, RelationInfo};
         use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
 
@@ -11907,7 +11905,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_convert_to_change_event_relation_schema_change_replica_identity() {
+    fn test_convert_to_change_event_relation_carries_replica_identity() {
         use crate::protocol::{ColumnInfo, RelationInfo};
         use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
 
@@ -11951,7 +11949,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_convert_to_change_event_relation_schema_change_column_rename() {
+    fn test_convert_to_change_event_relation_carries_column_rename() {
         use crate::protocol::{ColumnInfo, RelationInfo};
         use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
 
@@ -11998,7 +11996,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_convert_to_change_event_relation_schema_change_namespace() {
+    fn test_convert_to_change_event_relation_carries_namespace() {
         use crate::protocol::{ColumnInfo, RelationInfo};
         use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
 
@@ -12039,7 +12037,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_convert_to_change_event_relation_schema_change_key_flag() {
+    fn test_convert_to_change_event_relation_carries_key_flag() {
         use crate::protocol::{ColumnInfo, RelationInfo};
         use crate::{LogicalReplicationMessage, StreamingReplicationMessage};
 
