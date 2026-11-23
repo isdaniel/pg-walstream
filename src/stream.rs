@@ -1579,7 +1579,7 @@ impl LogicalReplicationStream {
                     }
                     return Ok(Some(event));
                 }
-                // Control message with no ChangeEvent (e.g. Relation) → next frame.
+                // Data message for a relation not yet seen → next frame.
                 Ok(None) => {}
                 Err(e) => return Err(self.noted(e)),
             }
@@ -10631,11 +10631,11 @@ pub(crate) mod tests {
     }
 
     // ================================================================
-    // Relation schema-change detection tests
+    // Relation event tests
     // ================================================================
 
     #[test]
-    fn test_convert_to_change_event_relation_first_time_emits_then_dedups() {
+    fn test_convert_to_change_event_relation_first_time_and_repeat_both_emit() {
         let mut stream = test_stream();
 
         let mk = || {
@@ -10657,15 +10657,17 @@ pub(crate) mod tests {
         assert!(first.is_some(), "First-time relation should emit an event");
         assert!(stream.state.get_relation(200).is_some());
 
-        // pgoutput repeats Relation at the start of every transaction; an
-        // unchanged repeat must stay silent.
-        let repeat =
-            crate::protocol::message_to_change_event(&mut stream.state, mk(), 0xB100).unwrap();
-        assert!(repeat.is_none(), "Unchanged repeat should return None");
+        // pgoutput resends an unchanged Relation after a relcache invalidation (ALTER POLICY, GRANT, ANALYZE, ...).
+        let repeat = crate::protocol::message_to_change_event(&mut stream.state, mk(), 0xB100)
+            .unwrap()
+            .expect("Unchanged repeat should emit a Relation event");
+        assert_eq!(repeat.event_type_str(), "relation");
+        assert_eq!(repeat.lsn.value(), 0xB100);
+        assert!(stream.state.get_relation(200).is_some());
     }
 
     #[test]
-    fn test_convert_to_change_event_relation_same_schema_returns_none() {
+    fn test_convert_to_change_event_relation_same_schema_emits() {
         let mut stream = test_stream();
 
         // Pre-populate cache
@@ -10686,21 +10688,25 @@ pub(crate) mod tests {
 
         let result =
             crate::protocol::message_to_change_event(&mut stream.state, msg, 0xC000).unwrap();
-        assert!(
-            result.is_none(),
-            "Same schema should not emit a Relation event"
-        );
+        let event = result.expect("Same schema should emit a Relation event");
+        assert!(matches!(
+            event.event_type,
+            EventType::Relation {
+                relation_id: 300,
+                ..
+            }
+        ));
     }
 
     #[test]
-    fn test_convert_to_change_event_relation_schema_change_new_column() {
+    fn test_convert_to_change_event_relation_carries_new_column() {
         let mut stream = test_stream();
 
         // Pre-populate cache with 2 columns
         let relation = relation_info(400, "accounts", &["email"]);
         stream.state.add_relation(relation);
 
-        // Send relation message with an extra column — schema change!
+        // Send relation message with an extra column
         let msg = StreamingReplicationMessage::new(LogicalReplicationMessage::Relation {
             relation_id: 400,
             namespace: Arc::from("public"),
@@ -10741,7 +10747,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_convert_to_change_event_relation_schema_change_type_change() {
+    fn test_convert_to_change_event_relation_carries_type_change() {
         let mut stream = test_stream();
 
         // Pre-populate with type_id=25 (text)
@@ -10771,7 +10777,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_convert_to_change_event_relation_schema_change_replica_identity() {
+    fn test_convert_to_change_event_relation_carries_replica_identity() {
         let mut stream = test_stream();
 
         // Pre-populate with replica_identity = 'd' (Default)
@@ -10805,7 +10811,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_convert_to_change_event_relation_schema_change_column_rename() {
+    fn test_convert_to_change_event_relation_carries_column_rename() {
         let mut stream = test_stream();
 
         // Pre-populate
@@ -10839,7 +10845,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_convert_to_change_event_relation_schema_change_namespace() {
+    fn test_convert_to_change_event_relation_carries_namespace() {
         let mut stream = test_stream();
 
         // Pre-populate in "public" schema
@@ -10870,7 +10876,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_convert_to_change_event_relation_schema_change_key_flag() {
+    fn test_convert_to_change_event_relation_carries_key_flag() {
         let mut stream = test_stream();
 
         // Pre-populate: "email" is NOT a key column (flags=0)
